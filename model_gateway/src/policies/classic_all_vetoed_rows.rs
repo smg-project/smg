@@ -253,7 +253,7 @@ impl Bed {
             placement::Stated::nothing,
         );
         match picked {
-            Some(worker) => {
+            Ok(worker) => {
                 let place = self
                     .workers
                     .iter()
@@ -264,12 +264,13 @@ impl Bed {
                     .position(|&p| p == place)
                     .expect("a worker of the row")
             }
-            None => {
+            Err(miss) => {
                 let failure = placement::single_failure(
                     &self.registry,
                     MODEL,
                     RoutingPool::HttpRegular,
                     None,
+                    miss,
                 );
                 match failure {
                     PlacementFailure::AllOverloaded(_) => self.workers.len(),

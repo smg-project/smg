@@ -38,11 +38,11 @@ These rules hold for the whole spec:
 | `signals` | Named values of a worker's report. See [Signals](#signals). | Empty |
 | `plans.pd-pair` | The rules of a pair. See [Prefill and decode](#prefill-and-decode). | See there |
 | `bindings` | The bindings, in order. See [Bindings](#bindings). | Empty |
-| `explain.sample` | Each deciding thread keeps every Nth pick or shed it counts, for explain. N is 0 to 4294967295. | `0`: keeps none |
+| `explain.sample` | Each deciding thread keeps every Nth pick or shed it counts, for explain. The count can start over: see [Explain](metrics.md#explain). N is 0 to 4294967295. | `0`: keeps none |
 
-A `generation` of zero asks the service to number the spec. See [Updating a policy spec](../REFERENCE.md#updating-a-document).
+A `generation` of zero asks the service to number the spec. See [Updating a policy spec](guarantees.md#updating-a-spec).
 
-In a host's own process the engine counts a request only where an id names it. See [Explain and metrics](../REFERENCE.md#explain-and-metrics).
+In a host's own process the engine counts a request only where an id names it. See [Explain and metrics](metrics.md#explain).
 
 ## Profiles
 
@@ -76,7 +76,7 @@ A send leaves the tally at the first of these events:
 - The worker is removed, joins again, is replaced or changes its number of ranks.
 - The end of `sent_ttl_ms`, where the profile sets it.
 
-The tally keeps 8,192 sends for a worker, and for each rank of a data-parallel worker, whether or not the profile sets `sent_ttl_ms`. One more send lets the oldest of them go.
+As a rule the tally keeps 8,192 sends for a worker, and for each rank of a data-parallel worker: one more send lets the oldest of them go. That holds whether or not the profile sets `sent_ttl_ms`.
 
 A profile that sets `sent_ttl_ms` or `sent_report_delay_ms` is refused unless one of its stages reads the tally. Of the built-in stages, these read it:
 
@@ -136,7 +136,7 @@ Other readers follow their own rules:
 | Field | What it holds | Default |
 |---|---|---|
 | `kind` | `tree` or `hash`. | `tree` |
-| `ttl_s` | How many seconds a placement of the classic hash index lives. The crate's engine does not read it: its record keeps a placement until `max_size` takes it. | 180 |
+| `ttl_s` | How many seconds a placement of the classic hash index lives. The crate's engine does not read it: no placement of its record expires. | 180 |
 | `max_size` | The size bound of a `tree`. The crate's engine bounds its record by it under either kind. | 67108864 |
 | `sweep_s` | How many seconds pass between sweeps. | 120 |
 
@@ -161,8 +161,9 @@ The crate's engine reads `kind` and `max_size` alone, for a pool whose profile r
 
 - Under `tree`, the engine bounds the model's record of sent prefixes at `max_size` divided by the block size, and at one placement at least. The record holds one placement for each block a worker was sent.
 - At the defaults that is 4,194,304 placements. The record takes about 55 bytes a block, so about 230 MB a model.
-- Under `hash`, the engine keeps the same record under the same bound, keyed at `view.boundaries` alone. It holds one placement for each boundary a request of token ids reaches and each worker sent it. A request that reaches no boundary, or one hashed by its text, is recorded nowhere.
-- A boundary past the first `max_block_hashes` blocks of a request keys nothing. A key ends at the last whole block under its boundary, and a request that holds those blocks reaches it. Every worker sent a head stays its holder until the bound takes the placement.
+- Under `hash`, the engine keeps the same record under the same bound, keyed at `view.boundaries` alone. For a request of token ids it holds one placement at most for each boundary and each worker sent the request.
+- Under `hash`, a request that carries fewer block hashes than the first boundary has whole blocks, or one hashed by its text, is recorded nowhere.
+- A boundary of more whole blocks than `max_block_hashes` keys nothing. A key ends at the last whole block under its boundary, and a request that holds those blocks reaches it. As a rule every worker sent a head stays its holder until the bound takes the placement.
 - The entry read is the one for the model the request names, under the id by which the first worker of its list lists that model. A model that workers list behind their primary one keeps its own record under its own entry.
 - A record read for a model behind a first worker's primary one is bounded by the smallest block size any list asked with, for as long as it lives.
 - An id and an alias of one model share one record. A name no model of that worker answers to reads the record and the entry of the worker's primary model id.
@@ -269,6 +270,7 @@ A binding with no block says the defaults.
 `bindings[].sessions` configures sticky placement. The rule pins a key to a worker, and a later request of the key follows that pin where it can. Among what sends it elsewhere: the rule's cap, a filter that refuses the worker for that request, and a target entry that names another worker.
 
 - The rule runs under `single`. It also runs on the two sides of `pd-pair` and of the pair in `epd`, each side by its own session.
+- Under `pd-pair` a rule's `sides` can name the one side it covers, `prefill` or `decode`. A side it leaves out is placed by its profile alone, and the rule reads, claims and writes no pin of that side's session.
 - Under `epd` it places no encode item.
 - A picker that places by session assignment runs on the pair's two sides of `epd`, and is refused on its encode side.
 - The stock controller refuses a rule that states `rule_placed: untold` under `pd-pair` and under `epd`.
@@ -283,6 +285,7 @@ A binding with no block says the defaults.
 | `inflight_cap` | 2 | Requests of one key a worker holds before the next is placed again. Above zero. 65535 means no cap. |
 | `recovery` | `original` | Which pin leads once both of a key's pins are usable again. |
 | `rule_placed` | `told` | Whether a request the rule placed alone is the profile's own. |
+| `sides` | Left out: both sides | Under `pd-pair`, the sides the rule covers: `prefill`, `decode` or both, each once. An empty list is refused. So is any list under `single` and under `epd`. |
 | `issue_session_id` | `false` | `true` is refused. |
 
 **The assignment.**
@@ -477,7 +480,7 @@ A `single` binding can name a second profile, as in `shadow: next`.
 - Each scrape reads the engine once, and no request does.
 - A binding that names a shadow has its series from the first scrape: the four kinds, for each side it is counted by.
 - A single request's decision whose lease fails to issue counts no shadow.
-- [Gateway routing metrics](../REFERENCE.md#gateway-routing-metrics) has the series.
+- [Gateway routing metrics](metrics.md#gateway-routing-metrics) has the series.
 
 **When a shadow is skipped.** These rules are a `single` binding's:
 
@@ -577,6 +580,7 @@ These rules stand beside the modes:
 Workers of the standalone service pair by their labels:
 
 - Over the registration RPC, the pairing descriptor accepts only a bootstrap port. The runtime comes from `spec.runtime`.
+- The pair rule and the encode classes read that name as the worker crate does. Two spellings of one runtime are one runtime to both. That crate's word for no runtime states none, like a row that names none. Another name it does not know is compared as written.
 - A worker registered this way, or found by the controller's own discovery, pairs by what its labels report, as a gateway reads them.
 - The labels report its transfer backend or `kv_connector`, its version, its KV layout facts and its operator's `pairing_protocol`.
 - The controller's discovery writes a found worker's pairing protocol and KV connector among that worker's labels.
@@ -620,8 +624,8 @@ The entry and its refusal names stand in [`encode.rs`](../src/engine/framework/e
 
 ## Where the rest stands
 
-A spec's life is in the reference:
+Updates and refusals stand on the guarantees page, and the presets in the reference:
 
-- [Updating a policy spec](../REFERENCE.md#updating-a-document)
-- [Decisions and refusals](../REFERENCE.md#decisions-and-refusals)
+- [Updating a policy spec](guarantees.md#updating-a-spec)
+- [Decisions and refusals](guarantees.md#decisions-and-refusals)
 - [The presets](../REFERENCE.md#presets), each as a whole spec

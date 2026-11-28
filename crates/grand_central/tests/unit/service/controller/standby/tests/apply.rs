@@ -47,7 +47,7 @@ fn told(log: &Log) -> Vec<(Position, String)> {
 /// Writes under the first term: registrations, a status change, a
 /// relabel and a resize.
 fn first(leader: &MemoryStore) {
-    let revision = |id| WorkersStore::get(leader, id).expect("the row").revision;
+    let revision = |id| leader.get(id).expect("the row").revision;
     let a = leader.upsert(facts("http://a:8000", 1)).id();
     leader.upsert(facts("http://b:8000", 1));
     leader.set_status(a, WorkerStatus::Ready, revision(a));
@@ -410,7 +410,7 @@ fn an_event_that_does_not_land_halts_the_batch_where_it_stands() {
     let ((leader, led), follower, (standby, _followed)) = pair();
     let at = Instant::now();
     let a = leader.upsert(facts("http://a:8000", 1)).id();
-    let revision = WorkersStore::get(&*leader, a).expect("the row").revision;
+    let revision = leader.get(a).expect("the row").revision;
     leader.set_status(a, WorkerStatus::Ready, revision);
     let sent = entries(&led, start(&led));
     let [term, registered, readied] = &sent[..] else {
@@ -515,7 +515,7 @@ fn the_standbys_numbers() {
             } else {
                 WorkerStatus::NotReady
             };
-            let row = WorkersStore::get(&*leader.0, id).expect("the row");
+            let row = leader.0.get(id).expect("the row");
             leader.0.set_status(id, status, row.revision);
         }
         let sent = entries(&leader.1, place);
@@ -773,9 +773,7 @@ fn a_restore_leaves_every_row_under_its_generations_overload_switch() {
 
     // A first restore under no generation: the row takes the start's.
     let row = leader.0.upsert(facts(a, 1)).id();
-    let revision = WorkersStore::get(&*leader.0, row)
-        .expect("the row")
-        .revision;
+    let revision = leader.0.get(row).expect("the row").revision;
     leader.0.set_status(row, WorkerStatus::Ready, revision);
     let cut = staged(&snapshot(&leader, at), at);
     assert_eq!(follower.restore(cut, None), Ok(true));

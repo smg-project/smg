@@ -107,6 +107,16 @@ and the call's end carries the terminal that ends the turn wherever the model st
 table has one (Kimi K3's message close), since nothing may follow; a turn a stop token ends has
 nothing after the call.
 
+Where a call is required and several are allowed, free text after a call would be read as content
+beside the calls. A table whose layout says what its template writes between two calls
+(`Layout::between_calls`) therefore gets a tag of one or more calls and no free text. In the tag
+built from the table's markers that text may follow each call, once or twice (between two calls
+and before the turn ends), nothing else may, and the terminal that ends the turn comes last where
+the table has one; in the tag written from the layout that text stands between two calls and the
+layout's `after_calls` follows the last. A table that says no such text keeps the tag that opens
+in free text. In a block syntax the text between two calls is written inside the block, and none
+stands between two blocks.
+
 `Format::answer_grammar` is the tag for an answer that is JSON a schema accepts, the
 `response_format` of a request, from the same table: the rows into the state the answer is written
 in, the schema, and the answer's close with the end of the turn. Where the output starts in
@@ -128,9 +138,9 @@ loosely, as before, though the gateway no longer asks for one). A table may boun
 its tokens (`Format::bounds_answer_whitespace`, written as xgrammar's `max_whitespace_cnt` on the
 answer's schema node; an xgrammar before 0.2.7 ignores the key): a model held to its answer's JSON
 after a long thought, by an engine that starts the grammar at the first token, may drift into tabs
-and newlines the schema's grammar otherwise admits without end. LFM2.5's table bounds them to
-thirty-two, which leaves four-space indentation seven levels deep; the calls' values are never
-bounded.
+and newlines the schema's grammar otherwise admits without end. LFM2.5's table and MiniMax M3's
+bound them to thirty-two, which leaves four-space indentation seven levels deep; the calls'
+values are never bounded.
 
 Where the thought is a message of its own before an answer that is another (Inkling's: the
 thought's close ends every message alike, and the next message's opener says what it is), and the
@@ -184,7 +194,8 @@ second time; the gateway reads it from the rendered prompt as it reads `reasonin
 (`Format::thought_closed`, `Options::thought_closed`), and a thought the model writes anyway carries
 its own. GLM 4.6's thinking-off prompt ends with the bare `<think></think>`, so its newline stays the
 tag's to write. An answer's tag keeps the schema alone after the close, the engine's own constraint,
-which the registry's tables leave to it.
+which the registry's tables leave to it unless they bound the answer's whitespace: such a table
+sends the schema alone as the tag of its node, where the bound is written.
 
 A marker that is one token of the model's vocabulary (`Format::marker_tokens`: a terminal, a
 structural token, one of the syntax's own tags (`CallSyntax::tag_texts`), or a token inside one) is

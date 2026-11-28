@@ -312,8 +312,9 @@ impl AsyncMultiModalTracker {
         self
     }
 
-    /// Sample videos that name no `fps` at this rate (the model's reference
-    /// default) instead of the connector default.
+    /// Sample videos that name no `fps` at this rate (the caller's default for
+    /// its clips: a rate the request or the server's start states, else the
+    /// model's reference default) instead of the connector default.
     pub fn with_default_video_sample_fps(mut self, fps: Option<f64>) -> Self {
         self.default_video_sample_fps = fps;
         self
@@ -689,8 +690,10 @@ fn is_data_url(url: &str, canonical_data_prefix: &str) -> bool {
         || url::Url::parse(url).is_ok_and(|parsed| parsed.scheme() == "data")
 }
 
-/// The fetch settings for one video: the request's `fps` when given (and
-/// valid), else the model's default, else the connector default; plus the
+/// The fetch settings for one video: the part's `fps` when given (and
+/// valid), else the caller's default for its clips
+/// ([`AsyncMultiModalTracker::with_default_video_sample_fps`]), else the
+/// connector default; plus the
 /// long-side cap when given and the model's frame placement.
 fn video_fetch_config(
     fps: Option<f64>,
@@ -728,9 +731,15 @@ pub(crate) const MAX_VIDEO_LONG_SIDE: u32 = 3584;
 /// Vision patch factor the per-frame cap must align to.
 pub(crate) const VIDEO_LONG_SIDE_FACTOR: u32 = 28;
 
+/// Whether `value` is a rate a video clip can be sampled at: a finite number
+/// inside the accepted range, bounds included.
+pub fn sample_fps_in_range(value: f64) -> bool {
+    value.is_finite() && (MIN_SAMPLE_FPS..=MAX_SAMPLE_FPS).contains(&value)
+}
+
 /// Reject a sampling rate outside M3's accepted range.
 fn validate_sample_fps(value: f64) -> MultiModalResult<f64> {
-    if !value.is_finite() || !(MIN_SAMPLE_FPS..=MAX_SAMPLE_FPS).contains(&value) {
+    if !sample_fps_in_range(value) {
         return Err(MediaConnectorError::InvalidSampleFps {
             value,
             min: MIN_SAMPLE_FPS,

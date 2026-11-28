@@ -353,16 +353,12 @@ async fn a_handle_over_a_link_ends_a_lease_its_alternate_served() {
             .await
             .expect("a ready fleet");
         for id in ["held-0", "held-1", "held-2"] {
-            let asked = Request {
-                id: id.as_bytes(),
-                facts: {
-                    let mut facts = RequestFacts::default();
-                    facts.model = MODEL;
-                    facts.budget_micros = 5_000_000;
-                    facts
-                },
-                constraints: Default::default(),
-            };
+            let asked = Request::of(id.as_bytes(), {
+                let mut facts = RequestFacts::default();
+                facts.model = MODEL;
+                facts.budget_micros = 5_000_000;
+                facts
+            });
             let started = Instant::now();
             let held = Box::pin(DecisionGuard::<&InProcess>::asked(
                 &link, &asked, started, ROOM,
@@ -446,16 +442,12 @@ async fn a_handle_over_a_link_is_answered_the_worker_its_request_names() {
         // names, or the reason of its shed.
         let mut answers = Vec::with_capacity(asks.len());
         for (id, named) in asks {
-            let asked = Request {
-                id: id.as_bytes(),
-                facts: {
-                    let mut facts = RequestFacts::default();
-                    facts.model = MODEL;
-                    facts.budget_micros = 5_000_000;
-                    facts
-                },
-                constraints: Default::default(),
-            };
+            let asked = Request::of(id.as_bytes(), {
+                let mut facts = RequestFacts::default();
+                facts.model = MODEL;
+                facts.budget_micros = 5_000_000;
+                facts
+            });
             let started = Instant::now();
             let held = Box::pin(DecisionGuard::<&InProcess>::asked_naming(
                 &link, &asked, named, started, ROOM,
@@ -575,33 +567,26 @@ async fn a_handle_over_a_link_is_held_to_the_workers_that_meet_its_requests_dema
         assert_eq!(link.welcome().protocol, PROTOCOL_VERSION);
 
         let none = Demands::default();
-        let at_worker = Demands {
-            references: References::Worker,
-            ..none
-        };
-        let past = Demands {
-            input_window: 4_097,
-            ..none
-        };
-        let unstated = Demands { runtime: 9, ..none };
-        let past_its_one = Demands {
-            runtime: 7,
-            input_window: 4_097,
-            ..none
-        };
-        let vision = Demands {
-            vision: true,
-            ..none
-        };
+        let mut a_runtime = none;
+        a_runtime.runtime = 7;
+        let mut at_worker = none;
+        at_worker.references = References::Worker;
+        let mut past = none;
+        past.input_window = 4_097;
+        let mut unstated = none;
+        unstated.runtime = 9;
+        let mut past_its_one = none;
+        past_its_one.runtime = 7;
+        past_its_one.input_window = 4_097;
+        let mut vision = none;
+        vision.vision = true;
+        let mut vision_at_a_runtime = vision;
+        vision_at_a_runtime.runtime = 7;
         // What a demand's asks are answered: the engines their picks name, or
         // the reason and the stage of a shed.
         let demands = [
             ("no demand", none, Ok(BTreeSet::from([0, 1, 2]))),
-            (
-                "a runtime",
-                Demands { runtime: 7, ..none },
-                Ok(BTreeSet::from([0])),
-            ),
+            ("a runtime", a_runtime, Ok(BTreeSet::from([0]))),
             ("a pipeline of its own", at_worker, Ok(BTreeSet::from([1]))),
             ("an input past a window", past, Ok(BTreeSet::from([1, 2]))),
             (
@@ -617,27 +602,24 @@ async fn a_handle_over_a_link_is_held_to_the_workers_that_meet_its_requests_dema
             ("vision", vision, Ok(BTreeSet::from([2]))),
             (
                 "vision and a runtime its engine does not state",
-                Demands {
-                    runtime: 7,
-                    ..vision
-                },
+                vision_at_a_runtime,
                 Err((Why::NoEndpoints, "vision")),
             ),
         ];
-        let asked = |id: &'static [u8], seed: u64, demands: Demands| Request {
-            id,
-            facts: {
+        let asked = |id: &'static [u8], seed: u64, demands: Demands| {
+            let mut request = Request::of(id, {
                 let mut facts = RequestFacts::default();
                 facts.model = MODEL;
                 facts.seed = seed;
                 facts.budget_micros = 5_000_000;
                 facts
-            },
-            constraints: {
+            });
+            request.constraints = {
                 let mut constraints = Constraints::default();
                 constraints.demands = demands;
                 constraints
-            },
+            };
+            request
         };
         let mut seed = 0;
         for (what, demanded, wanted) in demands {

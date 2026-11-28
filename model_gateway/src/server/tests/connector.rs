@@ -173,17 +173,11 @@ fn registration(app: &Arc<AppContext>, url: &str) -> WorkflowContext<WorkerWorkf
     WorkflowContext::new(WorkflowInstanceId::new(), data)
 }
 
+/// Registers `url` as a local gRPC worker. The registration's probes dial
+/// the engine: they get time enough on a loaded host.
 async fn register_grpc(app: &Arc<AppContext>, url: &str) -> Arc<dyn Worker> {
-    register_grpc_from(app, url, registration(app, url)).await
-}
-
-/// [`register_grpc`] over `context`, a registration of `url` its case set
-/// up.
-async fn register_grpc_from(
-    app: &Arc<AppContext>,
-    url: &str,
-    mut context: WorkflowContext<WorkerWorkflowData>,
-) -> Arc<dyn Worker> {
+    let mut context = registration(app, url);
+    context.data.config.health.timeout_secs = Some(30);
     context.data.worker_kind = Some(WorkerKind::Local);
     DetectConnectionModeStep
         .execute(&mut context)
@@ -458,11 +452,7 @@ async fn a_worker_on_a_hosts_connection_is_polled_through_it_and_sent_to_through
 ) {
     let (url, _) = mock_grpc_engine().await;
     let app = gateway(Extensions::new().connector(Arc::new(HostLoadsConnector))).await;
-    // The engine listens and the registration's probes dial it: they get
-    // time enough on a loaded host.
-    let mut registering = registration(&app, &url);
-    registering.data.config.health.timeout_secs = Some(30);
-    let worker = register_grpc_from(&app, &url, registering).await;
+    let worker = register_grpc(&app, &url).await;
     let connection = worker.engine_connection().await.unwrap().unwrap();
     let fronted = connection.downcast_arc::<Fronted>().unwrap();
     let front = Arc::clone(fronted.front());
@@ -546,20 +536,30 @@ async fn the_load_feed_holds_the_value_a_stock_grpc_polls_answer_states_by_name(
         let mut engines = Vec::new();
         for free in [10.0, 40.0, 70.0] {
             let url = mock_grpc_engine_stating(wire, NAME, UNIT, free).await;
-            // The engine listens and the registration's probes dial it:
-            // they get time enough on a loaded host.
-            let mut registering = registration(&app, &url);
-            registering.data.config.health.timeout_secs = Some(30);
-            let worker = register_grpc_from(&app, &url, registering).await;
+            let worker = register_grpc(&app, &url).await;
             engines.push((worker, free));
         }
         let (first, _) = &engines[0];
-        poll_once(&app, first.as_ref()).await;
-
         let feed = app.worker_monitor.as_ref().unwrap().subscribe();
+        // A poll moves on without an engine whose answer misses the poll's
+        // deadline, as on a loaded host: the case polls until the feed
+        // holds every engine's report.
+        for _ in 0..10 {
+            poll_once(&app, first.as_ref()).await;
+            let published = feed.borrow();
+            if engines
+                .iter()
+                .all(|(worker, _)| published.get(worker.url()).is_some())
+            {
+                break;
+            }
+        }
+
         let published = feed.borrow();
         for (worker, free) in &engines {
-            let report = published.get(worker.url()).unwrap();
+            let report = published.get(worker.url()).unwrap_or_else(|| {
+                panic!("{wire:?}: no report of {} after ten polls", worker.url())
+            });
             let stated: Vec<_> = report
                 .loads
                 .iter()

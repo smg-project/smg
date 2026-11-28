@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
         Arc, OnceLock, Weak,
     },
 };
@@ -66,14 +66,20 @@ pub enum Side {
 /// Routes a request completion to the policy that placed the request: the
 /// prefill, decode or encode policy by worker type, else the model's policy.
 /// Holds the registry weakly so a worker outliving its registry reports to
-/// nobody instead of keeping the registry alive.
+/// nobody instead of keeping the registry alive. While no policy of the
+/// registry hears a request's end (`completion_heard`), it reports to nobody
+/// and reads no policy.
 #[derive(Debug)]
 struct PolicyCompletionSink {
     registry: Weak<PolicyRegistry>,
+    completion_heard: Arc<AtomicBool>,
 }
 
 impl RequestCompletionSink for PolicyCompletionSink {
     fn request_completed(&self, worker: &dyn Worker) {
+        if !self.completion_heard.load(Ordering::Acquire) {
+            return;
+        }
         let Some(registry) = self.registry.upgrade() else {
             return;
         };
@@ -118,6 +124,10 @@ impl LoadBalancingPolicy for NoClassicPolicy {
     fn select_worker(&self, _: &[Arc<dyn Worker>], _: &SelectWorkerInfo) -> Option<usize> {
         self.asked.fetch_add(1, Ordering::Relaxed);
         None
+    }
+
+    fn hears_request_complete(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &'static str {
@@ -289,6 +299,13 @@ pub struct PolicyRegistry {
     /// started before a concurrent addition's insert must not publish over
     /// the bits that addition published.
     text_needs_refresh: Arc<Mutex<()>>,
+
+    /// Whether a policy that hears a request's end
+    /// ([`LoadBalancingPolicy::hears_request_complete`]) ever entered this
+    /// registry as its default, a model's or a side's policy. Only ever set,
+    /// and set before the policy is published; the completion sink reports
+    /// to no policy while it reads no.
+    completion_heard: Arc<AtomicBool>,
 
     /// What a pair's two decisions read of a request's text under
     /// Grand Central ([`TextNeeds::of_pairs`]): the answer of the stand-in
@@ -556,10 +573,12 @@ impl PolicyRegistry {
             })
             .collect();
         let text_needs = TextNeeds::of(default_policy.as_ref());
+        let completion_heard = default_policy.hears_request_complete();
         Self {
             model_policies: Arc::new(DashMap::with_hasher(FxBuildHasher)),
             text_needs: Arc::new(AtomicU8::new(text_needs.0)),
             text_needs_refresh: Arc::new(Mutex::new(())),
+            completion_heard: Arc::new(AtomicBool::new(completion_heard)),
             pair_text_needs: Arc::default(),
             default_policy,
             default_policy_config,
@@ -1154,6 +1173,7 @@ impl PolicyRegistry {
     pub fn completion_sink(self: &Arc<Self>) -> Arc<dyn RequestCompletionSink> {
         Arc::new(PolicyCompletionSink {
             registry: Arc::downgrade(self),
+            completion_heard: Arc::clone(&self.completion_heard),
         })
     }
 
@@ -1317,6 +1337,10 @@ impl PolicyRegistry {
     /// the publish is what makes this race-free against the setters: a
     /// setter either wrote before these reads, or its propagation scan runs
     /// after `publish` and finds the policy in place.
+    ///
+    /// A policy that hears a request's end is noted ahead of `publish`
+    /// (`completion_heard`), so the end of the first request it places
+    /// already reaches it.
     fn publish_with_shared_state(
         &self,
         policy: &Arc<dyn LoadBalancingPolicy>,
@@ -1328,6 +1352,9 @@ impl PolicyRegistry {
         Self::maybe_inject_monitor(policy, monitor.as_ref());
         policy.set_load_receiver(load_rx.as_ref().cloned());
         Self::maybe_inject_mesh_tree_sync(policy, mesh.as_ref());
+        if policy.hears_request_complete() {
+            self.completion_heard.store(true, Ordering::Release);
+        }
         publish();
     }
 
@@ -4030,6 +4057,127 @@ mod tests {
         assert_eq!(prefill_policy.completed.lock().unwrap().len(), 1);
     }
 
+    /// A [`CompletionRecorder`] that says it hears no request's end.
+    #[derive(Debug, Default)]
+    struct SaysNo(CompletionRecorder);
+
+    impl LoadBalancingPolicy for SaysNo {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            self.0.select_worker(workers, info)
+        }
+
+        fn on_request_complete(&self, worker_url: &str) {
+            self.0.on_request_complete(worker_url);
+        }
+
+        fn hears_request_complete(&self) -> bool {
+            false
+        }
+
+        fn name(&self) -> &'static str {
+            "says_no"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// While no policy of the registry hears a request's end, the sink
+    /// reports to none, and a sink made in that time reports again from the
+    /// entry of a policy that hears: to the policy that owns the worker, as
+    /// before.
+    #[test]
+    fn completion_sink_reports_to_no_policy_until_one_that_hears_enters() {
+        use smg_worker::identity::basic::WorkerLoadGuard;
+
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+
+        let registry = Arc::new(PolicyRegistry::new(PolicyConfig::Random));
+        let prefill_policy = Arc::new(SaysNo::default());
+        registry.set_prefill_policy(Arc::clone(&prefill_policy) as Arc<dyn LoadBalancingPolicy>);
+        let sink = registry.completion_sink();
+        let worker_of = |url: &str, worker_type| -> Arc<dyn Worker> {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(worker_type)
+                    .build(),
+            );
+            worker.set_completion_sink(Some(Arc::clone(&sink)));
+            worker
+        };
+        let prefill = worker_of("grpc://prefill:9000", WorkerType::Prefill);
+        let decode = worker_of("grpc://decode:9000", WorkerType::Decode);
+
+        drop(WorkerLoadGuard::with_key(Arc::clone(&prefill), None));
+        assert!(
+            prefill_policy.0.completed.lock().unwrap().is_empty(),
+            "no policy of the registry hears"
+        );
+
+        let decode_policy = Arc::new(CompletionRecorder::default());
+        registry.set_decode_policy(Arc::clone(&decode_policy) as Arc<dyn LoadBalancingPolicy>);
+        drop(WorkerLoadGuard::with_key(Arc::clone(&decode), None));
+        drop(WorkerLoadGuard::with_key(Arc::clone(&prefill), None));
+        assert_eq!(
+            decode_policy.completed.lock().unwrap().as_slice(),
+            ["grpc://decode:9000"]
+        );
+        assert_eq!(
+            prefill_policy.0.completed.lock().unwrap().as_slice(),
+            ["grpc://prefill:9000"]
+        );
+    }
+
+    /// Of the stock policies cache_aware alone hears a request's end, and a
+    /// policy that hears is noted on every road it enters the registry by:
+    /// as the default, for a model's hint and on each side.
+    #[test]
+    fn a_policy_that_hears_is_noted_on_every_road_it_enters_by() {
+        let heard = |registry: &PolicyRegistry| registry.completion_heard.load(Ordering::Acquire);
+        let quiet = || PolicyRegistry::new(PolicyConfig::Random);
+
+        for name in [
+            "random",
+            "round_robin",
+            "passthrough",
+            "power_of_two",
+            "least_load",
+            "bucket",
+            "manual",
+            "consistent_hashing",
+            "prefix_hash",
+        ] {
+            let registry = quiet();
+            let policy = registry.on_worker_added("model", Some(name));
+            assert_eq!(policy.name(), name);
+            assert!(!heard(&registry), "{name}");
+        }
+
+        let by_hint = quiet();
+        assert_eq!(
+            by_hint.on_worker_added("model", Some("cache_aware")).name(),
+            "cache_aware"
+        );
+        assert!(heard(&by_hint));
+
+        assert!(heard(&PolicyRegistry::new(cache_aware_config())));
+
+        for set in [
+            PolicyRegistry::set_prefill_policy,
+            PolicyRegistry::set_decode_policy,
+            PolicyRegistry::set_encode_policy,
+        ] {
+            let registry = quiet();
+            set(&registry, Arc::new(CompletionRecorder::default()));
+            assert!(heard(&registry));
+        }
+    }
+
     #[test]
     fn reconcile_in_flight_reaches_the_policy_that_owns_the_worker_type() {
         use smg_worker::identity::basic::WorkerLoadGuard;
@@ -4422,13 +4570,9 @@ mod tests {
             let mut binding = stock.bindings[0].clone();
             binding.matcher.model = model.to_string();
             if by_request_id {
-                binding.routing_key = Some(RoutingKeySpec {
-                    sources: vec![KeySourceSpec {
-                        rid: true,
-                        ..KeySourceSpec::default()
-                    }],
-                    strip_lineage: false,
-                });
+                let mut source = KeySourceSpec::default();
+                source.rid = true;
+                binding.routing_key = Some(RoutingKeySpec::of(vec![source]));
             }
             binding
         };

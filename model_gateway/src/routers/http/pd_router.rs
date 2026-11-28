@@ -82,7 +82,7 @@ use crate::{
             pd_failure::{PdSide, SidePhase},
             placement::{
                 self, CandidateFilter, PairFailure, Placed, PlacementFailure, PlacementInputs,
-                RefusalSite, RequestEnd,
+                RefusalSite, RequestEnd, SingleMiss,
             },
             prefill_admission::{
                 acquire_prefill, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
@@ -283,9 +283,16 @@ enum PdSelectionFailure {
     /// The policy spec in force binds no pair plan for the model: the
     /// placement's ready-made 501.
     NoPlanBound(Response),
+    /// Grand Central refused the pair's decision: the placement's
+    /// ready-made 500.
+    DecisionFailed(Response),
     /// The pre-existing string: no workers configured, all unhealthy or
     /// circuit-broken, or the policy declined.
     Unavailable(String),
+    /// [`Self::Unavailable`]'s string for a role, and a reason for its line:
+    /// the word Grand Central shed the pair under. The pair route's line
+    /// names it, and the deep probe's answer drops it.
+    ShedUnder(String, String),
     /// Both roles are up, but no prefill shares a KV transfer protocol with
     /// any decode (#2483).
     Incompatible(String),
@@ -621,6 +628,8 @@ impl PDRouter {
             PdSelectionFailure::Shed(shed) => shed,
             // Its line is written by [`Self::report_refusal`] too.
             PdSelectionFailure::NoPlanBound(refusal) => refusal,
+            // The engine's own line says why it refused the decision.
+            PdSelectionFailure::DecisionFailed(refusal) => refusal,
             PdSelectionFailure::Incompatible(error) => {
                 error!("Failed to select PD pair error={}", error);
                 error::service_unavailable("no_compatible_pd_pair", error)
@@ -635,20 +644,33 @@ impl PDRouter {
                 // [`Self::report_refusal`], once and rate-limited, not here.
                 placement::no_available_workers(format!("No available servers: {error}"))
             }
+            // The same answer for the client, and the line names the word.
+            PdSelectionFailure::ShedUnder(error, reason) => {
+                placement::no_available_workers_because(
+                    format!("No available servers: {error}"),
+                    reason,
+                )
+            }
         }
     }
 
     /// The line and marker of a refusal this router answers on its own (the
     /// `no_available_workers` 503 of a role that is down, the
-    /// `no_policy_plan_for_model` 501 of a pair no plan binds): one WARN per
-    /// refusal, rate-limited, with both roles' state, through
+    /// `no_policy_plan_for_model` 501 of a request no plan binds): one WARN
+    /// per refusal, rate-limited, with both roles' state, through
     /// [`placement::report_refusal`]; the access log then keeps quiet about
-    /// it. Every other response passes through unchanged.
-    fn report_refusal(&self, model_id: &str, refusal: Response) -> Response {
+    /// it. Every other response passes through unchanged. `function` is the
+    /// site that answers the refusal, as the line names it.
+    fn report_refusal(
+        &self,
+        function: &'static str,
+        model_id: &str,
+        refusal: Response,
+    ) -> Response {
         placement::report_refusal(
             &self.worker_registry,
             RefusalSite {
-                function: "PDRouter::execute_dual_dispatch_attempt",
+                function,
                 mode: "PrefillDecode",
                 pools: &[
                     ("prefill", RoutingPool::HttpPrefill),
@@ -1026,8 +1048,11 @@ impl PDRouter {
         let ((prefill, decode), guards) = match selected {
             Ok(admitted) => admitted,
             Err(e) => {
-                return self
-                    .report_refusal(context.model_id, Self::handle_server_selection_error(*e));
+                return self.report_refusal(
+                    "PDRouter::execute_dual_dispatch_attempt",
+                    context.model_id,
+                    Self::handle_server_selection_error(*e),
+                );
             }
         };
 
@@ -2878,15 +2903,24 @@ impl PDRouter {
             WorkerRole::Decode => "decode",
             WorkerRole::Single => "worker",
         };
+        let unavailable =
+            || format!("No available {role} workers (all circuits open or unhealthy)");
         match failure.verdict {
             PlacementFailure::AllOverloaded(shed) => PdSelectionFailure::Shed(shed),
             PlacementFailure::NoPlanBound(refusal) => PdSelectionFailure::NoPlanBound(refusal),
+            PlacementFailure::DecisionFailed(refusal) => {
+                PdSelectionFailure::DecisionFailed(refusal)
+            }
             PlacementFailure::NoCandidates => PdSelectionFailure::Unavailable(format!(
                 "No {role} workers available. Please check if {role} servers are configured and healthy."
             )),
-            PlacementFailure::Unavailable => PdSelectionFailure::Unavailable(format!(
-                "No available {role} workers (all circuits open or unhealthy)"
-            )),
+            PlacementFailure::Unavailable => PdSelectionFailure::Unavailable(unavailable()),
+            // The role's sentence stays the client's, and the line names
+            // the engine's word, with the side the answer is for.
+            PlacementFailure::ShedUnder(name) => {
+                let side = (failure.role != WorkerRole::Single).then_some(role);
+                PdSelectionFailure::ShedUnder(unavailable(), placement::shed_under(name, side))
+            }
             // Under Grand Central the name is the engine's, and a decline
             // that names no side is the pair's whole.
             PlacementFailure::PolicyDeclined(policy) => {
@@ -3438,13 +3472,15 @@ impl RouterTrait for PDRouter {
             // an all-vetoed fleet fails the probe, exactly as an all-circuit-
             // broken one already did.
             Err(failure) => match Self::pair_failure(*failure) {
-                PdSelectionFailure::Shed(refusal) | PdSelectionFailure::NoPlanBound(refusal) => {
+                PdSelectionFailure::Shed(refusal)
+                | PdSelectionFailure::NoPlanBound(refusal)
+                | PdSelectionFailure::DecisionFailed(refusal) => {
                     return refusal;
                 }
                 PdSelectionFailure::Incompatible(e) => {
                     return error::service_unavailable("no_compatible_pd_pair", e);
                 }
-                PdSelectionFailure::Unavailable(e) => {
+                PdSelectionFailure::Unavailable(e) | PdSelectionFailure::ShedUnder(e, _) => {
                     return error::service_unavailable(
                         "no_healthy_worker_pair",
                         format!("No healthy worker pair available: {e}"),
@@ -3617,7 +3653,7 @@ impl RouterTrait for PDRouter {
         let (placed, body) = {
             let (request_text, body) =
                 Self::count_tokens_routing_text(body, self.policies_need_request_text());
-            let Some(placed) = placement::select_single(
+            let placed = match placement::select_single(
                 &self.worker_registry,
                 &self.policy_registry,
                 model_id,
@@ -3634,11 +3670,38 @@ impl RouterTrait for PDRouter {
                     tried: &[],
                 },
                 placement::Stated::nothing,
-            ) else {
-                return error::service_unavailable(
-                    "no_prefill_servers",
-                    "No available prefill servers to count tokens",
-                );
+            ) {
+                Ok(placed) => placed,
+                Err(miss) => {
+                    // A miss that says nothing keeps the answer below and
+                    // reads no pool for it, as the gateway's own selection
+                    // never did. The engine's word is judged with no shed,
+                    // since the count judges no pool's load: a prefill pool
+                    // nobody is in keeps the answer below too.
+                    let judged = (miss != SingleMiss::UNSAID).then(|| {
+                        let prefills = placement::candidates(
+                            &self.worker_registry,
+                            model_id,
+                            RoutingPool::HttpPrefill,
+                            None,
+                        );
+                        placement::miss_failure(miss, prefills.as_slice(), model_id, false)
+                    });
+                    return match judged {
+                        Some(
+                            PlacementFailure::NoPlanBound(refusal)
+                            | PlacementFailure::DecisionFailed(refusal),
+                        ) => self.report_refusal(
+                            "PDRouter::route_messages_count_tokens",
+                            model_id,
+                            refusal,
+                        ),
+                        _ => error::service_unavailable(
+                            "no_prefill_servers",
+                            "No available prefill servers to count tokens",
+                        ),
+                    };
+                }
             };
             (placed, body)
         };
@@ -3838,6 +3901,7 @@ mod tests {
             common::{
                 placement::tests::{
                     engine_on, hearing_engine_on, hearing_pair_sides_on, hearing_pairs_on, Heard,
+                    Refusing,
                 },
                 prefill_admission::PrefillLoadGuard,
                 sse::SSE_CHANNEL_BUFFER,
@@ -4856,6 +4920,9 @@ mod tests {
             }
             PdSelectionFailure::Shed(_) => panic!("an empty fleet is not an overload shed"),
             PdSelectionFailure::NoPlanBound(_) => panic!("a classic gateway runs no policy spec"),
+            PdSelectionFailure::DecisionFailed(_) | PdSelectionFailure::ShedUnder(..) => {
+                panic!("a classic gateway has no engine to refuse or to shed")
+            }
             PdSelectionFailure::Incompatible(_) => {
                 panic!("an empty fleet has no pairing to be incompatible about")
             }
@@ -5987,6 +6054,138 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_empty());
+    }
+
+    /// What the token count answers by the engine's word, on a prefill pool
+    /// whose one worker is open: the count is decided as a single request.
+    /// A model that the policy spec in force binds no single-request plan
+    /// for is the 501 `no_policy_plan_for_model`. A decision the engine
+    /// refuses is the 500 `grand_central_decision_failed`. Neither carries
+    /// a retry hint. Each read the count's own 503 `no_prefill_servers`
+    /// before. A filter of the spec that keeps nobody keeps
+    /// that 503, and so does a prefill pool nobody is in, under each spec.
+    /// The gateway's own selection has no like case for the first two: it
+    /// reads no spec, and it has no engine to refuse. Its own miss reads
+    /// the 503
+    /// (`messages_count_tokens_uses_one_prefill_worker_and_no_bootstrap`).
+    #[tokio::test]
+    async fn a_token_count_is_answered_by_the_engines_word() {
+        let answered = |refusing: Refusing, prefills: usize| async move {
+            let router = create_test_pd_router();
+            for at in 0..prefills {
+                // Nothing listens there: the count is refused ahead of any
+                // send.
+                let url = format!("http://127.0.0.1:{}", 9700 + at);
+                let worker = create_test_worker(url, WorkerType::Prefill, true);
+                router
+                    .worker_registry
+                    .register_or_replace(Arc::from(worker));
+            }
+            refusing.single_on(&router.policy_registry);
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            let body: CountMessageTokensRequest =
+                serde_json::from_value(body).expect("valid count_tokens request");
+            let response = router
+                .route_messages_count_tokens(None, &tenant, body, UNKNOWN_MODEL_ID)
+                .await;
+            let code = error::extract_error_code_from_response(&response).to_string();
+            let hint = response.headers().contains_key(RETRY_AFTER);
+            (response.status(), code, hint)
+        };
+        let refused = |status: StatusCode, code: &str| (status, code.to_string(), false);
+
+        assert_eq!(
+            answered(Refusing::Unbound, 1).await,
+            refused(StatusCode::NOT_IMPLEMENTED, "no_policy_plan_for_model")
+        );
+        assert_eq!(
+            answered(Refusing::Faulted, 1).await,
+            refused(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "grand_central_decision_failed"
+            )
+        );
+        let unavailable = refused(StatusCode::SERVICE_UNAVAILABLE, "no_prefill_servers");
+        assert_eq!(answered(Refusing::Nobody, 1).await, unavailable);
+        for refusing in [Refusing::Unbound, Refusing::Faulted, Refusing::Nobody] {
+            assert_eq!(answered(refusing, 0).await, unavailable, "{refusing:?}");
+        }
+    }
+
+    /// A token count's refusal is the count's own. Both changed answers
+    /// name the model the count was routed under. The 501's line is written
+    /// under the count's function: under the pair route's it pointed an
+    /// operator at the dual dispatch, which a count never reaches. The 500
+    /// is no refusal the router reports, so it writes no such line.
+    #[tokio::test]
+    async fn a_token_counts_refusal_names_its_own_model_and_function() {
+        /// The `function` of each refusal line this thread writes: the
+        /// events that name one.
+        struct RefusalFunctions(Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalFunctions {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Function(String);
+                impl tracing::field::Visit for Function {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "function" {
+                            value.clone_into(&mut self.0);
+                        }
+                    }
+
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                }
+                if event.metadata().fields().field("function").is_some() {
+                    let mut function = Function(String::new());
+                    event.record(&mut function);
+                    self.0.lock().unwrap().push(function.0);
+                }
+            }
+        }
+
+        // A model of the case's own: its refusal lines share no allowance
+        // with another case's.
+        const COUNTED: &str = "a-counted-model";
+        let functions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _subscriber = test_subscriber(RefusalFunctions(Arc::clone(&functions)));
+        let answered = |refusing: Refusing| async move {
+            let router = create_test_pd_router();
+            // Nothing listens there: the count is refused ahead of any send.
+            let worker = BasicWorkerBuilder::new("http://127.0.0.1:9710")
+                .worker_type(WorkerType::Prefill)
+                .model(ModelCard::new(COUNTED))
+                .build();
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register(Arc::new(worker)).unwrap();
+            refusing.single_on(&router.policy_registry);
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let body = json!({"model": COUNTED, "messages": [{"role": "user", "content": "hi"}]});
+            let body: CountMessageTokensRequest =
+                serde_json::from_value(body).expect("valid count_tokens request");
+            let response = router
+                .route_messages_count_tokens(None, &tenant, body, COUNTED)
+                .await;
+            error_message(response).await
+        };
+
+        assert_eq!(
+            answered(Refusing::Unbound).await,
+            format!("the policy spec in force binds no single-request plan for model '{COUNTED}'")
+        );
+        assert_eq!(
+            answered(Refusing::Faulted).await,
+            format!("Grand Central made no decision for model '{COUNTED}'. The fault is the gateway's own.")
+        );
+        assert_eq!(
+            *functions.lock().unwrap(),
+            ["PDRouter::route_messages_count_tokens"]
+        );
     }
 
     /// The count route asks the pair's text question, and its request is
@@ -11213,6 +11412,23 @@ mod tests {
     /// a conversation's three turns would reach three engines of a side.
     #[tokio::test]
     async fn a_pairs_conversation_keeps_its_two_engines_under_the_overrides_rule() {
+        conversations_keep_their_engines(PolicyConfig::RoundRobin).await;
+    }
+
+    /// Beside a prefill under `consistent_hashing` the override's rule
+    /// names the decode side alone. Every turn of a conversation still
+    /// reaches one prefill engine, by the ring over its key, and the decode
+    /// engine its first turn reached, by its pin.
+    #[tokio::test]
+    async fn a_pairs_conversation_keeps_its_engines_beside_a_hash_prefill() {
+        conversations_keep_their_engines(PolicyConfig::ConsistentHashing).await;
+    }
+
+    /// Ten conversations of three turns through the pair route. The
+    /// document is the one the settings make of the `prefill` policy beside
+    /// a round-robin decode with the override on. The turns of each
+    /// conversation reach one engine a side.
+    async fn conversations_keep_their_engines(prefill: PolicyConfig) {
         use smg_grand_central::document::AppliedSpec;
 
         use crate::config::types::{RouterConfig, RoutingKeyOverrideConfig, RoutingMode};
@@ -11222,11 +11438,14 @@ mod tests {
         // the lineage of their id alone.
         const CONVERSATIONS: usize = 10;
 
+        // A side under round robin spreads the conversations by its turns.
+        // A ring spreads them by its hash of addresses a run draws.
+        let by_turns = matches!(prefill, PolicyConfig::RoundRobin);
         let settings = RouterConfig {
             mode: RoutingMode::PrefillDecode {
                 prefill_urls: Vec::new(),
                 decode_urls: Vec::new(),
-                prefill_policy: Some(PolicyConfig::RoundRobin),
+                prefill_policy: Some(prefill),
                 decode_policy: Some(PolicyConfig::RoundRobin),
             },
             policy: PolicyConfig::RoundRobin,
@@ -11326,7 +11545,7 @@ mod tests {
             engines.len()
         };
         assert!(
-            engines(|pair| pair.0) > 1 && engines(|pair| pair.1) > 1,
+            (!by_turns || engines(|pair| pair.0) > 1) && engines(|pair| pair.1) > 1,
             "ten conversations went to one engine of a side: {kept:?}"
         );
     }
@@ -12135,6 +12354,121 @@ mod tests {
             error::extract_error_code_from_response(&refused),
             placement::NO_PLAN_BOUND_CODE
         );
+    }
+
+    /// A pair router whose engine answers a pair as `refusing` says, over one
+    /// registered pair whose workers stand open. Nothing listens at either
+    /// address: a request that reached one would answer a failed dispatch.
+    fn pair_router_refusing(refusing: Refusing) -> PDRouter {
+        use crate::config::types::RoutingKeyOverrideConfig;
+
+        let policies = PolicyRegistry::for_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        refusing.pair_on(&policies);
+        let router = PDRouter {
+            policy_registry: Arc::new(policies),
+            ..create_test_pd_router()
+        };
+        register_pd_pair(
+            &router,
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:10".to_string(),
+        );
+        router
+    }
+
+    /// What the pair route answers a pair by the engine's word, though both
+    /// its workers are open: no worker is asked. A pair's decision the
+    /// engine refuses is the 500 `grand_central_decision_failed`, with no
+    /// retry hint, and the route does not replay it. Judged from the pools,
+    /// the client read "No available decode workers" and was told to come
+    /// back in a second. A filter that keeps no prefill reads as the
+    /// prefill's role unavailable, in the role's own sentence, and the
+    /// refusal's line names the filter and the side the answer is for: the
+    /// decode's where the placement answers for the decodes. The gateway's
+    /// own pair selection has no like case for the first: it has no engine
+    /// to refuse. For the second it names a policy that picked nobody
+    /// (`pair_pass`, in `model_gateway/src/routers/common/placement.rs`),
+    /// and no stage: it has none.
+    #[tokio::test]
+    async fn the_pair_route_answers_a_pair_by_the_engines_word() {
+        let answered = |refusing: Refusing| async move {
+            let router = pair_router_refusing(refusing);
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .expect("valid chat request");
+            router
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+                .await
+        };
+
+        let faulted = answered(Refusing::Faulted).await;
+        assert_eq!(faulted.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error::extract_error_code_from_response(&faulted),
+            placement::DECISION_FAILED_CODE
+        );
+        assert!(faulted.headers().get(RETRY_AFTER).is_none());
+        assert!(!is_retryable_response(&faulted));
+
+        let nobody = answered(Refusing::Nobody).await;
+        assert_eq!(nobody.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&nobody),
+            placement::NO_AVAILABLE_WORKERS_CODE
+        );
+        assert_eq!(
+            placement::refusal_reason(&nobody),
+            Some("Grand Central shed the pair under nobody, answered for its prefill side")
+        );
+        assert_eq!(
+            error_message(nobody).await,
+            "No available servers: No available prefill workers (all circuits open or \
+             unhealthy)"
+        );
+
+        // The side is the one the answer is for: under the same word the
+        // line says the decode's where the placement answers for the decodes.
+        let for_decodes = PairFailure {
+            role: WorkerRole::Decode,
+            verdict: PlacementFailure::ShedUnder("nobody"),
+        };
+        let PdSelectionFailure::ShedUnder(sentence, reason) = PDRouter::pair_failure(for_decodes)
+        else {
+            panic!("a shed under the engine's word is answered as one");
+        };
+        assert_eq!(
+            sentence,
+            "No available decode workers (all circuits open or unhealthy)"
+        );
+        assert_eq!(
+            reason,
+            "Grand Central shed the pair under nobody, answered for its decode side"
+        );
+    }
+
+    /// The deep probe gets the answer routing gives for a decision the
+    /// engine refuses too: the 500 `grand_central_decision_failed`, with no
+    /// retry hint, and no worker is asked. Judged from the pools, the probe
+    /// read the 503 `no_healthy_worker_pair` on a fleet with nobody down.
+    #[tokio::test]
+    async fn the_deep_probe_reads_a_refused_decision_as_routing_does() {
+        let router = pair_router_refusing(Refusing::Faulted);
+        let request = Request::builder().body(Body::empty()).unwrap();
+        let refused = tokio::time::timeout(ROUND_TRIP_GUARD, router.health_generate(request))
+            .await
+            .expect("the probe answers");
+        assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            placement::DECISION_FAILED_CODE
+        );
+        assert!(refused.headers().get(RETRY_AFTER).is_none());
     }
 
     /// A refusal this router answers on its own (no prefill/decode pair to

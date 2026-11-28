@@ -3,7 +3,7 @@
 // message's in-process form is the engine crate's own type (view.rs,
 // decision.rs, lease.rs), field for field in the same order; a wire message
 // is the record without its host-only fields, which the comments name;
-// tests/contracts.rs holds the two together.
+// tests/plugin/contracts.rs holds the two together.
 //
 // Versioning: design appendix A (additive within v1, negotiated per stream,
 // the controller speaks N and N-1). A `oneof` case a reader does not know

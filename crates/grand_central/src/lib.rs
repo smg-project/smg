@@ -64,9 +64,8 @@
 //!   writes (membership and status, a term's start), each at its
 //!   position under its term, told by the store through
 //!   [`store::Journal`]; the rejoin rule and the bounded read a standby or a watcher of
-//!   the rows is served by, and the store's cut at one position
-//!   ([`store::MemoryStore::checkpoint`]). The stream, the standby and the
-//!   watch are later steps.
+//!   the rows is served by, and the rows' cut at one position, taken off
+//!   the worker objects (`worker_host::Objects::checkpoint`).
 //!
 //! - Section 9, the WebAssembly plugin host (the `plugins::wasm` module, behind the `wasm`
 //!   feature): user policies as components of the committed `smg:policy`

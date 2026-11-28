@@ -8,8 +8,8 @@ use crate::{
     document::spec::{self, PolicySpec, Recovery, RulePlaced},
     engine::{
         decision::{self, Pair},
-        sticky_sessions::DecodeVerdict,
-        view::{self, Health, Identity, MediaCounts, Role, Session, WorkerId},
+        sticky_sessions::{DecodeVerdict, SessionExpiry, SessionSides},
+        view::{self, AffinityFacts, Health, Identity, MediaCounts, Role, Session, WorkerId},
     },
     policies::{
         manual::Manual,
@@ -23,6 +23,7 @@ use crate::{
         pickers::{self, Best, CountFirst},
         scorers::{self, LeastRequests},
     },
+    tracking::lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
 };
 
 mod class_tables;
@@ -373,6 +374,7 @@ const SESSIONS: SessionRule = SessionRule {
     sweep_micros: 0,
     recovery: Recovery::Latest,
     rule_placed: RulePlaced::Told,
+    sides: SessionSides::Any,
 };
 
 /// The least-requests profile under a sessions rule.

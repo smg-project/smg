@@ -48,7 +48,7 @@ use crate::{
         },
         proto::{self, busy::Reason, grand_central_server::GrandCentral as _},
     },
-    store::{HealthPolicy, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+    store::{HealthPolicy, Registrant, WorkerFacts, WorkerStatus},
 };
 
 /// A lease that stores `writes` writes: the thread that steps it panics
@@ -140,10 +140,45 @@ async fn the_bind_draws_its_logs_first_place() {
     let mut starts = Vec::new();
     for _ in 0..2 {
         let controller = Controller::bind(valid()).await.expect("the listeners bind");
-        starts.push(controller.shared.feed.log.head());
+        starts.push(controller.readiness.log_head());
     }
     assert_ne!(starts[0].seq, starts[1].seq, "two runs start apart");
     assert!(starts.iter().all(|start| start.seq != 0 && start.term == 0));
+}
+
+/// The bind takes its handles of one journal. A write to the store the
+/// controller hands out moves the head the readiness reads, and that
+/// head is the place of an applier the shared state makes. That store
+/// is the shared state's: a term set through it is the term the state
+/// says.
+#[tokio::test]
+async fn the_bind_takes_its_handles_of_one_journal() {
+    let controller = Controller::bind(valid()).await.expect("the listeners bind");
+    let store = controller.store();
+    let drawn = controller.readiness.log_head();
+    let written = WorkerFacts {
+        key: "http://w:8000".to_owned(),
+        ..WorkerFacts::default()
+    };
+    store.upsert(written);
+    let head = controller.readiness.log_head();
+    assert_ne!(head, drawn, "the write moved the readiness's log");
+    assert_eq!(controller.shared.follower().place(), head);
+    crate::store::LeasesStore::set_term(&*store, 1);
+    assert_eq!(controller.shared.store_term(), 1);
+}
+
+/// A controller hands out the fence its bind took from its candidate: a
+/// candidate a case puts in behind the bind has another, and the
+/// controller's stays the bind's.
+#[tokio::test]
+async fn a_controller_hands_out_the_fence_its_bind_took() {
+    let mut controller = Controller::bind(valid()).await.expect("the listeners bind");
+    let bound = controller.fence();
+    controller.elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
+        .expect("the settings are in order");
+    assert!(Arc::ptr_eq(&controller.fence(), &bound));
+    assert!(!Arc::ptr_eq(&controller.elector.fence(), &bound));
 }
 
 /// The thread gone at its take, before the serve read ready, and at its
@@ -191,7 +226,7 @@ async fn a_served_controller_decides_under_its_next_term_past_a_terms_mark() {
     });
     let case = async {
         let (wait, begun) = (Duration::from_secs(20), Instant::now());
-        while shared.fence.leader_term(Instant::now()).is_none() {
+        while shared.leading(Instant::now()).is_none() {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -234,7 +269,7 @@ async fn a_served_controller_keeps_no_sent_prefixes_of_a_model_whose_workers_lef
     });
     let case = async {
         let (wait, begun) = (Duration::from_secs(20), Instant::now());
-        while shared.fence.leader_term(Instant::now()).is_none() {
+        while shared.leading(Instant::now()).is_none() {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -282,7 +317,7 @@ async fn a_served_controller_lays_a_worker_written_through_its_holder() {
     });
     let case = async {
         let (wait, begun) = (Duration::from_secs(20), Instant::now());
-        while shared.fence.leader_term(Instant::now()).is_none() {
+        while shared.leading(Instant::now()).is_none() {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -334,7 +369,7 @@ async fn a_served_controller_probes_its_rows_while_it_leads() {
     });
     let case = async {
         let (wait, begun) = (Duration::from_secs(20), Instant::now());
-        while shared.fence.leader_term(Instant::now()).is_none() {
+        while shared.leading(Instant::now()).is_none() {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

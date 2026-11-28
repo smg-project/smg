@@ -41,10 +41,13 @@ use crate::{
     stages::{lifecycle::Lifecycle, registry::StageRegistry},
     store::{
         memory::seam, DecodeSide, GatewayId, Hand, LeaseRecord, LeaseState, LeasesStore,
-        MemoryStore, PickRecord, Registrant, WorkerFacts, WorkersStore,
+        MemoryStore, PickRecord, Registrant, WorkerFacts,
     },
     tracking::{
-        lease::{Dispatch, Lease, LeaseId, Outcome, ReleaseReason, Side, TransportClass},
+        lease::{
+            Dispatch, EventKind, EventSet, Lease, LeaseId, Outcome, ReleaseReason, Side,
+            TransportClass,
+        },
         DispatchCredit,
     },
 };
@@ -163,6 +166,14 @@ impl Lifecycle for Hears {
             step();
         }
         assert_ne!(lease.id.0, BURSTS, "the stage's call panics");
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([
+            EventKind::Dispatched,
+            EventKind::Completed,
+            EventKind::Released,
+        ])
     }
 }
 
@@ -1324,6 +1335,10 @@ impl Lifecycle for Bursts {
     fn on_dispatched(&self, lease: &Lease, _: &Target, _: Side, _: u32) {
         assert_eq!(lease.id.0, 0, "the stage's call panics");
     }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Dispatched])
+    }
 }
 
 impl Picker for Bursts {
@@ -1417,7 +1432,7 @@ fn a_late_dispatch_enters_no_rank_of_a_worker_that_left() {
     let count = counting(&store, 1);
     issued_on(&store, 1, 1, left, t0);
     issued_on(&store, 2, 1, stays, t0);
-    let row = WorkersStore::get(&*store, left).expect("the row");
+    let row = store.get(left).expect("the row");
     let removed = objects.remove(&store, left, row.revision);
     assert!(removed.is_some(), "the row leaves");
     let hand = Hand::new(A);
@@ -1458,7 +1473,7 @@ fn a_pairs_dispatch_is_counted_by_the_standing_generation_where_its_worker_stand
     }
     let standing = counting_under(&store, 2, Some(60_000));
     assert!(!Arc::ptr_eq(&first, &standing), "a count built new");
-    let row = WorkersStore::get(&*store, left).expect("the row");
+    let row = store.get(left).expect("the row");
     let removed = objects.remove(&store, left, row.revision);
     assert!(removed.is_some(), "the row leaves");
     let hand = Hand::new(A);

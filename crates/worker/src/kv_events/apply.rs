@@ -1075,6 +1075,53 @@ impl<H: HeldBlocks> WorkerIndexState<H> {
         self.block_of_record = 0;
     }
 
+    /// [`Self::index_emptied`], for an index that may hold another group
+    /// view for the worker since it emptied the worker's blocks. A state
+    /// that holds a view takes the index's view of `worker_id`: the rules
+    /// write that one from here on. A state that holds none takes none: it
+    /// asks the index for one where the rules first need it, as before.
+    pub fn index_emptied_in<I: BlockIndex<Held = H>>(&mut self, indexer: &I, worker_id: u32) {
+        self.index_emptied();
+        if self.groups.is_some() {
+            self.groups = Some(indexer.groups(worker_id));
+        }
+    }
+
+    /// Run `apply` with `lent` as the worker's reverse map, for a caller
+    /// that keeps that map elsewhere between its calls.
+    ///
+    /// For the call the state holds the lent map in `blocks`, and `lent`
+    /// holds the state's own map, its value at rest. At the call's end the
+    /// two are exchanged again, behind an `apply` that unwinds too: the
+    /// lender gets what stands in `blocks` then. That is the lent map as
+    /// `apply` left it, or the map `apply` put in its place: an index's
+    /// clear may leave a new, empty one. What the state keeps beside the
+    /// map stands as far as `apply` got.
+    ///
+    /// Returns `apply`'s answer and the number of blocks `blocks` held at
+    /// the call's end.
+    pub fn holding<R>(&mut self, lent: &mut H, apply: impl FnOnce(&mut Self) -> R) -> (R, usize) {
+        /// The state with a lent map in it. Dropped, it exchanges the
+        /// state's map and the lender's again, behind an `apply` that
+        /// unwound too.
+        struct Held<'a, H: HeldBlocks> {
+            state: &'a mut WorkerIndexState<H>,
+            lent: &'a mut H,
+        }
+
+        impl<H: HeldBlocks> Drop for Held<'_, H> {
+            fn drop(&mut self) {
+                std::mem::swap(&mut self.state.blocks, self.lent);
+            }
+        }
+
+        std::mem::swap(&mut self.blocks, lent);
+        let held = Held { state: self, lent };
+        let answer = apply(held.state);
+        let blocks = held.state.blocks.len();
+        (answer, blocks)
+    }
+
     /// The worker's block of record: tokens per block of the widest block
     /// its stores carried since its last clear, and none until a store
     /// names a width.

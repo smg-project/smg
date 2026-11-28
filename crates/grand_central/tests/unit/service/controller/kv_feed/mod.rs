@@ -31,7 +31,7 @@ mod tests {
             config::tests::valid, decision_slots::tests as bed, readiness::State,
             worker_objects::WorkerObjects, Controller,
         },
-        store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkerStatus},
         worker_host::{
             tests::HolderDoor, KvFeed, KvTables, Members, MembershipWriter as _, Objects,
             Precondition,

@@ -41,7 +41,7 @@
 //!
 //! **A pair.** A pair's binding names its shadows by side. Its first
 //! decision asks them where its entry lends room for what they say
-//! (`pair::side_shadows`), and counts them here.
+//! (`pair::side_shadows::side_shadows`), and counts them here.
 
 use std::{
     sync::{atomic::Ordering, Arc},

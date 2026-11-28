@@ -7,7 +7,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use smg_grand_central::{
-    engine::{PlaceRequest, Prompt, WorkerLists},
+    engine::{PlaceRequest, WorkerLists},
     policies::consistent_hashing::LentRing,
 };
 
@@ -39,13 +39,11 @@ pub(super) fn stated(run: &Run) -> bool {
 /// entry says them ([`place::one`]). It lends `ring` as that entry does
 /// ([`place::lent`]).
 pub(super) fn one(host: &Host, ring: Option<&'static dyn LentRing>) -> Option<u32> {
-    let request = PlaceRequest {
-        prompt: Prompt {
-            text: Some(TEXT),
-            ..Prompt::NONE
-        },
-        ring,
-        ..PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()))
+    let request = {
+        let mut request = PlaceRequest::of(MODEL, WorkerLists::Single(host.list.lent()));
+        request.prompt.text = Some(TEXT);
+        request.ring = ring;
+        request
     };
     let mut answer = host.engine.place(&request);
     let placement = answer.as_mut().ok()?;

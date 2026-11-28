@@ -436,9 +436,11 @@ impl InProcess {
     ///
     /// What stands across the call: the engine's clock, its session table
     /// and its record of sent prompts. The table takes the new document's
-    /// two times. The stages of a profile whose name and text did not
-    /// change stand too, with what they hold: the new document keeps their
-    /// objects.
+    /// two times. A document that keys a model's record another way can
+    /// start that record anew: another kind of the model's index, or other
+    /// boundaries under a hash index. The stages of a profile whose name
+    /// and text did not change stand too, with what they hold: the new
+    /// document keeps their objects.
     ///
     /// A profile's stages are built from its own block, the document's
     /// `view` and its `signals`. So a new document that changes `view` or
@@ -449,10 +451,11 @@ impl InProcess {
     /// the new list.
     ///
     /// A profile is built anew too where one of its stages, built again,
-    /// says otherwise of itself than the standing one. That is another
-    /// name, other words of a request's life to hear, or anything else the
-    /// engine reads of a stage when it builds a profile. A factory of the
-    /// host's own may build such a stage.
+    /// says otherwise of itself than the standing one. That is other words
+    /// of a request's life to hear, or anything else the engine reads of a
+    /// stage when it builds a profile. A factory of the host's own may
+    /// build such a stage. A stage built again under another name is no
+    /// such stage: the validation refuses its document.
     ///
     /// A count of sends stands where a profile that reads it is kept,
     /// whichever of its other readers changed, left or came. A profile

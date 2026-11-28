@@ -19,7 +19,7 @@ use crate::{
         decision::Decision,
         framework::{DRAW_FROM, WRITTEN_PAIR_FROM},
         sticky_sessions::SessionVerdict,
-        view::{fingerprint, AffinityHolder, AffinityRows, Phase},
+        view::{fingerprint, AffinityHolder, AffinityRows, Constraints, Phase, RequestFacts},
     },
 };
 

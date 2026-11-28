@@ -12,6 +12,10 @@ impl Lifecycle for Heard {
     fn on_released(&self, _: &Lease, _: ReleaseReason) {
         self.0.lock().push(Instant::now());
     }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Released])
+    }
 }
 
 impl Picker for Heard {

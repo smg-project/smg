@@ -98,10 +98,7 @@ impl DecisionRecord {
         let Some(at) = trace.made_under() else {
             return Some(names);
         };
-        let bound = at == binding.profile
-            || binding.decode_profile == Some(at)
-            || matches!(binding.plan, Plan::Epd { encode } if encode == at);
-        if let Some(profile) = engine.profiles().get(usize::from(at)).filter(|_| bound) {
+        if let Some(profile) = engine.profile_under(binding, at) {
             names.profile.clone_from(&profile.name);
             profile.picker.name().clone_into(&mut names.picker);
             names.filters = profile

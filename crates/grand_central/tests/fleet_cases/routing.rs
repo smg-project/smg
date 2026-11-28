@@ -10,7 +10,7 @@ use std::{
 
 use prost::Message as _;
 use smg_grand_central::{
-    document::{BindingSpec, Match, PolicySpec, SpecError},
+    document::{BindingSpec, PolicySpec, SpecError},
     engine::{Role, WireModes},
     policies::{bucket, power_of_two::PowerOfTwoMetric},
     service::{
@@ -179,11 +179,9 @@ fn sized(mut ask: DecideRequest, tokens: u32) -> DecideRequest {
 fn by_size() -> Result<PolicySpec, SpecError> {
     let mut document = PolicySpec::preset("bucket")?;
     for profile in document.profiles.values_mut() {
-        let sizes = smg_grand_central::document::BucketParams {
-            abs_threshold: Some(u32::MAX),
-            adjust_interval_s: Some(3_600),
-            ..Default::default()
-        };
+        let mut sizes = smg_grand_central::document::BucketParams::default();
+        sizes.abs_threshold = Some(u32::MAX);
+        sizes.adjust_interval_s = Some(3_600);
         profile.score = vec![smg_grand_central::document::ScoreStage::Bucket(sizes).into()];
     }
     Ok(document)
@@ -199,17 +197,10 @@ fn by_model() -> Result<PolicySpec, SpecError> {
     for (name, profile) in resident.profiles {
         // The first binding that matches decides: the model's own stands
         // ahead of the one that matches every model.
-        document.bindings.insert(
-            0,
-            BindingSpec {
-                matcher: Match {
-                    model: COUNTED.to_owned(),
-                    ..Match::default()
-                },
-                profile: Some(name.clone()),
-                ..BindingSpec::default()
-            },
-        );
+        let mut binding = BindingSpec::default();
+        COUNTED.clone_into(&mut binding.matcher.model);
+        binding.profile = Some(name.clone());
+        document.bindings.insert(0, binding);
         document.profiles.insert(name, profile);
     }
     Ok(document)

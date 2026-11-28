@@ -76,6 +76,11 @@ stage, so every generation of the policy gets stages of its own. Keep the
 factory cheap: its first call runs in `main`, before the command line is
 read. State that must outlive a generation rides the closure.
 
+Validation over the catalog refuses a policy document that names a stage
+under one of the engine's own refusal names, such as `binding`:
+[Register a Rust stage](../../crates/grand_central/docs/extending.md#register-a-rust-stage)
+has the rule.
+
 ## What a stage is handed
 
 A stage reads one decision's view and nothing else: the same view a built-in
@@ -91,9 +96,19 @@ with no error: a stage over one ties or keeps every worker.
 | `Candidate::session_hit`, `session_in_flight` | The request's session key: whether it is pinned to this worker, and its requests in flight there. | `session_hit` is set on the worker the ask names as pinned. `session_in_flight` is the row's own count of the key's requests in flight. Only a keyed request placed on one worker counts and is shown it: the controller steps the count on the worker's object while that request's lease is on file, and writes it into the row under a document that reads it, one with a stage that declares `Needs::session_in_flight` or a sessions rule with an in-flight cap. For any other request it reads 0. |
 | `RequestFacts::affinity_at(index)` (`AffinityFacts`) | The cache index: the prefix blocks of the request the worker at `index` holds. An empty column reads as nothing held. Filled for a profile with a stage that declares `Needs::affinity`. | One entry for each worker. Its index facts are not fed yet and read 0. |
 | `Candidate::role`, `wire_modes`, `zone`, `engine_kind`, `labels` | The worker's registration. | `role` and `wire_modes` are fed. `zone`, `engine_kind` and `labels` are fed against the lists the policy document declares (`view.zones`, `view.engines`, `view.labels`): a position from 1, and one bit for each label selector the worker meets. Each reads 0 where the document declares no list, and a worker whose zone or engine family its list does not name reads 0 there. |
-| `DispatchCredit::read` (`CreditedDispatches`) | What the deciding host sent the worker that no load report of it shows yet: the requests and their prompt tokens. A scorer's factory asks for its profile's count with `StageBuild::dispatch_credit`. | Fed by the dispatch reports of every gateway that decides through this controller. A send stops counting at a report sampled at or after it, at the profile's `sent_ttl_ms` or at the worker's removal. When a send arrives with 8,192 already held on a row, the tally lets the row's oldest go, at any age. |
+| `DispatchCredit::read` (`CreditedDispatches`) | The host's sends to the worker's row that still count: requests and their prompt tokens. A factory of a `_with` call asks for its profile's tally with `StageBuild::dispatch_credit`. | Fed by the dispatch reports of every gateway that decides through this controller. The notes under the table say when a send stops counting. |
 | `RequestFacts` | The request: the model, the tenant, the session key, the prompt's size and block hashes, the allow-listed headers. | The caller's, not the store's. |
 | `PoolFacts`, at `DecisionScope::open` | The pool the model resolves to: its size, the policy's generation, the overload regime. A stage that holds a decision scope reads it when the scope opens. | The size and the generation. The overload regime is not fed yet and reads as none. |
+
+Notes on the tally behind `DispatchCredit::read`:
+
+- As a rule a send stops counting at a report sampled at or after it, at the
+  profile's `sent_ttl_ms` or at the worker's removal.
+  [What a factory can ask](../../crates/grand_central/docs/extending.md#what-a-factory-can-ask)
+  has the rules.
+- When a send arrives with 8,192 or more held on a row, the tally lets one of
+  the row's sends go at any age, or none. As a rule it is the oldest. None
+  goes where the row, the new send counted, holds no more than 8,192.
 
 `Pack` reads `Candidate::load` and says so in `needs`. The example's tests
 hand the engine a worker list and its engines' load reports, and read where
@@ -113,8 +128,10 @@ profiles:
 `Pack` takes a weight from the document and nothing else:
 `- pack: { weight: 2 }`. A bare name weighs one. A scorer with settings of
 its own registers with `scorer_with` and reads them from the document as
-typed parameters: the crate's [reference](../../crates/grand_central/REFERENCE.md#register-a-rust-stage) shows one. The command line is the
-crate's, and it refuses a flag it does not know.
+typed parameters: the crate's page
+[A stage with parameters](../../crates/grand_central/docs/extending.md#a-stage-with-parameters)
+shows one. The command line is the crate's, and it refuses a flag it does
+not know.
 
 The stock `not-overloaded` filter is where `pack` stops filling a worker. It
 drops a worker judged overloaded: the queue or the KV-cache usage in its

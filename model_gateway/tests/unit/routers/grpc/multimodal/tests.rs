@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    sync::{atomic::AtomicBool, Arc, Mutex},
+    time::Duration,
+};
 
 use axum::body::to_bytes;
 use http::StatusCode;
@@ -7,7 +10,7 @@ use llm_multimodal::{hub::HubFetchError, MediaConnectorError, Modality, MultiMod
 use super::{
     config_unavailable_response, encoder_budget::ItemOverEncoderBudget, invalid_multimodal_request,
     processing_failed_message, processing_failed_response, record_decoder_availability,
-    report_jpeg_decoder, Response,
+    report_jpeg_decoder, trim_on_a_period, Response,
 };
 use crate::{middleware::test_support::json_of, routers::common::retry::NonRetryable};
 
@@ -462,4 +465,62 @@ fn only_an_explicit_verdict_makes_a_failure_the_requests_media() {
     assert!(!super::is_request_media_fault(&anyhow::anyhow!(
         "Image preprocessing failed"
     )));
+}
+
+/// When a trim under test was called, in seconds of the paused clock.
+type TrimCalls = Arc<Mutex<Vec<u64>>>;
+
+/// A trim that notes when it is called and frees nothing.
+fn noting(calls: &TrimCalls, start: tokio::time::Instant) -> impl Fn() -> usize {
+    let calls = Arc::clone(calls);
+    move || {
+        calls.lock().unwrap().push(start.elapsed().as_secs());
+        0
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_starts_in_one_process_trim_a_period_apart() {
+    static HELD: AtomicBool = AtomicBool::new(false);
+    let calls = TrimCalls::default();
+    let start = tokio::time::Instant::now();
+    // The second start comes ten seconds behind the first, so its ticks
+    // fall between the ticks of the first.
+    let first = trim_on_a_period(&HELD, noting(&calls, start));
+    let second = async {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        trim_on_a_period(&HELD, noting(&calls, start)).await;
+    };
+    let both = async { tokio::join!(first, second) };
+    assert!(tokio::time::timeout(Duration::from_secs(125), both)
+        .await
+        .is_err());
+    assert_eq!(*calls.lock().unwrap(), [30, 60, 90, 120]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_trimming_role_passes_on_a_period_behind_the_end_of_its_holder() {
+    static HELD: AtomicBool = AtomicBool::new(false);
+    let calls = TrimCalls::default();
+    let start = tokio::time::Instant::now();
+    // The first start goes with its runtime at second 95, five seconds
+    // behind its last trim; the second start ticks from second 10 on, so
+    // it takes the role at second 100 and trims from second 130.
+    let first = async {
+        let ended = tokio::time::timeout(
+            Duration::from_secs(95),
+            trim_on_a_period(&HELD, noting(&calls, start)),
+        )
+        .await;
+        assert!(ended.is_err());
+    };
+    let second = async {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        trim_on_a_period(&HELD, noting(&calls, start)).await;
+    };
+    let both = async { tokio::join!(first, second) };
+    assert!(tokio::time::timeout(Duration::from_secs(165), both)
+        .await
+        .is_err());
+    assert_eq!(*calls.lock().unwrap(), [30, 60, 90, 130, 160]);
 }

@@ -107,6 +107,59 @@ fn apply_prefill_media_identity(
     }
 }
 
+/// Whether `identity` can stand in for a stripped references side's whole
+/// multimodal payload: expanded prompt ids, and per-item content hashes on
+/// every batch, which key the decode prefix cache so two requests' media
+/// never share a block.
+fn identity_serves_a_stripped_side(identity: &vllm::MediaIdentity) -> bool {
+    let mut batches = identity
+        .mm_inputs
+        .iter()
+        .chain(&identity.extra_mm_inputs)
+        .peekable();
+    !identity.prompt_token_ids.is_empty()
+        && batches.peek().is_some()
+        && batches.all(|batch| !batch.mm_hashes.is_empty())
+}
+
+/// Give a stripped references side its whole multimodal payload: the prefill
+/// side's media identity (the expanded prompt ids and the per-item content
+/// hashes) replacing the references, then stripped to the hashes alone
+/// (pixels, placeholders and grid tensors never leave the prefill side). The
+/// identity is applied before the strip: it is what the side is stripped
+/// down to. A prefill that returned no identity that can stand in for the
+/// payload ([`identity_serves_a_stripped_side`]) fails the request:
+/// references never reach a language-model-only decode worker, and a side
+/// is never sent with media its prefix cache cannot tell apart.
+fn apply_refs_media_identity(
+    decode_request: &mut ProtoGenerateRequest,
+    prefill_media_identity: Option<&vllm::MediaIdentity>,
+) -> Result<(), Response> {
+    let applied = prefill_media_identity.is_some_and(|identity| {
+        identity_serves_a_stripped_side(identity) && decode_request.apply_media_identity(identity)
+    });
+    if !applied {
+        error!(
+            request_id = %decode_request.request_id(),
+            "prefill worker returned no media identity a language-model-only decode \
+             worker can be served with"
+        );
+        let mut response = error::bad_gateway(
+            "pd_decode_missing_media_identity",
+            "the prefill worker returned no usable media identity for this request (the \
+             expanded prompt ids, and content hashes on every batch), which a decode worker \
+             running with --language-model-only needs in place of the media references: \
+             the prefill servicer is older than this pairing, or could not describe the \
+             request's media"
+                .to_string(),
+        );
+        mark_non_retryable(&mut response);
+        return Err(response);
+    }
+    decode_request.strip_mm_to_hashes();
+    Ok(())
+}
+
 /// The bound on a sequential decode side's first token, counted from its
 /// dispatch (see [`liveness::decode_side_bound`]).
 #[derive(Clone, Copy, Debug)]
@@ -349,13 +402,28 @@ enum SequentialPdDecodeForm {
     /// so the engine sees a pure-text TokensPrompt and never touches its
     /// zero-budget encoder cache.
     TextPlusHashes,
+    /// Language-model-only decode worker, media references forwarded: the
+    /// references ride the decode side only until the prefill side answers,
+    /// then its media identity replaces them (the expanded prompt ids, the
+    /// per-item content hashes) and the side is stripped to text and hashes
+    /// before dispatch. A prefill that returns no usable identity fails the
+    /// request: references never reach a worker that cannot expand them.
+    RefsThenIdentity,
 }
 
 /// Pick the decode-side form, failing fast when the selected decode worker is
 /// language-model-only and the request is one that pairing cannot serve.
 /// Worker selection keeps such a request off such workers while the model
 /// pairs a decode worker with the vision encoder (`decode_needs_vision`), so
-/// a refusal here means none is paired.
+/// a refusal here means none is paired. `language_model_reads_grids` is the
+/// model's answer to whether its language model reads the grid tensors the
+/// request carries (`RoutingSnapshot::language_model_reads_grids`): when it
+/// does not, the grids feed only the vision tower, which runs on the side
+/// that encodes the media (the prefill side, or the encode workers in
+/// encode/prefill/decode mode), and the stripped side serves the request.
+/// For media references that also needs the prefill side to be asked for
+/// its media identity (`identity_solicited`, asked only of such a request):
+/// the identity is what the stripped side is made of.
 // Always in line: the plan's decision ran this built in, on every sequential
 // request's path, before the check of its refusals called it too. With two
 // callers it stood alone, and a request read 32 instructions more.
@@ -364,6 +432,8 @@ fn sequential_pd_decode_form(
     request: &ProtoGenerateRequest,
     decode_language_model_only: bool,
     relay_kv_params: bool,
+    identity_solicited: impl FnOnce() -> bool,
+    language_model_reads_grids: bool,
 ) -> Result<SequentialPdDecodeForm, Response> {
     if !decode_language_model_only {
         return Ok(if relay_kv_params {
@@ -372,7 +442,7 @@ fn sequential_pd_decode_form(
             SequentialPdDecodeForm::Full
         });
     }
-    if request.has_vllm_mrope_grids() {
+    if language_model_reads_grids && request.has_vllm_mrope_grids() {
         // Grid-dependent models (Qwen-VL family) derive decode-side positions
         // from the grid tensors: a language-model-only decode worker rejects
         // them and stripping them would mis-rotate every generated token, so
@@ -390,14 +460,37 @@ fn sequential_pd_decode_form(
     }
     if request.has_vllm_media_refs() {
         // Media references reach each side as unexpanded anchors the side
-        // expands itself; a language-model-only decode worker cannot.
+        // expands itself; a language-model-only decode worker cannot. The
+        // pairing still serves the request when the decode side needs no
+        // expansion of its own: a single sample relays the KV handoff, the
+        // prefill side is asked for its media identity (the expanded prompt
+        // ids and the per-item content hashes), and the model's language
+        // model reads no grid tensors.
+        let unserved = if !relay_kv_params {
+            Some("the request asks for more than one sample")
+        } else if language_model_reads_grids {
+            Some("the model is not known to leave the grid tensors unread by its language model")
+        } else if !identity_solicited() {
+            Some(
+                "the pair's KV connector does not return the prefill's media identity \
+                 (NIXL does, and Mooncake with a discovered engine id)",
+            )
+        } else {
+            None
+        };
+        let Some(unserved) = unserved else {
+            return Ok(SequentialPdDecodeForm::RefsThenIdentity);
+        };
         let mut response = error::bad_request(
             "pd_decode_language_model_only_media_refs",
-            "no decode worker with a vision encoder is paired for this model, and a \
-             decode worker running with --language-model-only cannot expand media \
-             references; add such a decode worker or use router-side multimodal \
-             processing (--mm-processing=router) for this pool"
-                .to_string(),
+            format!(
+                "no decode worker with a vision encoder is paired for this model, and a \
+                 decode worker running with --language-model-only cannot expand media \
+                 references. Such a worker takes the prefill's media identity in their \
+                 place, but not here: {unserved}. Add a decode worker with the vision \
+                 encoder, or use router-side multimodal processing \
+                 (--mm-processing=router) for this pool."
+            ),
         );
         mark_non_retryable(&mut response);
         return Err(response);
@@ -417,6 +510,22 @@ fn sequential_pd_decode_form(
         return Err(response);
     }
     Ok(SequentialPdDecodeForm::TextPlusHashes)
+}
+
+/// Whether the prefill request of a pair on the connector `mode` carries KV
+/// params, so its servicer is asked for the media identity: a minted
+/// Mooncake handoff, or a relayed NIXL one, of a single sample alone. The
+/// plan's decision, its refusal check and the plan itself read it here.
+fn solicits_identity(mode: &KvConnectorMode, relay_kv_params: bool) -> bool {
+    relay_kv_params
+        && matches!(
+            mode,
+            KvConnectorMode::Nixl
+                | KvConnectorMode::Mooncake {
+                    engine_id: Some(_),
+                    ..
+                }
+        )
 }
 
 /// What refuses a pair on the MoRI-IO connector, for the plan's decision and
@@ -457,9 +566,12 @@ impl SequentialPlan {
     /// [`execute_sequential_pd`], so a refused request's prefill was never
     /// said to be sent. [`Self::refuses`] makes the same refusals without
     /// the plan: a refusal added here is added there.
+    /// `language_model_reads_grids` is the model's answer the routing
+    /// snapshot keeps (see [`sequential_pd_decode_form`]).
     pub(crate) fn decide(
         proto_request: &ProtoGenerateRequest,
         workers: &WorkerSelection,
+        language_model_reads_grids: bool,
     ) -> Result<Self, Response> {
         let mode = match workers.decode_worker() {
             // A MoRI-IO decode engine never recomputes the prompt, whatever the
@@ -526,10 +638,18 @@ impl SequentialPlan {
             && workers
                 .decode_worker()
                 .is_some_and(|worker| worker_language_model_only(worker.as_ref()));
-        let decode_form =
-            sequential_pd_decode_form(proto_request, decode_language_model_only, relay_kv_params)?;
-        let stripped_mm_decode = matches!(decode_form, SequentialPdDecodeForm::TextPlusHashes)
-            && proto_request.has_mm_inputs();
+        let decode_form = sequential_pd_decode_form(
+            proto_request,
+            decode_language_model_only,
+            relay_kv_params,
+            || solicits_identity(&mode, relay_kv_params),
+            language_model_reads_grids,
+        )?;
+        let stripped_mm_decode = match decode_form {
+            SequentialPdDecodeForm::TextPlusHashes => proto_request.has_mm_inputs(),
+            SequentialPdDecodeForm::RefsThenIdentity => proto_request.has_vllm_media_refs(),
+            SequentialPdDecodeForm::Full | SequentialPdDecodeForm::IdentityOnly => false,
+        };
         Ok(Self {
             mode,
             relay_kv_params,
@@ -542,13 +662,18 @@ impl SequentialPlan {
 
     /// What [`Self::decide`] refuses of the pair and the request, asked
     /// without the plan: of each side's connector it asks one thing,
-    /// whether it is MoRI-IO, and it logs no line and mints no transfer id.
-    /// For a caller that asks ahead of the dispatch that decides the plan.
+    /// whether it is MoRI-IO, and it mints no transfer id. It reads the
+    /// prefill's connector mode only where the decode form asks for it (media
+    /// references a language-model-only decode could take stripped), and
+    /// logs no line but that reader's own warning of an invalid `dp_size`
+    /// label. For a caller that asks ahead of the dispatch that decides the
+    /// plan.
     /// `decide` makes the same two refusals in its own lines, which every
     /// sequential request runs.
     pub(crate) fn refuses(
         proto_request: &ProtoGenerateRequest,
         workers: &WorkerSelection,
+        language_model_reads_grids: bool,
     ) -> Result<(), Response> {
         // The plan's mode is MoRI-IO for a MoRI-IO decode, and else what the
         // prefill's connector says.
@@ -564,15 +689,27 @@ impl SequentialPlan {
             && workers
                 .decode_worker()
                 .is_some_and(|worker| worker_language_model_only(worker.as_ref()));
-        sequential_pd_decode_form(proto_request, decode_language_model_only, relay_kv_params)
-            .map(drop)
+        sequential_pd_decode_form(
+            proto_request,
+            decode_language_model_only,
+            relay_kv_params,
+            || {
+                workers.prefill_worker().is_some_and(|prefill| {
+                    solicits_identity(
+                        &connector_mode_for_worker(prefill.as_ref()),
+                        relay_kv_params,
+                    )
+                })
+            },
+            language_model_reads_grids,
+        )
+        .map(drop)
     }
 
     /// The prefill request carried KV params, so the servicer was asked for
     /// the media identity.
     fn identity_solicited(&self) -> bool {
-        self.mooncake_transfer_id.is_some()
-            || (self.mode == KvConnectorMode::Nixl && self.relay_kv_params)
+        solicits_identity(&self.mode, self.relay_kv_params)
     }
 
     /// The two sides' requests from the client's: the decode side in the form
@@ -600,7 +737,13 @@ impl SequentialPlan {
         let mut decode_request = match self.decode_form {
             SequentialPdDecodeForm::Full => proto_request.clone(),
             SequentialPdDecodeForm::TextPlusHashes => proto_request.clone_without_mm(),
-            SequentialPdDecodeForm::IdentityOnly => proto_request.clone_without_mm_pixels(),
+            // The references stay on the stripped side until the prefill
+            // side's media identity replaces them (`relay_to_decode`): the
+            // identity's expanded ids and hashes are what the side is
+            // stripped down to, so they must land before the strip.
+            SequentialPdDecodeForm::RefsThenIdentity | SequentialPdDecodeForm::IdentityOnly => {
+                proto_request.clone_without_mm_pixels()
+            }
         };
         if let ProtoGenerateRequest::Vllm(request) = &mut decode_request {
             request.ec_transfer_params_json = None;
@@ -1077,13 +1220,23 @@ fn relay_to_decode(
         }
         _ => {}
     }
-    apply_prefill_media_identity(
-        decode_request,
-        handed_off,
-        relay_kv_params,
-        plan.identity_solicited(),
-        prefill_media_identity,
-    );
+    match plan.decode_form {
+        // A stripped references side has no reprocess fallback: its whole
+        // multimodal payload is the prefill side's identity, so that identity
+        // must land, and be stripped, before the side is sent.
+        SequentialPdDecodeForm::RefsThenIdentity => {
+            apply_refs_media_identity(decode_request, prefill_media_identity)?;
+        }
+        SequentialPdDecodeForm::Full
+        | SequentialPdDecodeForm::IdentityOnly
+        | SequentialPdDecodeForm::TextPlusHashes => apply_prefill_media_identity(
+            decode_request,
+            handed_off,
+            relay_kv_params,
+            plan.identity_solicited(),
+            prefill_media_identity,
+        ),
+    }
 
     // A stripped multimodal side cannot fall back to a local recompute: the
     // image KV exists only on the prefill worker, so without a handoff the
@@ -1580,11 +1733,13 @@ mod tests {
 
         // Full-vision decode worker: today's forms, untouched.
         assert_eq!(
-            sequential_pd_decode_form(&mm_request, false, true).expect("vision decode"),
+            sequential_pd_decode_form(&mm_request, false, true, || true, true)
+                .expect("vision decode"),
             SequentialPdDecodeForm::IdentityOnly
         );
         assert_eq!(
-            sequential_pd_decode_form(&mm_request, false, false).expect("vision decode n>1"),
+            sequential_pd_decode_form(&mm_request, false, false, || true, true)
+                .expect("vision decode n>1"),
             SequentialPdDecodeForm::Full
         );
 
@@ -1601,18 +1756,382 @@ mod tests {
             .model_specific_tensors
             .clear();
         assert_eq!(
-            sequential_pd_decode_form(&stripable, true, true).expect("stripped side"),
+            sequential_pd_decode_form(&stripable, true, true, || true, true)
+                .expect("stripped side"),
             SequentialPdDecodeForm::TextPlusHashes
         );
         let text = ProtoGenerateRequest::Vllm(Box::default());
         assert_eq!(
-            sequential_pd_decode_form(&text, true, true).expect("text request"),
+            sequential_pd_decode_form(&text, true, true, || true, true).expect("text request"),
             SequentialPdDecodeForm::TextPlusHashes
         );
         assert_eq!(
-            sequential_pd_decode_form(&text, true, false).expect("text n>1"),
+            sequential_pd_decode_form(&text, true, false, || true, true).expect("text n>1"),
             SequentialPdDecodeForm::TextPlusHashes
         );
+    }
+
+    /// Grid tensors the model's language model does not read (MiniMax M3's
+    /// feed its vision tower alone) leave a language-model-only decode
+    /// worker the stripped side, as a request without grids does; a
+    /// full-vision decode worker keeps its forms.
+    #[test]
+    fn grids_the_language_model_does_not_read_take_the_stripped_side() {
+        let mut gridded = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut gridded else {
+            panic!("expected vLLM request");
+        };
+        req.media_refs = None;
+        assert!(gridded.has_vllm_mrope_grids());
+
+        assert_eq!(
+            sequential_pd_decode_form(&gridded, true, true, || true, false)
+                .expect("plain-RoPE grids"),
+            SequentialPdDecodeForm::TextPlusHashes
+        );
+        assert_eq!(
+            sequential_pd_decode_form(&gridded, false, true, || true, false)
+                .expect("vision decode"),
+            SequentialPdDecodeForm::IdentityOnly
+        );
+        // n>1 recomputes the prompt on the decode side whatever the grids
+        // are: still refused there, for its samples.
+        let Err(refused) = sequential_pd_decode_form(&gridded, true, false, || true, false) else {
+            panic!("n>1 cannot recompute on a pixel-less decode worker");
+        };
+        assert_eq!(
+            refused
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "pd_decode_language_model_only_n_samples"
+        );
+    }
+
+    /// A single-sample media-references request of a model whose language
+    /// model reads no grids, with the KV handoff relayed and the prefill side
+    /// asked for its media identity, is served by a language-model-only
+    /// decode worker: the references go to the prefill side alone, the
+    /// decode side takes the identity. Without the identity asked for, or
+    /// with grids the model reads, it is refused as before.
+    #[test]
+    fn sequential_pd_decode_form_serves_refs_on_a_language_model_only_decode() {
+        let refs_only = media_refs_request("refs", 1);
+        assert_eq!(
+            sequential_pd_decode_form(&refs_only, true, true, || true, false)
+                .expect("a single-sample refs request of a model that reads no grids"),
+            SequentialPdDecodeForm::RefsThenIdentity
+        );
+        // A full-vision decode worker keeps its form.
+        assert_eq!(
+            sequential_pd_decode_form(&refs_only, false, true, || true, false)
+                .expect("vision decode"),
+            SequentialPdDecodeForm::IdentityOnly
+        );
+        for (name, identity_solicited, reads_grids) in [
+            ("no identity asked for", false, false),
+            ("grids the language model reads", true, true),
+        ] {
+            let Err(refused) = sequential_pd_decode_form(
+                &refs_only,
+                true,
+                true,
+                || identity_solicited,
+                reads_grids,
+            ) else {
+                panic!("{name}: refused");
+            };
+            assert_eq!(
+                refused
+                    .headers()
+                    .get(error::HEADER_X_SMG_ERROR_CODE)
+                    .unwrap(),
+                "pd_decode_language_model_only_media_refs",
+                "{name}"
+            );
+        }
+    }
+
+    /// A prefill/decode pair as [`connector_pair`] builds it, its decode
+    /// worker running as a language model only.
+    fn language_model_only_decode_pair(
+        connector: &str,
+        engine_id: Option<&str>,
+    ) -> WorkerSelection {
+        let WorkerSelection::Disaggregated { prefill, .. } = connector_pair(connector, engine_id)
+        else {
+            panic!("a disaggregated pair");
+        };
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Vllm)
+                .connection_mode(ConnectionMode::Grpc)
+                .label(smg_worker::labels::SUPPORTS_VISION_LABEL, "false")
+                .build(),
+        );
+        WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill,
+            decode: decode.into(),
+            runtime_type: RuntimeType::Vllm,
+        }
+    }
+
+    /// The plan asks the form with what the pair's connector gives: a NIXL
+    /// handoff of a single sample, or a minted Mooncake one, asks the prefill
+    /// for its media identity, so such a references request on a
+    /// language-model-only decode worker is planned as the stripped
+    /// references side, with no local recompute to fall back on. The same
+    /// request keeps its refusal when the model's language model reads the
+    /// grids, when it asks for several samples, and on a connector that asks
+    /// for no identity. The check of the plan's refusals answers alike.
+    #[tokio::test]
+    async fn the_plan_serves_refs_on_a_language_model_only_decode_only_with_a_solicited_identity() {
+        let nixl = language_model_only_decode_pair(NIXL_CONNECTOR, None);
+        let plan = SequentialPlan::decide(&media_refs_request("refs-plan", 1), &nixl, false)
+            .unwrap_or_else(|_| panic!("a single-sample refs request on a NIXL pair"));
+        assert_eq!(plan.decode_form, SequentialPdDecodeForm::RefsThenIdentity);
+        assert!(plan.identity_solicited());
+        assert!(plan.stripped_mm_decode);
+
+        let minted = language_model_only_decode_pair(MOONCAKE_CONNECTOR, Some("engine-a"));
+        let plan = SequentialPlan::decide(&media_refs_request("refs-minted", 1), &minted, false)
+            .unwrap_or_else(|_| panic!("a minted Mooncake handoff asks for the identity too"));
+        assert_eq!(plan.decode_form, SequentialPdDecodeForm::RefsThenIdentity);
+        assert!(
+            SequentialPlan::refuses(&media_refs_request("refs-minted", 1), &minted, false).is_ok(),
+            "the check reads the same connector"
+        );
+
+        let legacy = language_model_only_decode_pair(MOONCAKE_CONNECTOR, None);
+        for (name, request, workers, reads_grids) in [
+            (
+                "the language model reads the grids",
+                media_refs_request("refs-grids", 1),
+                &nixl,
+                true,
+            ),
+            (
+                "several samples",
+                media_refs_request("refs-n2", 2),
+                &nixl,
+                false,
+            ),
+            (
+                "a legacy Mooncake handoff asks for no identity",
+                media_refs_request("refs-legacy", 1),
+                &legacy,
+                false,
+            ),
+        ] {
+            assert!(
+                SequentialPlan::refuses(&request, workers, reads_grids).is_err(),
+                "{name}: the check refuses it"
+            );
+            let Err(response) = SequentialPlan::decide(&request, workers, reads_grids) else {
+                panic!("{name}: the pairing is refused");
+            };
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST, "{name}");
+            assert!(
+                text_of(response)
+                    .await
+                    .contains("pd_decode_language_model_only_media_refs"),
+                "{name}"
+            );
+        }
+    }
+
+    /// The plan of a references request served stripped on a
+    /// language-model-only decode worker: NIXL, single sample, the identity
+    /// asked for.
+    fn refs_then_identity_plan() -> SequentialPlan {
+        SequentialPlan {
+            mode: KvConnectorMode::Nixl,
+            relay_kv_params: true,
+            mooncake_transfer_id: None,
+            decode_form: SequentialPdDecodeForm::RefsThenIdentity,
+            stripped_mm_decode: true,
+            streaming: false,
+        }
+    }
+
+    /// A language-model-only decode worker, references forwarded, n=1, the
+    /// KV handoff relayed. The prefill side gets the references; when it
+    /// answers, its media identity gives the decode side the expanded prompt
+    /// ids, and the side is stripped to the per-item content hashes: no
+    /// references, no pixels, no grids, and no per-request salt while the
+    /// hashes key the cache.
+    #[test]
+    fn refs_then_identity_serves_decode_the_prefill_identity() {
+        let plan = refs_then_identity_plan();
+        let workers = language_model_only_decode_pair(NIXL_CONNECTOR, None);
+        let (prefill, mut decode) = plan.requests(media_refs_request("refs-relay", 1), &workers);
+        // The references go to the prefill side; the decode side holds them
+        // only until the identity lands.
+        assert!(
+            prefill.has_vllm_media_refs(),
+            "the prefill side expands them"
+        );
+        assert!(
+            decode.has_vllm_media_refs(),
+            "the decode side holds them until the identity lands"
+        );
+        let ProtoGenerateRequest::Vllm(prefill_req) = &prefill else {
+            panic!("expected vLLM request");
+        };
+        assert_eq!(
+            prefill_req.kv_transfer_params_json.as_deref(),
+            Some(NIXL_PREFILL_KV_PARAMS),
+            "the prefill side is tagged for the handoff and the identity"
+        );
+
+        let handed_off = relay_to_decode(
+            &plan,
+            &workers,
+            &mut decode,
+            Some("{\"do_remote_prefill\":true}".to_string()),
+            Some(&identity()),
+        )
+        .unwrap_or_else(|_| panic!("the identity serves the stripped side"));
+        assert!(handed_off);
+
+        let ProtoGenerateRequest::Vllm(decode_req) = &decode else {
+            panic!("expected vLLM request");
+        };
+        let Some(vllm::generate_request::Input::Tokenized(tokenized)) = &decode_req.input else {
+            panic!("the decode side stays tokenized");
+        };
+        assert_eq!(tokenized.input_ids, vec![7, 8, 100, 100, 100, 9]);
+        assert!(decode_req.media_refs.is_none());
+        assert!(
+            decode_req.cache_salt.is_none(),
+            "the router sets no salt: the hashes key the decode prefix cache"
+        );
+        let mm = decode_req.mm_inputs.as_ref().expect("the hashes stay");
+        assert_eq!(mm.mm_hashes, vec!["h1".to_string(), "h2".to_string()]);
+        assert!(mm.pixel_values.is_none());
+        assert!(mm.mm_placeholders.is_empty());
+        assert!(mm.model_specific_tensors.is_empty());
+    }
+
+    /// A prefill that answers without a usable identity (none, or one
+    /// without expanded ids) fails the request with a 502 the retry layer
+    /// does not replay; the decode side is never stripped, so its references
+    /// can never reach a language-model-only decode worker.
+    #[test]
+    fn a_refs_side_without_an_identity_fails_before_the_refs_could_be_sent() {
+        let plan = refs_then_identity_plan();
+        let workers = language_model_only_decode_pair(NIXL_CONNECTOR, None);
+        let kv = Some("{\"do_remote_prefill\":true}".to_string());
+
+        let (_, mut decode) = plan.requests(media_refs_request("refs-noid", 1), &workers);
+        let Err(response) = relay_to_decode(&plan, &workers, &mut decode, kv.clone(), None) else {
+            panic!("no identity: the request fails");
+        };
+        assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "pd_decode_missing_media_identity"
+        );
+        assert!(
+            !is_retryable_response(&response),
+            "an older prefill servicer would fail every replay the same way"
+        );
+        assert!(
+            decode.has_vllm_media_refs(),
+            "the references are never stripped without an identity"
+        );
+
+        let mut empty = identity();
+        empty.prompt_token_ids.clear();
+        let (_, mut decode) = plan.requests(media_refs_request("refs-empty", 1), &workers);
+        assert!(
+            relay_to_decode(&plan, &workers, &mut decode, kv, Some(&empty)).is_err(),
+            "an identity without ids is unusable"
+        );
+        assert!(decode.has_vllm_media_refs());
+    }
+
+    /// The stripped references side has no local recompute to fall back on:
+    /// an identity that lands without a KV handoff (a prefill that returned
+    /// no transfer parameters) fails the request with a 502 the retry layer
+    /// does not replay, after the references are gone from the side, which
+    /// is never sent.
+    #[test]
+    fn a_stripped_refs_side_without_a_kv_handoff_is_not_sent() {
+        let plan = refs_then_identity_plan();
+        let workers = language_model_only_decode_pair(NIXL_CONNECTOR, None);
+        let (_, mut decode) = plan.requests(media_refs_request("refs-nokv", 1), &workers);
+        let Err(response) = relay_to_decode(&plan, &workers, &mut decode, None, Some(&identity()))
+        else {
+            panic!("no handoff to pull the prompt KV from");
+        };
+        assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get(error::HEADER_X_SMG_ERROR_CODE)
+                .unwrap(),
+            "pd_decode_missing_kv_transfer_params"
+        );
+        assert!(
+            !is_retryable_response(&response),
+            "the prompt's KV is on that prefill alone"
+        );
+        assert!(
+            !decode.has_vllm_media_refs(),
+            "the references were stripped before the handoff was checked"
+        );
+    }
+
+    /// An identity whose batches do not all carry content hashes cannot key
+    /// the decode prefix cache by what the media was: the request fails with
+    /// the missing-identity 502 the retry layer does not replay, whether no
+    /// batch carries hashes or one of two does not, and the references are
+    /// never stripped.
+    #[test]
+    fn an_identity_without_hashes_for_every_batch_fails_before_the_side_could_be_sent() {
+        let without_hashes = || {
+            let mut batch = identity().mm_inputs.expect("an image batch");
+            batch.mm_hashes.clear();
+            batch
+        };
+        let mut none_hashed = identity();
+        none_hashed.mm_inputs = Some(without_hashes());
+        let mut one_unhashed = identity();
+        one_unhashed.extra_mm_inputs = vec![without_hashes()];
+        for (name, identity) in [
+            ("no batch carries hashes", none_hashed),
+            ("one batch of two carries none", one_unhashed),
+        ] {
+            let plan = refs_then_identity_plan();
+            let workers = language_model_only_decode_pair(NIXL_CONNECTOR, None);
+            let (_, mut decode) = plan.requests(media_refs_request("refs-hashless", 1), &workers);
+            let Err(response) = relay_to_decode(
+                &plan,
+                &workers,
+                &mut decode,
+                Some("{\"do_remote_prefill\":true}".to_string()),
+                Some(&identity),
+            ) else {
+                panic!("{name}: the request fails");
+            };
+            assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY, "{name}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(error::HEADER_X_SMG_ERROR_CODE)
+                    .unwrap(),
+                "pd_decode_missing_media_identity",
+                "{name}"
+            );
+            assert!(!is_retryable_response(&response), "{name}");
+            assert!(decode.has_vllm_media_refs(), "{name}: never stripped");
+        }
     }
 
     /// The refusals of a pool with no vision-capable decode worker (worker
@@ -1633,7 +2152,7 @@ mod tests {
         // M-RoPE grids + language-model-only decode: cannot strip (positions
         // would be wrong), cannot send (encoder-cache budget 0).
         let gridded = vllm_pd_mm_request();
-        let response = sequential_pd_decode_form(&gridded, true, true)
+        let response = sequential_pd_decode_form(&gridded, true, true, || true, true)
             .expect_err("mRoPE grids need a vision-capable decode worker");
         assert!(refusal(response)
             .await
@@ -1647,7 +2166,7 @@ mod tests {
         };
         req.mm_inputs = None;
         req.extra_mm_inputs.clear();
-        let response = sequential_pd_decode_form(&refs_only, true, true)
+        let response = sequential_pd_decode_form(&refs_only, true, true, || true, true)
             .expect_err("media refs need a processing decode worker");
         assert!(refusal(response)
             .await
@@ -1665,7 +2184,7 @@ mod tests {
             .unwrap()
             .model_specific_tensors
             .clear();
-        let response = sequential_pd_decode_form(&fanout, true, false)
+        let response = sequential_pd_decode_form(&fanout, true, false, || true, true)
             .expect_err("n>1 cannot recompute on a pixel-less decode worker");
         assert!(refusal(response)
             .await
@@ -1775,8 +2294,14 @@ mod tests {
         };
 
         // A multimodal request in the three forms a language-model-only
-        // decode is refused, as the decode form's own case builds them.
-        let gridded = vllm_pd_mm_request();
+        // decode is refused, as the decode form's own case builds them: grid
+        // tensors (refused only while the model's language model reads
+        // them), media references, and samples of a multimodal prompt.
+        let mut gridded = vllm_pd_mm_request();
+        let ProtoGenerateRequest::Vllm(req) = &mut gridded else {
+            panic!("expected vLLM request");
+        };
+        req.media_refs = None;
         let mut refs_only = vllm_pd_mm_request();
         let ProtoGenerateRequest::Vllm(req) = &mut refs_only else {
             panic!("expected vLLM request");
@@ -1805,12 +2330,17 @@ mod tests {
 
         let nixl = Some(NIXL_CONNECTOR);
         let moriio = Some(MORIIO_CONNECTOR);
+        let mooncake = Some(MOONCAKE_CONNECTOR);
+        // Each row's code when the model's language model reads the grids,
+        // and when it reads none of them: the grids row and the references
+        // row of a pair that asks for the media identity tell the two apart.
         let rows = [
-            ("a NIXL pair", pair(nixl, None, None), &text, None),
+            ("a NIXL pair", pair(nixl, None, None), &text, None, None),
             (
                 "a MoRI-IO decode",
                 pair(nixl, moriio, None),
                 &text,
+                Some("moriio_grpc_pd_unsupported"),
                 Some("moriio_grpc_pd_unsupported"),
             ),
             (
@@ -1818,17 +2348,27 @@ mod tests {
                 pair(moriio, None, None),
                 &text,
                 Some("moriio_grpc_pd_unsupported"),
+                Some("moriio_grpc_pd_unsupported"),
             ),
             (
                 "grids for a language-model-only decode",
                 pair(nixl, None, Some("false")),
                 &gridded,
                 Some("pd_decode_language_model_only_mrope"),
+                None,
             ),
             (
                 "media references for a language-model-only decode",
                 pair(nixl, None, Some("false")),
                 &refs_only,
+                Some("pd_decode_language_model_only_media_refs"),
+                None,
+            ),
+            (
+                "media references for a language-model-only decode on a legacy Mooncake pair",
+                pair(mooncake, None, Some("false")),
+                &refs_only,
+                Some("pd_decode_language_model_only_media_refs"),
                 Some("pd_decode_language_model_only_media_refs"),
             ),
             (
@@ -1836,11 +2376,13 @@ mod tests {
                 pair(nixl, None, Some("false")),
                 &fanout,
                 Some("pd_decode_language_model_only_n_samples"),
+                Some("pd_decode_language_model_only_n_samples"),
             ),
             (
                 "one sample of a multimodal prompt for a language-model-only decode",
                 pair(nixl, None, Some("false")),
                 &pixels,
+                None,
                 None,
             ),
             (
@@ -1848,22 +2390,33 @@ mod tests {
                 pair(nixl, None, Some("false")),
                 &text,
                 None,
+                None,
             ),
             (
                 "grids for a decode with the vision encoder",
                 pair(nixl, None, Some("true")),
                 &gridded,
                 None,
+                None,
             ),
         ];
-        for (name, workers, request, refused) in rows {
-            // A refusal is read as one whatever it bears: a refusal with no
-            // code is not a row's `None`.
-            let refused = refused.map(|code| Some(code.to_owned()));
-            let checked = SequentialPlan::refuses(request, &workers).err().map(code);
-            let decided = SequentialPlan::decide(request, &workers).err().map(code);
-            assert_eq!(checked, refused, "{name}: the check");
-            assert_eq!(decided, refused, "{name}: the plan's decision");
+        for (name, workers, request, if_read, if_not_read) in rows {
+            for (reads, refused) in [(true, if_read), (false, if_not_read)] {
+                // A refusal is read as one whatever it bears: a refusal with
+                // no code is not a row's `None`.
+                let refused = refused.map(|code| Some(code.to_owned()));
+                let checked = SequentialPlan::refuses(request, &workers, reads)
+                    .err()
+                    .map(code);
+                let decided = SequentialPlan::decide(request, &workers, reads)
+                    .err()
+                    .map(code);
+                assert_eq!(checked, refused, "{name}, grids read {reads}: the check");
+                assert_eq!(
+                    decided, refused,
+                    "{name}, grids read {reads}: the plan's decision"
+                );
+            }
         }
     }
 
@@ -1927,7 +2480,8 @@ mod tests {
     #[test]
     fn a_nixl_pair_is_sent_as_recorded() {
         let workers = connector_pair(NIXL_CONNECTOR, None);
-        let plan = SequentialPlan::decide(&recorded_request(1), &workers).expect("a NIXL pair");
+        let plan =
+            SequentialPlan::decide(&recorded_request(1), &workers, true).expect("a NIXL pair");
         assert_eq!(plan.mode, KvConnectorMode::Nixl);
         assert_eq!(
             sent_pair(&plan, recorded_request(1), &workers, Some(NIXL_RETURNED)),
@@ -1939,7 +2493,7 @@ mod tests {
     fn a_minted_mooncake_pair_is_sent_as_recorded() {
         let workers = connector_pair(MOONCAKE_CONNECTOR, Some("engine-a"));
         let mut plan =
-            SequentialPlan::decide(&recorded_request(1), &workers).expect("a Mooncake pair");
+            SequentialPlan::decide(&recorded_request(1), &workers, true).expect("a Mooncake pair");
         assert!(
             matches!(
                 plan.mode,
@@ -1966,7 +2520,8 @@ mod tests {
     #[test]
     fn a_legacy_mooncake_pair_is_sent_as_recorded() {
         let workers = connector_pair(MOONCAKE_CONNECTOR, None);
-        let plan = SequentialPlan::decide(&recorded_request(1), &workers).expect("a Mooncake pair");
+        let plan =
+            SequentialPlan::decide(&recorded_request(1), &workers, true).expect("a Mooncake pair");
         assert!(
             matches!(
                 plan.mode,
@@ -1994,7 +2549,8 @@ mod tests {
     #[test]
     fn an_n_greater_than_one_pair_is_sent_as_recorded() {
         let workers = connector_pair(NIXL_CONNECTOR, None);
-        let plan = SequentialPlan::decide(&recorded_request(2), &workers).expect("a NIXL pair");
+        let plan =
+            SequentialPlan::decide(&recorded_request(2), &workers, true).expect("a NIXL pair");
         assert!(!plan.relay_kv_params, "n>1 relays no handoff");
         assert_eq!(
             sent_pair(&plan, recorded_request(2), &workers, None),

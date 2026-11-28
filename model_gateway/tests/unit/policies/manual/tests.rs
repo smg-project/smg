@@ -1,0 +1,905 @@
+use std::collections::HashMap;
+
+use metrics_exporter_prometheus::PrometheusBuilder;
+use openai_protocol::worker::WorkerStatus;
+
+use super::*;
+use crate::policies::test_support::{headers_with_routing_key, make_workers, with_headers};
+
+#[test]
+fn test_manual_role_namespaces_sticky_entries() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+    let headers = headers_with_routing_key("user-123");
+
+    let prefill = SelectWorkerInfo {
+        headers: Some(&headers),
+        role: WorkerRole::Prefill,
+        ..Default::default()
+    };
+    let decode = SelectWorkerInfo {
+        headers: Some(&headers),
+        role: WorkerRole::Decode,
+        ..Default::default()
+    };
+
+    let (p1, _) = policy.select_worker_impl(&workers, &prefill);
+    let (d1, _) = policy.select_worker_impl(&workers, &decode);
+
+    // Same key under two roles -> two independent sticky entries.
+    assert_eq!(policy.routing_map.len(), 2);
+    for _ in 0..5 {
+        assert_eq!(policy.select_worker_impl(&workers, &prefill).0, p1);
+        assert_eq!(policy.select_worker_impl(&workers, &decode).0, d1);
+    }
+}
+
+#[test]
+fn test_manual_header_key_outranks_rid_key() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    let headers = headers_with_routing_key("conv");
+    let turn1 = SelectWorkerInfo {
+        headers: Some(&headers),
+        rid_key: Some("request-1"),
+        ..Default::default()
+    };
+    let turn2 = SelectWorkerInfo {
+        headers: Some(&headers),
+        rid_key: Some("request-2"),
+        ..Default::default()
+    };
+
+    let (first, branch) = policy.select_worker_impl(&workers, &turn1);
+    assert_eq!(branch, ExecutionBranch::Vacant);
+    let (second, branch) = policy.select_worker_impl(&workers, &turn2);
+    assert_eq!(second, first, "header key must outrank fresh request IDs");
+    assert_eq!(branch, ExecutionBranch::OccupiedHit);
+
+    assert_eq!(policy.routing_map.len(), 1);
+    assert!(policy.routing_map.contains_key(&RoutingId::new("conv")));
+}
+
+#[test]
+fn test_manual_rid_key_namespaces_per_role() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    let prefill = SelectWorkerInfo {
+        rid_key: Some("conv"),
+        role: WorkerRole::Prefill,
+        ..Default::default()
+    };
+    let decode = SelectWorkerInfo {
+        rid_key: Some("conv"),
+        role: WorkerRole::Decode,
+        ..Default::default()
+    };
+
+    let (p1, _) = policy.select_worker_impl(&workers, &prefill);
+    let (d1, _) = policy.select_worker_impl(&workers, &decode);
+
+    // Same rid under two roles -> two independent sticky entries.
+    assert_eq!(policy.routing_map.len(), 2);
+    for _ in 0..5 {
+        assert_eq!(policy.select_worker_impl(&workers, &prefill).0, p1);
+        assert_eq!(policy.select_worker_impl(&workers, &decode).0, d1);
+    }
+}
+
+#[test]
+fn test_manual_consistent_routing() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    let headers = headers_with_routing_key("user-123");
+    let info = with_headers(&headers);
+
+    let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+    let first_idx = first_result.unwrap();
+    assert_eq!(branch, ExecutionBranch::Vacant);
+
+    for _ in 0..10 {
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(
+            result,
+            Some(first_idx),
+            "Same routing_id should route to same worker"
+        );
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
+    }
+}
+
+#[test]
+fn test_manual_different_routing_ids() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    let mut distribution = HashMap::new();
+    for i in 0..100 {
+        let headers = headers_with_routing_key(&format!("user-{i}"));
+        let info = with_headers(&headers);
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::Vacant);
+        *distribution.entry(result.unwrap()).or_insert(0) += 1;
+    }
+
+    assert!(
+        distribution.len() > 1,
+        "Should distribute across multiple workers"
+    );
+}
+
+#[test]
+fn test_manual_fallback_random() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    let mut counts = HashMap::new();
+    for _ in 0..100 {
+        let info = SelectWorkerInfo::default();
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::NoRoutingId);
+        if let Some(idx) = result {
+            *counts.entry(idx).or_insert(0) += 1;
+        }
+    }
+
+    assert_eq!(counts.len(), 2, "Random fallback should use all workers");
+}
+
+#[test]
+fn test_manual_with_unhealthy_workers() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    workers[0].set_status(WorkerStatus::NotReady);
+
+    let headers = headers_with_routing_key("test-routing-id");
+    let info = with_headers(&headers);
+
+    let (result, branch) = policy.select_worker_impl(&workers, &info);
+    assert_eq!(result, Some(1), "Should only select healthy worker");
+    assert_eq!(branch, ExecutionBranch::Vacant);
+
+    for _ in 0..10 {
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, Some(1), "Should only select healthy worker");
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
+    }
+}
+
+#[test]
+fn test_manual_no_healthy_workers() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000"]);
+
+    workers[0].set_status(WorkerStatus::NotReady);
+    let headers = headers_with_routing_key("test");
+    let info = with_headers(&headers);
+    let (result, branch) = policy.select_worker_impl(&workers, &info);
+    assert_eq!(result, None);
+    assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
+}
+
+#[test]
+fn test_manual_empty_routing_id() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    let mut counts = HashMap::new();
+    for _ in 0..100 {
+        let headers = headers_with_routing_key("");
+        let info = with_headers(&headers);
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(branch, ExecutionBranch::NoRoutingId);
+        if let Some(idx) = result {
+            *counts.entry(idx).or_insert(0) += 1;
+        }
+    }
+
+    assert_eq!(
+        counts.len(),
+        2,
+        "Empty routing_id should use random fallback"
+    );
+}
+
+#[test]
+fn test_manual_remaps_when_worker_becomes_unhealthy() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    let headers = headers_with_routing_key("sticky-user");
+    let info = with_headers(&headers);
+
+    let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+    let first_idx = first_result.unwrap();
+    assert_eq!(branch, ExecutionBranch::Vacant);
+
+    workers[first_idx].set_status(WorkerStatus::NotReady);
+
+    let (new_result, branch) = policy.select_worker_impl(&workers, &info);
+    let new_idx = new_result.unwrap();
+    assert_ne!(new_idx, first_idx, "Should remap to healthy worker");
+    assert_eq!(branch, ExecutionBranch::OccupiedMiss);
+
+    for _ in 0..10 {
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(
+            result,
+            Some(new_idx),
+            "Should consistently route to new worker"
+        );
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
+    }
+}
+
+#[test]
+fn test_manual_empty_workers() {
+    let policy = ManualPolicy::new();
+    let workers: Vec<Arc<dyn Worker>> = vec![];
+    let headers = headers_with_routing_key("test");
+    let info = with_headers(&headers);
+    let (result, branch) = policy.select_worker_impl(&workers, &info);
+    assert_eq!(result, None);
+    assert_eq!(branch, ExecutionBranch::NoHealthyWorkers);
+}
+
+#[test]
+fn test_manual_single_worker() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000"]);
+
+    let headers = headers_with_routing_key("single-test");
+    let info = with_headers(&headers);
+
+    let (result, branch) = policy.select_worker_impl(&workers, &info);
+    assert_eq!(result, Some(0));
+    assert_eq!(branch, ExecutionBranch::Vacant);
+
+    for _ in 0..10 {
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(result, Some(0));
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
+    }
+}
+
+#[test]
+fn test_manual_worker_recovery() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    let headers = headers_with_routing_key("recovery-test");
+    let info = with_headers(&headers);
+
+    let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+    let first_idx = first_result.unwrap();
+    assert_eq!(branch, ExecutionBranch::Vacant);
+
+    workers[first_idx].set_status(WorkerStatus::NotReady);
+
+    let (second_result, branch) = policy.select_worker_impl(&workers, &info);
+    let second_idx = second_result.unwrap();
+    assert_ne!(second_idx, first_idx);
+    assert_eq!(branch, ExecutionBranch::OccupiedMiss);
+
+    workers[first_idx].set_status(WorkerStatus::Ready);
+
+    let (after_recovery, branch) = policy.select_worker_impl(&workers, &info);
+    assert_eq!(
+        after_recovery,
+        Some(first_idx),
+        "Should return to original worker after recovery since it's first in candidate list"
+    );
+    assert_eq!(branch, ExecutionBranch::OccupiedHit);
+}
+
+#[test]
+fn test_manual_max_candidate_workers_eviction() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    let headers = headers_with_routing_key("eviction-test");
+    let info = with_headers(&headers);
+
+    let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+    let first_idx = first_result.unwrap();
+    assert_eq!(branch, ExecutionBranch::Vacant);
+
+    workers[first_idx].set_status(WorkerStatus::NotReady);
+
+    let (second_result, branch) = policy.select_worker_impl(&workers, &info);
+    let second_idx = second_result.unwrap();
+    assert_ne!(second_idx, first_idx);
+    assert_eq!(branch, ExecutionBranch::OccupiedMiss);
+
+    workers[second_idx].set_status(WorkerStatus::NotReady);
+
+    let remaining_idx = (0..3).find(|&i| i != first_idx && i != second_idx).unwrap();
+    let (third_result, branch) = policy.select_worker_impl(&workers, &info);
+    assert_eq!(
+        third_result,
+        Some(remaining_idx),
+        "Should select the only remaining healthy worker"
+    );
+    assert_eq!(branch, ExecutionBranch::OccupiedMiss);
+
+    workers[first_idx].set_status(WorkerStatus::Ready);
+
+    let (idx_after_restore, branch) = policy.select_worker_impl(&workers, &info);
+    assert_ne!(
+        idx_after_restore,
+        Some(first_idx),
+        "First worker should be evicted from candidates due to MAX_CANDIDATE_WORKERS=2"
+    );
+    assert_eq!(branch, ExecutionBranch::OccupiedHit);
+}
+
+#[test]
+fn test_manual_policy_name() {
+    let policy = ManualPolicy::new();
+    assert_eq!(policy.name(), "manual");
+}
+
+#[test]
+fn test_manual_routing_info_push_bounded() {
+    let mut info = Node {
+        candi_worker_urls: vec!["http://w1:8000".to_string()],
+        last_access: Instant::now(),
+    };
+
+    info.push_bounded("http://w2:8000".to_string());
+    assert_eq!(info.candi_worker_urls.len(), 2);
+    assert_eq!(info.candi_worker_urls[0], "http://w1:8000");
+    assert_eq!(info.candi_worker_urls[1], "http://w2:8000");
+
+    info.push_bounded("http://w3:8000".to_string());
+    assert_eq!(info.candi_worker_urls.len(), 2);
+    assert_eq!(
+        info.candi_worker_urls[0], "http://w2:8000",
+        "Oldest entry should be removed"
+    );
+    assert_eq!(info.candi_worker_urls[1], "http://w3:8000");
+}
+
+#[test]
+fn test_manual_find_healthy_worker_priority() {
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    let urls = vec![
+        "http://w1:8000".to_string(),
+        "http://w2:8000".to_string(),
+        "http://w3:8000".to_string(),
+    ];
+    let healthy_indices = [0, 1, 2];
+
+    let result = find_healthy_worker(&urls, &workers, |idx| healthy_indices.contains(&idx));
+    assert_eq!(
+        result,
+        Some(0),
+        "Should return first healthy worker in urls"
+    );
+
+    workers[0].set_status(WorkerStatus::NotReady);
+    let healthy_indices = [1, 2];
+    let result = find_healthy_worker(&urls, &workers, |idx| healthy_indices.contains(&idx));
+    assert_eq!(result, Some(1), "Should skip unhealthy and return next");
+
+    workers[1].set_status(WorkerStatus::NotReady);
+    let healthy_indices = [2];
+    let result = find_healthy_worker(&urls, &workers, |idx| healthy_indices.contains(&idx));
+    assert_eq!(result, Some(2), "Should return last healthy worker");
+
+    workers[2].set_status(WorkerStatus::NotReady);
+    let healthy_indices: Vec<usize> = vec![];
+    let result = find_healthy_worker(&urls, &workers, |idx| healthy_indices.contains(&idx));
+    assert_eq!(result, None, "Should return None when no healthy workers");
+}
+
+#[test]
+fn test_manual_find_worker_index_by_url() {
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    assert_eq!(
+        find_worker_index_by_url(&workers, "http://w1:8000"),
+        Some(0)
+    );
+    assert_eq!(
+        find_worker_index_by_url(&workers, "http://w2:8000"),
+        Some(1)
+    );
+    assert_eq!(
+        find_worker_index_by_url(&workers, "http://w3:8000"),
+        None,
+        "Should return None for unknown URL"
+    );
+}
+
+#[test]
+fn test_manual_config_default() {
+    let config = ManualConfig::default();
+    assert_eq!(config.eviction_interval_secs, 60);
+    assert_eq!(config.max_idle_secs, 4 * 3600);
+}
+
+/// The pin of the kept count: a selection publishes the map's size only
+/// when it inserted a key; a hit records nothing about the size.
+#[test]
+fn a_selection_publishes_the_map_size_only_for_a_new_key() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let headers = headers_with_routing_key("conv-1");
+    let info = with_headers(&headers);
+
+    let first = PrometheusBuilder::new().build_recorder();
+    let first_handle = first.handle();
+    ::metrics::with_local_recorder(&first, || {
+        policy.select_worker(&workers, &info);
+    });
+    assert!(
+        first_handle
+            .render()
+            .contains("smg_manual_policy_cache_entries 1"),
+        "the new key sets the gauge to 1"
+    );
+
+    let hits = PrometheusBuilder::new().build_recorder();
+    let hits_handle = hits.handle();
+    ::metrics::with_local_recorder(&hits, || {
+        for _ in 0..3 {
+            policy.select_worker(&workers, &info);
+        }
+    });
+    assert!(
+        !hits_handle
+            .render()
+            .contains("smg_manual_policy_cache_entries"),
+        "a hit publishes nothing about the map's size"
+    );
+}
+
+#[test]
+fn a_full_map_records_no_new_key_and_answers_the_keys_it_holds() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let held = headers_with_routing_key("held");
+    let pinned = policy.select_worker(&workers, &with_headers(&held));
+    // One key under the 4,194,304 a map holds: the kept count stands for
+    // the keys no test inserts, and the next key takes the last room.
+    policy.entries.store(4_194_303, Ordering::Relaxed);
+    policy.pin_front("last", "http://w1:8000");
+    // The test under an entry's lock refuses at the most, and a refusal
+    // writes no count.
+    assert!(!policy.admits_new_entry());
+    assert_eq!(policy.entry_count(), MAX_ROUTING_KEYS);
+    let fresh = headers_with_routing_key("fresh");
+    assert!(policy
+        .select_worker(&workers, &with_headers(&fresh))
+        .is_some());
+    policy.pin_front("fresh", "http://w2:8000");
+    assert_eq!(policy.routing_map.len(), 2, "a new key is not recorded");
+    assert_eq!(policy.select_worker(&workers, &with_headers(&held)), pinned);
+    // The idle eviction gives the room back: the key is recorded.
+    evict_idle(
+        &policy.routing_map,
+        &policy.entries,
+        Duration::ZERO,
+        Instant::now(),
+    );
+    policy.select_worker(&workers, &with_headers(&fresh));
+    assert_eq!(policy.routing_map.len(), 1);
+    // The count as the map stands: the drop takes it off the gauge.
+    policy.entries.store(1, Ordering::Relaxed);
+}
+
+#[test]
+fn the_idle_eviction_takes_the_count_and_the_gauge_down_by_what_it_removed() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    ::metrics::with_local_recorder(&recorder, || {
+        let policy = ManualPolicy::new();
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        for key in ["conv-1", "conv-2", "conv-3"] {
+            let headers = headers_with_routing_key(key);
+            policy.select_worker(&workers, &with_headers(&headers));
+        }
+        policy.pin_front("conv-1", "http://w2:8000");
+        assert_eq!(
+            policy.entry_count(),
+            3,
+            "a pin of a held key counts nothing"
+        );
+        policy.pin_front("conv-4", "http://w2:8000");
+        assert_eq!(policy.entry_count(), 4, "a pin of a new key counts it");
+        assert!(
+            handle
+                .render()
+                .contains("smg_manual_policy_cache_entries 4"),
+            "every new key moved the gauge up by one"
+        );
+
+        // Two entries used an hour later: a pass at that instant with a
+        // minute's bound removes the other two, not everything (a reset
+        // to zero would read the same as a full pass).
+        let later = Instant::now() + Duration::from_secs(3600);
+        for key in ["conv-3", "conv-4"] {
+            policy
+                .routing_map
+                .get_mut(&RoutingId(key.to_string()))
+                .expect("a kept key")
+                .last_access = later;
+        }
+        let evicted = evict_idle(
+            &policy.routing_map,
+            &policy.entries,
+            Duration::from_secs(60),
+            later,
+        );
+        assert_eq!(evicted, 2);
+        assert_eq!(policy.entry_count(), 2);
+        assert_eq!(policy.routing_map.len(), 2);
+        assert!(
+            handle
+                .render()
+                .contains("smg_manual_policy_cache_entries 2"),
+            "the pass moved the gauge down by what it removed"
+        );
+
+        let evicted = evict_idle(&policy.routing_map, &policy.entries, Duration::ZERO, later);
+        assert_eq!(evicted, 2);
+        assert_eq!(policy.entry_count(), 0);
+        assert_eq!(policy.routing_map.len(), 0);
+        assert!(
+            handle
+                .render()
+                .contains("smg_manual_policy_cache_entries 0"),
+            "the last pass left the gauge at zero"
+        );
+    });
+}
+
+#[test]
+fn test_manual_with_disabled_eviction() {
+    let config = ManualConfig {
+        eviction_interval_secs: 0,
+        max_idle_secs: 3600,
+        assignment_mode: ManualAssignmentMode::Random,
+    };
+    let policy = ManualPolicy::with_config(config);
+    assert!(policy._eviction_task.is_none());
+}
+
+#[test]
+fn test_manual_last_access_updates() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let headers = headers_with_routing_key("test-key");
+    let info = with_headers(&headers);
+    let routing_id = RoutingId::new("test-key");
+
+    // Vacant: first access
+    let (result, branch) = policy.select_worker_impl(&workers, &info);
+    assert_eq!(branch, ExecutionBranch::Vacant);
+    let first_idx = result.unwrap();
+    let access_after_vacant = policy.routing_map.get(&routing_id).unwrap().last_access;
+    assert!(access_after_vacant.elapsed().as_millis() < 100);
+
+    std::thread::sleep(Duration::from_millis(10));
+
+    // OccupiedHit: same worker still healthy
+    let (_, branch) = policy.select_worker_impl(&workers, &info);
+    assert_eq!(branch, ExecutionBranch::OccupiedHit);
+    let access_after_hit = policy.routing_map.get(&routing_id).unwrap().last_access;
+    assert!(access_after_hit > access_after_vacant);
+
+    std::thread::sleep(Duration::from_millis(10));
+
+    // OccupiedMiss: worker becomes unhealthy
+    workers[first_idx].set_status(WorkerStatus::NotReady);
+    let (_, branch) = policy.select_worker_impl(&workers, &info);
+    assert_eq!(branch, ExecutionBranch::OccupiedMiss);
+    let access_after_miss = policy.routing_map.get(&routing_id).unwrap().last_access;
+    assert!(access_after_miss > access_after_hit);
+}
+
+/// The eviction thread wakes once per interval (`PeriodicTask`: one timed
+/// wait per interval), so an entry idle for `max_idle` leaves the map at the
+/// first tick after that, up to one interval later. The test waits for that
+/// tick with a deadline instead of a fixed sleep: a sleep of exactly
+/// interval + max_idle ended in the same instant as the tick that evicts,
+/// and lost the race on a loaded host. Once the entry is gone the test
+/// also asserts that at least `max_idle` passed since the insert: an
+/// eviction thread that ignored `max_idle` would clear the map at its
+/// first tick, one interval early.
+#[test]
+fn test_manual_ttl_eviction_logic() {
+    let config = ManualConfig {
+        eviction_interval_secs: 1,
+        max_idle_secs: 2,
+        assignment_mode: ManualAssignmentMode::Random,
+    };
+    let policy = ManualPolicy::with_config(config);
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    let headers = headers_with_routing_key("key-0");
+    let info = with_headers(&headers);
+    let inserted = Instant::now();
+    policy.select_worker_impl(&workers, &info);
+
+    assert_eq!(policy.routing_map.len(), 1);
+
+    // Idle for max_idle (2 s), evicted by the tick that follows (at 3 s at
+    // the latest); the deadline leaves four more seconds for a loaded host.
+    let deadline = Instant::now() + Duration::from_secs(7);
+    while !policy.routing_map.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "the idle entry was not evicted within the deadline ({} left)",
+            policy.routing_map.len()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The lower bound: an eviction thread that ignored `max_idle` would
+    // clear the map at its first tick, one second in. Time since the
+    // insert only grows, so this never reads red on a slow host.
+    assert!(
+        inserted.elapsed() >= Duration::from_secs(2),
+        "the entry was evicted before max_idle ({:?} after the insert)",
+        inserted.elapsed()
+    );
+}
+
+#[test]
+fn test_min_group_select_distributes_evenly() {
+    let config = ManualConfig {
+        assignment_mode: ManualAssignmentMode::MinGroup,
+        ..Default::default()
+    };
+    let policy = ManualPolicy::with_config(config);
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    for i in 0..9 {
+        let routing_key = format!("key-{i}");
+        let headers = headers_with_routing_key(&routing_key);
+        let info = with_headers(&headers);
+
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert!(result.is_some());
+        assert_eq!(branch, ExecutionBranch::Vacant);
+
+        let selected_idx = result.unwrap();
+        workers[selected_idx].increment_routing_key_load(&routing_key);
+    }
+
+    let distribution: HashMap<_, usize> = policy
+        .routing_map
+        .iter()
+        .map(|e| e.candi_worker_urls.first().unwrap().clone())
+        .fold(HashMap::new(), |mut acc, url| {
+            *acc.entry(url).or_default() += 1;
+            acc
+        });
+
+    assert_eq!(distribution.len(), 3, "Should use all 3 workers");
+    for count in distribution.values() {
+        assert_eq!(*count, 3, "Each worker should have exactly 3 routing keys");
+    }
+}
+
+#[test]
+fn test_min_group_select_prefers_worker_with_fewer_routing_keys() {
+    let config = ManualConfig {
+        assignment_mode: ManualAssignmentMode::MinGroup,
+        ..Default::default()
+    };
+    let policy = ManualPolicy::with_config(config);
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    workers[0].increment_routing_key_load("existing-1");
+    workers[0].increment_routing_key_load("existing-2");
+    workers[1].increment_routing_key_load("existing-3");
+
+    assert_eq!(workers[0].routing_key_load(), 2);
+    assert_eq!(workers[1].routing_key_load(), 1);
+    assert_eq!(workers[2].routing_key_load(), 0);
+
+    let headers = headers_with_routing_key("new-key");
+    let info = with_headers(&headers);
+    let (result, _) = policy.select_worker_impl(&workers, &info);
+    let selected_idx = result.unwrap();
+
+    assert_eq!(selected_idx, 2, "Should select worker with 0 routing keys");
+}
+
+#[test]
+fn test_min_load_select_prefers_worker_with_fewer_requests() {
+    let config = ManualConfig {
+        assignment_mode: ManualAssignmentMode::MinLoad,
+        ..Default::default()
+    };
+    let policy = ManualPolicy::with_config(config);
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+
+    workers[0].increment_load();
+    workers[0].increment_load();
+    workers[1].increment_load();
+
+    assert_eq!(workers[0].load(), 2);
+    assert_eq!(workers[1].load(), 1);
+    assert_eq!(workers[2].load(), 0);
+
+    let headers = headers_with_routing_key("new-key");
+    let info = with_headers(&headers);
+    let (result, _) = policy.select_worker_impl(&workers, &info);
+    let selected_idx = result.unwrap();
+
+    assert_eq!(selected_idx, 2, "Should select worker with 0 load");
+}
+
+#[test]
+fn test_min_group_sticky_after_assignment() {
+    let config = ManualConfig {
+        assignment_mode: ManualAssignmentMode::MinGroup,
+        ..Default::default()
+    };
+    let policy = ManualPolicy::with_config(config);
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    workers[0].increment_routing_key_load("key-0");
+    workers[1].increment_routing_key_load("key-1");
+    workers[1].increment_routing_key_load("key-2");
+
+    let headers = headers_with_routing_key("new-key");
+    let info = with_headers(&headers);
+
+    let (first_result, branch) = policy.select_worker_impl(&workers, &info);
+    let first_idx = first_result.unwrap();
+    assert_eq!(branch, ExecutionBranch::Vacant);
+    assert_eq!(
+        first_idx, 0,
+        "Should select worker 0 (has 1 routing key vs 2)"
+    );
+
+    for _ in 0..10 {
+        let (result, branch) = policy.select_worker_impl(&workers, &info);
+        assert_eq!(
+            result,
+            Some(first_idx),
+            "Same routing key should route to same worker"
+        );
+        assert_eq!(branch, ExecutionBranch::OccupiedHit);
+    }
+}
+
+#[test]
+fn test_pin_front_promotes_and_bounds_candidates() {
+    let policy = ManualPolicy::new();
+    policy.pin_front("k", "http://w1:8000");
+    policy.pin_front("k", "http://w2:8000");
+    let node = policy.routing_map.get(&RoutingId::new("k")).unwrap();
+    assert_eq!(node.candi_worker_urls, ["http://w2:8000", "http://w1:8000"]);
+    drop(node);
+
+    // Re-pinning an existing candidate moves it to the front, deduped.
+    policy.pin_front("k", "http://w1:8000");
+    let node = policy.routing_map.get(&RoutingId::new("k")).unwrap();
+    assert_eq!(node.candi_worker_urls, ["http://w1:8000", "http://w2:8000"]);
+    drop(node);
+
+    policy.pin_front("k", "http://w3:8000");
+    let node = policy.routing_map.get(&RoutingId::new("k")).unwrap();
+    assert_eq!(node.candi_worker_urls.len(), MAX_CANDIDATE_WORKERS);
+    assert_eq!(node.candi_worker_urls[0], "http://w3:8000");
+}
+
+#[test]
+fn test_peek_pin_states() {
+    let policy = ManualPolicy::new();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let healthy = [0, 1];
+
+    assert_eq!(
+        policy.peek_pin(&workers, "k", |idx| healthy.contains(&idx)),
+        PinState::Vacant
+    );
+
+    policy.pin_front("k", "http://w2:8000");
+    assert_eq!(
+        policy.peek_pin(&workers, "k", |idx| healthy.contains(&idx)),
+        PinState::Pinned(1)
+    );
+
+    workers[1].set_status(WorkerStatus::NotReady);
+    assert_eq!(
+        policy.peek_pin(&workers, "k", |idx| idx == 0),
+        PinState::Stale
+    );
+}
+
+#[test]
+fn test_delegate_mode_standalone_assigns_min_load() {
+    // With no underlying policy to delegate to, delegate degrades to
+    // min-load assignment.
+    let policy = ManualPolicy::with_config(ManualConfig {
+        assignment_mode: ManualAssignmentMode::Delegate,
+        ..Default::default()
+    });
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    workers[0].increment_load();
+
+    let info = SelectWorkerInfo::default();
+    let (result, branch) = policy.select_worker_impl(&workers, &info);
+    assert_eq!(result, Some(1));
+    assert_eq!(branch, ExecutionBranch::NoRoutingId);
+}
+
+#[test]
+fn test_random_mode_does_not_consider_load() {
+    let config = ManualConfig {
+        assignment_mode: ManualAssignmentMode::Random,
+        ..Default::default()
+    };
+    let policy = ManualPolicy::with_config(config);
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+
+    workers[0].increment_routing_key_load("key-1");
+    workers[0].increment_routing_key_load("key-2");
+    workers[0].increment_routing_key_load("key-3");
+
+    let mut selected_worker_0 = false;
+    for i in 0..50 {
+        let headers = headers_with_routing_key(&format!("test-{i}"));
+        let info = with_headers(&headers);
+        let (result, _) = policy.select_worker_impl(&workers, &info);
+        if result == Some(0) {
+            selected_worker_0 = true;
+            break;
+        }
+    }
+    assert!(
+        selected_worker_0,
+        "Random mode should sometimes select worker 0 despite higher load"
+    );
+}
+
+/// A policy dropped with its map takes its entries out of the gauge: a
+/// replacement's keys count from zero, not from the old map's worth.
+#[test]
+fn a_dropped_policy_takes_its_entries_out_of_the_gauge() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    ::metrics::with_local_recorder(&recorder, || {
+        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+        let policy = ManualPolicy::new();
+        for key in ["conv-1", "conv-2", "conv-3"] {
+            let headers = headers_with_routing_key(key);
+            policy.select_worker(&workers, &with_headers(&headers));
+        }
+        assert!(
+            handle
+                .render()
+                .contains("smg_manual_policy_cache_entries 3"),
+            "three new keys moved the gauge to 3"
+        );
+
+        drop(policy);
+        assert!(
+            handle
+                .render()
+                .contains("smg_manual_policy_cache_entries 0"),
+            "the dropped policy's entries left the gauge"
+        );
+
+        let replacement = ManualPolicy::new();
+        let headers = headers_with_routing_key("conv-4");
+        replacement.select_worker(&workers, &with_headers(&headers));
+        assert!(
+            handle
+                .render()
+                .contains("smg_manual_policy_cache_entries 1"),
+            "a replacement's keys count from zero"
+        );
+    });
+}

@@ -454,6 +454,9 @@ mod tests {
                 error::internal_error("no_response_produced", "none"),
                 REASON_INTERNAL,
             ),
+            // A decision Grand Central itself failed is the gateway's own
+            // processing: its code has no arm, and its 500 says so.
+            (placement::decision_failed("m"), REASON_INTERNAL),
             (
                 error::service_unavailable("tokenizer_not_ready", "loading"),
                 REASON_INTERNAL,
@@ -530,6 +533,21 @@ mod tests {
             assert_eq!(
                 error_type_for_response(&response),
                 error_type,
+                "{}",
+                extract_error_code_from_response(&response)
+            );
+        }
+        // Two refusals of the gateway's own are no capacity refusal: a spec
+        // that binds no plan of the request's kind, and a decision Grand
+        // Central itself failed. No wait clears either, and each keeps its
+        // class by status.
+        for response in [
+            placement::no_plan_bound("m", "single-request"),
+            placement::decision_failed("m"),
+        ] {
+            assert_eq!(
+                error_type_for_response(&response),
+                "backend_error",
                 "{}",
                 extract_error_code_from_response(&response)
             );

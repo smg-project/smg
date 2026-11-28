@@ -9,10 +9,11 @@
 //! A multipart upload to the transcription route, which stands under no body
 //! deadline, is measured as the chat body is.
 //!
-//! Each case answers chat requests, and the clean `200` row of that route in
-//! the response counter carries no label a test could own. The stream cut
-//! test reads exact differences of the row, so the cases here run under its
-//! `serial` key, never beside it.
+//! The chat cases answer chat requests, and the clean `200` row of that route
+//! in the response counter carries no label a test could own. The stream cut
+//! test reads exact differences of the row, so those cases run under its
+//! `serial` key, never beside it. The multipart case answers no chat request
+//! and runs under no key.
 
 use std::{convert::Infallible, str::FromStr, sync::Arc, time::Duration};
 

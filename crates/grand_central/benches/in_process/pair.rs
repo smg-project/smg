@@ -56,8 +56,12 @@
 //! saturated, by the engine's entry and by the one call alike. `--refused
 //! outage` takes every decode out of service under such a binding, and
 //! `--refused partners` under the cell's own: each request is shed with no
-//! endpoint, by either entry too. The result's `conversions=` counts the
-//! two lists together.
+//! endpoint, by either entry too. `--no-room N` leaves the last `N`
+//! decodes of the cell with no room at their host's gate ([`Rooms`]): every
+//! other place stays open, and each pair goes to a decode that has one.
+//! `--live-gates 1` gives the cell a host that reads each place's worker at
+//! every answer of its gate ([`Gates`]), with `--no-room N` or without it.
+//! The result's `conversions=` counts the two lists together.
 
 use std::{
     cell::OnceCell,
@@ -73,8 +77,8 @@ use smg_grand_central::{
     document::{AppliedSpec, Assignment, PolicySpec},
     engine::{
         prefills_full, Decided, Decision, DecodeVerdict, Demands, Identity, InProcess, LiftedVeto,
-        PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest, Plain, Prompt,
-        PublishedList, Request, RequestMaker, ShedReason, Unplaced, WorkerLists,
+        PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest, Plain, PublishedList,
+        Request, RequestMaker, ShedReason, Unplaced, WorkerLists,
     },
     store::GatewayId,
     tracking::{DecisionGuard, Outcome, Side, TransportClass},
@@ -237,6 +241,51 @@ impl PairAdmission for Full {
     }
 }
 
+/// A pair's host whose first decodes alone have a room: every prefill has
+/// capacity, and no decode from the stated place on has a room.
+#[derive(Debug)]
+struct Rooms(usize);
+
+impl PairAdmission for Rooms {
+    fn has_capacity(&self, _: usize) -> bool {
+        true
+    }
+
+    fn has_room(&self, decode: usize) -> bool {
+        decode < self.0
+    }
+}
+
+/// A pair's host that reads each place's worker at every answer, as a
+/// gateway that keeps its gate on its workers does: a prefill has capacity
+/// by its load, and a decode ahead of the stated place has a room by its
+/// running window, its admitted requests and the rooms waited for at its
+/// gate. No decode from the stated place on has a room. The engine asks
+/// each place of the two lists once a decision, ahead of a pair's draws.
+#[derive(Debug)]
+struct Gates {
+    prefills: Arc<[Arc<dyn Worker>]>,
+    decodes: Arc<[Arc<dyn Worker>]>,
+    rooms: usize,
+}
+
+impl PairAdmission for Gates {
+    fn has_capacity(&self, prefill: usize) -> bool {
+        self.prefills
+            .get(prefill)
+            .is_some_and(|worker| worker.load() < usize::MAX)
+    }
+
+    fn has_room(&self, decode: usize) -> bool {
+        decode < self.rooms
+            && self.decodes.get(decode).is_some_and(|worker| {
+                worker.max_running_requests().is_none_or(|window| {
+                    worker.pd_admitted() + worker.pd_waiting_rooms() < usize::from(window)
+                })
+            })
+    }
+}
+
 /// What a run states refuses every pair of its cell (`--refused`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Refused {
@@ -334,18 +383,12 @@ impl Decodes {
     /// The pair's two lists as `host` hands them for one request: its own
     /// list as the prefills, and these decodes.
     fn lists<'a>(&'a self, host: &'a Host) -> WorkerLists<'a> {
-        WorkerLists::Pair(PairLists {
-            prefill: host.list.lent(),
-            decode: self.list.lent(),
-            classes: &self.classes,
-            admission: self.admission,
-            prefill_places: None,
-            decode_places: None,
-            prefill_stalled: &[],
-            prefill_held: &[],
-            decode_stalled: &[],
-            decode_held: &[],
-        })
+        WorkerLists::Pair(PairLists::of(
+            host.list.lent(),
+            self.list.lent(),
+            &self.classes,
+            self.admission,
+        ))
     }
 
     /// One pair request of `host` by the one call: the model, the two
@@ -356,15 +399,10 @@ impl Decodes {
     /// ([`NAMED`]). The call answers workers and no place of a list, so the
     /// place this says is the first.
     fn called(&self, host: &Host, rule: bool, named: bool) -> Option<u32> {
-        let mut request = PlaceRequest {
-            prompt: Prompt {
-                tokens: Some(&place::PROMPT),
-                ..Prompt::NONE
-            },
-            admits: ruled::admits(rule),
-            demands: self.demands,
-            ..PlaceRequest::of(MODEL, self.lists(host))
-        };
+        let mut request = PlaceRequest::of(MODEL, self.lists(host));
+        request.prompt.tokens = Some(&place::PROMPT);
+        request.admits = ruled::admits(rule);
+        request.demands = self.demands;
         if named {
             request.headers = &NUMBER;
         }
@@ -498,6 +536,7 @@ pub(super) fn runs(run: &Run) -> bool {
     }
     // A shadow profile decides beside a single request's decision.
     assert!(run.shadow == Shadowed::No, "a pair's cell runs no shadow");
+    assert!(run.other_models == 0, "a pair's cell states no other model");
     let side = |side: &str, worker_type| -> Arc<[Arc<dyn Worker>]> {
         let url = |at: usize| format!("http://{side}-{at:04}:8000");
         (0..run.workers)
@@ -562,6 +601,21 @@ pub(super) fn runs(run: &Run) -> bool {
         list: published(&decodes),
         admission: if run.refused == Refused::Limit {
             &Full
+        } else if run.live_gates || run.no_room != 0 {
+            assert!(
+                run.no_room < decodes.len(),
+                "a pair needs a decode with a room"
+            );
+            let rooms = decodes.len() - run.no_room;
+            if run.live_gates {
+                Box::leak(Box::new(Gates {
+                    prefills: Arc::clone(&prefills),
+                    decodes: Arc::clone(&decodes),
+                    rooms,
+                }))
+            } else {
+                Box::leak(Box::new(Rooms(rooms)))
+            }
         } else {
             &Open
         },

@@ -29,11 +29,6 @@
 //! under it. A cell holds a value for each document its list is asked
 //! under, and an engine reads the one made under its own.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{
     fmt,
     sync::{Arc, OnceLock},
@@ -176,6 +171,7 @@ fn ids_stand(facts: &[FixedFacts]) -> bool {
 /// The cell is the one beside `workers` and is lent with no other list: the
 /// value in it is of the list that filled it.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct LentList<'a> {
     /// The list, as the program published it.
     pub workers: &'a Arc<[Arc<dyn Worker>]>,
@@ -214,6 +210,23 @@ pub struct LentList<'a> {
     /// entry catches the panic. The engine's task holds it and counts it
     /// with its own ([`InProcess::upkeep_faults`]).
     pub facts: Option<&'a [FixedFacts]>,
+}
+
+impl<'a> LentList<'a> {
+    /// A list and the cell its program keeps beside it, with no facts of its
+    /// workers: every worker then states the default ([`Self::facts`]). A
+    /// program that knows its workers assigns them. It checks nothing. Code
+    /// outside this crate starts here: the record gains fields, so no literal
+    /// of it builds there.
+    #[inline]
+    #[must_use]
+    pub const fn of(workers: &'a Arc<[Arc<dyn Worker>]>, cell: &'a ListCell) -> Self {
+        Self {
+            workers,
+            cell,
+            facts: None,
+        }
+    }
 }
 
 /// A worker list as a program publishes it: the list, the cell beside it,

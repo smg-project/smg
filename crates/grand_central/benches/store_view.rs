@@ -158,7 +158,7 @@ fn pool_of(n: usize) -> (Arc<MemoryStore>, Vec<WorkerId>) {
         })
         .collect();
     assert_eq!(store.publish_due(), None);
-    filled::filled(&store, MODEL, Role::Single, n);
+    filled::filled(&store, &ids, MODEL);
     (store, ids)
 }
 
@@ -280,13 +280,15 @@ fn writes_beside_vetoes(c: &mut Criterion, fixtures: &mut [Fixture]) {
     if turn.joined {
         join_or_leave(store, &joining, &mut turn);
     }
+    // Each write of the turn landed, and a turn that wrote ended on a
+    // leave: the joining member is out, and the pool is as it was.
     landed(store, turn.epoch);
     for gateway in others {
         for nth in 0..64 {
             store.gateway_veto(gateway, vetoed(nth), None);
         }
     }
-    filled::filled(store, MODEL, Role::Single, n);
+    filled::filled(store, &fixture.ids, MODEL);
 }
 
 /// A membership write beside vetoes spread over pools, in a store of its
@@ -316,8 +318,8 @@ fn member_write_beside_spread_vetoes(c: &mut Criterion) {
         })
         .collect();
     assert_eq!(store.publish_due(), None);
-    let spread = (0..MEMBERS).step_by(POOLS).count();
-    filled::filled(&store, "spread-0", Role::Single, spread);
+    let spread: Vec<WorkerId> = ids.iter().copied().step_by(POOLS).collect();
+    filled::filled(&store, &spread, "spread-0");
     let until = Instant::now() + Duration::from_secs(3_600);
     for gateway in (2..14).map(GatewayId) {
         for id in &ids {
@@ -389,11 +391,11 @@ fn member_write_under(c: &mut Criterion, group: &str, cell: &str, places: bool) 
             .collect(),
         ..WorkerFacts::default()
     };
-    for index in 0..MEMBERS {
-        ready_member(&store, facts(format!("http://l{index}:8000"), index));
-    }
+    let ids: Vec<WorkerId> = (0..MEMBERS)
+        .map(|index| ready_member(&store, facts(format!("http://l{index}:8000"), index)))
+        .collect();
     assert_eq!(store.publish_due(), None);
-    filled::filled(&store, MODEL, Role::Single, MEMBERS);
+    filled::filled(&store, &ids, MODEL);
     // A fifth of the members state a zone the list of zones does not
     // name: where that list stands, the store counts those members
     // outside, and under the selectors alone it counts none.
@@ -435,13 +437,13 @@ fn pair_writes(c: &mut Criterion) {
             }
         };
         let store = MemoryStore::new();
-        for index in 0..2 * n {
-            ready_member(&store, facts_of(index));
-        }
+        let ids: Vec<WorkerId> = (0..2 * n)
+            .map(|index| ready_member(&store, facts_of(index)))
+            .collect();
         assert_eq!(store.publish_due(), None);
-        for role in [Role::Prefill, Role::Decode] {
-            filled::filled(&store, MODEL, role, n);
-        }
+        let (prefills, decodes) = ids.split_at(n);
+        filled::filled(&store, prefills, MODEL);
+        filled::filled(&store, decodes, MODEL);
         let written = facts_of(n / 2);
         let named = WorkerFacts {
             engine_kind: "rt-b".to_string(),
@@ -511,12 +513,12 @@ fn member_write_beside_many_models(c: &mut Criterion) {
         let listed = (0..ids).map(|model| format!("model-{model}")).collect();
         let wide = facts_of("http://wide:8000".to_string(), listed);
         let store = MemoryStore::new();
-        for facts in (0..8).map(&small).chain([wide]) {
-            ready_member(&store, facts);
-        }
+        let facts = (0..8).map(&small).chain([wide]);
+        let members: Vec<WorkerId> = facts.map(|facts| ready_member(&store, facts)).collect();
         assert_eq!(store.publish_due(), None);
-        filled::filled(&store, MODEL, Role::Single, 8);
-        filled::filled(&store, "model-0", Role::Single, 1);
+        let (small_ones, wide_one) = members.split_at(8);
+        filled::filled(&store, small_ones, MODEL);
+        filled::filled(&store, wide_one, "model-0");
         let written = small(3);
         let now = Instant::now();
         let (mut epoch, mut revision) = (WorkersStore::epoch(&store), 1);

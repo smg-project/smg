@@ -16,7 +16,7 @@
 //! completion allocates nothing after the first ones. A keeper of worker
 //! objects is pinned in a build with the `worker-host` feature: a status
 //! tell copies each id of its worker's models once, and only for a store
-//! that tells a journal. A separate
+//! that tells a journal. A read of a row copies no model card. A separate
 //! executable, so it can declare the counting allocator the pins need.
 //!
 //! One pin reads frees: a decision that spans a write frees nothing on its
@@ -1036,11 +1036,7 @@ mod in_process {
                     .map(|at| ready_worker(&format!("http://w{at}:8000"), MODEL))
                     .collect();
                 let cell = ListCell::default();
-                let lent = LentList {
-                    workers: &list,
-                    cell: &cell,
-                    facts: None,
-                };
+                let lent = LentList::of(&list, &cell);
                 let request = PlaceRequest::of(MODEL, WorkerLists::Single(lent));
                 let serve = || {
                     let mut placement = engine.place(&request).expect("a worker of the list");
@@ -1118,11 +1114,7 @@ mod in_process {
                 .map(|at| ready_worker(&format!("http://w{at}:8000"), MODEL))
                 .collect();
             let cell = ListCell::default();
-            let lent = LentList {
-                workers: &list,
-                cell: &cell,
-                facts: None,
-            };
+            let lent = LentList::of(&list, &cell);
             let request = PlaceRequest::of(MODEL, WorkerLists::Single(lent));
             let serve = || {
                 let placement = engine.place(&request).expect("a worker of the list");
@@ -1157,26 +1149,12 @@ mod in_process {
                 Arc::from([typed("grpc://decode:9000", WorkerType::Decode)]);
             let (prefill_cell, decode_cell) = (ListCell::default(), ListCell::default());
             let classes = PartnerClasses::number(1, [&[0_u32][..]]);
-            let lists = PairLists {
-                prefill: LentList {
-                    workers: &prefills,
-                    cell: &prefill_cell,
-                    facts: None,
-                },
-                decode: LentList {
-                    workers: &decodes,
-                    cell: &decode_cell,
-                    facts: None,
-                },
-                classes: &classes,
-                admission: &Open,
-                prefill_places: None,
-                decode_places: None,
-                prefill_stalled: &[],
-                prefill_held: &[],
-                decode_stalled: &[],
-                decode_held: &[],
-            };
+            let lists = PairLists::of(
+                LentList::of(&prefills, &prefill_cell),
+                LentList::of(&decodes, &decode_cell),
+                &classes,
+                &Open,
+            );
             let request = PlaceRequest::of(MODEL, WorkerLists::Pair(lists));
             let serve = || {
                 let placement = engine.place(&request).expect("a pair of the lists");
@@ -1208,7 +1186,7 @@ mod status_tells {
 
     use smg_grand_central::{
         service::replication::Log,
-        store::{MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore},
+        store::{MemoryStore, Registrant, WorkerFacts, WorkerStatus},
         worker_host::{Members, Objects},
     };
     use smg_worker::registry::WorkerRegistry;
@@ -1241,11 +1219,17 @@ mod status_tells {
             };
             let laid = objects.upsert(&store, facts, Registrant::Control);
             let id = laid.expect("a registration").id();
-            let row = WorkersStore::get(&store, id).expect("the row");
+            let row = objects.read_row(id).expect("the row");
             let signal = || objects.connect_row(&store, id, row.revision);
             let ((), allocations) = allocations_during(signal);
-            let stands = WorkersStore::get(&store, id).expect("the row").status;
-            assert_eq!(stands, WorkerStatus::Ready, "the signal readied the row");
+            // The status the store holds: the holder's cut states it.
+            let cut = objects.checkpoint(&store).rows;
+            let stands = cut.iter().find(|row| row.id == id).map(|row| row.status);
+            assert_eq!(
+                stands,
+                Some(WorkerStatus::Ready),
+                "the signal readied the row"
+            );
             allocations
         };
         (0..8).map(one).min().expect("eight rows")
@@ -1269,5 +1253,75 @@ mod status_tells {
                 "a journal {journaled}: {one} for one model, {many} for {MODELS}"
             );
         }
+    }
+}
+
+/// What a read of a row copies of its worker's models, through a host's
+/// read call on the keeper of its worker objects.
+#[cfg(feature = "worker-host")]
+mod row_reads {
+    use std::sync::Arc;
+
+    use smg_grand_central::{
+        store::{MemoryStore, Registrant, WorkerFacts},
+        worker_host::{Members, Objects},
+    };
+    use smg_worker::{model_card::ModelCard, registry::WorkerRegistry};
+
+    use super::allocations_during;
+
+    /// The fewest allocation calls of one read of a row among a few reads.
+    /// The row's worker serves two models. Each card is as the keeper
+    /// builds it from the row, an id alone. Where `filled`, the test sets
+    /// cards that hold more beside their ids. Each holds a display name,
+    /// two aliases, a family, an architecture, a tokenizer path, a chat
+    /// template of 4 KiB and two parsers' names.
+    fn a_row_read(filled: bool) -> usize {
+        let store = MemoryStore::new();
+        let objects: Objects<Members> = Objects::new(Arc::new(WorkerRegistry::new()));
+        let key = "http://w:8000".to_owned();
+        let facts = WorkerFacts {
+            key: key.clone(),
+            engine: key,
+            incarnation: 1,
+            models: vec!["m0".to_owned(), "m1".to_owned()],
+            dp_size: 1,
+            ..WorkerFacts::default()
+        };
+        let laid = objects.upsert(&store, facts, Registrant::Control);
+        let id = laid.expect("a registration").id();
+        if filled {
+            let object = objects.object(id).expect("the row's object");
+            let worker = objects.registry().get(&object).expect("the object");
+            let card = |model: &str| {
+                ModelCard::new(model)
+                    .with_display_name("M")
+                    .with_aliases(["m-a", "m-b"])
+                    .with_hf_model_type("llama")
+                    .with_architectures(vec!["LlamaForCausalLM".to_owned()])
+                    .with_tokenizer_path(model)
+                    .with_chat_template("x".repeat(4096))
+                    .with_reasoning_parser("r")
+                    .with_tool_parser("t")
+            };
+            let cards = vec![card("m0"), card("m1")];
+            let changed = objects.registry().refresh_models(&worker, cards);
+            assert!(changed, "the object took the filled cards");
+        }
+        let one = |_| {
+            let (row, allocations) = allocations_during(|| objects.read_row(id));
+            assert_eq!(row.expect("the row").facts.models, ["m0", "m1"]);
+            allocations
+        };
+        (0..4).map(one).min().expect("four reads")
+    }
+
+    /// A read of a row copies each id of its worker's models and no card.
+    /// It allocates the same for cards that hold their ids alone and for
+    /// cards that hold what this case fills beside them.
+    #[test]
+    fn a_row_read_copies_a_models_id_and_no_card() {
+        let (built, filled) = (a_row_read(false), a_row_read(true));
+        assert_eq!(filled, built, "ids alone against filled cards");
     }
 }

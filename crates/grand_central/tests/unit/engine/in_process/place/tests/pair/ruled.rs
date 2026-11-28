@@ -331,10 +331,10 @@ fn a_pair_whose_first_picks_are_not_ready_is_held_to_the_rules_workers() {
 }
 
 /// A pair held to the rule's workers answers the word its caller waits on
-/// where each prefill the rule takes is at the caller's admission limit
-/// beside an open partner, as a pair over whole lists does. The decision
-/// that names a prefill with room is given up first, and nothing is issued
-/// for the one that sheds.
+/// where each prefill the rule takes stands but for the caller's admission
+/// limit beside an open partner, as a pair over whole lists does. The
+/// decision that names a prefill with room is given up first, and nothing
+/// is issued for the one that sheds.
 ///
 /// The classic router asks a prefill's limit of the open prefills the rule
 /// takes, and answers that they are at capacity

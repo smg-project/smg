@@ -1453,3 +1453,109 @@ fn a_stores_width_is_its_first_blocks() {
         assert_eq!(store_width(&store(widths)), width, "{widths:?}");
     }
 }
+
+/// A held map of a case's own: the marks pushed into it, in their order.
+/// The loan's cases tell the lent map from the state's own by what each
+/// holds, with no index beside them.
+#[derive(Debug, Default, PartialEq)]
+struct Marks(Vec<i64>);
+
+impl HeldBlocks for Marks {
+    fn contains_key(&self, hash: SequenceHash) -> bool {
+        self.0.iter().any(|&mark| SequenceHash::from(mark) == hash)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn hashes(&self) -> Vec<SequenceHash> {
+        self.0
+            .iter()
+            .map(|&mark| SequenceHash::from(mark))
+            .collect()
+    }
+}
+
+/// A lent map is the state's for one call: `apply` writes it there, the
+/// call counts it, and behind the call the lender has it again and the
+/// state its own map. This loan holds a mark already, and the count is of
+/// the whole map.
+#[test]
+fn a_lent_map_is_the_states_for_one_call() {
+    let mut wb = WorkerIndexState::<Marks>::default();
+    wb.blocks.0.push(9);
+    let mut lent = Marks(vec![1]);
+
+    let (inside, held) = wb.holding(&mut lent, |wb| {
+        wb.blocks.0.push(2);
+        wb.blocks.0.clone()
+    });
+    assert_eq!(inside, [1, 2], "`apply` wrote the lent map");
+    assert_eq!(held, 2, "the count is the lent map's at the call's end");
+    assert_eq!(lent, Marks(vec![1, 2]), "the lender has its map again");
+    assert_eq!(wb.blocks, Marks(vec![9]), "the state has its own map again");
+}
+
+/// An `apply` that unwinds leaves the two maps as a whole call does: the
+/// lender has its map with what `apply` wrote ahead of the unwinding, and
+/// the state its own. This loan begins empty.
+#[test]
+fn an_apply_that_unwinds_leaves_both_maps_where_they_were() {
+    let mut wb = WorkerIndexState::<Marks>::default();
+    wb.blocks.0.push(9);
+    let mut lent = Marks::default();
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: ((), usize) = wb.holding(&mut lent, |wb| {
+            wb.blocks.0.push(2);
+            panic!("the call unwinds")
+        });
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(lent, Marks(vec![2]), "the lender has its map again");
+    assert_eq!(wb.blocks, Marks(vec![9]), "the state has its own map again");
+}
+
+/// An index that emptied a worker's blocks may hold another view for the
+/// worker. A state that holds a view empties it and takes the index's view
+/// of its own worker. A state that holds none takes none and makes none.
+#[test]
+fn an_emptied_index_hands_its_view_to_a_state_that_holds_one() {
+    let indexer = KvIndex::chain();
+    let other = indexer.intern_worker("http://w0:8000").unwrap();
+    let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+    let mut wb = WorkerIndexState::default();
+
+    wb.index_emptied_in(&indexer, w1);
+    assert!(wb.groups.is_none(), "a state without a view takes none");
+    assert!(indexer.groups().is_empty(), "and none is made");
+
+    apply_events(
+        &[
+            store_event(stored_event(1, &TOKENS)),
+            group_store(1, Some("sliding_window"), Some(5), &[1]),
+        ],
+        w1,
+        &indexer,
+        &mut wb,
+    );
+    let before = wb.groups.clone().expect("the group's store makes the view");
+    assert_eq!(before.retained_blocks(), 1);
+    // The index makes the worker's view again, as where its entry for the
+    // worker is made again.
+    indexer.groups().remove(w1);
+    wb.index_emptied_in(&indexer, w1);
+    assert_eq!(before.retained_blocks(), 0, "the view before is emptied");
+    let after = wb.groups.clone().expect("the state holds a view still");
+    assert!(!Arc::ptr_eq(&before, &after), "and it is let go");
+    let index = indexer.groups().get(w1).expect("the index's view");
+    assert!(
+        Arc::ptr_eq(&after, &index),
+        "the state's view is the index's view of its worker"
+    );
+    assert!(
+        indexer.groups().get(other).is_none(),
+        "no view of another worker is made"
+    );
+}

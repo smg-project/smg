@@ -160,6 +160,9 @@ pub struct Controller {
     metrics: Arc<metrics::Metrics>,
     /// This replica's candidate: the election thread steps it once served.
     elector: Elector,
+    /// The candidate's fence, taken at the bind: [`Self::fence`] hands it
+    /// out.
+    fence: Arc<Fence>,
     /// The election's sight of the lease, written by its thread.
     standing: watch::Sender<ElectionObservation>,
     /// The listeners' close: one word, said once by the serve's drain.
@@ -170,8 +173,11 @@ pub struct Controller {
     /// ([`tell_role`]), which takes this sender whole: [`Shared::role`] is
     /// its receiver.
     role: watch::Sender<Option<u64>>,
-    /// What every listener's instance of the service reads; the store is
-    /// its field, the run loop's tasks read the same one.
+    /// The store's handle, taken at the bind: [`Self::store`] hands it
+    /// out, and the run loop's tasks read it.
+    store: Arc<MemoryStore>,
+    /// What every listener's instance of the service reads. It holds the
+    /// same store, and no method of it returns that store.
     shared: Arc<Shared>,
     /// The spec's file source, once [`Controller::spec_file`] has read it:
     /// the serve watches it.
@@ -506,6 +512,10 @@ impl Controller {
         // The standby's lag, made once from the configured interval: the
         // readiness reads the one `Shared` holds.
         let lag = Arc::new(Lag::new(standby::synced_within(config.load_poll_interval)));
+        // No method of the shared state returns its store or the log that
+        // store journals to: the run loop's handle of the store and the
+        // readiness's handle of the log are taken here, ahead of it.
+        let (store, log) = (Arc::clone(&journal.0), Arc::clone(&journal.1.log));
         // Under a lease another replica can take, the document door is
         // built under this replica's fence, with a spec source or with
         // none: its source writes while the replica leads, and its hook
@@ -520,12 +530,8 @@ impl Controller {
             config.decide_shards,
         )
         .map_err(Error::DecisionThreads)?;
-        let (phase, readiness) = readiness::channel(
-            elector.fence(),
-            steps,
-            Arc::clone(&shared.lag),
-            Arc::clone(&shared.feed.log),
-        );
+        let (phase, readiness) =
+            readiness::channel(elector.fence(), steps, Arc::clone(&shared.lag), log);
         let shared = Arc::new(shared);
         #[cfg(feature = "discovery")]
         let discovery = config
@@ -544,7 +550,7 @@ impl Controller {
                     settings,
                     &workers.holder(),
                     Arc::new(door),
-                    Arc::clone(&shared.fence),
+                    elector.fence(),
                     config.worker_overload,
                 )
                 .map(Box::new)
@@ -556,10 +562,12 @@ impl Controller {
             phase,
             readiness,
             metrics: Arc::new(metrics::Metrics::new()),
+            fence: elector.fence(),
             elector,
             standing,
             stop,
             role,
+            store,
             shared,
             spec_file: None,
             listeners,
@@ -799,7 +807,7 @@ impl Controller {
 
     /// The store the serve's tasks and the scopes' calls feed and read.
     pub fn store(&self) -> Arc<MemoryStore> {
-        Arc::clone(&self.shared.store)
+        Arc::clone(&self.store)
     }
 
     /// The KV tables of this replica: the ones its holder of worker objects
@@ -833,7 +841,7 @@ impl Controller {
     /// renew deadline. A shard thread reads it before every decision it
     /// sends; readiness and the `Leader` call read the same one.
     pub fn fence(&self) -> Arc<Fence> {
-        Arc::clone(&self.shared.fence)
+        Arc::clone(&self.fence)
     }
 
     /// The load reports of this replica's workers as its decisions are
@@ -905,6 +913,7 @@ impl Controller {
             standing,
             stop,
             role,
+            store,
             shared,
             spec_file,
             listeners,
@@ -916,7 +925,6 @@ impl Controller {
             discovery,
             ..
         } = self;
-        let store = Arc::clone(&shared.store);
         // A replica under a shared lease follows its leader where it can,
         // and says once why it cannot: it then behaves as before a standby
         // existed.
@@ -1024,7 +1032,7 @@ impl Controller {
         }
         #[cfg(feature = "discovery")]
         if let Some(discovery) = discovery {
-            let standing = shared.standing.clone();
+            let standing = shared.steps();
             let discovery_stop = stop.subscribe();
             tasks.spawn(async move {
                 discovery.run(standing, discovery_stop).await;
@@ -1032,11 +1040,12 @@ impl Controller {
             });
         }
         // The presence sweep: what a gateway held is let go once its grace
-        // period ended with no new `Hello`.
-        let gateways = Arc::clone(&shared.gateways);
-        let sweep_stop = stop.subscribe();
+        // period ended with no new `Hello`. The names that left, the leases
+        // past their dispatch deadline and the upkeep of the standing
+        // document's engine ride its task's clock (`Gateways::run`).
+        let sweep = shared.presence_task(stop.subscribe());
         tasks.spawn(async move {
-            gateways.run(sweep_stop).await;
+            sweep.await;
             Ok(())
         });
         // The restores' clock: a leader lets go of a snapshot's cut whose
@@ -1089,7 +1098,7 @@ impl Controller {
                 .await
                 .map_err(Error::Admin)
         });
-        let mut looks = shared.standing.clone();
+        let mut looks = shared.steps();
         let mut election = shared
             .elect(elector, standing)
             .map_err(Error::ElectionThread)?;

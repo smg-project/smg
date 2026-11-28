@@ -127,8 +127,9 @@ pub trait Lifecycle: Send + Sync {
     /// the report's snapshot for its decisions, and its own doc names the
     /// reports a decision can read first. `false` by default: a host tells
     /// no report to an engine none of whose stages keeps one, and such a
-    /// stage decides the same untold. The engine asks once, at its build:
-    /// the answer is the stage's for the engine's life. A host may tell
+    /// stage decides the same untold. The engine lists the stage by its
+    /// answer at the engine's build: that answer is the stage's for the
+    /// engine's life, and a later engine may ask again. A host may tell
     /// such a stage under its own locks: a stage that calls from that word a
     /// door of the host that takes one of them waits on itself.
     fn keeps_loads(&self) -> bool {
@@ -158,21 +159,36 @@ pub trait Lifecycle: Send + Sync {
     /// ([`EventSet::LEASE`]: the issue, the dispatch, the completion and
     /// the release), and any other stage takes none.
     ///
-    /// The engine cannot see an overridden method, and a host that decides
-    /// in its own process tells a word on a lease only where a stage of
-    /// the document takes it, and keeps nothing for a word nobody takes: a
-    /// document none of whose stages takes one costs a request no lease.
-    /// So a stage that implements [`Self::on_decision_issued`],
+    /// The engine tells a stage a word on a lease only where the stage
+    /// names the word's kind here, whichever host tells the engine. It
+    /// cannot see an overridden method: it lists at its build the stages
+    /// that take each word, and a word it tells the stages walks that
+    /// list. So a stage that implements [`Self::on_decision_issued`],
     /// [`Self::on_dispatched`], [`Self::on_completed`] or
     /// [`Self::on_released`] and declares no need names that call's kind
-    /// here, or it is not told there. A stage that declares the need may
-    /// name the kinds it takes, and is then told no other: each kind left
-    /// out is a word its requests do not pay for. The engine asks once, at
-    /// its build: the answer is the stage's for the engine's life.
+    /// here, or the engine does not tell it. A stage that declares the
+    /// need may name the kinds it takes: each kind left out is a word its
+    /// requests do not pay for. A host that decides in its own process
+    /// keeps nothing for a word nobody takes: a document none of whose
+    /// stages takes one costs a request no lease. The engine lists the
+    /// stage by its answer at the engine's build: that answer is the
+    /// stage's for the engine's life, and a stage whose answer moves
+    /// later is told by the first. A later engine may ask again, and keeps
+    /// the stage only where the stage its own build made in that place
+    /// named the same words, and answered [`Self::keeps_loads`] the
+    /// same: a stage kept is told by its first answers still.
     ///
     /// A change of membership and a signal are told to every stage,
     /// whatever it answers: no host reads those two kinds of the answer
-    /// yet. A plugin's stage answers every kind its plugin observes.
+    /// yet.
+    ///
+    /// A plugin's stage answers its fallback stage's kinds, and the kinds it
+    /// forwards to its plugin. Of the stages made through one binder, the
+    /// first scorer or picker forwards every kind the plugin observes, and
+    /// the others none. A plugin's stage hands each word it is told on to
+    /// its fallback, behind its plugin's call where it makes one, whatever
+    /// the fallback names: a fallback may hear a word it does not name, and
+    /// none at which that call panics.
     ///
     /// The two answers part for a stage that takes a word only to drop
     /// state early: it decides the same without the call and declares no

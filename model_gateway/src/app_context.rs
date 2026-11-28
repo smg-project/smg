@@ -1156,11 +1156,11 @@ impl AppContextBuilder {
             .ok_or_else(|| unset("kv_event_monitor"))?;
         let events = Some(cache_events);
         let later = respec.is_some();
-        let data = WorkerData {
-            registry: Arc::clone(registry) as Arc<dyn Members>,
-            loads: Some(monitor.subscribe()),
-            cache_indexes: Self::engine_caches(&document, &spec, events, policies, registry, later),
-        };
+        let data = WorkerData::of(
+            Arc::clone(registry) as Arc<dyn Members>,
+            Some(monitor.subscribe()),
+            Self::engine_caches(&document, &spec, events, policies, registry, later),
+        );
         Self::start_engine(spec, data, policies, registry, respec)?;
         Ok(self)
     }
@@ -1286,13 +1286,11 @@ impl AppContextBuilder {
         if let Some((document, spec)) = Self::policy_in_force(config, stages)? {
             let respec = stages.is_none().then(|| Self::respec(config, None));
             let later = respec.is_some();
-            let data = WorkerData {
-                registry: Arc::clone(registry) as Arc<dyn Members>,
-                loads: Some(monitor.subscribe()),
-                cache_indexes: Self::engine_caches(
-                    &document, &spec, None, policies, registry, later,
-                ),
-            };
+            let data = WorkerData::of(
+                Arc::clone(registry) as Arc<dyn Members>,
+                Some(monitor.subscribe()),
+                Self::engine_caches(&document, &spec, None, policies, registry, later),
+            );
             Self::start_engine(spec, data, policies, registry, respec)?;
         }
         Ok(())
@@ -1316,13 +1314,11 @@ impl AppContextBuilder {
         loads: Option<LoadReceiver>,
     ) -> Result<(), String> {
         if let Some((document, spec)) = Self::policy_in_force(config, None)? {
-            let data = WorkerData {
-                registry: Arc::clone(registry) as Arc<dyn Members>,
+            let data = WorkerData::of(
+                Arc::clone(registry) as Arc<dyn Members>,
                 loads,
-                cache_indexes: Self::engine_caches(
-                    &document, &spec, None, policies, registry, true,
-                ),
-            };
+                Self::engine_caches(&document, &spec, None, policies, registry, true),
+            );
             let respec = Some(Self::respec(config, None));
             Self::start_engine(spec, data, policies, registry, respec)?;
         }

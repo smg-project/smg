@@ -18,7 +18,7 @@ use anyhow::Result;
 use axum::response::Response;
 use llm_multimodal::{EncoderInputFormat, Modality};
 use smg_worker::{
-    identity::basic::{RuntimeType, Worker, WorkerType},
+    identity::basic::{RuntimeType, Worker, WorkerType, NIXL_CONNECTOR},
     labels::SUPPORTS_VISION_LABEL,
 };
 
@@ -144,6 +144,22 @@ pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
         .labels
         .get(SUPPORTS_VISION_LABEL)
         .is_some_and(|value| value == "false")
+}
+
+/// Whether `worker` can take a media-references request's decode side
+/// stripped to text and content hashes, without processing the references
+/// itself: a vLLM engine running as a language model only, on the NIXL
+/// connector, whose relayed handoff always asks the prefill side for its
+/// media identity. The vLLM sequential dispatch alone builds that side
+/// (`sequential_pd`). A pair of another runtime sends its decode side the
+/// references themselves. A Mooncake pair asks for the identity only when
+/// its prefill has an engine id, which a decode worker cannot answer for, so
+/// its workers stay held to the references predicate too.
+pub(crate) fn worker_takes_stripped_refs_side(worker: &dyn Worker) -> bool {
+    let spec = &worker.metadata().spec;
+    spec.runtime_type == RuntimeType::Vllm
+        && worker_language_model_only(worker)
+        && spec.kv_connector.as_deref() == Some(NIXL_CONNECTOR)
 }
 
 /// Whether every worker of `model_id` that a request's pixels go to runs

@@ -451,7 +451,8 @@ pub mod bench_support {
             None,
             inputs,
             Stated::nothing,
-        )?;
+        )
+        .ok()?;
         let shed =
             overload::shed_if_worker_overloaded(&*worker, model, registry.overload_shed_enabled());
         if shed.is_some() {
@@ -489,7 +490,8 @@ pub mod bench_support {
             None,
             inputs,
             Stated::nothing,
-        )?;
+        )
+        .ok()?;
         let shed =
             overload::shed_if_worker_overloaded(&*worker, model, registry.overload_shed_enabled());
         if shed.is_some() {
@@ -577,7 +579,8 @@ pub mod bench_support {
             None,
             inputs,
             Stated::nothing,
-        )?;
+        )
+        .ok()?;
         let shed =
             overload::shed_if_worker_overloaded(&*worker, model, registry.overload_shed_enabled());
         if shed.is_some() {
@@ -793,6 +796,7 @@ pub mod bench_support {
                 inputs,
                 Stated::nothing,
             )
+            .ok()
             .map(Placed::into_worker)
         }
     }

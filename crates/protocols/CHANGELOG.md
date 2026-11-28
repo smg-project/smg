@@ -190,6 +190,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   was a string, an array, a number or a boolean. A member with an object, with `null` or with no
   `parameters` is accepted as before, and a self-hosted model's strict member is passed through as
   before.
+- A `root` message of a chat request keeps its `current_date` and `current_location`. The chat
+  templates that read a root message print one line for each behind its text; the crate dropped
+  both while reading the message, so the rendered prompt lost the two lines. A root without them
+  is written as before, a value that is no string is dropped as before, and roots merged into one
+  keep the first date and the first location a root names (an empty text names none). Breaking:
+  `ChatMessage::Root` gains the fields `current_date: Option<String>` and
+  `current_location: Option<String>`.
 - A tool the model calls by name is refused when that name is the empty string (`400`,
   `error.code` `empty_string`, in the public API's words: `Invalid 'tools[1].function.name': empty
   string. Expected a string with minimum length 1, but got an empty string instead.`). On Chat

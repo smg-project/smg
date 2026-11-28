@@ -28,6 +28,63 @@ pub(crate) fn image_urls(count: usize) -> MediaPlan {
     }))
 }
 
+/// Placeholder preparation records the spec's answer to whether the language
+/// model reads the grid tensors: MiniMax M3's reads none of them, Qwen2-VL's
+/// reads them, and a plan or a placeholder set no spec answered for keeps
+/// `true`, the answer that keeps the refusal of a language-model-only decode.
+#[tokio::test]
+async fn placeholder_preparation_records_whether_the_language_model_reads_the_grids() {
+    assert!(MediaPlan::default().language_model_reads_grids());
+    assert!(PlaceholderTokens::default().language_model_reads_grids());
+    let families = [
+        (
+            "org/minimax-m3",
+            &[("]<]image[>[", 200025)],
+            serde_json::json!({"model_type": "minimax_m3_vl"}),
+            false,
+        ),
+        (
+            "org/qwen2-vl",
+            &[("<|image_pad|>", 151655)],
+            serde_json::json!({"model_type": "qwen2_vl", "image_token_id": 151655}),
+            true,
+        ),
+    ];
+    for (model_id, tokens, config, reads) in families {
+        let registry = Arc::new(MultimodalConfigRegistry::new());
+        registry.insert(
+            "tok".to_string(),
+            Arc::new(MultimodalModelConfig::new(
+                config,
+                PreProcessorConfig::default(),
+                None,
+            )),
+        );
+        let components =
+            MultimodalComponents::new(registry, None, None, &MultimodalSettings::default())
+                .unwrap();
+        let tokenizer = MockTokenizer::new().with_tokens(tokens);
+        let placeholders = prepare_placeholder_tokens_with_env(
+            &image_urls(1),
+            model_id,
+            &tokenizer,
+            &components,
+            "tok",
+            "unused",
+            &HashMap::new(),
+            |_| true,
+            |_| None,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{model_id}: {error:#}"));
+        assert_eq!(
+            placeholders.language_model_reads_grids(),
+            reads,
+            "{model_id}"
+        );
+    }
+}
+
 /// `count` fetchable parts of `modality`.
 fn media_urls(modality: Modality, count: usize) -> MediaPlan {
     match modality {
@@ -934,7 +991,7 @@ fn image_chat_plan(cap: Option<serde_json::Value>) -> MediaPlan {
             "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": image_url}]}]
         }))
         .unwrap();
-    super::super::media_plan_chat(&request.messages)
+    super::super::media_plan_chat(&request.messages, &request.other)
 }
 
 fn image_components(config: serde_json::Value) -> MultimodalComponents {

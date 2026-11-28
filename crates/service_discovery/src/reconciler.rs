@@ -113,9 +113,9 @@ pub(super) enum Drain {
     /// A removal drains it, and an addition would put it back in service.
     Reclaimable,
     /// A removal drains it and an addition is not to bring it back: the
-    /// registration workflow leaves a ZMQ worker in the state it replaced,
-    /// and a `DELETE` holds the worker's own URL (a DP rank's carries its
-    /// rank) and removes what stands there.
+    /// registration workflow does not activate a ZMQ worker (it waits for
+    /// the worker's connect signal), and a `DELETE` holds the worker's own
+    /// URL (a DP rank's carries its rank) and removes what stands there.
     Final,
 }
 

@@ -286,6 +286,12 @@ impl SessionPlace {
         self.superseded.told.load(Ordering::Acquire)
     }
 
+    /// The grace period of the table this seat stands in: the session's
+    /// `Welcome` tells it in whole milliseconds.
+    pub(crate) fn grace(&self) -> Duration {
+        self.gateways.grace()
+    }
+
     /// One kind's veto on `worker` set until `until`, or lifted, at `now`:
     /// the other kinds' ends stand, and the store shows the latest of them
     /// with the hold among them ([`hold_of`]).
@@ -500,8 +506,9 @@ impl Gateways {
         })
     }
 
-    /// The gateway's presence at `now` for a decide stream's open: `None`
-    /// when it is not present. No decision asks: a stream's open and end do.
+    /// The gateway's presence at `now` for a decide stream: `None` when it
+    /// is not present. No decision asks: a stream does where it is placed
+    /// under a term, at its open or at a request's receipt.
     pub(crate) fn presence(&self, gateway: GatewayId, now: Instant) -> Option<Presence> {
         let mut table = self.table.lock();
         self.observe(&mut table, self.fence.leader_term(now), now);

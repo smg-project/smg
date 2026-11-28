@@ -48,6 +48,7 @@
 //! layout has no structural tag for its calls.
 
 #[cfg(test)]
+#[path = "../../tests/unit/to_symphony/layout/tests.rs"]
 mod tests;
 
 use std::{fmt, ops::Range};

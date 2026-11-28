@@ -420,11 +420,14 @@ impl MembershipChange {
     }
 }
 
-/// The membership store's rows, as a host reads them.
+/// The membership store, as its host reads it: the epoch of its last write,
+/// and a count the host keeps beside a row. No entry reads a row.
 ///
 /// The trait holds no write. A host writes a row through the holder of its
 /// worker objects. A store with no holder takes a decided change
-/// ([`crate::store::MemoryStore::follow`]).
+/// ([`crate::store::MemoryStore::follow`]). Its own write hands that call
+/// the default place. A journaled store journals it only under a term the
+/// store took.
 ///
 /// Every write moves the store's epoch; a write of a row's facts moves the
 /// row's revision, a status change does not. The store keeps no log of
@@ -451,17 +454,21 @@ impl MembershipChange {
 /// leaves. A status change builds no pool and publishes nothing: a
 /// decision reads a worker's status on its worker object, which the holder
 /// of the objects moves with the row's.
+///
+/// A host with a holder reads a row off its worker objects:
+/// `Objects::read_row`, `Objects::read_row_under` and
+/// `Objects::checkpoint`, under the `worker-host` feature. Each takes the
+/// holder's turn, so code that runs inside that turn calls none of them:
+/// the read never returns there. The store calls its journal inside the
+/// turn of a holder's write of a row,
+/// [`Journal::released`](super::Journal::released) too, and of its cut
+/// ([`Journal::head`](super::Journal::head)). A journal is told the row a
+/// write leaves and the one it takes out
+/// ([`Journal::member`](super::Journal::member)). A host with no holder
+/// reads no row of the store: it keeps the rows it handed the store.
 pub trait WorkersStore: Send + Sync {
-    fn get(&self, id: WorkerId) -> Option<WorkerRow>;
-
-    /// The row under a registration key, whatever its incarnation.
-    fn by_key(&self, key: &str) -> Option<WorkerRow>;
-
     /// The epoch of the last write.
     fn epoch(&self) -> u64;
-
-    /// Every row with the epoch it stands at.
-    fn all_rows(&self) -> (u64, Vec<WorkerRow>);
 
     /// Takes the count the store's host keeps for the row `id`
     /// ([`HostCount`]): the store keeps it equal to the count its leases

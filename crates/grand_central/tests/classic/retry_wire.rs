@@ -74,10 +74,9 @@ impl Replayed for Row {
             let (wire_modes, runtime) = runtimes.stays_on(asked.wire.as_ref())?;
             let mut constraints = Constraints::default();
             constraints.wire_modes = wire_modes;
-            constraints.demands = Demands {
-                runtime,
-                ..Demands::default()
-            };
+            let mut demands = Demands::default();
+            demands.runtime = runtime;
+            constraints.demands = demands;
             answers.push(bed.answer(constraints, pool_refusal)?);
         }
         Ok(answers)

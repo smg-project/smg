@@ -29,9 +29,18 @@ from __future__ import annotations
 
 import atexit
 import logging
+import os
 import threading
 
-from .constants import DEFAULT_STARTUP_TIMEOUT, ConnectionMode, WorkerType, zmq_backend
+from .constants import (
+    DEFAULT_STARTUP_TIMEOUT,
+    ENV_EXTERNAL_WORKERS,
+    ENV_EXTERNAL_WORKERS_FLUSH_CACHE,
+    ConnectionMode,
+    WorkerType,
+    zmq_backend,
+)
+from .external_workers import ExternalWorkerRegistry, load_external_workers
 from .gateway import Gateway
 from .process_utils import wait_for_workers_ready
 from .worker import Worker, start_workers, stop_workers
@@ -56,13 +65,30 @@ class WorkerPool:
     sufficient.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, external_workers: ExternalWorkerRegistry | None = None) -> None:
+        """Create an empty worker pool, optionally bound to an explicit external registry."""
         self._lock = threading.Lock()
         self._key: _PoolKey | None = None
         self._workers: list[Worker] = []
         self._gateway: Gateway | None = None
         self._gateway_key: tuple | None = None
         self._closed = False
+        self._external_workers = external_workers
+        self._external_env_cache: tuple[str, str, ExternalWorkerRegistry] | None = None
+
+    def _resolve_external_workers(self) -> ExternalWorkerRegistry:
+        """Return the active external worker registry, caching parsed env configuration."""
+        if self._external_workers is not None:
+            return self._external_workers
+        raw = os.environ.get(ENV_EXTERNAL_WORKERS, "")
+        flush_raw = os.environ.get(ENV_EXTERNAL_WORKERS_FLUSH_CACHE, "")
+        if (
+            self._external_env_cache is None
+            or self._external_env_cache[0] != raw
+            or self._external_env_cache[1] != flush_raw
+        ):
+            self._external_env_cache = (raw, flush_raw, load_external_workers(raw))
+        return self._external_env_cache[2]
 
     def current_workers(self) -> list[Worker]:
         """The cached regular workers as they stand (a snapshot; may be empty)."""
@@ -156,15 +182,21 @@ class WorkerPool:
             )
 
             if self._key == key and all(w.is_alive() for w in self._workers):
+                kind = (
+                    "external"
+                    if any(getattr(w, "external", False) for w in self._workers)
+                    else "cached"
+                )
                 logger.info(
-                    "WorkerPool: reusing %d cached worker(s) for %s",
+                    "WorkerPool: reusing %d %s worker(s) for %s",
                     count,
+                    kind,
                     key,
                 )
                 return list(self._workers)
 
             if self._key is not None:
-                reason = "key mismatch" if self._key != key else "dead worker"
+                reason = "key mismatch" if self._key != key else "dead or unhealthy worker"
                 logger.info(
                     "WorkerPool: evicting %s to start %s (%s)",
                     self._key,
@@ -172,6 +204,20 @@ class WorkerPool:
                     reason,
                 )
                 self._evict_locked()
+
+            external_workers = self._resolve_external_workers().attach(
+                model_id=model_id,
+                engine=engine,
+                mode=mode,
+                count=count,
+                worker_type=worker_type,
+                gpus=gpus,
+                extra_engine_args=extra_engine_args,
+            )
+            if external_workers is not None:
+                self._key = key
+                self._workers = external_workers
+                return list(external_workers)
 
             new_workers = start_workers(
                 model_id=model_id,
@@ -303,11 +349,20 @@ class WorkerPool:
             self._closed = True
 
     def _evict_locked(self) -> None:
+        """Release cached workers and gateway; never stop externally managed workers."""
         try:
             if self._gateway is not None:
                 self._gateway.shutdown()
         finally:
-            stop_workers(self._workers)
+            local_workers = [w for w in self._workers if not getattr(w, "external", False)]
+            external_count = len(self._workers) - len(local_workers)
+            if external_count:
+                logger.info(
+                    "WorkerPool: detaching %d external worker(s) without stopping them",
+                    external_count,
+                )
+            if local_workers:
+                stop_workers(local_workers)
             self._workers = []
             self._key = None
             self._gateway = None

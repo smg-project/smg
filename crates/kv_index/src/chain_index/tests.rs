@@ -1661,3 +1661,306 @@ fn the_deepest_read_keeps_only_the_workers_its_caller_names() {
     }
     assert_eq!(deepest(&index, &chain, &[], 16, 1).0, vec![]);
 }
+
+/// What one chunk of the run slab holds with `words` coverage words a run laid, its first
+/// block and its further block together.
+fn slab_chunk_bytes(words: usize) -> usize {
+    RUN_CHUNK * (size_of::<Run>() + words * size_of::<AtomicU64>())
+        + size_of::<OnceLock<Box<[AtomicU64]>>>()
+}
+
+/// A fleet that fits the first coverage word holds one word a run, however high the index's
+/// ceiling of workers is.
+#[test]
+fn a_fleet_within_one_word_holds_one_coverage_word_a_run() {
+    let index = ChainIndex::with_max_workers(MAX_WORDS * 64);
+    let held: Vec<ContentHash> = (0..4).map(|p| content(41, p)).collect();
+    let blocks = blocks_of(&held);
+    for name in 0..8 {
+        let worker = index.intern_worker(&format!("w{name}")).expect("id");
+        let mut map = ChainBlockMap::default();
+        index
+            .apply_stored(worker, &blocks, None, &mut map)
+            .expect("stored");
+    }
+    let stats = index.stats();
+    assert_eq!(stats.slab_bytes, slab_chunk_bytes(1));
+    assert_eq!(
+        stats.header_bytes,
+        stats.runs_allocated * (size_of::<Run>() + size_of::<AtomicU64>())
+    );
+    let mut holders = scores(&index, &held);
+    holders.sort_unstable();
+    assert_eq!(holders, (0..8u32).map(|w| (w, 4)).collect::<Vec<_>>());
+}
+
+/// The 65th worker of an index is the first of the second coverage word: its store gives the
+/// chunk, made at one word a run, its further block, it is read as a holder beside the first
+/// 64, and its removal leaves them whole.
+#[test]
+fn the_sixty_fifth_worker_reads_and_writes_right() {
+    let index = ChainIndex::with_max_workers(MAX_WORDS * 64);
+    let held: Vec<ContentHash> = (0..4).map(|p| content(42, p)).collect();
+    let blocks = blocks_of(&held);
+    let mut maps = Vec::new();
+    for name in 0..65 {
+        let worker = index.intern_worker(&format!("w{name}")).expect("id");
+        let mut map = ChainBlockMap::default();
+        index
+            .apply_stored(worker, &blocks, None, &mut map)
+            .expect("stored");
+        if name == 63 {
+            assert_eq!(index.stats().slab_bytes, slab_chunk_bytes(1));
+        }
+        maps.push((worker, map));
+    }
+    assert_eq!(index.stats().slab_bytes, slab_chunk_bytes(MAX_WORDS));
+    let mut holders = scores(&index, &held);
+    holders.sort_unstable();
+    assert_eq!(holders, (0..65u32).map(|w| (w, 4)).collect::<Vec<_>>());
+    let (last, map) = maps.pop().expect("the 65th");
+    assert_eq!(last, 64);
+    index.remove_worker(last, map);
+    let mut holders = scores(&index, &held);
+    holders.sort_unstable();
+    assert_eq!(holders, (0..64u32).map(|w| (w, 4)).collect::<Vec<_>>());
+}
+
+/// A store and a split read a run's coverage as far as a worker can hold a bit. The 65th
+/// worker grows the leaf it alone holds in place, a hole it cuts into that run leaves it on
+/// the tail, and a worker of the first word does not grow in place a leaf the 65th holds too.
+#[test]
+fn a_split_and_a_store_read_a_holder_of_a_further_word() {
+    let index = ChainIndex::with_max_workers(MAX_WORDS * 64);
+    let near = index.intern_worker("w0").expect("id");
+    for name in 1..64 {
+        index.intern_worker(&format!("w{name}")).expect("id");
+    }
+    let far = index.intern_worker("w64").expect("id");
+    assert_eq!((near, far), (0, 64));
+    let (mut near_map, mut far_map) = (ChainBlockMap::default(), ChainBlockMap::default());
+    let held: Vec<ContentHash> = (0..10).map(|p| content(1, p)).collect();
+    let blocks = blocks_of(&held);
+    index
+        .apply_stored(far, &blocks[..6], None, &mut far_map)
+        .expect("store far");
+    index
+        .apply_stored(far, &blocks[6..8], Some(blocks[5].seq_hash), &mut far_map)
+        .expect("grow far");
+    assert_eq!(
+        index.stats().runs_live,
+        1,
+        "the far worker grows its own leaf"
+    );
+    // A hole splits the run: the tail keeps its only holder, so the healed chain matches whole.
+    index.apply_removed(far, &[blocks[2].seq_hash], &mut far_map);
+    assert_eq!(scores(&index, &held), vec![(far, 2)]);
+    assert_eq!(index.entry_count(), 7, "the hole takes one block");
+    index
+        .apply_stored(far, &blocks[2..3], Some(blocks[1].seq_hash), &mut far_map)
+        .expect("heal");
+    assert_eq!(scores(&index, &held), vec![(far, 8)]);
+    assert_eq!(index.entry_count(), 8, "the heal gives it back");
+    // The near worker holds the tail whole too and stores past it: no leaf of one worker.
+    index
+        .apply_stored(near, &blocks[..8], None, &mut near_map)
+        .expect("store near");
+    index
+        .apply_stored(near, &blocks[8..], Some(blocks[7].seq_hash), &mut near_map)
+        .expect("grow near");
+    assert_eq!(scores(&index, &held), vec![(near, 10), (far, 8)]);
+    let mut reference = ReferenceIndexer::new();
+    reference
+        .apply_stored(far, &blocks[..8], None)
+        .expect("ref far");
+    reference
+        .apply_stored(near, &blocks, None)
+        .expect("ref near");
+    assert_eq!(index.debug_blocks(), reference.blocks());
+    assert_eq!(
+        index.entry_count(),
+        10,
+        "the distinct blocks: positions 0 to 9"
+    );
+}
+
+/// A removal reads a run's coverage as far as a worker can hold a bit: a run the 65th worker
+/// holds whole stays in the tree when the last holder of the first word leaves it, by an
+/// eviction of its blocks and by the removal of the worker.
+#[test]
+fn a_removal_leaves_a_run_a_holder_of_a_further_word_still_holds() {
+    let index = ChainIndex::with_max_workers(MAX_WORDS * 64);
+    let near = index.intern_worker("w0").expect("id");
+    for name in 1..64 {
+        index.intern_worker(&format!("w{name}")).expect("id");
+    }
+    let far = index.intern_worker("w64").expect("id");
+    assert_eq!((near, far), (0, 64));
+    let (mut near_map, mut far_map) = (ChainBlockMap::default(), ChainBlockMap::default());
+    let evicted: Vec<ContentHash> = (0..6).map(|p| content(1, p)).collect();
+    let left: Vec<ContentHash> = (0..6).map(|p| content(2, p)).collect();
+    let mut reference = ReferenceIndexer::new();
+    for held in [&evicted, &left] {
+        let blocks = blocks_of(held);
+        index
+            .apply_stored(near, &blocks, None, &mut near_map)
+            .expect("store near");
+        index
+            .apply_stored(far, &blocks, None, &mut far_map)
+            .expect("store far");
+        reference.apply_stored(far, &blocks, None).expect("ref far");
+    }
+    let hashes: Vec<_> = blocks_of(&evicted)
+        .iter()
+        .map(|block| block.seq_hash)
+        .collect();
+    index.apply_removed(near, &hashes, &mut near_map);
+    assert_eq!(scores(&index, &evicted), vec![(far, 6)]);
+    index.remove_worker(near, near_map);
+    assert_eq!(scores(&index, &evicted), vec![(far, 6)]);
+    assert_eq!(scores(&index, &left), vec![(far, 6)]);
+    assert_eq!(index.debug_blocks(), reference.blocks());
+    assert_eq!(
+        index.entry_count(),
+        12,
+        "the far worker still holds both chains"
+    );
+}
+
+/// A coverage word no worker reached reads as zero and stays unmade: neither a read nor a
+/// clear makes the further block.
+#[test]
+fn a_missing_coverage_word_reads_as_zero() {
+    let slab = RunSlab::new(MAX_WORDS);
+    let coverage = slab.coverage(7);
+    set(coverage, 3);
+    assert!(has(coverage, 3));
+    assert!(!has(coverage, 64) && !has(coverage, 1023));
+    clear(coverage, 200);
+    assert_eq!(workers(coverage), vec![3]);
+    let words = coverage.words();
+    assert!(covered_only_by(coverage, 3, words) && !covered_only_by(coverage, 64, words));
+    assert!(!coverage_is_empty(coverage, words) && coverage_is_empty(slab.coverage(8), words));
+    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(1));
+    set(coverage, 200);
+    assert_eq!(workers(coverage), vec![3, 200]);
+    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(MAX_WORDS));
+}
+
+/// A chunk made while the pool's workers span more than one coverage word lays every word of
+/// the ceiling a run, a run's words side by side: an index whose 65 workers are interned
+/// before its second chunk lays the ceiling there and makes no further block for a holder of
+/// the second word, while the chunk made with the index stays at one word a run.
+#[test]
+fn a_chunk_made_at_a_wider_pool_lays_its_words_side_by_side() {
+    let index = ChainIndex::with_max_workers(MAX_WORDS * 64);
+    let ids: Vec<u32> = (0..65)
+        .map(|name| index.intern_worker(&format!("w{name}")).expect("id"))
+        .collect();
+    let (first, last) = (ids[0], ids[64]);
+    let mut map = ChainBlockMap::default();
+    let chains = RUN_CHUNK as u64 + 8;
+    for chain in 0..chains {
+        let blocks = blocks_of(&[content(7_000 + chain, 0)]);
+        index
+            .apply_stored(first, &blocks, None, &mut map)
+            .expect("stored");
+    }
+    let stats = index.stats();
+    assert!(stats.runs_allocated > RUN_CHUNK && stats.runs_allocated <= 2 * RUN_CHUNK);
+    let laid = slab_chunk_bytes(1) + slab_chunk_bytes(MAX_WORDS);
+    assert_eq!(stats.slab_bytes, laid);
+    let newest = [content(7_000 + chains - 1, 0)];
+    let mut far = ChainBlockMap::default();
+    index
+        .apply_stored(last, &blocks_of(&newest), None, &mut far)
+        .expect("stored");
+    assert_eq!(index.stats().slab_bytes, laid);
+    let mut holders = scores(&index, &newest);
+    holders.sort_unstable();
+    assert_eq!(holders, vec![(first, 1), (last, 1)]);
+    assert_eq!(scores(&index, &[content(7_000, 0)]), vec![(first, 1)]);
+}
+
+/// A chunk made while the pool spans the whole ceiling lays every word in its first block: no
+/// further block is ever made, and the last worker of the last run reads and writes right.
+#[test]
+fn a_chunk_made_at_the_ceiling_never_makes_a_further_block() {
+    let slab = RunSlab::new(MAX_WORDS);
+    slab.live_words.store(MAX_WORDS, Ordering::Release);
+    let last = slab.coverage(RUN_CHUNK as u32 - 1);
+    for worker in [0, 63, 64, 1023] {
+        set(last, worker);
+    }
+    assert_eq!(workers(last), vec![0, 63, 64, 1023]);
+    assert!(coverage_is_empty(
+        slab.coverage(RUN_CHUNK as u32 - 2),
+        MAX_WORDS
+    ));
+    clear(last, 1023);
+    assert_eq!(workers(last), vec![0, 63, 64]);
+    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(MAX_WORDS));
+}
+
+/// A worker past the first block of a chunk made while the pool fit one word: its bit lands
+/// in the further block of its own run alone, beside the bits of the first block, and its
+/// removal leaves every other holder of the run and of the runs beside it.
+#[test]
+fn a_worker_past_the_first_block_of_a_chunk_reads_and_writes_right() {
+    let slab = RunSlab::new(MAX_WORDS);
+    slab.live_words.store(1, Ordering::Release);
+    let (before, run, after) = (slab.coverage(6), slab.coverage(7), slab.coverage(8));
+    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(1));
+    set(before, 63);
+    set(after, 0);
+    for worker in [3, 63] {
+        set(run, worker);
+    }
+    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(1));
+    assert!(!has(run, 64) && !has(run, 1023));
+    for worker in [64, 1023] {
+        set(run, worker);
+    }
+    set(before, 1023);
+    set(after, 64);
+    assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(MAX_WORDS));
+    assert_eq!(workers(run), vec![3, 63, 64, 1023]);
+    assert_eq!(workers(before), vec![63, 1023]);
+    assert_eq!(workers(after), vec![0, 64]);
+    clear(run, 64);
+    clear(run, 3);
+    assert_eq!(workers(run), vec![63, 1023]);
+    assert_eq!(workers(before), vec![63, 1023]);
+    assert_eq!(workers(after), vec![0, 64]);
+    let copy = slab.coverage(9);
+    run.copy_into(copy, MAX_WORDS);
+    assert_eq!(workers(copy), vec![63, 1023]);
+}
+
+/// Two stores that meet at the first bit of a word: the further block is made once and both
+/// bits stand.
+#[test]
+fn two_stores_that_meet_at_the_first_bit_of_a_word_both_land() {
+    for round in 0..200u32 {
+        let slab = RunSlab::new(MAX_WORDS);
+        let gate = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for worker in [64u32, 65] {
+                let (slab, gate) = (&slab, &gate);
+                scope.spawn(move || {
+                    gate.wait();
+                    set(slab.coverage(round), worker);
+                });
+            }
+        });
+        assert_eq!(workers(slab.coverage(round)), vec![64, 65], "round {round}");
+        assert_eq!(slab.chunk_bytes(), slab_chunk_bytes(MAX_WORDS));
+    }
+}
+
+/// The directory of chunks is made whole with the index, one entry for every chunk it may ever
+/// hold: an entry is five pointers, as it is without the further words.
+#[test]
+fn a_directory_entry_is_no_larger_for_the_further_words() {
+    assert_eq!(size_of::<OnceLock<RunChunk>>(), 5 * size_of::<usize>());
+}

@@ -3311,6 +3311,7 @@ fn content_parts_of_every_role_reach_a_string_template_as_one_text() {
     ]);
     let messages: Vec<ChatMessage> = serde_json::from_value(json!([
         {"role": "system", "content": parts.clone()},
+        {"role": "root", "content": parts.clone()},
         {"role": "developer", "content": parts.clone()},
         {"role": "user", "content": parts.clone()},
         {"role": "assistant", "content": parts.clone()},
@@ -3318,12 +3319,45 @@ fn content_parts_of_every_role_reach_a_string_template_as_one_text() {
     ]))
     .unwrap();
     let turns = process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
-    assert_eq!(turns.len(), 5);
+    assert_eq!(turns.len(), 6);
     for turn in &turns {
         let text = turn["content"]
             .as_str()
             .unwrap_or_else(|| panic!("no text: {turn}"));
         assert!(text.contains("first") && text.contains("second"), "{turn}");
+    }
+}
+
+/// A root message reaches the template with its date and its location beside
+/// its content, under both content formats; a root that carries neither
+/// gains no key.
+#[test]
+fn a_root_message_reaches_the_template_with_its_date_and_location() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {
+            "role": "root",
+            "content": "Answer in French.",
+            "current_date": "2026-03-14",
+            "current_location": "Lyon, France"
+        },
+        {"role": "root", "content": "Be brief."},
+        {"role": "user", "content": "Bonjour"}
+    ]))
+    .unwrap();
+    for format in [
+        ChatTemplateContentFormat::String,
+        ChatTemplateContentFormat::OpenAI,
+    ] {
+        let turns = process_content_format(&messages, format, None).unwrap();
+        assert_eq!(turns[0]["current_date"], json!("2026-03-14"), "{format:?}");
+        assert_eq!(
+            turns[0]["current_location"],
+            json!("Lyon, France"),
+            "{format:?}"
+        );
+        for key in ["current_date", "current_location"] {
+            assert!(turns[1].get(key).is_none(), "{format:?}: {}", turns[1]);
+        }
     }
 }
 

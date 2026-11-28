@@ -90,8 +90,9 @@ use crate::{
 /// The shed of a request whose named worker cannot take it: the request
 /// has no worker, and moves to no other. `side` is the side of a pair the
 /// worker was missed on: the side whose count the number reached nobody of
-/// ([`ReachedPair::NoWorker`]), or the side the decision held to the
-/// worker's place was left with nobody on ([`held`]).
+/// ([`ReachedPair::NoWorker`]), the side the decision held to the worker's
+/// place was left with nobody on, or the side the call's last ask could
+/// not send to ([`held`]).
 const fn missed(side: Option<PairSide>) -> Unplaced {
     Unplaced::Shed {
         reason: ShedReason::NoEndpoints,
@@ -101,18 +102,25 @@ const fn missed(side: Option<PairSide>) -> Unplaced {
     }
 }
 
-/// [`missed`] on no side: a single request's, and a pair's whose asks
-/// named pairs none of which could be sent to.
+/// [`missed`] on no side: a single request's.
 const MISSED: Unplaced = missed(None);
 
 /// What a decision held to a named worker answers, as the request's
 /// answer: where it named no worker because of the worker (no worker for
 /// the call's asks, its own shed with no endpoint, or for workers over
-/// their thresholds), the request is shed under [`TARGET_WORKER`], on the
-/// side that decision's shed names. Any other answer stands as it is.
-fn held<'a>(placed: Result<Placement<'a>, Unplaced>) -> Result<Placement<'a>, Unplaced> {
+/// their thresholds), the request is shed under [`TARGET_WORKER`]. The
+/// shed is on the side that decision's shed names: none where the route's
+/// rule took no worker of a list behind the call's first ask
+/// ([`again`](super::pair::again)). Where the call had no worker for its
+/// asks it is on `unsent`, the side its last ask could not send to
+/// ([`Call::unsent`]): none for a single request. Any other answer stands
+/// as it is.
+fn held<'a>(
+    placed: Result<Placement<'a>, Unplaced>,
+    unsent: Option<PairSide>,
+) -> Result<Placement<'a>, Unplaced> {
     placed.map_err(|unplaced| match unplaced {
-        Unplaced::NoWorkers => MISSED,
+        Unplaced::NoWorkers => missed(unsent),
         Unplaced::Shed {
             reason: ShedReason::NoEndpoints | ShedReason::Saturated,
             side,
@@ -265,7 +273,7 @@ pub(super) fn single<'a>(
     // The call's one decision: behind a worker it cannot send to, no
     // second one is made.
     call.spent = ASKS - 1;
-    held(super::single(engine, request, Some(list), &mut call))
+    held(super::single(engine, request, Some(list), &mut call), None)
 }
 
 /// The number `request` names its worker by, read once in its headers
@@ -419,9 +427,9 @@ fn taking(
 /// (`model_gateway/src/routers/common/placement.rs:3044`, `:3090`, with
 /// the policy's miss at
 /// `model_gateway/src/policies/consistent_hashing.rs:187-193`, on main
-/// `d43c7b2a9`). Prefills at the
-/// caller's admission limit answer [`Unplaced::PrefillsFull`] as for any
-/// pair: the named prefill is waited for. Any other answer of
+/// `d43c7b2a9`). Where the decision held to the places says that its
+/// prefills are full, the answer is [`Unplaced::PrefillsFull`] as for any
+/// pair's decision: the named prefill is waited for. Any other answer of
 /// [`super::pair::place`] stands as it is.
 #[inline(never)]
 pub(super) fn pair<'a>(
@@ -631,9 +639,8 @@ fn held_pair<'a>(
     // second one is made. Held to its prefill alone, the call asks again
     // as any pair's does, and its rule is asked of that one place.
     call.named_pair = decode.is_some();
-    held(super::pair::asks(
-        engine, request, &held_to, &lent, &mut call,
-    ))
+    let placed = super::pair::asks(engine, request, &held_to, &lent, &mut call);
+    held(placed, call.unsent)
 }
 
 /// The call of a pair that names its worker where the decode's side alone
@@ -726,9 +733,10 @@ fn decode_alone<'a>(
     };
     let lent = WorkerLists::Pair(held_to);
     let placed = super::pair::asks(engine, request, &held_to, &lent, &mut call);
-    // Each pair the asks named held the one decode.
+    // Each pair the asks named held the one decode: the shed is on the
+    // side the call's last ask could not send to.
     placed.map_err(|unplaced| match unplaced {
-        Unplaced::NoWorkers => MISSED,
+        Unplaced::NoWorkers => missed(call.unsent),
         other => other,
     })
 }

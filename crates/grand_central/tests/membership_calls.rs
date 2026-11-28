@@ -569,7 +569,7 @@ async fn the_store_holds_the_rows_the_door_answered() {
             .expect("a listener of the configuration");
     }
     let addresses = controller.addresses();
-    let store = controller.store();
+    let (store, workers) = (controller.store(), controller.workers());
     let mut readiness = controller.readiness();
     let (stop, stopped) = oneshot::channel::<()>();
     let serve = controller.serve(async {
@@ -644,9 +644,10 @@ async fn the_store_holds_the_rows_the_door_answered() {
             .expect("registered")
             .into_inner();
 
-        // The store's rows are the rows the answers told, in the snapshot's
-        // order (by key).
-        let (epoch, rows) = store.all_rows();
+        // The rows of the holder's cut are the rows the answers told, in the
+        // snapshot's order (by key).
+        let cut = workers.checkpoint(&store);
+        let (epoch, rows) = (cut.epoch, cut.rows);
         assert_eq!(epoch, unchecked.membership_epoch);
         let told = [row_of(&checked), row_of(&unchecked)];
         assert_eq!(rows.len(), 2);
@@ -667,6 +668,10 @@ async fn the_store_holds_the_rows_the_door_answered() {
                     !told.health_policy.is_some_and(|policy| policy.disabled)
                 )
             );
+            // The holder's read by the row's id states those facts.
+            let facts = Some(&stored.facts);
+            let read = workers.read_row(stored.id);
+            assert_eq!(read.as_ref().map(|row| &row.facts), facts, "by id");
         }
         assert_eq!(
             rows.iter().map(|row| row.status).collect::<Vec<_>>(),
@@ -722,12 +727,18 @@ async fn the_store_holds_the_rows_the_door_answered() {
             panic!("no ranks in {ranks:?}");
         };
         assert_eq!(answer.rows.len(), 2);
+        // The holder's cut: the rows the holder and the store both hold.
+        let cut = workers.checkpoint(&store).rows;
         for rank in 0..2 {
             let url = format!("http://127.0.0.1:9/c@{rank}");
-            assert!(store.by_key(&url).is_some(), "{url}");
+            let id = workers.read_row_under(&url).map(|row| row.id);
+            assert!(id.is_some(), "{url}");
+            let told = cut.iter().any(|row| Some(row.id) == id);
+            assert!(told, "{url}: the store tells the row");
         }
 
-        // A removal through the door leaves the store without the row.
+        // A removal through the door leaves the holder without the row, and
+        // the store at the epoch the answer names.
         let removal = proto::DeregisterWorkerRequest {
             worker_id: told[0].id,
             revision: told[0].revision,
@@ -738,7 +749,7 @@ async fn the_store_holds_the_rows_the_door_answered() {
             .await
             .expect("removed")
             .into_inner();
-        assert_eq!(store.by_key("http://127.0.0.1:9/a"), None);
+        assert_eq!(workers.read_row_under("http://127.0.0.1:9/a"), None);
         assert_eq!(store.epoch(), removed.membership_epoch);
 
         stop.send(()).expect("the serve still runs");

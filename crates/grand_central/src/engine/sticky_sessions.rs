@@ -52,6 +52,47 @@ pub struct SessionRule {
     /// pick the rule placed carries the word to the engine that tells the
     /// stages of it.
     pub rule_placed: RulePlaced,
+    /// The sides of a pair the rule covers.
+    pub sides: SessionSides,
+}
+
+/// The sides of a pair a sessions rule covers (`sessions.sides` in a
+/// document). A side the rule does not cover is its profile's alone: the
+/// rule reads, claims and writes no pin of that side's session. A
+/// binding built in code can leave out a side whose picker leaves the
+/// placement to the rule, which no checked document can. A debug build
+/// stops where the engine is built. A release build places that side by
+/// the rule, as it places a side the rule covers. A gateway decides its
+/// sticky override a role at a time, and leaves a role to a policy that
+/// keeps a routing key's handling to itself: its `manual` and its
+/// `consistent_hashing`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionSides {
+    /// Any side the binding's plan has for a rule: what a document that
+    /// names no side states, and one that names both. Under `single` that
+    /// is the request's one side, and under `pd-pair` both sides. Under a
+    /// plan with an encode side it is the prefill and the decode, and
+    /// never the encode side.
+    #[default]
+    Any,
+    /// The prefill side alone.
+    Prefill,
+    /// The decode side alone.
+    Decode,
+}
+
+impl SessionSides {
+    /// Whether the rule covers `decode`, the decode side of a pair, or its
+    /// prefill side.
+    #[inline]
+    pub(crate) const fn covers(self, decode: bool) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Prefill => !decode,
+            Self::Decode => decode,
+        }
+    }
 }
 
 impl SessionRule {
@@ -159,9 +200,10 @@ pub enum SessionExpiry {
     At(u64),
     /// At no instant: the key's rule has no TTL.
     Never,
-    /// No decision has read the key since its entry was made: a dispatch
-    /// made the entry anew, behind the end of an absence, a forget or the
-    /// key's own end, and the next decision's read starts the key over.
+    /// No decision's read began the key's entry: a claim or a dispatch
+    /// made it where the table held none of the key. A decision's read
+    /// finds no pin there, and the first read that writes the key starts
+    /// it over.
     Unread,
 }
 
@@ -294,8 +336,12 @@ struct Entry {
     /// dated before it comes from a decision that read no pin of this
     /// life, and writes nothing. The three are a dispatch
     /// ([`SessionTable::dispatched`]), a move at the cap
-    /// ([`SessionTable::respilled`]) and a decode call's date. `0` in an
-    /// entry no decision has read: every word is written there.
+    /// ([`SessionTable::respilled`]) and a decode call's date.
+    ///
+    /// `0` in an entry no read began, one a claim or a dispatch made
+    /// ([`SessionTable::slot`]). It stays `0` until a read that writes
+    /// the key begins a life ([`SessionTable::lookup`]): no word is
+    /// dropped there as an older life's.
     oldest_reader_micros: u64,
     /// What the claim of record was written over, read while a claim
     /// stands. A decode call claims under the lease its pair's first
@@ -455,9 +501,10 @@ impl Entry {
 
     /// Whether a word dated `at` comes from an older life of the key: it
     /// is dated before the oldest date a decision read this one under. A
-    /// pair's decode call reads under its lease's date
-    /// ([`SessionTable::told_under`]). A word that states no instant (`0`)
-    /// does not. Neither does any word in an entry no decision has read.
+    /// word that states no instant (`0`) does not. Neither does any word
+    /// in an entry no read began, which has no such date
+    /// ([`SessionTable::slot`]). A pair's decode call reads under its
+    /// lease's date ([`SessionTable::told_under`]).
     fn outlived(&self, at: u64) -> bool {
         at != 0 && at < self.oldest_reader_micros
     }
@@ -525,6 +572,119 @@ impl Entry {
             self.front(worker);
         } else {
             self.place(worker);
+        }
+    }
+
+    /// A move at the cap onto `target`, the id that stands for the worker
+    /// ([`SessionTable::respilled`]): the worker leads the pins, and
+    /// [`Entry::over`] follows the move.
+    fn moved(&mut self, target: WorkerId) {
+        // A move onto the worker that stayed behind its lease's dispatch
+        // fronts it over the withdrawn pin, as the respill's own dispatch
+        // does: a request sent on that pin yet joins behind it.
+        if self.over == Over::Led && self.pins[0] == target {
+            self.over = Over::Trailed;
+        }
+        // A move onto the worker that leads the pins writes no pin and is
+        // a move all the same: a claim that stands over another one reads
+        // as any pin and claim from here, and no dispatch of its lease
+        // takes the moved pin back.
+        if self.pins[0] == target && matches!(self.over, Over::Replaced | Over::Own) {
+            self.over = Over::None;
+        }
+        self.front(target);
+    }
+
+    /// [`SessionTable::dispatched`] for a key whose claim of record was
+    /// written over another, or whose lease's first claim a dispatch
+    /// withdrew ([`Over`]): `named` is the id the dispatch asks by,
+    /// `target` the id that stands for it, and `claimed_here` whether the
+    /// claim's lease names the dispatched id. Out of line: a key in
+    /// neither state pays one test.
+    #[cold]
+    #[inline(never)]
+    fn tied(
+        &mut self,
+        verdict: SessionVerdict,
+        (claimed_here, named): (bool, WorkerId),
+        target: WorkerId,
+        at: u64,
+    ) {
+        match self.over {
+            Over::Own if self.claim != WorkerId(0) => {
+                // The claim of record is a decode call's, and the
+                // key's other pin is the first claim of the same
+                // lease. No dispatch confirmed either, and the lease
+                // goes to one of them.
+                let dated = self.dated_at(at);
+                if claimed_here {
+                    // The lease went to the call's worker: its first
+                    // claim is withdrawn. Another lease's dispatch
+                    // here confirms the call's claim once this
+                    // returns, and the first claim stays a pin.
+                    if at == 0 || dated {
+                        self.over = Over::None;
+                        let held = self.pins.iter().position(|pin| *pin == target);
+                        let first = held.map_or(WorkerId(0), |held| self.pins[1 - held]);
+                        if first != WorkerId(0) {
+                            self.withdraw(first);
+                            // The claim is confirmed once this returns,
+                            // and its lease's id is read no more: the
+                            // entry keeps the withdrawn claim's worker
+                            // and its slot, for a request that followed
+                            // that pin and is sent there yet.
+                            self.leased = first;
+                            self.over = if held == Some(1) {
+                                Over::Led
+                            } else {
+                                Over::Trailed
+                            };
+                        }
+                    }
+                } else if self.claim != target
+                    && at != 0
+                    && dated
+                    && verdict == SessionVerdict::Claimed(named)
+                    && self.pins.contains(&target)
+                {
+                    // The lease went back to its first claim, which
+                    // its own word names: the call's is withdrawn.
+                    // Another lease of that instant claimed nothing
+                    // there, and leaves both below.
+                    let pin = std::mem::replace(&mut self.claim, WorkerId(0));
+                    self.withdraw(pin);
+                    self.over = Over::None;
+                } else {
+                    // The key was served elsewhere: both stand as they
+                    // are.
+                    self.over = Over::None;
+                }
+            }
+            Over::Led | Over::Trailed => {
+                // The lease's dispatch on its call's worker withdrew
+                // its first claim, and the pins stand as that left
+                // them. A request that followed that pin ahead of the
+                // withdrawal is sent there: the key was served on it,
+                // and the pin stands where it stood. A respill on the
+                // worker that stayed fronts it over that pin.
+                if target == self.leased {
+                    if verdict == SessionVerdict::Pinned {
+                        self.pins = if self.over == Over::Led {
+                            [target, self.pins[0]]
+                        } else {
+                            [self.pins[0], target]
+                        };
+                        self.over = Over::None;
+                    }
+                } else if verdict == SessionVerdict::Respill && self.pins[0] == target {
+                    self.over = Over::Trailed;
+                }
+            }
+            // A claim written over a standing one that its lease has
+            // yet to date, or a tie whose claim left by another road:
+            // the key was served meanwhile, and its pins read as any
+            // pin and claim.
+            Over::Replaced | Over::Own | Over::None => self.over = Over::None,
         }
     }
 
@@ -876,9 +1036,16 @@ impl SessionTable {
     /// one while the table holds fewer than [`KEYS`]. `None` for a key a
     /// full table does not hold: nothing is recorded of it, and its request
     /// is placed with no pin. Room comes back as keys leave
-    /// ([`Self::retain`]). An entry a claim or a dispatch makes where its
-    /// decision's read found no room is one no decision has read: the
-    /// key's next read starts it over ([`SessionExpiry::Unread`]).
+    /// ([`Self::retain`]).
+    ///
+    /// An entry a claim or a dispatch makes is one no read began. It has
+    /// no reader's date ([`Entry::oldest_reader_micros`]): no word is
+    /// dropped there as an older life's, and each is taken in the order
+    /// it comes, as a gateway's sticky map takes each write. A decision's
+    /// read finds no pin in it, and the first read that writes the key
+    /// starts it over ([`Self::lookup`], [`SessionExpiry::Unread`]). A
+    /// claim call reads its pins as they stand.
+    ///
     /// Writers of different shards that race for the last room each take
     /// it: the table can stand past [`KEYS`] by a key a shard at the most.
     /// Always inlined: it stands on the pin's path of every keyed decision.
@@ -956,7 +1123,8 @@ impl SessionTable {
     /// the decision's first read and this call, the new life takes `at`
     /// as a reader's date ([`Entry::read_under`]). The decision's
     /// dispatch is then written into the life its call read. A call that
-    /// states no instant (`0`) lowers nothing.
+    /// states no instant (`0`) lowers nothing. An entry the call makes
+    /// itself takes no reader's date: no read began it ([`Self::slot`]).
     ///
     /// The pin and the claim of record take the id that stands for the
     /// worker ([`Self::stands`]): the decision read its rows ahead of this
@@ -1001,7 +1169,10 @@ impl SessionTable {
         };
         // A read of the key's life as it stands, whatever the answer. A
         // call that states no instant lowers nothing: a zero date would
-        // open the life to every older word.
+        // open the life to every older word. An entry this call made has
+        // no reader's date and takes none here: under a date, a word
+        // dated before it is dropped, and a request that read the entry
+        // the key held before may send such a word yet.
         if at != 0 {
             entry.read_under(at);
         }
@@ -1062,12 +1233,13 @@ impl SessionTable {
     /// confirmed ([`Self::told_under`]), the move ends what ties the two:
     /// the dispatch of that call's lease then takes back neither pin.
     ///
-    /// `at` is the moving decision's instant. A move dated before every
-    /// decision that read the key's current life writes nothing
-    /// ([`Entry::outlived`]). The key started over since the moving
+    /// `at` is the moving decision's instant. A move dated before the
+    /// oldest date a decision read the key's current life under writes
+    /// nothing ([`Entry::outlived`]). The key started over since the moving
     /// decision read its pin, and the move would front a worker over
     /// pins that decision never read. A caller that states no instant
-    /// (`0`) moves the pin in any life.
+    /// (`0`) moves the pin in any life. An entry no read began has no
+    /// such date, and takes a move of any date ([`Self::slot`]).
     pub(crate) fn respilled(&self, key: Session, target: WorkerId, at: u64) {
         let key = key.get();
         if target == WorkerId(0) {
@@ -1082,21 +1254,7 @@ impl SessionTable {
             // two: the dispatch behind this move finds the worker pinned
             // and asks the renames no more, so the move asks them here.
             let target = self.stands(entry, target);
-            // A move onto the worker that stayed behind its lease's
-            // dispatch fronts it over the withdrawn pin, as the respill's
-            // own dispatch does: a request sent on that pin yet joins
-            // behind it.
-            if entry.over == Over::Led && entry.pins[0] == target {
-                entry.over = Over::Trailed;
-            }
-            // A move onto the worker that leads the pins writes no pin and
-            // is a move all the same: a claim that stands over another one
-            // reads as any pin and claim from here, and no dispatch of its
-            // lease takes the moved pin back.
-            if entry.pins[0] == target && matches!(entry.over, Over::Replaced | Over::Own) {
-                entry.over = Over::None;
-            }
-            entry.front(target);
+            entry.moved(target);
         }
     }
 
@@ -1227,98 +1385,6 @@ impl SessionTable {
         }
     }
 
-    /// [`Self::dispatched`] for a key whose claim of record was written over
-    /// another, or whose lease's first claim a dispatch withdrew ([`Over`]):
-    /// `named` is the id the dispatch asks by, `target` the id that stands
-    /// for it, and `claimed_here` whether the claim's lease names the
-    /// dispatched id. Out of line: a key in neither state pays one test.
-    #[cold]
-    #[inline(never)]
-    fn tied(
-        entry: &mut Entry,
-        verdict: SessionVerdict,
-        (claimed_here, named): (bool, WorkerId),
-        target: WorkerId,
-        at: u64,
-    ) {
-        match entry.over {
-            Over::Own if entry.claim != WorkerId(0) => {
-                // The claim of record is a decode call's, and the
-                // key's other pin is the first claim of the same
-                // lease. No dispatch confirmed either, and the lease
-                // goes to one of them.
-                let dated = entry.dated_at(at);
-                if claimed_here {
-                    // The lease went to the call's worker: its first
-                    // claim is withdrawn. Another lease's dispatch
-                    // here confirms the call's claim below, and the
-                    // first claim stays a pin.
-                    if at == 0 || dated {
-                        entry.over = Over::None;
-                        let held = entry.pins.iter().position(|pin| *pin == target);
-                        let first = held.map_or(WorkerId(0), |held| entry.pins[1 - held]);
-                        if first != WorkerId(0) {
-                            entry.withdraw(first);
-                            // The claim is confirmed below, and its
-                            // lease's id is read no more: the entry
-                            // keeps the withdrawn claim's worker and
-                            // its slot, for a request that followed
-                            // that pin and is sent there yet.
-                            entry.leased = first;
-                            entry.over = if held == Some(1) {
-                                Over::Led
-                            } else {
-                                Over::Trailed
-                            };
-                        }
-                    }
-                } else if entry.claim != target
-                    && at != 0
-                    && dated
-                    && verdict == SessionVerdict::Claimed(named)
-                    && entry.pins.contains(&target)
-                {
-                    // The lease went back to its first claim, which
-                    // its own word names: the call's is withdrawn.
-                    // Another lease of that instant claimed nothing
-                    // there, and leaves both below.
-                    let pin = std::mem::replace(&mut entry.claim, WorkerId(0));
-                    entry.withdraw(pin);
-                    entry.over = Over::None;
-                } else {
-                    // The key was served elsewhere: both stand as they
-                    // are.
-                    entry.over = Over::None;
-                }
-            }
-            Over::Led | Over::Trailed => {
-                // The lease's dispatch on its call's worker withdrew
-                // its first claim, and the pins stand as that left
-                // them. A request that followed that pin ahead of the
-                // withdrawal is sent there: the key was served on it,
-                // and the pin stands where it stood. A respill on the
-                // worker that stayed fronts it over that pin.
-                if target == entry.leased {
-                    if verdict == SessionVerdict::Pinned {
-                        entry.pins = if entry.over == Over::Led {
-                            [target, entry.pins[0]]
-                        } else {
-                            [entry.pins[0], target]
-                        };
-                        entry.over = Over::None;
-                    }
-                } else if verdict == SessionVerdict::Respill && entry.pins[0] == target {
-                    entry.over = Over::Trailed;
-                }
-            }
-            // A claim written over a standing one that its lease has
-            // yet to date, or a tie whose claim left by another road:
-            // the key was served meanwhile, and its pins read as any
-            // pin and claim.
-            Over::Replaced | Over::Own | Over::None => entry.over = Over::None,
-        }
-    }
-
     /// The commit dispatched a decision for `key` to `target` under the
     /// decision's `verdict`: the pin follows the rule. The preferred pin
     /// taken, or the failover taken while the preferred one was unroutable,
@@ -1326,10 +1392,9 @@ impl SessionTable {
     /// respill a worker outside the pins joins them by the key's recovery
     /// rule. A dispatch to the claimed worker confirms the claim first; the
     /// claiming decision's commit elsewhere withdraws it. A dispatch on an
-    /// id its worker had before it was
-    /// registered again is one on that worker, under the id that stands
-    /// ([`Self::stands`]). A dispatch on a claim's lease asks by the
-    /// claim of record.
+    /// id its worker had before it was registered again is one on that
+    /// worker, under the id that stands ([`Self::stands`]). A dispatch on a
+    /// claim's lease asks by the claim of record.
     ///
     /// `at` is the instant the dispatched lease is issued under. The
     /// claiming decision is the one whose lease names the claim's id and
@@ -1337,10 +1402,12 @@ impl SessionTable {
     /// older decision that claimed the same worker withdraws nothing. A
     /// lease that states no instant (`0`) is known by its worker alone.
     ///
-    /// A dispatch dated before every decision that read the key's current
-    /// life writes nothing ([`Entry::outlived`]): the key started over
-    /// between that dispatch's decision and its send. One that states no
-    /// instant is written.
+    /// A dispatch dated before the oldest date a decision read the key's
+    /// current life under writes nothing ([`Entry::outlived`]): the key
+    /// started over between that dispatch's decision and its send. One
+    /// that states no instant is written. So is a dispatch of any date
+    /// in an entry no read began, one a claim or this call made
+    /// ([`Self::slot`]): it has no such date.
     ///
     /// A decode call's claim may stand over the first claim of its own
     /// lease ([`Self::told_under`]). That lease's dispatch on the call's
@@ -1369,10 +1436,10 @@ impl SessionTable {
         let Some(entry) = self.slot(&mut shard, key) else {
             return;
         };
-        // A dispatch dated before every decision that read the key's
-        // current life comes from an older one. The new life keeps its
-        // own pins: a gateway's sticky map pins where it selects, and a
-        // send that comes late writes nothing there.
+        // A dispatch dated before the oldest date a decision read the
+        // key's current life under comes from an older one. The new life
+        // keeps its own pins: a gateway's sticky map pins where it
+        // selects, and a send that comes late writes nothing there.
         if entry.outlived(at) {
             return;
         }
@@ -1393,7 +1460,7 @@ impl SessionTable {
         let named = entry.of_record(target);
         let target = self.stands(entry, named);
         if entry.over != Over::None {
-            Self::tied(entry, verdict, (claimed_here, named), target, at);
+            entry.tied(verdict, (claimed_here, named), target, at);
         }
         entry.confirm_claim(target);
         if let SessionVerdict::Claimed(claimed) = verdict {

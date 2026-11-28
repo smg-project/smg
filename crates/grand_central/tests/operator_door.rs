@@ -10,7 +10,7 @@ use smg_grand_central::{
     stages::StageRegistry,
     store::{
         identity, MembershipChange, MemoryStore, Position, Registrant, StaleGeneration,
-        WorkerFacts, WorkerRow, WorkerStatus,
+        StoreCheckpoint, WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
     },
 };
 
@@ -75,6 +75,7 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
         ("grpc://a:8000", "other"),
         ("grpc://operator:secret@c:8000", "served"),
     ];
+    let mut handed = Vec::new();
     for (epoch, (key, model)) in (1..).zip(rows) {
         let id = identity(key, 1);
         let facts = WorkerFacts {
@@ -94,16 +95,29 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
             maker: Registrant::Control,
         };
         let registered = MembershipChange::Registered { id };
+        handed.push(row.clone());
         store.follow(Position::default(), epoch, registered, Some(row));
     }
-    assert_eq!(store.checkpoint().rows.len(), 3, "each row landed");
-    let asked = WorkerRowsQuery {
-        models: vec!["served".to_owned()],
-        limit: 1,
+    // A store with no holder gives its host no read of a row: the host
+    // keeps the rows it handed, and cuts them by key at the store's epoch.
+    let cut = || {
+        let mut rows: Vec<WorkerRow> = handed.clone();
+        rows.sort_by(|a, b| a.facts.key.cmp(&b.facts.key));
+        let (at, epoch) = (Position::default(), store.epoch());
+        StoreCheckpoint { at, epoch, rows }
     };
+    // Three writes, three steps of the epoch, and the cut's rows by key.
+    let stands = cut();
+    let keys = stands.rows.iter().map(|row| row.facts.key.as_str());
+    let by_key = [rows[1].0, rows[0].0, rows[2].0];
+    assert_eq!(keys.collect::<Vec<_>>(), by_key, "the rows by key");
+    assert_eq!(stands.epoch, 3, "each row landed");
+    let mut asked = WorkerRowsQuery::default();
+    asked.models = vec!["served".to_owned()];
+    asked.limit = 1;
     // A lone read's answer: the first rows by key that serve the model, as
     // many as the limit, with the count that serve it.
-    let mut rows = store.checkpoint().rows;
+    let mut rows = cut().rows;
     rows.retain(|row| row.facts.models == asked.models);
     let serving = rows.len();
     rows.truncate(asked.limit);
@@ -114,12 +128,8 @@ fn a_host_applies_its_start_document_and_serves_a_read_only_source() {
     assert_eq!(row.facts.key, "grpc://b:8000");
     assert!(page.truncated);
 
-    let asked = WorkerRowsQuery { limit: 2, ..asked };
-    let page = worker_rows_page(
-        &asked,
-        Rows::Shared(Arc::new(store.checkpoint())),
-        Instant::now(),
-    );
+    asked.limit = 2;
+    let page = worker_rows_page(&asked, Rows::Shared(Arc::new(cut())), Instant::now());
     assert!(!page.truncated);
     let last = page.rows.last().expect("the second matching row");
     assert_eq!(last.facts.key, "grpc://c:8000");

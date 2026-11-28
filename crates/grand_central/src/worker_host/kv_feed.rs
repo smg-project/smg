@@ -12,9 +12,11 @@
 //! A row written over the controller's wire states its own signal, so such
 //! a worker keeps streaming when the active generation reads no index. A
 //! row found at a host's door is stated by the generation in force at that
-//! write ([`asks_events`]). The follow is told of a worker once for each
+//! write ([`asks_events_under`]). The follow is told of a worker once for each
 //! object laid for it, so a later generation moves a standing worker's
 //! stream when its row is laid again at the door, and not before.
+//!
+//! [`asks_events_under`]: super::membership_writer::asks_events_under
 
 use std::{
     collections::HashSet,
@@ -34,13 +36,6 @@ use tokio::{
 };
 
 use super::{kv_tables::indexed_under, KvHost, Objects};
-use crate::{
-    engine::{
-        view::{Phase, Role, WireModes},
-        Engine,
-    },
-    store::WorkerFacts,
-};
 
 /// A host's cache-event collector and the worker objects it follows.
 pub struct KvFeed<G: Generation> {
@@ -228,28 +223,6 @@ impl<G: Generation> KvFeed<G> {
 fn reaped(ended: Result<(), JoinError>) {
     if let Some(panic) = ended.err().and_then(|error| error.try_into_panic().ok()) {
         std::panic::resume_unwind(panic);
-    }
-}
-
-/// Whether a found row asks for its engine's cache events under `engine`:
-/// whether a decision reads the index for the row's first model, the one
-/// the row is indexed under, in the phase of the row's role. Only a gRPC
-/// worker streams.
-pub(super) fn asks_events(facts: &WorkerFacts, engine: &Engine) -> bool {
-    facts.wire_modes.contains(WireModes::GRPC)
-        && facts
-            .models
-            .first()
-            .is_some_and(|model| engine.needs_for(model, phase_of(facts.role)).events)
-}
-
-/// The phase a role's pool decides: what a binding is matched on.
-const fn phase_of(role: Role) -> Phase {
-    match role {
-        Role::Single => Phase::Single,
-        Role::Prefill => Phase::Prefill,
-        Role::Decode => Phase::Decode,
-        Role::Encode => Phase::Encode,
     }
 }
 

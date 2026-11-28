@@ -33,11 +33,11 @@ use tonic::{
 use tracing::{info, warn};
 
 use super::{
-    election::ElectionObservation,
+    election::{ElectionObservation, Leader},
     generations::Generations,
     principal::ENTRY,
     replication::BEAT,
-    service::{Leader, Shared},
+    service::Shared,
     worker_wire::{self, Refused},
 };
 use crate::{
@@ -49,7 +49,7 @@ use crate::{
         },
         replication::{Log, LogPositionLost},
     },
-    store::{LeasesStore, MemoryStore, Position, StoreCheckpoint, WorkerRow},
+    store::{MemoryStore, Position, StoreCheckpoint, WorkerRow},
     worker_host::{Members, Objects},
 };
 
@@ -373,6 +373,10 @@ impl Lag {
     }
 
     /// Stores the frame's instant, and returns what the frame before left.
+    /// What the lag keeps of it is whole microseconds past the origin, never
+    /// more of them than `at` is past it. So the origin plus them is an
+    /// instant the clock holds, and the two sums that make the kept instant
+    /// again ([`Self::turn`], [`Self::read`]) need no check.
     fn store(&self, at: Instant) -> u64 {
         let micros = at.saturating_duration_since(self.origin).as_micros();
         let micros = u64::try_from(micros).unwrap_or(u64::MAX - 1);
@@ -395,16 +399,24 @@ impl Lag {
     }
 
     /// The last frame at the head at `now`, by one read of it: its age, and
-    /// the instant the sync lapses with no further such frame, none where the
-    /// frame is as old as the bound already. `None` where the lag holds no
-    /// frame. This replica is synced while there is such an instant: the
-    /// `Leader` call's `synced` and a follower's readiness are this read.
-    pub(crate) fn read(&self, now: Instant) -> Option<(Duration, Option<Instant>)> {
+    /// when the sync lapses with no further such frame ([`Lapse`]). `None`
+    /// where the lag holds no frame. A replica that follows is synced until
+    /// its sync has lapsed: its `Leader` call's `synced` and, while it
+    /// serves, its readiness are this read.
+    ///
+    /// The sync lapses at the frame's instant as the lag keeps it, a whole
+    /// microsecond, plus the bound. A bound the clock cannot add to that
+    /// instant does not lapse on this clock ([`Lapse::Never`]).
+    pub(crate) fn read(&self, now: Instant) -> Option<(Duration, Lapse)> {
         let frame = self.frame.load(Ordering::Relaxed).checked_sub(1)?;
         let applied = self.origin + Duration::from_micros(frame);
-        let lapse = applied + self.within;
         let age = now.saturating_duration_since(applied);
-        Some((age, (now < lapse).then_some(lapse)))
+        let lapse = match applied.checked_add(self.within) {
+            Some(lapse) if now < lapse => Lapse::At(lapse),
+            Some(_) => Lapse::Lapsed,
+            None => Lapse::Never,
+        };
+        Some((age, lapse))
     }
 
     /// The standby asks its leader to be restored: an event of the
@@ -433,6 +445,37 @@ impl Lag {
     /// silence that had ended the sync.
     pub(crate) fn turns(&self) -> watch::Receiver<u64> {
         self.turns.subscribe()
+    }
+}
+
+/// When a standby's sync lapses with no further frame at the head: the
+/// second word of one read of its lag ([`Lag::read`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Lapse {
+    /// The sync has lapsed: the clock has reached the instant the bound
+    /// ends at.
+    Lapsed,
+    /// The sync lapses at this instant, which the clock has not reached.
+    At(Instant),
+    /// The sync does not lapse on this clock, which cannot hold the instant
+    /// the bound ends at.
+    Never,
+}
+
+impl Lapse {
+    /// Whether a replica that follows is synced: its sync has not lapsed.
+    pub(crate) fn synced(self) -> bool {
+        self != Self::Lapsed
+    }
+
+    /// The instant the clock alone ends the sync at, where there is one.
+    /// A readiness whose fence is closed at its sample says it as the next
+    /// turn, or the fence's next turn where that is the earlier.
+    pub(crate) fn instant(self) -> Option<Instant> {
+        match self {
+            Self::At(lapse) => Some(lapse),
+            Self::Lapsed | Self::Never => None,
+        }
     }
 }
 
@@ -605,12 +648,7 @@ pub(crate) struct Standby {
 
 impl Standby {
     pub(crate) fn new(shared: Arc<Shared>, port: u16) -> Self {
-        let follower = Follower::new(
-            Arc::clone(&shared.store),
-            Arc::clone(&shared.feed.log),
-            Arc::clone(&shared.objects),
-        )
-        .through(Arc::clone(&shared.generations));
+        let follower = shared.follower().through(Arc::clone(&shared.generations));
         Self {
             shared,
             follower,
@@ -633,17 +671,16 @@ impl Standby {
     /// names another leader, or the same one under another term: the sync
     /// is with one leader's term ([`Lag::forget`]).
     pub(crate) async fn run(self, mut stop: watch::Receiver<bool>) {
-        let mut steps = self.shared.standing.clone();
+        let mut steps = self.shared.steps();
         let mut streak = Streak::default();
-        let mut led = self.shared.fence.term();
+        let mut led = self.shared.held_term();
         // The term of the leader the last stream was opened against.
         let mut followed = None;
         loop {
-            let leading = self.shared.fence.leader_term(Instant::now());
-            let leader = self.shared.leader(leading);
+            let leader = self.shared.leader(Instant::now());
             // The fence's term moves at a take alone: this replica has
             // held the lease since the loop's last look.
-            let term = self.shared.fence.term();
+            let term = self.shared.held_term();
             if term != led {
                 self.shared.lag.forget();
                 led = term;
@@ -681,7 +718,7 @@ impl Standby {
             let wait = match next {
                 Next::Join | Next::Turn => continue,
                 Next::Lease => MOST,
-                Next::Wait => streak.wait(&self.shared.identity),
+                Next::Wait => streak.wait(self.shared.identity()),
             };
             tokio::select! {
                 () = pause(&mut steps, next == Next::Lease, wait) => {}
@@ -703,8 +740,7 @@ impl Standby {
             if steps.changed().await.is_err() {
                 return Next::Lease;
             }
-            let leading = self.shared.fence.leader_term(Instant::now());
-            let named = self.shared.leader(leading);
+            let named = self.shared.leader(Instant::now());
             if named.controller_id != leader.controller_id
                 || named.address != leader.address
                 || named.term != leader.term
@@ -810,7 +846,7 @@ impl Standby {
         let asks = self.asks.load(Ordering::Relaxed);
         if asks {
             self.pace.wait().await;
-            if self.shared.fence.leader_term(Instant::now()).is_some() {
+            if self.shared.leading(Instant::now()).is_some() {
                 return Ended::leads(false);
             }
         }
@@ -839,7 +875,7 @@ impl Standby {
             // under the term its store stands under. A hello that asks to
             // be restored names its place under no term, and states the
             // floor all the same.
-            term_seen: leader.term.max(self.shared.store.term()),
+            term_seen: leader.term.max(self.shared.store_term()),
             max_backlog: 0,
             last_applied_term: place.term,
         };

@@ -33,15 +33,17 @@
 //!
 //! Locks, in one order: the holder's, then the table's, then a lane's. The
 //! table's is taken under the holder's lock where a row is stated or
-//! leaves, and alone by a batch, each for as long as it takes to find or to
-//! change an entry; then the lane's own, so two rows apply at once. Nothing
-//! here calls the holder, and what runs in a lane's turn reads neither the
-//! holder nor the adapter's list of rows: a holder that waits for a lane's
-//! turn waits for one batch and no more. No product path holds the table's
-//! lock while it asks for a lane's: a leaving row's blocks go out under its
-//! lane's lock alone, and no batch of another row waits behind them. The
-//! cases' reader of overlaps takes each lane's lock under the table's, an
-//! order no path inverts.
+//! leaves, and outside it by a batch, each for as long as it takes to find
+//! or to change an entry; then the lane's own, so two rows apply at once.
+//! Through its admission the adapter's batch holds its own state of the
+//! row around both, a lock nothing here asks for. Nothing here calls the
+//! holder, and what runs in a lane's turn reads neither the holder nor the
+//! adapter's list of rows: a holder that waits for a lane's turn waits for
+//! one batch and no more. No product path holds the table's lock while it
+//! asks for a lane's: a leaving row's blocks go out under its lane's lock
+//! alone, and no batch of another row waits behind them. The cases' reader
+//! of overlaps takes each lane's lock under the table's, an order no path
+//! inverts.
 
 use std::{
     collections::HashMap,

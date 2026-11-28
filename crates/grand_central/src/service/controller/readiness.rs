@@ -26,7 +26,10 @@ use std::{
 
 use tokio::sync::watch;
 
-use super::{election::ElectionObservation, standby::Lag};
+use super::{
+    election::ElectionObservation,
+    standby::{Lag, Lapse},
+};
 use crate::{
     service::{
         elector::Fence,
@@ -216,10 +219,10 @@ impl Readiness {
         let leads = term.is_some();
         // A leader follows nobody: it has no lag and no sync to lapse.
         let (lag, lapse) = match self.lag.read(now) {
-            Some((age, lapse)) if !leads => (Some(age), lapse),
+            Some((age, lapse)) if !leads => (Some(age), Some(lapse)),
             _ => (None, None),
         };
-        let synced = lapse.is_some();
+        let synced = lapse.is_some_and(Lapse::synced);
         let state = match *self.phase.borrow() {
             Phase::Starting => State::Starting,
             Phase::Draining => State::Draining,
@@ -228,7 +231,9 @@ impl Readiness {
             Phase::Serving => State::Follower,
         };
         // The clock alone turns the state at the sync's lapse and at the
-        // fence's next turn: the earlier of the two.
+        // fence's next turn: the earlier of the two. A sync that does not
+        // lapse on this clock has no instant of its own.
+        let lapse = lapse.and_then(Lapse::instant);
         let turn = match (lapse, self.fence.turns_at(now)) {
             (Some(lapse), Some(fence)) => Some(lapse.min(fence)),
             (lapse, fence) => lapse.or(fence),

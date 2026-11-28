@@ -421,6 +421,9 @@ pub(crate) fn execute_plan<'a>(
         let dispatched_at = tokio::time::Instant::now();
         let deadline =
             request_timeout.map(|timeout| RequestDeadline::after_from(dispatched_at, timeout));
+        // The decode form of a grid-bearing request on a disaggregated pair
+        // turns on the model's answer the snapshot keeps.
+        let language_model_reads_grids = ctx.routing.language_model_reads_grids;
         let dispatch = async {
             match execution_plan {
                 ExecutionPlan::Single(request) => match request {
@@ -451,6 +454,7 @@ pub(crate) fn execute_plan<'a>(
                         room_residue,
                         None,
                         behind.take(),
+                        language_model_reads_grids,
                     ))
                     .await
                 }
@@ -470,6 +474,7 @@ pub(crate) fn execute_plan<'a>(
                         prefill,
                         ledger,
                         behind.take(),
+                        language_model_reads_grids,
                     ))
                     .await
                     .map_err(|mut response| {
@@ -492,6 +497,7 @@ pub(crate) fn execute_plan<'a>(
                         ledger,
                         dispatched_at.into_std(),
                         &mut behind,
+                        language_model_reads_grids,
                     )
                     .await
                 }
@@ -898,13 +904,16 @@ fn pd_runtime_unsupported(runtime_type: &RuntimeType) -> Response {
 /// other, the sequential plan's, by the check that builds no plan
 /// ([`SequentialPlan::refuses`]). A batch asks this ahead of its words of
 /// its two sends, where those words say anything
-/// ([`PrefillAhead::ahead_of_its_send`]).
+/// ([`PrefillAhead::ahead_of_its_send`]). `language_model_reads_grids` is
+/// the model's answer the routing snapshot keeps, as the dispatch asks it
+/// ([`execute_pd_dispatch`]).
 // Out of line: a batch of a classic answer never comes here, and its
 // dispatch keeps the body it had.
 #[inline(never)]
 fn pd_batch_refusal(
     requests: &[ProtoGenerateRequest],
     workers: &WorkerSelection,
+    language_model_reads_grids: bool,
 ) -> Result<(), Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         return Err(pd_selection_missing());
@@ -913,9 +922,9 @@ fn pd_batch_refusal(
         return Err(pd_runtime_unsupported(runtime_type));
     };
     match protocol.dispatch {
-        PdDispatch::Sequential => requests
-            .iter()
-            .try_for_each(|request| SequentialPlan::refuses(request, workers)),
+        PdDispatch::Sequential => requests.iter().try_for_each(|request| {
+            SequentialPlan::refuses(request, workers, language_model_reads_grids)
+        }),
         PdDispatch::Parallel => Ok(()),
     }
 }
@@ -951,6 +960,9 @@ fn batch_decode_sent(behind: &mut Option<DecodeBehindPrefill<'_>>, workers: &Wor
 /// `prefill` is the prefill's load as the dispatch was handed it
 /// ([`PrefillSend`]): one request's send is said here, where the shape is
 /// dispatched.
+/// `language_model_reads_grids` is the model's answer the routing snapshot
+/// keeps (`RoutingSnapshot::language_model_reads_grids`), read where the
+/// sequential shape's plan is decided.
 #[expect(clippy::too_many_arguments)]
 async fn execute_pd_dispatch(
     proto_request: ProtoGenerateRequest,
@@ -962,6 +974,7 @@ async fn execute_pd_dispatch(
     room_residue: Option<RoomResidue>,
     encode: Option<EncodeWatch>,
     behind: Option<DecodeBehindPrefill<'_>>,
+    language_model_reads_grids: bool,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         return Err(pd_selection_missing());
@@ -985,7 +998,7 @@ async fn execute_pd_dispatch(
     // refusals ahead of it ([`pd_batch_refusal`]), so none comes behind it.
     let result = match protocol.dispatch {
         PdDispatch::Sequential => {
-            let plan = SequentialPlan::decide(&proto_request, workers)?;
+            let plan = SequentialPlan::decide(&proto_request, workers, language_model_reads_grids)?;
             execute_sequential_pd(
                 plan,
                 proto_request,
@@ -1163,6 +1176,8 @@ async fn execute_fanout_pd(
 /// the prefill side's wait (see [`launch_encode_dispatch`]) on this attempt
 /// and on a replay (see [`prepare_epd_attempt`]). `encode_watch` is the
 /// dispatch context's slot for the watch on that dispatch.
+/// `language_model_reads_grids` is the model's answer the routing snapshot
+/// keeps, for the pair's decode side ([`execute_pd_dispatch`]).
 #[expect(clippy::too_many_arguments)]
 async fn execute_epd_dispatch(
     mut proto_request: ProtoGenerateRequest,
@@ -1174,6 +1189,7 @@ async fn execute_epd_dispatch(
     prefill: PrefillAhead,
     ledger: &AttemptLedger,
     behind: Option<DecodeBehindPrefill<'_>>,
+    language_model_reads_grids: bool,
 ) -> Result<ExecutionResult, Response> {
     let mut cleanup = prepare_epd_attempt(&mut proto_request, encode, encode_watch).await?;
     // An EPD request's room is left as minted: no sticky prefill rank.
@@ -1187,6 +1203,7 @@ async fn execute_epd_dispatch(
         None,
         encode_watch.clone(),
         behind,
+        language_model_reads_grids,
     )
     .await;
     if result.is_ok() {
@@ -1351,7 +1368,9 @@ async fn encode_dispatch_failed(watch: Option<&mut EncodeWatch>) -> String {
 /// `behind` is the plan's slot for what it holds of a pair's decode guards
 /// made ahead of their send (see [`DecodeBehindPrefill`]): a batch that
 /// goes out says that send from it. The slot is empty for every other
-/// batch.
+/// batch. `language_model_reads_grids` is the model's answer the routing
+/// snapshot keeps, for every pair sub-request's decode side
+/// ([`execute_pd_dispatch`]).
 #[expect(clippy::too_many_arguments)]
 async fn execute_batch_dispatch(
     kind: ExecutionPlanKind,
@@ -1363,6 +1382,7 @@ async fn execute_batch_dispatch(
     ledger: &AttemptLedger,
     dispatched_at: Instant,
     behind: &mut Option<DecodeBehindPrefill<'_>>,
+    language_model_reads_grids: bool,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     // The batch's prefills go out with the dispatches below: the send is
@@ -1383,7 +1403,7 @@ async fn execute_batch_dispatch(
             // carried to another place on a classic answer's path too.
             if let Some(load) = prefill_guard.as_ref() {
                 load.ahead_of_its_send(|| -> Result<(), Response> {
-                    pd_batch_refusal(&requests, workers)?;
+                    pd_batch_refusal(&requests, workers, language_model_reads_grids)?;
                     batch_decode_sent(behind, workers);
                     Ok(())
                 })?;
@@ -1428,6 +1448,7 @@ async fn execute_batch_dispatch(
                             None, // the room as minted: no sticky prefill rank
                             None, // no encode dispatch on this path
                             None, // the decode's send is said: by its guard, or by the batch above
+                            language_model_reads_grids,
                         )
                         .await
                     }
@@ -6017,9 +6038,9 @@ pub(crate) mod tests {
             decode: side("grpc://decode:30000", WorkerType::Decode, Some("false")).into(),
             runtime_type: RuntimeType::Vllm,
         };
-        assert_eq!(code(pd_batch_refusal(&[text(), text()], &pair)), None);
+        assert_eq!(code(pd_batch_refusal(&[text(), text()], &pair, true)), None);
         assert_eq!(
-            code(pd_batch_refusal(&[text(), references()], &pair)).as_deref(),
+            code(pd_batch_refusal(&[text(), references()], &pair, true)).as_deref(),
             Some("pd_decode_language_model_only_media_refs"),
             "the second sub-request alone is refused"
         );
@@ -6028,7 +6049,7 @@ pub(crate) mod tests {
             worker: side("grpc://single:30000", WorkerType::Regular, None).into(),
         };
         assert_eq!(
-            code(pd_batch_refusal(&[text()], &single)).as_deref(),
+            code(pd_batch_refusal(&[text()], &single, true)).as_deref(),
             Some("pd_mode_requires_disaggregated_workers")
         );
     }

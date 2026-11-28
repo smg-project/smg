@@ -166,6 +166,108 @@ fn a_reset_counts_under_its_reason() {
     });
 }
 
+/// A recorder that asks two things at each counter it is asked for:
+/// whether the adapter's records are free, and whether its row still
+/// holds a block.
+struct AsksAtItsCounter<'a> {
+    sink: &'a KvAdapter,
+    row: WorkerId,
+    asked: AtomicU32,
+    held: AtomicU32,
+    ahead: AtomicU32,
+}
+
+impl metrics::Recorder for AsksAtItsCounter<'_> {
+    fn describe_counter(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_gauge(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn describe_histogram(
+        &self,
+        _: metrics::KeyName,
+        _: Option<metrics::Unit>,
+        _: metrics::SharedString,
+    ) {
+    }
+
+    fn register_counter(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Counter {
+        self.asked.fetch_add(1, Ordering::Relaxed);
+        if self.sink.feeds.try_lock().is_none() {
+            self.held.fetch_add(1, Ordering::Relaxed);
+        }
+        if self.sink.tables.indexed_blocks(self.row, 0) != 0 {
+            self.ahead.fetch_add(1, Ordering::Relaxed);
+        }
+        metrics::Counter::noop()
+    }
+
+    fn register_gauge(&self, _: &metrics::Key, _: &metrics::Metadata<'_>) -> metrics::Gauge {
+        metrics::Gauge::noop()
+    }
+
+    fn register_histogram(
+        &self,
+        _: &metrics::Key,
+        _: &metrics::Metadata<'_>,
+    ) -> metrics::Histogram {
+        metrics::Histogram::noop()
+    }
+}
+
+/// A reset writes its series last: behind the reset, with the adapter's
+/// records let go. A recorder is the host's. A removal asks for the
+/// records under the rows' lock, so a recorder that called the adapter
+/// under the records could stop that removal. And a feed could open and
+/// store inside the call of a recorder that ran ahead of the reset,
+/// which then cleared that store. A row with no record writes no
+/// series, whatever record another row has.
+#[test]
+fn a_reset_writes_its_series_last_with_the_records_let_go() {
+    let f = Fixture::single(Some(BLOCK_SIZE));
+    let (_host, sink) = opened(&f);
+    assert_eq!(
+        sink.admit(f.row, 0, facts(1), &wide(1, 32)),
+        BatchOutcome::Applied
+    );
+    // A second row, with no feed open.
+    let other = f.store.upsert(WorkerFacts {
+        key: "http://b:8000".into(),
+        engine: "http://b:8000".into(),
+        incarnation: 1,
+        models: vec![MODEL.into()],
+        dp_size: 1,
+        ..WorkerFacts::default()
+    });
+    let recorder = AsksAtItsCounter {
+        sink: &sink,
+        row: f.row,
+        asked: AtomicU32::new(0),
+        held: AtomicU32::new(0),
+        ahead: AtomicU32::new(0),
+    };
+    let read = |count: &AtomicU32| count.load(Ordering::Relaxed);
+    metrics::with_local_recorder(&recorder, || {
+        sink.resync(other.id(), None, ResyncReason::DataLoss);
+        assert_eq!(read(&recorder.asked), 0, "no record, no series");
+        sink.resync(f.row, None, ResyncReason::DataLoss);
+    });
+    assert_eq!(read(&recorder.asked), 1, "one series");
+    assert_eq!(read(&recorder.held), 0, "the records are free");
+    assert_eq!(read(&recorder.ahead), 0, "the row is reset");
+}
+
 /// A store whose parent the row does not hold is placed as a chain
 /// of its own and counted for the worker: the rules' own count
 /// reaches a series.
@@ -292,8 +394,29 @@ fn blocks_declined_at_a_size_cap_are_counted_for_the_worker() {
     });
 }
 
+/// A batch that holds a released state names no series. It took its
+/// row's state ahead of its stream's removal and comes behind it: it is
+/// passed over ahead of the row's cursor, which stays unheard.
+#[test]
+fn a_batch_that_holds_a_released_state_names_no_series() {
+    let series = Series::new();
+    metrics::with_local_recorder(&series.recorder, || {
+        let f = Fixture::single(Some(BLOCK_SIZE));
+        let (_host, sink) = opened(&f);
+        let feed = sink.feeds.lock().get(&f.row).cloned();
+        let feed = feed.expect("the stream's feed");
+        let state = sink.applied(f.row, (f.row, 0)).expect("the row's state");
+        sink.removed(f.row);
+        let late = wide(1, 32);
+        let outcome = sink.admit_under(f.row, (f.row, 0), &feed, state, facts(1), &late);
+        assert_eq!(outcome, BatchOutcome::Skipped);
+        assert!(!series.names_the_worker());
+        assert_eq!(f.tables.cursor(f.row, 0), None);
+    });
+}
+
 /// A stream that left names no series: its batch is passed over and
-/// counted nowhere, and its reset counts under no worker.
+/// counted nowhere, and a reset it begins then counts under no worker.
 #[test]
 fn a_stream_that_left_names_no_series() {
     let series = Series::new();

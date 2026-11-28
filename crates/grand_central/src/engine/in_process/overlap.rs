@@ -10,7 +10,7 @@
 //! record of the prefixes it sent. A pair decision reads a column a side in
 //! the rows' place ([`AffinityFacts`]): the engine's own pair decision fills
 //! one from the same data and writes the record behind the pair's pick
-//! (`column`, `record_by_column`).
+//! (`decide_by_columns`).
 //!
 //! Behind a single decision the pick states what its first target holds of
 //! the request ([`Overlap`]): the worker's entry of the rows the decision was
@@ -755,7 +755,7 @@ struct RecordRead {
 /// ([`column()`]). The write behind the pick made over that column stands on
 /// it ([`record_by_column`]).
 #[derive(Clone, Copy, Debug)]
-pub(super) struct PrefixRead {
+struct PrefixRead {
     read: RecordRead,
 }
 
@@ -1663,12 +1663,13 @@ impl Table {
     /// are one a boundary of the view the request reaches, the fold through
     /// the boundary's last whole block ([`Self::depths`]), as a
     /// consistent-hash stage keys a prefix: the heads the classic policy
-    /// keys its placement map by. A boundary counts in whole blocks: a
-    /// request reaches it with the blocks under it, where the classic
-    /// policy asks for its every token. A request with fewer whole blocks
-    /// than the first boundary's has no key, and neither has one hashed by
+    /// keys its placement map by. A boundary counts in whole blocks, where
+    /// the classic policy asks for its every token. A request of token ids
+    /// reaches a boundary that holds a whole block where it carries a hash
+    /// for each block under it. A request that carries fewer hashes than
+    /// the first depth counts has no key, and neither has one hashed by
     /// windows of its text, since such an index keys token ids: the record
-    /// names it nobody and its pick writes nothing.
+    /// names it nobody and takes no placement for it.
     fn fold_keys(&self, keys: &mut Vec<u64>, facts: &RequestFacts<'_>) {
         let hashes = facts.block_hashes;
         let Some(boundaries) = self.boundaries.as_deref() else {
@@ -2473,7 +2474,7 @@ pub(super) fn decide_behind<'p, 'h>(
 
 /// One list's column for a decision that reads a column in the rows' place:
 /// each side of the engine's pair decision, by the side's own list and
-/// `phase`.
+/// `phase` ([`decide_by_columns`]).
 ///
 /// `column` is emptied and filled with one entry a worker of `workers`, in
 /// the list's order: the worker's age, what the model's index holds for it
@@ -2500,7 +2501,7 @@ pub(super) fn decide_behind<'p, 'h>(
     clippy::too_many_arguments,
     reason = "the list as `decide` takes it, the phase a pair's request does not carry, and the column"
 )]
-pub(super) fn column(
+fn column(
     affinity: &Affinity,
     pool: &PoolAffinity,
     spec: &AppliedSpec,
@@ -2525,10 +2526,114 @@ pub(super) fn column(
             table.fill(facts, table.side_alone, buffers, column)
         })
     });
-    // A place whose stages read no affinity keeps no table: every worker
-    // reads as holding nothing, just admitted.
+    // The table of a place whose stages read no affinity holds an empty
+    // column: every worker reads as holding nothing, just admitted.
     column.resize(workers.len(), AffinityFacts::default());
     read
+}
+
+/// One list of a pair, as its side's column is read from it: what is kept
+/// beside the list, its workers and their ids, in one order.
+#[derive(Clone, Copy)]
+pub(super) struct SideList<'a> {
+    pub(super) pool: &'a PoolAffinity,
+    pub(super) workers: &'a [Arc<dyn Worker>],
+    pub(super) ids: &'a [WorkerId],
+}
+
+/// A pair's decision over its two lists' columns of who holds the prompt,
+/// the prefills' first, and what each side's record of sent prefixes keeps
+/// of where the prompt went. A pair's decision over its columns and an
+/// encode request's are made here, so the two read and write one way: a
+/// pair that its two draws decide reads no column and is made ahead of
+/// this. `prefill` is `None` for the decode asked again, which reads no
+/// column of the prefills. Each list is handed as a closure that answers
+/// the same list at each call: it is asked behind the test of its side's
+/// phase and again at its record's write. So a side whose phase reads no
+/// affinity names no list, and no list is kept across the decision. As
+/// values the two lists cost such a decision more instructions, counted
+/// with Callgrind.
+///
+/// Each side whose phase reads affinity is handed its own list's column,
+/// read at the side's phase and by the side's own profile's word of the
+/// record ([`column()`]), which the list's table read. A side whose phase
+/// reads none pays one test and keeps an empty column. `decide` is the
+/// decision over the two columns.
+///
+/// `turn` is what the caller turns in the decision where it stands, by
+/// the prefills' column and ahead of each side's word and write: a pair
+/// states what its prefill holds and names a held decode again. It is
+/// handed beside the decision so that the decision is built where it is
+/// read here: turned inside the closure that made it, a pair's decision
+/// was copied once more on its way out.
+///
+/// Behind its pick each side's record keeps where the prompt went
+/// ([`record_by_column`]), where that side's profile is told of the side
+/// ([`lease_events::stages_hear`]): the first target the request's caller
+/// sends to (`sends_to`, [`sent_to`]), and nobody where it sends to none.
+/// Each side asks its own word: a sessions rule that keeps what it places
+/// from the profile may have placed one side alone and left the other to
+/// its stages, and the side it placed writes nothing. The prefill's worker
+/// is written at the prefill phase and the decode's at the decode phase,
+/// each where its side's fill read the record. A pair neither side of
+/// which read its record asks its caller nothing of the pick's targets:
+/// `sends_to` is not called.
+// In line at its two callers: as a call the two fills cost a pair's
+// decision whose sides read no affinity 25 instructions, counted with
+// Callgrind.
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "what is kept, the request's facts, the two lists and their columns, the target its caller takes, the decision and what its caller turns in it"
+)]
+pub(super) fn decide_by_columns<'a>(
+    affinity: &Affinity,
+    spec: &AppliedSpec,
+    facts: &RequestFacts<'_>,
+    prefill: Option<impl Fn() -> SideList<'a>>,
+    decode: impl Fn() -> SideList<'a>,
+    columns: &mut [Vec<AffinityFacts>; 2],
+    sends_to: impl Fn(&Target) -> bool,
+    decide: impl FnOnce(&[AffinityFacts], &[AffinityFacts]) -> Decision,
+    turn: impl FnOnce(&mut Decision, &[AffinityFacts]),
+) -> Decision {
+    let reads = |phase| spec.engine().needs_for_phase(phase).affinity;
+    let fill = |list: SideList<'_>, phase, column_of: &mut Vec<AffinityFacts>| {
+        let SideList { pool, workers, ids } = list;
+        column(affinity, pool, spec, workers, ids, phase, facts, column_of)
+    };
+    let [prefill_column, decode_column] = columns;
+    prefill_column.clear();
+    decode_column.clear();
+    let prefill_read = match &prefill {
+        Some(list) if reads(Phase::Prefill) => fill(list(), Phase::Prefill, prefill_column),
+        _ => None,
+    };
+    let decode_read = if reads(Phase::Decode) {
+        fill(decode(), Phase::Decode, decode_column)
+    } else {
+        None
+    };
+    let mut decision = decide(prefill_column, decode_column);
+    turn(&mut decision, prefill_column);
+    let told = |side| lease_events::stages_hear(&decision, side);
+    let prefill_read = prefill_read.filter(|_| told(Side::Prefill));
+    let decode_read = decode_read.filter(|_| told(Side::Decode));
+    if prefill_read.is_none() && decode_read.is_none() {
+        return decision;
+    }
+    let Some(sent) = sent_to(&decision, sends_to) else {
+        return decision;
+    };
+    if let (Some(read), Some(list)) = (prefill_read, &prefill) {
+        let (pool, id) = (list().pool, sent.id);
+        record_by_column(pool, Phase::Prefill, facts, read, prefill_column, id);
+    }
+    if let (Some(read), Some(pair)) = (decode_read, sent.pair) {
+        let (pool, id) = (decode().pool, pair.decode_id);
+        record_by_column(pool, Phase::Decode, facts, read, decode_column, id);
+    }
+    decision
 }
 
 /// States in a decision's pick what its first target holds of the request
@@ -2591,7 +2696,7 @@ pub(super) fn state(decision: &mut Decision, feed: Feed<'_>, facts: &RequestFact
 /// tree ([`sent_address`]), the hand-over of a pin the keyed entry followed
 /// to this lookup, a pair's two writes behind its pick, and the statement
 /// of what a pick's first target holds ([`state`]). A pair's two writes ask
-/// it a side at a time, each of its own side (`pair::record_sides`), and
+/// it a side at a time, each of its own side ([`decide_by_columns`]), and
 /// then name the target the request goes to ([`sent_to`]). A pair's first
 /// pick states what its prefill holds by the pick's own word, which is the
 /// prefill side's, whatever placed its decode: its first target is its
@@ -2627,7 +2732,7 @@ pub(super) fn told_target(decision: &Decision) -> Option<&Target> {
 /// writes nothing. A worker the column holds no entry for is written as no
 /// repeat. The fill gives every worker of its list an entry, so no decision
 /// of the engine hands such a column.
-pub(super) fn record_by_column(
+fn record_by_column(
     pool: &PoolAffinity,
     phase: Phase,
     facts: &RequestFacts<'_>,
@@ -2715,9 +2820,9 @@ pub(super) fn sent_target(
 /// The first target of a decision's pick that the request's caller sends
 /// to (`sends_to`), asked best first, whatever the sessions rule says of
 /// the pick: a pair's two writes ask the rule's word of each side first
-/// (`pair::record_sides`). `None` where the decision picked nobody or the
+/// ([`decide_by_columns`]). `None` where the decision picked nobody or the
 /// caller sends to none of the pick's targets.
-pub(super) fn sent_to(decision: &Decision, sends_to: impl Fn(&Target) -> bool) -> Option<&Target> {
+fn sent_to(decision: &Decision, sends_to: impl Fn(&Target) -> bool) -> Option<&Target> {
     let mut targets = decision.pick()?.targets.iter();
     targets.find(|target| sends_to(target))
 }

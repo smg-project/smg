@@ -27,7 +27,7 @@ use crate::{
         replication::{Entry, Event},
     },
     stages::registry,
-    store::{WorkerFacts, WorkerStatus, WorkersStore},
+    store::{LeasesStore, WorkerFacts, WorkerStatus, WorkersStore},
     worker_host::tests::lay_standing,
 };
 
@@ -44,7 +44,7 @@ impl Lag {
     /// Whether this replica is synced at `now`: its last frame at the head
     /// is younger than the bound.
     fn synced(&self, now: Instant) -> bool {
-        self.read(now).is_some_and(|(_, lapse)| lapse.is_some())
+        self.read(now).is_some_and(|(_, lapse)| lapse.synced())
     }
 
     /// The bound [`Lag::synced`] reads under.

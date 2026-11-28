@@ -22,7 +22,10 @@ fn media_plan_detects_image() {
         name: None,
     }];
 
-    assert_eq!(media_plan_chat(&messages).modalities(), &[Modality::Image]);
+    assert_eq!(
+        media_plan_chat(&messages, &Map::new()).modalities(),
+        &[Modality::Image]
+    );
 }
 
 #[test]
@@ -39,7 +42,10 @@ fn media_plan_detects_video() {
         name: None,
     }];
 
-    assert_eq!(media_plan_chat(&messages).modalities(), &[Modality::Video]);
+    assert_eq!(
+        media_plan_chat(&messages, &Map::new()).modalities(),
+        &[Modality::Video]
+    );
 }
 
 #[test]
@@ -54,7 +60,10 @@ fn media_plan_detects_audio() {
         name: None,
     }];
 
-    assert_eq!(media_plan_chat(&messages).modalities(), &[Modality::Audio]);
+    assert_eq!(
+        media_plan_chat(&messages, &Map::new()).modalities(),
+        &[Modality::Audio]
+    );
 }
 
 #[test]
@@ -65,7 +74,7 @@ fn media_plan_is_empty_for_string_text() {
         name: None,
     }];
 
-    assert!(media_plan_chat(&messages).is_empty());
+    assert!(media_plan_chat(&messages, &Map::new()).is_empty());
 }
 
 #[test]
@@ -78,7 +87,7 @@ fn media_plan_is_empty_for_text_parts() {
         name: None,
     }];
 
-    assert!(media_plan_chat(&messages).is_empty());
+    assert!(media_plan_chat(&messages, &Map::new()).is_empty());
 }
 
 #[test]
@@ -179,7 +188,10 @@ fn extracts_inline_audio_as_a_shared_base64_source() {
     }];
     let request_data = request_text(&messages);
 
-    assert_eq!(media_plan_chat(&messages).modalities(), &[Modality::Audio]);
+    assert_eq!(
+        media_plan_chat(&messages, &Map::new()).modalities(),
+        &[Modality::Audio]
+    );
 
     let parts = extract_media_parts(&messages);
     assert_eq!(parts.len(), 1);
@@ -231,7 +243,7 @@ fn the_plan_shares_the_request_image_text() {
     }];
     let request_url = request_text(&messages);
 
-    let plan = media_plan_chat(&messages);
+    let plan = media_plan_chat(&messages, &Map::new());
     match &plan.parts()[0] {
         MediaContentPart::ImageUrl { url, .. } => assert!(
             std::ptr::eq(url.as_ptr(), request_url),
@@ -416,4 +428,46 @@ fn a_media_type_with_a_comma_keeps_the_data_url_form() {
         }
         _ => panic!("expected the data URL form"),
     }
+}
+
+/// A plan that holds a video part carries the rate the request states,
+/// beside its parts and not in them: the parts stay as written, so the
+/// request is routed as it is without the key. A value that is no rate
+/// in range is no rate, and a plan without a video part reads no key.
+#[test]
+fn a_requests_video_rate_is_carried_beside_the_parts() {
+    let plan = |part: Value, media_io_kwargs: Value| {
+        let request: openai_protocol::chat::ChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
+                "model": "checkpoint",
+                "media_io_kwargs": media_io_kwargs,
+                "messages": [{"role": "user", "content": [part]}]
+            }))
+            .unwrap();
+        media_plan_chat(&request.messages, &request.other)
+    };
+    let video = || serde_json::json!({"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}});
+    let image =
+        serde_json::json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}});
+
+    let stated = plan(video(), serde_json::json!({"video": {"fps": 2}}));
+    assert_eq!(stated.request_video_fps(), Some(2.0));
+    assert!(stated.is_forwardable(), "the rate is no hint of a part");
+    for no_rate in [
+        serde_json::json!({"video": {"fps": 9}}),
+        serde_json::json!({"video": {"fps": "2"}}),
+        serde_json::json!({"video": {"num_frames": 8}}),
+        serde_json::json!({"image": {"fps": 2}}),
+        serde_json::json!("fps"),
+    ] {
+        assert_eq!(
+            plan(video(), no_rate.clone()).request_video_fps(),
+            None,
+            "{no_rate}"
+        );
+    }
+    assert_eq!(
+        plan(image, serde_json::json!({"video": {"fps": 2}})).request_video_fps(),
+        None
+    );
 }

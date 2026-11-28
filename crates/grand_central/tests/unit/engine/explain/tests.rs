@@ -108,6 +108,42 @@ fn a_trace_for_a_profile_outside_its_binding_names_the_plan_alone() {
 }
 
 #[test]
+fn a_trace_for_a_bindings_profile_names_it_beside_a_decode_profile() {
+    let engine = naming_engine(7);
+    for (binding, plan) in [(1, "pd-pair"), (2, "epd")] {
+        let names = record(7, Some(binding), 1)
+            .names(&engine)
+            .expect("a binding");
+        assert_eq!(names.plan, plan);
+        assert_eq!(names.profile, "prefill");
+    }
+}
+
+#[test]
+fn a_trace_for_a_position_past_the_profiles_names_the_plan_alone() {
+    let plan_alone = |plan| DecisionNames {
+        plan,
+        ..DecisionNames::default()
+    };
+    // Index 4, one past the end of four profiles: the binding does not
+    // name it.
+    let engine = naming_engine(7);
+    let names = record(7, Some(2), 4).names(&engine);
+    assert_eq!(names, Some(plan_alone("epd")));
+
+    // Index 1, one past the end of one profile, and the binding names it:
+    // an engine built by hand, its profile with a stage of each kind.
+    let mut only = Profile::of("only".to_owned(), Box::new(Best));
+    only.filters.push(Box::new(Healthy));
+    only.scorers
+        .push(WeightedScorer::of(Box::new(LeastRequests), 1.0));
+    let binding = Binding::of("*".to_owned(), 1);
+    let engine = Engine::new(vec![only], vec![binding], 7, Needs::default());
+    let names = record(7, Some(0), 1).names(&engine);
+    assert_eq!(names, Some(plan_alone("single")));
+}
+
+#[test]
 fn a_record_with_no_binding_has_no_names() {
     let engine = naming_engine(7);
     assert_eq!(record(7, None, 1).names(&engine), None);

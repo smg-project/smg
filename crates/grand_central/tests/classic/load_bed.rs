@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use smg_grand_central::{
     engine::WireModes,
-    store::{MemoryStore, Overload, Registrant, WorkerFacts, WorkersStore},
+    store::{MemoryStore, Overload, Registrant, WorkerFacts},
     worker_host::{load_monitor, Members, Objects},
 };
 use smg_worker::{
@@ -227,7 +227,7 @@ impl Bed {
             };
             let written = objects.upsert(&store, facts, Registrant::Control);
             let id = written.ok_or("a write the store did not take")?.id();
-            let stored = WorkersStore::get(&store, id).ok_or("no row behind its write")?;
+            let stored = objects.read_row(id).ok_or("no row behind its write")?;
             objects.connect_row(&store, id, stored.revision);
         }
         store.publish_now();

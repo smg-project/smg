@@ -355,6 +355,8 @@ fn refusal(failure: EpdSelectionFailure) -> Answer {
                 PlacementFailure::NoCompatiblePair { .. } => "no_compatible_pair",
                 PlacementFailure::PrefillAtCapacity => "at_capacity",
                 PlacementFailure::NoPlanBound(_) => "no_plan_bound",
+                PlacementFailure::DecisionFailed(_) => "decision_failed",
+                PlacementFailure::ShedUnder(_) => "shed_under",
             }),
         },
     }
@@ -588,6 +590,7 @@ impl Bed {
                     media_refs: request.references,
                     vision: request.images,
                     pipeline: PipelinePin::Any,
+                    refs_stripped_decode: false,
                 },
                 decode_vision: request.decode_images,
                 image_fanout: request.fanout,

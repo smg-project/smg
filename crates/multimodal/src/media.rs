@@ -5265,6 +5265,7 @@ pub(crate) fn decode_frame_bytes(
                         .with_guessed_format()
                         .map_err(MediaConnectorError::Io)?;
                     let is_png = reader.format() == Some(image::ImageFormat::Png);
+                    let is_bmp = reader.format() == Some(image::ImageFormat::Bmp);
                     let mut decoder = reader.into_decoder()?;
                     // `ImageReader::decode` reserves the decoded buffer against the
                     // crate's allocation limit (512 MiB by default) before it
@@ -5278,10 +5279,24 @@ pub(crate) fn decode_frame_bytes(
                     let orientation = decoder
                         .orientation()
                         .unwrap_or(image::metadata::Orientation::NoTransforms);
-                    let image = if is_png {
-                        png_into_pool(decoder)?
+                    // A bitmap of the plain kind is read here, behind the
+                    // decoder's own reading of the header and the reservation
+                    // above; any other one stays with the decoder.
+                    let plain_bmp = if is_bmp {
+                        plain_bmp_into_pool(bytes, decoder.dimensions())
                     } else {
-                        image::DynamicImage::from_decoder(decoder)?
+                        None
+                    };
+                    let image = if is_png {
+                        // The PNG decoder writes every byte of the image
+                        // it reports.
+                        eight_bit_into_pool(decoder, false)?
+                    } else if let Some(image) = plain_bmp {
+                        image
+                    } else {
+                        // No other decoder is held to that: its buffer
+                        // arrives zeroed, as the crate's own vector does.
+                        eight_bit_into_pool(decoder, true)?
                     };
                     oriented(image, orientation)
                 }
@@ -5299,14 +5314,19 @@ pub(crate) fn decode_frame_bytes(
     Ok(image)
 }
 
-/// What `DynamicImage::from_decoder` returns for a PNG of an eight-bit
+/// What `DynamicImage::from_decoder` returns for an image of an eight-bit
 /// layout, with the pixels in a buffer of the pool the JPEG and WebP decoders
 /// take theirs from. The crate's own vector is a zeroed allocation of the
-/// image's size, which is fresh pages on every request; the PNG decoder
-/// writes every byte of the image it reports, so the buffer need not arrive
-/// zeroed. A sixteen-bit layout, which the pool does not take back, keeps the
-/// crate's path.
-fn png_into_pool(decoder: impl image::ImageDecoder) -> image::ImageResult<image::DynamicImage> {
+/// image's size, which is fresh pages on every request. With `zeroed` the
+/// pooled buffer arrives zeroed too, so a byte the decoder leaves alone
+/// reads as it does in the crate's vector; without it the buffer holds a
+/// previous request's bytes, for a decoder that writes every byte of the
+/// image it reports. A sixteen-bit layout, which the pool does not take
+/// back, keeps the crate's path.
+fn eight_bit_into_pool(
+    decoder: impl image::ImageDecoder,
+    zeroed: bool,
+) -> image::ImageResult<image::DynamicImage> {
     type Layout = fn(u32, u32, Vec<u8>) -> Option<image::DynamicImage>;
     let layout: Layout = match decoder.color_type() {
         image::ColorType::Rgb8 => |width, height, pixels| {
@@ -5328,7 +5348,11 @@ fn png_into_pool(decoder: impl image::ImageDecoder) -> image::ImageResult<image:
         return image::DynamicImage::from_decoder(decoder);
     };
     let (width, height) = decoder.dimensions();
-    let mut pixels = buffer_pool::take(len);
+    let mut pixels = if zeroed {
+        buffer_pool::take_zeroed(len)
+    } else {
+        buffer_pool::take(len)
+    };
     if let Err(error) = decoder.read_image(&mut pixels) {
         // A refused decode hands its buffer back; the next take is warm.
         buffer_pool::recycle(pixels);
@@ -5339,6 +5363,86 @@ fn png_into_pool(decoder: impl image::ImageDecoder) -> image::ImageResult<image:
             image::error::ParameterErrorKind::DimensionMismatch,
         ))
     })
+}
+
+/// What `DynamicImage::from_decoder` returns for a bitmap of the plain kind,
+/// with the pixels in a buffer of the pool: an info header (of 40, 52, 56,
+/// 108 or 124 bytes, which the `image` crate reads alike), one plane, 24 bits
+/// a pixel, no compression, and every row with its padding inside the file.
+/// A row is stored blue first and padded to four bytes, the bottom row first
+/// unless the height is negative; each goes to its place in one pass, where
+/// the crate's decoder makes a read call and a reverse for every pixel into
+/// a fresh zeroed vector.
+///
+/// `dimensions` is what the crate's decoder read from the same header, and
+/// the caller has reserved the image against the allocation limit. `None`
+/// for any other bitmap (a palette, a run-length or bit-field compression,
+/// 16 or 32 bits a pixel, the 12-byte header), for a header that does not
+/// give `dimensions` and for a file short of its rows: the crate's decoder
+/// then reads or refuses it as before.
+fn plain_bmp_into_pool(bytes: &[u8], dimensions: (u32, u32)) -> Option<image::DynamicImage> {
+    // The file header (14 bytes) and the first 40 bytes of the info header,
+    // the part every size of it shares.
+    let header = bytes.get(..54)?;
+    let word = |at: usize| -> Option<[u8; 4]> { header.get(at..at + 4)?.try_into().ok() };
+    let plain = header.starts_with(b"BM")
+        && matches!(u32::from_le_bytes(word(14)?), 40 | 52 | 56 | 108 | 124)
+        // One plane and 24 bits a pixel, then no compression.
+        && word(26)? == [1, 0, 24, 0]
+        && word(30)? == [0; 4];
+    if !plain {
+        return None;
+    }
+    let (width, height) = dimensions;
+    let stored_height = i32::from_le_bytes(word(22)?);
+    let as_declared = u32::try_from(i32::from_le_bytes(word(18)?)) == Ok(width)
+        && stored_height.unsigned_abs() == height;
+    if !as_declared || width == 0 || height == 0 {
+        return None;
+    }
+    let row_len = usize::try_from(width).ok()?.checked_mul(3)?;
+    let rows = usize::try_from(height).ok()?;
+    // A stored row is padded to a multiple of four bytes.
+    let stride = row_len.checked_add(3)? & !3;
+    let offset = usize::try_from(u32::from_le_bytes(word(10)?)).ok()?;
+    let stored = bytes.get(offset..)?.get(..stride.checked_mul(rows)?)?;
+    let mut pixels = buffer_pool::take(row_len.checked_mul(rows)?);
+    bgr_rows_into_rgb(stored, stride, stored_height < 0, row_len, &mut pixels);
+    image::RgbImage::from_raw(width, height, pixels).map(image::DynamicImage::ImageRgb8)
+}
+
+/// The stored rows of a 24-bit bitmap (`stride` bytes each, blue first, the
+/// top row first when `top_down`) into `pixels` (`row_len` bytes a row, red
+/// first, the top row first). The pixel loop is a fixed permutation of three
+/// bytes, which the compiler turns into byte shuffles where the target has
+/// them: `multiversion` compiles the function with AVX2 and without and
+/// selects the clone at the first call.
+#[cfg_attr(
+    target_arch = "x86_64",
+    multiversion::multiversion(targets("x86_64+avx2"))
+)]
+fn bgr_rows_into_rgb(
+    stored: &[u8],
+    stride: usize,
+    top_down: bool,
+    row_len: usize,
+    pixels: &mut [u8],
+) {
+    let rows = pixels.len() / row_len;
+    for (y, row) in pixels.chunks_exact_mut(row_len).enumerate() {
+        let from_top = if top_down { y } else { rows - 1 - y };
+        let Some(stored) = stored.chunks_exact(stride).nth(from_top) else {
+            return;
+        };
+        for (pixel, &[blue, green, red]) in row
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .zip(stored.as_chunks::<3>().0)
+        {
+            *pixel = [red, green, blue];
+        }
+    }
 }
 
 /// The four bytes that open an icon file (reserved 0, type 1), the magic the
@@ -5577,13 +5681,20 @@ static OVER_WHITE: [[u8; 256]; 256] = {
 };
 
 /// Composite straight-alpha RGBA over opaque white: per channel one read of
-/// [`OVER_WHITE`], in the row the pixel's alpha names. The output is a buffer
-/// of the pool, and every pixel of the image writes its three bytes.
+/// [`OVER_WHITE`], in the row the pixel's alpha names. The row of a full
+/// alpha returns the value it is given, so the leading blocks in which every
+/// pixel is opaque keep their stored colour without those reads, and the
+/// table takes the image from the first block that holds a transparent pixel.
+/// The output is a buffer of the pool, and every pixel of the image writes
+/// its three bytes.
 fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
     let (width, height) = rgba.dimensions();
     let (pixels, _) = rgba.as_raw()[..4 * width as usize * height as usize].as_chunks::<4>();
     let mut out = buffer_pool::take(3 * pixels.len());
-    for (rgb, px) in out.as_chunks_mut::<3>().0.iter_mut().zip(pixels) {
+    let lead = opaque_lead(pixels, &mut out);
+    let (_, blended) = pixels.split_at(lead);
+    let (_, rest) = out.split_at_mut(3 * lead);
+    for (rgb, px) in rest.as_chunks_mut::<3>().0.iter_mut().zip(blended) {
         let over_white = &OVER_WHITE[usize::from(px[3])];
         *rgb = [px[0], px[1], px[2]].map(|value| over_white[usize::from(value)]);
     }
@@ -5592,6 +5703,41 @@ fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
         reason = "out holds exactly width * height * 3 bytes by construction"
     )]
     image::RgbImage::from_raw(width, height, out).expect("buffer matches image dimensions")
+}
+
+/// The pixels one step of [`opaque_lead`] takes: a block is read for its
+/// alpha and copied while the first-level cache still holds it, and an image
+/// with a transparent pixel pays that read for one block alone.
+const OPAQUE_BLOCK: usize = 1024;
+
+/// Writes the three colour bytes, as stored, of the leading blocks of
+/// `pixels` in which no pixel is transparent to any degree (the alpha bytes
+/// of the block, ANDed, are still the full alpha) into `out`, and returns how
+/// many pixels those blocks hold. Nothing is written for the first block that
+/// holds a transparent pixel, nor for any pixel behind it.
+#[cfg_attr(
+    target_arch = "x86_64",
+    multiversion::multiversion(targets("x86_64+avx2"))
+)]
+fn opaque_lead(pixels: &[[u8; 4]], out: &mut [u8]) -> usize {
+    let mut lead = 0;
+    for (block, stored) in pixels
+        .chunks(OPAQUE_BLOCK)
+        .zip(out.chunks_mut(3 * OPAQUE_BLOCK))
+    {
+        let [.., alpha] = block
+            .iter()
+            .fold(u32::MAX, |all, px| all & u32::from_ne_bytes(*px))
+            .to_ne_bytes();
+        if alpha != u8::MAX {
+            break;
+        }
+        for (rgb, px) in stored.as_chunks_mut::<3>().0.iter_mut().zip(block) {
+            *rgb = [px[0], px[1], px[2]];
+        }
+        lead += block.len();
+    }
+    lead
 }
 
 /// [`decode_frame_bytes`] for bytes whose header nobody read first.

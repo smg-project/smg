@@ -1,10 +1,5 @@
 //! The block hashes of a request's prompt: [`PromptHashes`] and its seeds.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use kv_index::{
     salt::{request_content_hashes_with_seed, request_text_hashes_with_seed},
     XXH3_SEED,
@@ -21,6 +16,7 @@ use crate::{
 /// that partitions its workers' caches (by a salt, an adapter or a key of
 /// its own) derives both seeds from the request's partition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HashSeeds {
     /// The seed the token blocks are hashed under. It must be the seed the
     /// workers hash the blocks of this partition under, so the index of
@@ -34,7 +30,9 @@ pub struct HashSeeds {
 }
 
 impl HashSeeds {
-    /// The seeds of a request with no cache partition.
+    /// The seeds of a request with no cache partition. Code outside this
+    /// crate starts here and assigns a partition's two: the record gains
+    /// fields, so no literal of it builds there.
     pub const PLAIN: Self = Self {
         event: XXH3_SEED,
         partition: XXH3_SEED,

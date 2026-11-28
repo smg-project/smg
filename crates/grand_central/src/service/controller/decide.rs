@@ -40,7 +40,7 @@
 //! millisecond of the span left, the `Busy` a late decision is told. The
 //! lease of a decision stopped there does not wait for its dispatch
 //! deadline: the stream gives it up, by a release handed to the leases'
-//! file as a `Released` frame's is ([`MemoryStore::hand`]). A decision
+//! file as a `Released` frame's is ([`LeaseHand::given_up`]). A decision
 //! waits in the queue as it was made ([`wire::Decided`]), and its frame is
 //! built at the send, on the thread that encodes it, with what the span
 //! has left there.
@@ -72,7 +72,6 @@
 
 use std::{
     future::{self, Future},
-    mem,
     pin::Pin,
     sync::{atomic::Ordering, Arc},
     task::{Context, Poll, Waker},
@@ -90,13 +89,13 @@ use super::{
     decision_slots::{Job, Refused},
     gateways::Presence,
     principal::Principal,
-    service::Shared,
+    service::{LeaseHand, Shared},
     session,
     wire::{self, Checked, Refusal},
 };
 use crate::{
     service::proto::{self, busy::Reason},
-    store::{GatewayId, Hand, MemoryStore},
+    store::GatewayId,
     tracking::lease::ReleaseReason,
 };
 
@@ -186,7 +185,7 @@ pub(crate) struct Answers<S = Streaming<proto::DecideRequest>> {
     /// The stream's hand at the leases' file: a decision stopped at the
     /// send gives its lease up through it, and so does each decision still
     /// in the queue at the stream's end, where the hand is given back.
-    hand: Hand,
+    hand: LeaseHand,
     /// The gateway's frames; `None` once it closed its side.
     inbound: Option<S>,
     /// The deciders' answers, and the handle each request carries to its
@@ -238,12 +237,9 @@ pub(crate) fn serve<S>(
     let now = shared.deciders.now();
     // The table is asked where this replica leads. One that does not lead
     // has none to ask: the stream opens, and its requests are told.
-    let (placed, presence) = match shared.fence.leader_term(now) {
+    let (placed, presence) = match shared.leading(now) {
         Some(term) => {
-            let presence = shared
-                .gateways
-                .presence(gateway, now)
-                .ok_or_else(|| Status::failed_precondition(NO_SESSION))?;
+            let presence = shared.present(gateway, now)?;
             (Some(term), Some(presence))
         }
         None => (None, None),
@@ -262,7 +258,7 @@ pub(crate) fn serve<S>(
         let _ = word.wait_for(|stop| *stop).await;
     }));
     let (sender, decided) = mpsc::channel(WINDOW as usize);
-    let hand = Hand::new(gateway);
+    let hand = shared.hand(gateway);
     Ok(Answers {
         shared,
         gateway,
@@ -328,7 +324,7 @@ impl<S> Answers<S> {
         let deciders = &self.shared.deciders;
         let now = deciders.now();
         let lease = lease.map(|leased| leased.sent_at(now));
-        let stopped = if self.shared.fence.leader_term(now) != Some(term) {
+        let stopped = if self.shared.leading(now) != Some(term) {
             Some((Reason::NotLeader, ReleaseReason::Abandoned))
         } else if lease.as_ref().is_some_and(wire::Leased::spent) {
             Some((Reason::BudgetGoneOnArrival, ReleaseReason::LateDecision))
@@ -339,7 +335,7 @@ impl<S> Answers<S> {
             return wire::decided(id, term, &decision, lease.as_ref(), encode);
         };
         if let Some(leased) = lease {
-            leased.given_up(&self.shared.store, &self.hand, release);
+            self.hand.given_up(&leased, release);
         }
         deciders.busy(id, reason)
     }
@@ -358,20 +354,17 @@ impl<S> Answers<S> {
             return Ok(());
         }
         self.credit -= 1;
-        // The stream's place in the presence table is of one term: the
-        // first request this replica would decide under a term asks the
-        // table, as an open does.
-        let Some(term) = self.shared.fence.leader_term(received) else {
+        // The stream's place in the presence table is of one term: a
+        // request that spends a credit under a term the stream holds no
+        // place under asks the table, as an open does, whatever budget it
+        // states.
+        let Some(term) = self.shared.leading(received) else {
             let busy = deciders.busy(request.into_id(), Reason::NotLeader);
             self.own = Some((busy, true));
             return Ok(());
         };
         if self.placed != Some(term) {
-            let presence = self
-                .shared
-                .gateways
-                .presence(self.gateway, received)
-                .ok_or_else(|| Status::failed_precondition(NO_SESSION))?;
+            let presence = self.shared.present(self.gateway, received)?;
             // The place has no waker yet: the stream arms it before it
             // sleeps, in the poll that took it.
             self.gone = ended(presence.clone());
@@ -422,7 +415,7 @@ impl<S> Drop for Answers<S> {
     /// counted as that decider counts one: dropped, its stream gone.
     ///
     /// The hand then goes back to the store, as a session's does at its
-    /// end ([`MemoryStore::hand_back`]). Where a file's decider keeps its
+    /// end ([`LeaseHand::back`]). Where a file's decider keeps its
     /// watch a hand leaves its frame for that decider's next look. This
     /// last look applies it in place where no decider is at work: what
     /// the stream handed here, and at each send it stopped.
@@ -437,16 +430,14 @@ impl<S> Drop for Answers<S> {
                 ..
             } = decided
             {
-                leased.given_up(&self.shared.store, &self.hand, abandoned);
+                self.hand.given_up(&leased, abandoned);
             }
         }
         if dropped != 0 {
             let counts = self.shared.deciders.counts();
             counts.dropped_gone.fetch_add(dropped, Ordering::Relaxed);
         }
-        let hand = mem::replace(&mut self.hand, Hand::new(self.gateway));
-        let store: &MemoryStore = &self.shared.store;
-        store.hand_back(hand);
+        self.hand.back();
     }
 }
 

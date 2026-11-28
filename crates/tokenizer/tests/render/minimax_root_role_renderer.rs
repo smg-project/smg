@@ -90,6 +90,11 @@ const M3_RENDER_FIXTURES: &str = include_str!("../fixtures/minimax_m3/render_fix
 const M2_TEMPLATE_PATH: &str = "tests/fixtures/minimax_m2/chat_template.jinja";
 const M2_TEMPLATE: &str = include_str!("../fixtures/minimax_m2/chat_template.jinja");
 const M2_RENDER_FIXTURES: &str = include_str!("../fixtures/minimax_m2/render_fixtures.json");
+/// The template of the newest checkpoint: its system slot prints a date and
+/// a location off the root message, as the template without a root branch
+/// prints them off its system message.
+const M31_TEMPLATE_PATH: &str = "tests/fixtures/minimax_m31/chat_template.jinja";
+const M31_TEMPLATE: &str = include_str!("../fixtures/minimax_m31/chat_template.jinja");
 
 /// The model id the requests are normalized under: it selects the MiniMax
 /// provider profile, the one that accepts the `root` role, for both
@@ -313,4 +318,103 @@ fn root_message_ids_match_the_template_with_the_root_branch() {
     for case in &fixtures(M3_RENDER_FIXTURES).cases {
         check_case(&tok, case, true);
     }
+}
+
+/// The `current_date` and `current_location` of a root message reach the
+/// template: each of the two templates that read them prints one line for
+/// each right behind the root's text. The request goes the gateway's road
+/// and renders as the template renders the list the client sent (for the
+/// template without a root branch, that list with the root as its system
+/// message, which is what the renderer hands it).
+#[test]
+fn the_date_and_location_of_a_root_message_reach_the_template() {
+    let root = json!({
+        "role": "root",
+        "content": "Answer in French.",
+        "current_date": "2026-03-14",
+        "current_location": "Lyon, France",
+    });
+    let mut root_as_system = root.clone();
+    root_as_system["role"] = json!("system");
+    let user = json!({"role": "user", "content": "Bonjour"});
+    let slot = "Answer in French.\nCurrent date: 2026-03-14\nCurrent location: Lyon, France";
+
+    for (path, template, as_sent) in [
+        (
+            M31_TEMPLATE_PATH,
+            M31_TEMPLATE,
+            [root.clone(), user.clone()],
+        ),
+        (
+            M2_TEMPLATE_PATH,
+            M2_TEMPLATE,
+            [root_as_system, user.clone()],
+        ),
+    ] {
+        for field in [
+            "system_message.current_date",
+            "system_message.current_location",
+        ] {
+            assert!(template.contains(field), "{path} does not read {field}");
+        }
+        let temp = TempDir::new().expect("temp dir");
+        let tok = minimal_tokenizer_with_template(&temp, path);
+        let case = Case {
+            name: format!("a dated root through {path}"),
+            messages: vec![root.clone(), user.clone()],
+            rendered_from: None,
+            tools: None,
+            text: String::new(),
+            ids: Vec::new(),
+        };
+        let direct = tok
+            .apply_chat_template(&as_sent, params(&case))
+            .unwrap_or_else(|e| panic!("{path}: render of the list as sent failed: {e}"));
+        assert!(
+            direct.contains(slot),
+            "{path}: the template itself does not print the two lines:\n{direct}"
+        );
+        assert_eq!(
+            render(&tok, &case),
+            direct,
+            "{path}: the prompt differs from the template's rendering of the request as sent"
+        );
+    }
+}
+
+/// A system message behind a dated root, on the template without a root
+/// branch: the renderer hands the root on as a system message and merges the
+/// two by the engine's own rule for several system messages, which keeps
+/// their texts alone. The merged message carries neither key, so the
+/// template prints the two texts and neither line.
+#[test]
+fn a_system_message_behind_a_dated_root_merges_it_without_its_date_and_location() {
+    let temp = TempDir::new().expect("temp dir");
+    let tok = minimal_tokenizer_with_template(&temp, M2_TEMPLATE_PATH);
+    let case = Case {
+        name: "a dated root, then a system message".to_string(),
+        messages: vec![
+            json!({
+                "role": "root",
+                "content": "Answer in French.",
+                "current_date": "2026-03-14",
+                "current_location": "Lyon, France",
+            }),
+            json!({"role": "system", "content": "Be terse."}),
+            json!({"role": "user", "content": "Bonjour"}),
+        ],
+        rendered_from: None,
+        tools: None,
+        text: String::new(),
+        ids: Vec::new(),
+    };
+    let prompt = render(&tok, &case);
+    assert!(
+        prompt.contains("Answer in French.\n\nBe terse."),
+        "the two texts are not merged into one system message:\n{prompt}"
+    );
+    assert!(
+        !prompt.contains("Current date:") && !prompt.contains("Current location:"),
+        "the merged system message printed a date or a location line:\n{prompt}"
+    );
 }

@@ -13,9 +13,7 @@
 //!   longest the log's lock is held;
 //! - `policy_store_journal/read/watched_at_head`: a watch's read at the
 //!   log's head: nothing to copy, the lock and the look at the log alone.
-//!   The log of the three read cells holds a full ring;
-//! - `policy_store_journal/cut/watched/<n>`: one cut of the rows: the copy
-//!   a writer of the rows waits for, and the sort after it.
+//!   The log of the three read cells holds a full ring.
 //!
 //! Every member is ready, in a store that leads a term as a serving
 //! controller's does. The journaled store's log retains 4,096 events.
@@ -38,7 +36,7 @@ use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BenchmarkGroup, BenchmarkId, Criterion,
 };
 use smg_grand_central::{
-    engine::{Role, WorkerId},
+    engine::WorkerId,
     service::replication::Log,
     store::{
         identity, LeasesStore, MembershipChange, MemoryStore, Position, Registrant, WorkerFacts,
@@ -142,7 +140,7 @@ fn pool_on(n: usize, log: Option<Log>) -> Pool {
         })
         .collect();
     landed(&store, epoch);
-    filled::filled(&store, MODEL, Role::Single, n);
+    filled::filled(&store, &ids, MODEL);
     Pool { store, log, ids }
 }
 
@@ -261,16 +259,5 @@ fn read(c: &mut Criterion) {
     group.finish();
 }
 
-fn cut(c: &mut Criterion) {
-    let mut group = c.benchmark_group("policy_store_journal/cut");
-    for n in SIZES {
-        let pool = pool_of(n, true);
-        group.bench_with_input(BenchmarkId::new("watched", n), &n, |b, _| {
-            b.iter(|| black_box(pool.store.checkpoint()));
-        });
-    }
-    group.finish();
-}
-
-criterion_group!(benches, status_write, member_write, read, cut);
+criterion_group!(benches, status_write, member_write, read);
 criterion_main!(benches);

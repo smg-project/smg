@@ -392,7 +392,10 @@ pub enum ShedReason {
 /// decision that drew first ([`Trace::drew_first`]) asked the filters about
 /// the rows it drew alone and holds no count of the pool: [`Survivors::get`]
 /// answers `None` there, never a zero, and a reader prints the word, not a
-/// number. The default is a count of zero.
+/// number. A pair decided by each side's draw is no such decision: its draw
+/// is asked only where the whole pass keeps every row, and it writes the
+/// count that pass writes, the size of its prefill list. The default is a
+/// count of zero.
 ///
 /// The count and its absence are one word of the record, written by one
 /// store as the bare count was: a trace that says whether it counted is the
@@ -549,7 +552,10 @@ impl Trace {
     /// is of the rows drawn. A decision by the rows its key names carries
     /// the mark with no draw, a pin followed or a ring walked
     /// ([`Engine::decide_keyed`](crate::engine::Engine::decide_keyed)): no
-    /// pass ran for it either, and `top` is of the rows it hands out.
+    /// pass ran for it either, and `top` is of the rows it hands out. A
+    /// pair decided by each side's draw does not carry it: that draw stands
+    /// for a pass that keeps every row, and the trace holds the count that
+    /// pass writes.
     pub const fn drew_first(&self) -> bool {
         self.survivors.get().is_none()
     }
@@ -935,10 +941,16 @@ pub struct Shed {
     /// parts from it too where a pair stands only among the workers the
     /// demand left out.
     /// The decode side too where the prefill was picked and the decode's
-    /// run refused. A decode decided again names the decode side, and the
-    /// prefill side where the held prefill left its list. A pair whose
+    /// run refused. A decode decided again names the decode side where
+    /// its own run refused, and the prefill side where the held prefill
+    /// left its list. A pair whose
     /// named worker's number reaches nobody (`target-worker`) names the
-    /// side it reaches nobody on, the prefills' first. A call's shed as
+    /// side it reaches nobody on, the prefills' first. A pair whose named
+    /// workers cannot be sent to after all names the decode side where a
+    /// pair of the call's last decision lost its decode alone, and the
+    /// prefill side otherwise: that selection asks the prefill first. It
+    /// names none where the route's rule is asked then and takes no worker
+    /// of a list: the call ends on the rule's refusal. A call's shed as
     /// saturated that stands behind a route's rule names the side of the
     /// list that selection judges among the rule's workers: the prefill
     /// side where none of the rule's prefills can take the request,
@@ -1119,6 +1131,19 @@ pub const TARGET_WORKER: &str = "target-worker";
 /// it.
 pub const BINDING: &str = "binding";
 
+/// Whether `name` is one of the engine's own refusal words: a name the
+/// engine sheds or declines under that no stock stage bears. The registry
+/// takes a host's stage of such a name, and no document can name that
+/// stage, so a host asks this of a name before it ships a stage. The
+/// public [`BINDING`] and [`TARGET_WORKER`] are among the words. A stock
+/// stage's name is none of them: the registry itself refuses a host's
+/// stage under one. The name is matched whole and by case. A later
+/// release may keep more names.
+#[must_use]
+pub fn refuses_under(name: &str) -> bool {
+    KEPT.contains(&name)
+}
+
 /// The stage a pool is shed under when none of its rows takes the pixels
 /// its request holds, an image or a video: the `epd` plan's vision rule
 /// sheds under it, and so does a request's vision demand
@@ -1144,6 +1169,26 @@ pub(crate) const CONTEXT_WINDOW: &str = "context-window";
 /// constraint as the request's was decided
 /// ([`UnmetDemand::Decoding`](crate::engine::demands::UnmetDemand::Decoding)).
 pub(crate) const DECODING: &str = "decoding";
+
+impl crate::engine::UnmetDemand {
+    /// The stage a pool this demand left nobody is shed under. A runtime is
+    /// the rest of a request's wire, and is shed as its gateway's wires
+    /// are. Vision is shed under the word of the `epd` plan's vision rule.
+    /// An encode request's encoders are shed under none of these: the
+    /// encode pass keeps their part of a demand in its one test of an
+    /// encoder, and names what they lack in its own order.
+    #[must_use]
+    pub const fn stage(self) -> &'static str {
+        match self {
+            Self::Runtime => WIRES,
+            Self::Vision => VISION,
+            Self::References => REFERENCES,
+            Self::Pipeline => PIPELINE,
+            Self::Window => CONTEXT_WINDOW,
+            Self::Decoding => DECODING,
+        }
+    }
+}
 
 /// The stage a decision names when it is refused for its affinity column:
 /// what a host counts its sheds under.
@@ -1236,13 +1281,16 @@ pub(crate) const CONTROLLER: &str = "controller";
 /// stage of such a name, and the validator refuses a document that names
 /// it, and at the name it answers
 /// [`SpecError::BadStage`](crate::document::SpecError::BadStage): no
-/// document runs a stage registered under one. A stage can still bear
-/// such a name in ways the validator does not see. Three are known: a
-/// profile a host builds in code, a plain factory whose later build
-/// answers another name than it registered under, and a stage that
-/// answers one name where the registry or the validator asks it and
-/// another at a decision. Under [`CONTROLLER`] the client's door also
-/// reads a stage of the controller's own document.
+/// document runs a stage registered under one. The validator holds a
+/// stage to its registered name at every build, so no stage it builds
+/// answers such a name then. A stage can still bear one in ways the
+/// validator does not see. Two are known: a profile a host builds in
+/// code, and a stage that answers one name where the registry or the
+/// validator asks it and another behind that: where the engine is built,
+/// where a profile is kept, or at a decision. A host asks
+/// [`refuses_under`] of a name before it ships a stage. Under
+/// [`CONTROLLER`] the client's door also reads a stage of the
+/// controller's own document.
 pub(crate) const KEPT: [&str; 28] = [
     WIRES,
     SUBSET_HINT,

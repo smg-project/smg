@@ -78,7 +78,7 @@ fn all(log: &Log) -> Vec<Entry> {
 }
 
 fn revision(store: &MemoryStore, id: WorkerId) -> u64 {
-    WorkersStore::get(store, id).expect("the row").revision
+    store.get(id).expect("the row").revision
 }
 
 /// A membership event's change, the row it left in the table and its
@@ -139,7 +139,7 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
         ..facts(KEY, 1)
     });
     store.set_term(5);
-    let replaced = WorkersStore::get(&store, a).expect("the row");
+    let replaced = store.get(a).expect("the row");
     let b = store.upsert(facts(KEY, 2)).id();
     // A status write: one the row holds already tells nothing.
     for status in [
@@ -149,7 +149,7 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
     ] {
         store.set_status(b, status, revision(&store, b));
     }
-    let found = WorkersStore::get(&store, b).expect("the row");
+    let found = store.get(b).expect("the row");
     store.remove(b, found.revision);
 
     let entries = all(&log);
@@ -762,7 +762,7 @@ fn a_standby_that_follows_holds_the_leaders_tables_and_its_log() {
     rounds(&leader, &lives, 40);
     reads(&leader);
     let wide = leader.upsert(facts("http://wide:8000", 1)).id();
-    let revision = WorkersStore::get(&leader, wide).expect("the row").revision;
+    let revision = leader.get(wide).expect("the row").revision;
     leader.set_status(wide, WorkerStatus::Ready, revision);
     reads(&leader);
     // A width change, which the stream tells as a relabel.
@@ -994,7 +994,7 @@ fn a_restore_leaves_nothing_of_the_tables_it_replaces() {
     };
     assert!(held(&store));
     assert!(store.restore_from(leader.checkpoint()));
-    assert!(WorkersStore::get(&store, gone).is_none());
+    assert!(store.get(gone).is_none());
     assert!(!store.vetoed(ASKER, kept, now), "the veto in the table");
     assert!(!held(&store), "the veto in the world");
     // And the key that left is free: its next registration is a first one.
@@ -1093,7 +1093,7 @@ fn a_change_that_does_not_fit_the_tables_is_not_applied_and_takes_no_place() {
     for entry in &all(&led) {
         follows(&standby, &followed, entry);
     }
-    let held = WorkersStore::get(&standby, a).expect("the row");
+    let held = standby.get(a).expect("the row");
     let b = identity("http://b:8000", 1);
     let other = WorkerRow {
         id: b,
@@ -1296,7 +1296,7 @@ fn a_followed_row_keeps_the_instant_it_was_admitted_at() {
         Some(relabelled),
     );
     assert!(adopting.landed());
-    let held = WorkersStore::get(&standby, id).expect("the row");
+    let held = standby.get(id).expect("the row");
     assert_eq!((held.revision, held.admitted_at), (2, row.admitted_at));
 }
 
@@ -1336,7 +1336,7 @@ fn a_followed_row_keeps_the_maker_its_leader_wrote() {
         Some(relabelled),
     );
     assert!(adopting.landed());
-    let held = WorkersStore::get(&standby, id).expect("the row");
+    let held = standby.get(id).expect("the row");
     assert_eq!((held.revision, held.maker), (2, found));
 }
 

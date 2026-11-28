@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use openai_protocol::model_card::ModelCard;
-use smg_worker::{identity::basic::WorkerType, test_support::no_health_check};
+use smg_worker::{
+    identity::basic::{WorkerType, NIXL_CONNECTOR},
+    test_support::no_health_check,
+};
 
 use super::*;
 #[cfg(all(
@@ -383,6 +386,42 @@ fn a_model_without_a_spec_goes_to_a_capable_worker_or_is_refused() {
         assert_eq!(err, MmRefsError::RouterSpecMissing);
         assert_eq!(err.code(), "multimodal_not_supported");
         assert!(err.to_string().contains("no media spec"), "{err}");
+    }
+}
+
+/// A request that states a sampling rate for its clips
+/// (`media_io_kwargs.video.fps`) is routed as it is without the key: the
+/// rate is no part's own, so a model without a spec, whose clip nothing
+/// but a worker processes, is still forwarded, under worker placement
+/// and under the automatic one.
+#[test]
+fn a_request_that_states_a_video_rate_is_still_forwarded() {
+    let request: openai_protocol::chat::ChatCompletionRequest =
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "media_io_kwargs": {"video": {"fps": 2}},
+            "messages": [{"role": "user", "content": [
+                {"type": "video_url", "video_url": {"url": "https://a/1.mp4"}}
+            ]}]
+        }))
+        .unwrap();
+    let plan = super::super::media_plan_chat(&request.messages, &request.other);
+    assert_eq!(plan.request_video_fps(), Some(2.0));
+    let registry = registry_with(vec![capable("grpc://127.0.0.1:9452")]);
+
+    for mode in [MmProcessingMode::Worker, MmProcessingMode::Auto] {
+        assert_eq!(
+            resolve_mm_processing(
+                &components(mode),
+                &registry,
+                MODEL,
+                &plan,
+                &PlaceholderTokens::worker_only()
+            )
+            .expect("a stated rate refuses no request"),
+            MmProcessing::Worker,
+            "{mode:?}"
+        );
     }
 }
 
@@ -992,7 +1031,7 @@ fn selection_check_requires_every_worker_and_scheme() {
     let single = WorkerSelection::Single {
         worker: capable("grpc://127.0.0.1:9600").into(),
     };
-    ensure_selection_supports_media_refs(&single, &plan_https, PipelinePin::Any)
+    ensure_selection_supports_media_refs(&single, &plan_https, PipelinePin::Any, false)
         .expect("capable single");
 
     let plain = WorkerSelection::Single {
@@ -1005,12 +1044,12 @@ fn selection_check_requires_every_worker_and_scheme() {
         .into(),
     };
     assert_eq!(
-        ensure_selection_supports_media_refs(&plain, &plan_https, PipelinePin::Any),
+        ensure_selection_supports_media_refs(&plain, &plan_https, PipelinePin::Any, false),
         Err(MmRefsError::WorkerNotCapable)
     );
 
     let file_plan = plan(vec![image_url("file:///media/1.png")]);
-    let err = ensure_selection_supports_media_refs(&single, &file_plan, PipelinePin::Any)
+    let err = ensure_selection_supports_media_refs(&single, &file_plan, PipelinePin::Any, false)
         .expect_err("file scheme not advertised");
     assert_eq!(err.code(), "media_ref_scheme_not_accepted");
 
@@ -1027,8 +1066,58 @@ fn selection_check_requires_every_worker_and_scheme() {
         runtime_type: RuntimeType::Vllm,
     };
     assert_eq!(
-        ensure_selection_supports_media_refs(&pd, &plan_https, PipelinePin::Any),
+        ensure_selection_supports_media_refs(&pd, &plan_https, PipelinePin::Any, false),
         Err(MmRefsError::WorkerNotCapable)
+    );
+
+    // A vLLM decode worker running as a language model only, which processes
+    // no references: a stripped decode side takes the prefill's media
+    // identity, so no reference reaches it and it is not judged. A side that
+    // is not stripped, or a decode worker of another runtime, is.
+    let lm_only_decode = |runtime| {
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:9613")
+                .model(ModelCard::new(MODEL))
+                .worker_type(WorkerType::Decode)
+                .runtime_type(runtime)
+                .connection_mode(ConnectionMode::Grpc)
+                .kv_connector(NIXL_CONNECTOR)
+                .label(SUPPORTS_VISION_LABEL, "false")
+                .health_config(no_health_check())
+                .build(),
+        );
+        WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: capable("grpc://127.0.0.1:9612"),
+            decode: decode.into(),
+            runtime_type: runtime,
+        }
+    };
+    ensure_selection_supports_media_refs(
+        &lm_only_decode(RuntimeType::Vllm),
+        &plan_https,
+        PipelinePin::Any,
+        true,
+    )
+    .expect("a stripped decode side takes no reference");
+    assert_eq!(
+        ensure_selection_supports_media_refs(
+            &lm_only_decode(RuntimeType::Vllm),
+            &plan_https,
+            PipelinePin::Any,
+            false
+        ),
+        Err(MmRefsError::WorkerNotCapable)
+    );
+    assert_eq!(
+        ensure_selection_supports_media_refs(
+            &lm_only_decode(RuntimeType::Sglang),
+            &plan_https,
+            PipelinePin::Any,
+            true
+        ),
+        Err(MmRefsError::WorkerNotCapable),
+        "only the vLLM dispatch strips the side"
     );
 
     // Both workers fetch: the accepted schemes are the intersection of what
@@ -1048,10 +1137,10 @@ fn selection_check_requires_every_worker_and_scheme() {
         decode: capable("grpc://127.0.0.1:9605").into(),
         runtime_type: RuntimeType::Vllm,
     };
-    ensure_selection_supports_media_refs(&mixed, &plan_https, PipelinePin::Any)
+    ensure_selection_supports_media_refs(&mixed, &plan_https, PipelinePin::Any, false)
         .expect("https on both workers");
     assert_eq!(
-        ensure_selection_supports_media_refs(&mixed, &file_plan, PipelinePin::Any),
+        ensure_selection_supports_media_refs(&mixed, &file_plan, PipelinePin::Any, false),
         Err(MmRefsError::SchemeNotAccepted {
             scheme: "file".to_string(),
             accepted: "data,http,https".to_string(),
@@ -1072,7 +1161,7 @@ fn selection_check_requires_every_worker_and_scheme() {
         runtime_type: RuntimeType::Vllm,
     };
     assert_eq!(
-        ensure_selection_supports_media_refs(&half, &file_plan, PipelinePin::Any)
+        ensure_selection_supports_media_refs(&half, &file_plan, PipelinePin::Any, false)
             .expect_err("prefill's set still applies")
             .code(),
         "media_ref_scheme_not_accepted"
@@ -1261,13 +1350,13 @@ fn selection_check_pins_unopted_models_to_pipeline_workers_and_audio_off_them() 
     let engine_single = WorkerSelection::Single {
         worker: capable("grpc://127.0.0.1:9731").into(),
     };
-    ensure_selection_supports_media_refs(&pipeline_single, &image, PipelinePin::Only)
+    ensure_selection_supports_media_refs(&pipeline_single, &image, PipelinePin::Only, false)
         .expect("the pipeline worker takes the unopted model");
     assert_eq!(
-        ensure_selection_supports_media_refs(&engine_single, &image, PipelinePin::Only),
+        ensure_selection_supports_media_refs(&engine_single, &image, PipelinePin::Only, false),
         Err(MmRefsError::PipelineWorkerRequired)
     );
-    ensure_selection_supports_media_refs(&engine_single, &image, PipelinePin::Any)
+    ensure_selection_supports_media_refs(&engine_single, &image, PipelinePin::Any, false)
         .expect("an opted-in model goes to the engine's processor");
 
     let half = WorkerSelection::Disaggregated {
@@ -1277,15 +1366,15 @@ fn selection_check_pins_unopted_models_to_pipeline_workers_and_audio_off_them() 
         runtime_type: RuntimeType::Vllm,
     };
     assert_eq!(
-        ensure_selection_supports_media_refs(&half, &image, PipelinePin::Only),
+        ensure_selection_supports_media_refs(&half, &image, PipelinePin::Only, false),
         Err(MmRefsError::PipelineWorkerRequired)
     );
 
     assert_eq!(
-        ensure_selection_supports_media_refs(&pipeline_single, &audio, PipelinePin::Any),
+        ensure_selection_supports_media_refs(&pipeline_single, &audio, PipelinePin::Any, false),
         Err(MmRefsError::PipelineTakesNoAudio)
     );
-    ensure_selection_supports_media_refs(&engine_single, &audio, PipelinePin::Any)
+    ensure_selection_supports_media_refs(&engine_single, &audio, PipelinePin::Any, false)
         .expect("the engine's processor takes audio");
     assert_eq!(
         MmRefsError::PipelineTakesNoAudio.code(),

@@ -427,6 +427,122 @@ fn a_batch_behind_its_streams_removal_is_passed_over() {
     assert_eq!(f.tables.indexed_blocks(row, 0), 1);
 }
 
+/// Two last removals of one row that overlap. The first marks the row
+/// and waits at its release: the case holds the state it set aside. A
+/// feed opens on the mark and ends, and its removal leaves the row to
+/// the first, whose mark stands. So a third feed's batch is passed
+/// over, and the first removal's end clears and forgets nothing of that
+/// feed's: its next batch begins the row.
+#[test]
+fn a_last_removal_leaves_a_marked_row_to_the_removal_that_marked_it() {
+    let f = Fixture::single(Some(BLOCK_SIZE));
+    let (_host, sink) = opened(&f);
+    let row = f.row;
+    let own = |sequence, hash| sink.admit(row, 0, facts(sequence), &wide(hash, 32));
+    assert_eq!(own(1, 1), BatchOutcome::Applied);
+    let (state, _) = sink.applied(row, (row, 0)).expect("the row's state");
+    let marked = || {
+        let leaving = sink.rows.try_lock()?.written.get(&row)?.leaving;
+        leaving.then_some(())
+    };
+    let outcome = std::thread::scope(|scope| {
+        let held = state.lock();
+        let first = scope.spawn(|| sink.removed(row));
+        // The case looks for the first removal's mark for ten seconds.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = marked();
+        while seen.is_none() && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+            seen = marked();
+        }
+        // A second feed opens on the mark and ends, and a third opens and
+        // sends a batch. Not where the mark was not seen: the row's entry
+        // could hand that batch the state this case holds.
+        let outcome = seen.map(|()| {
+            open_feed(&sink, row);
+            sink.removed(row);
+            open_feed(&sink, row);
+            own(2, 2)
+        });
+        // The state is let go before any failure is said, so a case that
+        // fails ends: the first removal waits on nothing.
+        drop(held);
+        first.join().expect("the first removal ends");
+        outcome
+    });
+    assert_eq!(outcome, Some(BatchOutcome::Skipped));
+    assert_eq!(own(3, 3), BatchOutcome::Applied);
+    assert_eq!(f.tables.indexed_blocks(row, 0), 1);
+    let rows = sink.rows.lock();
+    let kept = rows.written.get(&row);
+    let kept = kept.map(|kept| (kept.stream, kept.leaving));
+    assert_eq!(kept, Some((row, false)));
+}
+
+/// A last removal takes the rows' lock ahead of its record's. The
+/// record's own lock is the probe: the case holds it and sees the rows'
+/// lock held. `removed` is one call of `leave`, so that hold is the one
+/// that marks the rows. The case looks for that hold for ten seconds,
+/// and fails where it sees none.
+#[test]
+fn a_last_removal_takes_its_record_in_the_hold_that_marks_its_rows() {
+    let f = Fixture::single(Some(BLOCK_SIZE));
+    let (_host, sink) = opened(&f);
+    let row = f.row;
+    assert_eq!(
+        sink.admit(row, 0, facts(1), &wide(1, 32)),
+        BatchOutcome::Applied
+    );
+    let busy = std::thread::scope(|scope| {
+        let feeds = sink.feeds.lock();
+        let removal = scope.spawn(|| sink.removed(row));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut busy = false;
+        while !busy && std::time::Instant::now() < deadline {
+            busy = sink.rows.try_lock().is_none();
+            std::thread::yield_now();
+        }
+        // The record is let go before any failure is said, so a case
+        // that fails ends: the removal waits on nothing.
+        drop(feeds);
+        removal.join().expect("the removal ends");
+        busy
+    });
+    assert!(busy, "the removal held the rows' lock within the bound");
+    assert_eq!(f.tables.indexed_blocks(row, 0), 0);
+    assert!(sink.rows.lock().written.is_empty());
+    assert!(sink.feeds.lock().is_empty());
+}
+
+/// A row's record counts its open feeds. With three open, the first
+/// two removals take nothing, and the third takes the record and the
+/// row.
+#[test]
+fn a_removal_takes_nothing_while_any_feed_of_its_row_stays_open() {
+    let f = Fixture::single(Some(BLOCK_SIZE));
+    let (_host, sink) = opened(&f);
+    let row = f.row;
+    open_feed(&sink, row);
+    open_feed(&sink, row);
+    assert_eq!(
+        sink.admit(row, 0, facts(1), &wide(1, 32)),
+        BatchOutcome::Applied
+    );
+    for left in [2, 1] {
+        sink.removed(row);
+        let open = {
+            let feeds = sink.feeds.lock();
+            let feed = feeds.get(&row);
+            feed.map(|feed| feed.open.load(Ordering::Relaxed))
+        };
+        assert_eq!(open, Some(left));
+        assert_eq!(f.tables.indexed_blocks(row, 0), 1);
+    }
+    sink.removed(row);
+    assert!(sink.feeds.lock().is_empty());
+    assert_eq!(f.tables.indexed_blocks(row, 0), 0);
+}
+
 /// A batch reads its feed's record where it begins and learns at its
 /// end. One that began ahead of its stream's removal and learns behind it
 /// names no size: the feed is its row's no longer, and the model's

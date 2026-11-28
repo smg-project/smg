@@ -29,6 +29,7 @@ mod postgres_migrations;
 mod redis;
 pub mod schema;
 #[cfg(test)]
+#[path = "../tests/unit/test_support.rs"]
 pub(crate) mod test_support;
 pub(crate) mod versioning;
 

@@ -262,7 +262,7 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "tes
 tracing-subscriber = { workspace = true }
 # The corpus test reads YAML documents.
 serde_yaml = { workspace = true }
-# The contract tests (tests/contracts.rs) compile the protocol to a
+# The contract tests (tests/plugin/contracts.rs) compile the protocol to a
 # descriptor set through protoc and resolve the WebAssembly world; no code
 # is generated and nothing at run time reads the files.
 prost-build = { version = "0.14.4", default-features = false }
@@ -310,6 +310,10 @@ required-features = ["controller"]
 name = "in_process"
 required-features = ["in-process"]
 
+# With no block here, Cargo finds a test program only at `tests/*.rs` and at
+# `tests/*/main.rs`. A program's root anywhere else under `tests/` takes a
+# block with a `path`: with none it is not built, and nothing says so.
+
 [[test]]
 name = "binary"
 required-features = ["controller"]
@@ -343,12 +347,19 @@ required-features = ["in-process", "worker-host"]
 name = "controller"
 required-features = ["controller"]
 
+# A program of its own: it starts child processes from its own test executable.
+[[test]]
+name = "elector_cell"
+path = "tests/replicas/elector_cell.rs"
+
 [[test]]
 name = "elector_k8s_cell"
+path = "tests/replicas/elector_k8s_cell.rs"
 required-features = ["kubernetes"]
 
 [[test]]
 name = "failover"
+path = "tests/replicas/failover.rs"
 required-features = ["client"]
 
 [[test]]
@@ -357,12 +368,29 @@ required-features = ["client"]
 
 [[test]]
 name = "grpc_plugin"
+path = "tests/plugin/grpc_plugin.rs"
 required-features = ["controller"]
 
 # Two cases in a process of their own: each lowers a limit of the process.
 [[test]]
 name = "grpc_runtime"
+path = "tests/plugin/grpc_runtime.rs"
 required-features = ["controller"]
+
+# A program of its own: its case files name the root's items by `crate::`.
+[[test]]
+name = "wasm_plugin"
+path = "tests/plugin/wasm_plugin.rs"
+
+# A program of its own: the contracts' page names it by `--test wit`.
+[[test]]
+name = "wit"
+path = "tests/plugin/wit.rs"
+
+# A program of its own: the contracts' page names it by `--test contracts`.
+[[test]]
+name = "contracts"
+path = "tests/plugin/contracts.rs"
 
 [[test]]
 name = "membership_calls"
@@ -370,10 +398,12 @@ required-features = ["controller"]
 
 [[test]]
 name = "replicas"
+path = "tests/replicas/replicas.rs"
 required-features = ["controller"]
 
 [[test]]
 name = "replication"
+path = "tests/replicas/replication.rs"
 required-features = ["controller"]
 
 [[test]]
@@ -386,6 +416,11 @@ required-features = ["controller"]
 name = "crypto_provider"
 required-features = ["controller"]
 
+# Roots by subject stand under `benches/decision/`, `placement/`, `plugins/`,
+# `service/`. `common/`, `in_process/`, `service/decide_stream/` hold modules.
+# `decision/` holds roots: rows with a target of their own beside the gated
+# `decision` binary. A new bench takes its subject's folder and a `path`.
+
 [[bench]]
 name = "decision"
 harness = false
@@ -393,16 +428,19 @@ harness = false
 [[bench]]
 name = "shadow"
 harness = false
+path = "benches/decision/shadow.rs"
 
 # One validation by a spec's index keys. Apart from `decision`: that binary
 # is a pull-request gate's, and a row added to it moves its other rows.
 [[bench]]
 name = "spec_index"
 harness = false
+path = "benches/decision/spec_index.rs"
 
 [[bench]]
 name = "pair_table"
 harness = false
+path = "benches/placement/pair_table.rs"
 
 [[bench]]
 name = "affinity"
@@ -411,36 +449,44 @@ harness = false
 [[bench]]
 name = "affinity_rows"
 harness = false
+path = "benches/decision/affinity_rows.rs"
 
 [[bench]]
 name = "elector"
 harness = false
+path = "benches/service/elector.rs"
 
 [[bench]]
 name = "wasm_plugin"
 harness = false
+path = "benches/plugins/wasm_plugin.rs"
 required-features = ["wasm"]
 
 [[bench]]
 name = "grpc_plugin"
 harness = false
+path = "benches/plugins/grpc_plugin.rs"
 required-features = ["controller"]
 
 [[bench]]
 name = "epd"
 harness = false
+path = "benches/placement/epd.rs"
 
 [[bench]]
 name = "encode_pair"
 harness = false
+path = "benches/placement/encode_pair.rs"
 
 [[bench]]
 name = "decode_later"
 harness = false
+path = "benches/placement/decode_later.rs"
 
 [[bench]]
 name = "contention"
 harness = false
+path = "benches/decision/contention.rs"
 
 [[bench]]
 name = "store_view"
@@ -467,6 +513,7 @@ harness = false
 [[bench]]
 name = "vetoed"
 harness = false
+path = "benches/decision/vetoed.rs"
 
 # The `bucket` preset's rows. Apart from `decision`, as `spec_index` is:
 # that binary runs at its gate's bound.
@@ -477,19 +524,23 @@ harness = false
 [[bench]]
 name = "draw"
 harness = false
+path = "benches/decision/draw.rs"
 
 [[bench]]
 name = "pair_classes"
 harness = false
+path = "benches/placement/pair_classes.rs"
 
 [[bench]]
 name = "decide_stream"
 harness = false
+path = "benches/service/decide_stream.rs"
 required-features = ["controller"]
 
 [[bench]]
 name = "encode_classes"
 harness = false
+path = "benches/placement/encode_classes.rs"
 
 # The sent-prefix predictor's read and write, alone. A decision's naming
 # reads it through the store's record, and no id of `decision` times that
@@ -497,26 +548,31 @@ harness = false
 [[bench]]
 name = "predictor"
 harness = false
+path = "benches/decision/predictor.rs"
 
 [[bench]]
 name = "dispatch_credit"
 harness = false
+path = "benches/decision/dispatch_credit.rs"
 
 [[bench]]
 name = "signals"
 harness = false
+path = "benches/decision/signals.rs"
 
 # A `has-room` rule beside the same profile without it. Apart from
 # `decision`, whose binary takes no new id.
 [[bench]]
 name = "has_room"
 harness = false
+path = "benches/decision/has_room.rs"
 
 # A registered scorer's read of a row's report through the view's
 # reading, beside the same scorer reading the row's field.
 [[bench]]
 name = "load_report_reader"
 harness = false
+path = "benches/decision/load_report_reader.rs"
 
 # The in-process engine over a host's worker objects: a binary with switches.
 [[bench]]
@@ -529,6 +585,7 @@ required-features = ["in-process"]
 [[bench]]
 name = "kv_adapter"
 harness = false
+path = "benches/service/kv_adapter.rs"
 required-features = ["worker-host"]
 
 [lints]

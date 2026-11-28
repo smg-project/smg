@@ -707,6 +707,7 @@ fn a_ranked_decision_is_the_weighted_sums_under_every_picker() {
     let build = |name: &str| match catalog.find_picker(name) {
         Some(Found::Built(picker)) => Some(picker),
         Some(Found::Typed | Found::With(_) | Found::Kept) => None,
+        Some(Found::Misnamed(answers)) => panic!("{name}: its factory answers {answers}"),
         None => Some(Box::new(Lowest) as Box<dyn Picker>),
     };
     let mut marked = Vec::new();

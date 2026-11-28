@@ -225,14 +225,14 @@ impl Bed {
         let mut document = PolicySpec::preset("round_robin").map_err(|err| err.to_string())?;
         document.generation = 1;
         let profile = document.profiles.keys().next().cloned();
-        document.bindings = vec![BindingSpec {
-            profile: Some(profile.ok_or("the preset's profile")?),
-            overload: Some(OverloadSpec {
-                shed_when_all_vetoed: shed,
-                ..OverloadSpec::default()
-            }),
-            ..BindingSpec::default()
-        }];
+        let mut binding = BindingSpec::default();
+        binding.profile = Some(profile.ok_or("the preset's profile")?);
+        binding.overload = Some({
+            let mut overload = OverloadSpec::default();
+            overload.shed_when_all_vetoed = shed;
+            overload
+        });
+        document.bindings = vec![binding];
         let applied = AppliedSpec::validate(&document).map_err(|err| err.to_string())?;
         let engine = InProcess::new(applied);
         let objects: Result<Vec<_>, String> = (0..)
@@ -290,20 +290,20 @@ impl Bed {
             self.seed += 1;
             let id = self.seed.to_le_bytes();
             let asked = Asked {
-                request: Request {
-                    id: &id,
-                    facts: {
+                request: {
+                    let mut request = Request::of(&id, {
                         let mut facts = RequestFacts::default();
                         facts.model = MODEL;
                         facts.seed = self.seed;
                         facts
-                    },
-                    constraints,
+                    });
+                    request.constraints = constraints;
+                    request
                 },
-                lent: LentList {
-                    workers: &self.list,
-                    cell: &self.cell,
-                    facts: Some(&self.facts),
+                lent: {
+                    let mut lent = LentList::of(&self.list, &self.cell);
+                    lent.facts = Some(&self.facts);
+                    lent
                 },
             };
             // A maker that says no request plain is answered whole.

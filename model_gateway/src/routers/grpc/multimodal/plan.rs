@@ -23,11 +23,36 @@ use super::{
 /// multimodal pipeline. Text remains in the message representation used by the
 /// chat template; media is kept here in authored order for fetching and count
 /// validation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct MediaPlan {
     parts: Vec<MediaContentPart>,
     modalities: Vec<Modality>,
     counts: HashMap<Modality, usize>,
+    /// The rate the request states for sampling its video clips: the default
+    /// of this plan's clips in the gateway's own pipeline, ahead of the
+    /// model's. It is no part's own rate, so it decides nothing about where
+    /// the media is processed.
+    request_video_fps: Option<f64>,
+    /// Whether the model's language model computes token positions from the
+    /// grid tensors (`ModelProcessorSpec::language_model_reads_grids`),
+    /// recorded when the plan is kept as media references for worker-side
+    /// processing. `true` until the model's spec says otherwise.
+    language_model_reads_grids: bool,
+}
+
+/// Every field empty except `language_model_reads_grids`, which is `true`: a
+/// plan no spec answered for keeps the refusal of a language-model-only
+/// decode worker.
+impl Default for MediaPlan {
+    fn default() -> Self {
+        Self {
+            parts: Vec::new(),
+            modalities: Vec::new(),
+            counts: HashMap::new(),
+            request_video_fps: None,
+            language_model_reads_grids: true,
+        }
+    }
 }
 
 impl MediaPlan {
@@ -58,6 +83,21 @@ impl MediaPlan {
             plan.parts.push(part);
         }
         plan
+    }
+
+    /// Carry the rate the request states for sampling its video clips;
+    /// `rate` is read only for a plan that holds a video part.
+    pub(crate) fn with_request_video_fps(mut self, rate: impl FnOnce() -> Option<f64>) -> Self {
+        if self.modalities.contains(&Modality::Video) {
+            self.request_video_fps = rate();
+        }
+        self
+    }
+
+    /// The rate the request states for sampling its video clips, if it
+    /// states one in range and the plan holds a clip.
+    pub(crate) fn request_video_fps(&self) -> Option<f64> {
+        self.request_video_fps
     }
 
     /// The plan's items of `modality` per source (`url`, `data_url`,
@@ -129,6 +169,19 @@ impl MediaPlan {
         &self.parts
     }
 
+    /// Record the spec's answer (see [`PlaceholderTokens::language_model_reads_grids`]).
+    pub(crate) fn set_language_model_reads_grids(&mut self, reads: bool) {
+        self.language_model_reads_grids = reads;
+    }
+
+    /// Whether the model's language model computes token positions from the
+    /// grid tensors. When it does not, a disaggregated decode side that
+    /// pulls the prefill's KV derives its positions without them and can be
+    /// served the prefill's media identity stripped to text and hashes.
+    pub(crate) fn language_model_reads_grids(&self) -> bool {
+        self.language_model_reads_grids
+    }
+
     /// Whether every part is a plain image/audio/video URL without per-item
     /// processing hints, i.e. something a worker can fetch and process itself.
     pub(crate) fn is_forwardable(&self) -> bool {
@@ -159,7 +212,7 @@ impl MediaPlan {
 /// templates receive canonical `image` / `audio` / `video` parts. Keeping the
 /// mapping typed prevents the former `image_placeholder` argument from being
 /// accidentally reused for every modality.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub(crate) struct PlaceholderTokens {
     tokens: HashMap<Modality, String>,
     /// Modalities whose anchor a vLLM worker can expand itself.
@@ -172,6 +225,25 @@ pub(crate) struct PlaceholderTokens {
     /// placeholders, their expansion and the per-prompt limits, as on the
     /// engine's own server.
     worker_only: bool,
+    /// The spec's answer to whether the model's language model computes
+    /// token positions from the grid tensors
+    /// (`ModelProcessorSpec::language_model_reads_grids`); `true` for a
+    /// model without a spec.
+    language_model_reads_grids: bool,
+}
+
+/// Every field empty except `language_model_reads_grids`, which is `true`
+/// until a spec answers.
+impl Default for PlaceholderTokens {
+    fn default() -> Self {
+        Self {
+            tokens: HashMap::new(),
+            worker_expandable: HashMap::new(),
+            rendered_markers: Vec::new(),
+            worker_only: false,
+            language_model_reads_grids: true,
+        }
+    }
 }
 
 impl PlaceholderTokens {
@@ -201,6 +273,18 @@ impl PlaceholderTokens {
 
     pub(crate) fn set_worker_expandable(&mut self, modality: Modality, expandable: bool) {
         self.worker_expandable.insert(modality, expandable);
+    }
+
+    pub(crate) fn set_language_model_reads_grids(&mut self, reads: bool) {
+        self.language_model_reads_grids = reads;
+    }
+
+    /// Whether the model's language model computes token positions from the
+    /// grid tensors: an M-RoPE model (the Qwen-VL family) does, and a
+    /// disaggregated decode side stripped of them would mis-rotate every
+    /// generated token. `true` when no spec answered.
+    pub(crate) fn language_model_reads_grids(&self) -> bool {
+        self.language_model_reads_grids
     }
 
     /// Whether a vLLM worker can expand the rendered anchor for `modality`
@@ -420,6 +504,7 @@ async fn prepare_placeholder_tokens_with_env(
             )
         })?;
     let mut placeholders = PlaceholderTokens::default();
+    placeholders.set_language_model_reads_grids(spec.language_model_reads_grids());
     for &modality in plan.modalities() {
         let token = spec
             .placeholder_token_for(&metadata, modality)

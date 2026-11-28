@@ -20,4 +20,5 @@ pub use replica::ReplicaId;
 pub use watermark::CrdtWatermark;
 
 #[cfg(test)]
+#[path = "../../tests/unit/crdt_kv/tests.rs"]
 mod tests;

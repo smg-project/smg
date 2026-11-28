@@ -26,7 +26,7 @@ use net::loopback;
 use smg_grand_central::{
     engine::WorkerId,
     service::controller::{Config, Listener, Scope},
-    store::{MemoryStore, Registrant, WorkerFacts, WorkersStore},
+    store::{MemoryStore, Registrant, WorkerFacts},
     worker_host::{Members, Objects},
 };
 use tonic::{metadata::AsciiMetadataValue, transport::Channel, Request};
@@ -111,7 +111,7 @@ fn stating<T>(name: Option<&'static str>, message: T) -> Request<T> {
 /// [`Controller::workers`]: smg_grand_central::service::controller::Controller::workers
 fn ready(holder: &Objects<Members>, store: &MemoryStore, stated: WorkerFacts) -> Option<WorkerId> {
     let id = holder.upsert(store, stated, Registrant::Control)?.id();
-    let revision = WorkersStore::get(store, id)?.revision;
+    let revision = holder.read_row(id)?.revision;
     holder.connect_row(store, id, revision);
     Some(id)
 }

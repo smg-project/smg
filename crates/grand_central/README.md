@@ -33,7 +33,7 @@ A profile runs three steps over the workers that serve the request's model.
 2. **Score.** Each scorer rates the workers that are left from 0 to 1. Above, `least-requests` rates the worker with the fewest requests in flight highest.
 3. **Pick.** One picker chooses from the scores. A pick names the chosen worker and up to three alternates, best first.
 
-A decision that finds no worker is a *shed*: a refusal that names its reason and a stage or constraint. As a rule it names the one that stopped the decision; a pair's shed can name another. By default a single profile first tries again with the overload veto lifted, then with liveness doubts lifted. See [Decisions and refusals](REFERENCE.md#decisions-and-refusals).
+A decision that finds no worker is a *shed*: a refusal that names its reason and a stage or constraint. As a rule it names the one that stopped the decision; a pair's shed can name another. By default a single profile first tries again with the overload veto lifted, then with liveness doubts lifted. See [Decisions and refusals](docs/guarantees.md#decisions-and-refusals).
 
 A profile can weigh one scorer over another:
 
@@ -136,7 +136,7 @@ target/release/smg-grand-central --controller-id controller-0 --spec-file policy
 - Ask for a worker with `Session` and `Decide` on the gateway listener.
 - The service checks a changed policy spec before it replaces the running one.
 
-[The controller's wire test](tests/controller.rs) shows registration and the decision stream end to end. The service page lists every [flag](docs/service.md#start-the-service) and every [call](docs/service.md#a-gateway-that-calls-the-service).
+[The controller's wire test](tests/controller_cases/decisions.rs) shows registration and the decision stream end to end. The service page lists every [flag](docs/service.md#start-the-service) and every [call](docs/service.md#a-gateway-that-calls-the-service).
 
 ## Presets
 
@@ -161,9 +161,9 @@ Each preset has one profile, the same three filters and a binding for every mode
 
 A host can add stages of its own in three ways:
 
-- **A Rust stage.** Implement `Filter`, `Scorer` or `Picker` and register it in the host's stage catalog. See [Register a Rust stage](REFERENCE.md#register-a-rust-stage) and the [example program](../../examples/grand-central).
-- **A WebAssembly component.** Compile a component for the `smg:policy` package and load it in the host. See [Load a WebAssembly component](REFERENCE.md#load-a-webassembly-component) and the [WIT file](contracts/smg-policy.wit).
-- **A gRPC plugin.** Implement the `PolicyPlugin` service and let the host call it. See [Call a gRPC plugin](REFERENCE.md#call-a-grpc-plugin) and the [service contract](contracts/policy_plugin.proto).
+- **A Rust stage.** Implement `Filter`, `Scorer` or `Picker` and register it in the host's stage catalog. See [Register a Rust stage](docs/extending.md#register-a-rust-stage) and the [example program](../../examples/grand-central).
+- **A WebAssembly component.** Compile a component for the `smg:policy` package and load it in the host. See [Load a WebAssembly component](docs/extending.md#load-a-webassembly-component) and the [WIT file](contracts/smg-policy.wit).
+- **A gRPC plugin.** Implement the `PolicyPlugin` service and let the host call it. See [Call a gRPC plugin](docs/extending.md#call-a-grpc-plugin) and the [service contract](contracts/policy_plugin.proto).
 
 ## Reference
 
@@ -173,8 +173,8 @@ A host can add stages of its own in three ways:
 - [Prefill and decode pairs](docs/policy-spec.md#prefill-and-decode) and [encode with a pair](docs/policy-spec.md#encode-with-a-pair)
 - [Overload](docs/policy-spec.md#overload), [sessions](docs/policy-spec.md#sessions), [a request's key](docs/policy-spec.md#the-requests-key), [shadows](docs/policy-spec.md#a-shadow-profile) and [reserved fields](docs/policy-spec.md#reserved-fields)
 - [Signals a decision can read](docs/embedding.md#signals-a-decision-can-read)
-- [Decisions and refusals](REFERENCE.md#decisions-and-refusals) and [updating a policy spec](REFERENCE.md#updating-a-document)
-- [Explain and metrics](REFERENCE.md#explain-and-metrics)
+- [Decisions and refusals](docs/guarantees.md#decisions-and-refusals) and [updating a policy spec](docs/guarantees.md#updating-a-spec)
+- [Explain and metrics](docs/metrics.md)
 - [Worker discovery](docs/service.md#worker-discovery) for the standalone service
 - [Cost and regression gates](REFERENCE.md#cost-and-regression-gates)
 - [The design document](docs/design.md)

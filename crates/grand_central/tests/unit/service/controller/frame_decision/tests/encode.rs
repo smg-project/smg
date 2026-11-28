@@ -36,9 +36,7 @@ use crate::{
         proto,
     },
     stages::{lifecycle::Lifecycle, pickers::target_of, registry::StageRegistry},
-    store::{
-        GatewayId, HealthSink, LeaseState, LeasesStore, LookOutcome, MemoryStore, WorkersStore,
-    },
+    store::{GatewayId, HealthSink, LeaseState, LeasesStore, LookOutcome, MemoryStore},
     tracking::lease::Side,
     worker_host::{Members, Objects},
 };
@@ -407,7 +405,7 @@ fn an_encode_requests_pick_is_filed_its_pairs_leases_and_none_for_an_encoder() {
     // What the leases on file book on each worker, as its object counts it.
     let booked = || {
         [p, d, e].map(|id| {
-            let row = WorkersStore::get(&*store, id).expect("the row");
+            let row = store.get(id).expect("the row");
             let object = objects.registry().get_by_url(&row.facts.key);
             object.expect("its object").load()
         })

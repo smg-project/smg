@@ -37,6 +37,7 @@ use crate::{
             },
             replication::{journaled_at, tests::journaled_from},
             spec_store::{tests::names, SpecStore},
+            standby::Lag,
             wire::Checked,
             PROTOCOL_FLOOR, PROTOCOL_VERSION,
         },
@@ -231,7 +232,7 @@ async fn the_services_calls_write_the_worker_objects_its_decisions_read() {
     let ids = ["w0", "w1", "w2"].map(register);
     assert_eq!(named(), BTreeSet::from(ids));
     let leave = |id: WorkerId, drain: bool| {
-        let row = WorkersStore::get(&*store, id).expect("the row stands");
+        let row = store.get(id).expect("the row stands");
         let request = proto::DeregisterWorkerRequest {
             worker_id: id.0,
             revision: row.revision,
@@ -277,7 +278,7 @@ async fn a_leader_at_its_terms_mark_leaves_and_decides_on_under_the_next_term() 
     // The first take, then a fleet, a profile and the ids just under
     // the term's mark.
     let begun = Instant::now();
-    while shared.fence.leader_term(Instant::now()).is_none() {
+    while shared.leading(Instant::now()).is_none() {
         assert!(begun.elapsed() < wait, "no first take");
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
@@ -360,7 +361,7 @@ async fn an_election_dropped_without_a_stop_ends_while_the_deciders_hold_its_doo
     .expect("the decider starts");
     let running = shared.elect(elector, standing).expect("a thread");
     let patience = Duration::from_secs(20);
-    let mut looks = shared.standing.clone();
+    let mut looks = shared.steps();
     {
         let led = looks.wait_for(|standing| standing.holder == IDENTITY);
         let led = tokio::time::timeout(patience, led).await;
@@ -373,7 +374,7 @@ async fn an_election_dropped_without_a_stop_ends_while_the_deciders_hold_its_doo
     tokio::time::timeout(patience, ended)
         .await
         .expect("the election thread ends within 20 s of its handle's drop");
-    assert_eq!(shared.fence.leader_term(Instant::now()), None);
+    assert_eq!(shared.leading(Instant::now()), None);
     assert!(looks.borrow().holder.is_empty(), "the lease is given up");
 }
 
@@ -421,7 +422,7 @@ async fn a_deferred_document_stands_a_moment_behind_the_first_term() {
         .await
         .expect("the first take applies the start's document within 20 s");
     assert_eq!(shared.store.snapshot().spec().generation(), 1);
-    assert_eq!(shared.fence.term(), 1, "under its first term");
+    assert_eq!(shared.held_term(), 1, "under its first term");
 
     running.stop();
     tokio::time::timeout(Duration::from_secs(20), running.ended())
@@ -472,7 +473,7 @@ async fn left_with_no_leader(
     .expect("the decider starts");
     let mut running = shared.elect(elector, standing).expect("a thread");
     let (wait, begun) = (Duration::from_secs(60), Instant::now());
-    while shared.fence.leader_term(Instant::now()).is_none() {
+    while shared.leading(Instant::now()).is_none() {
         assert!(begun.elapsed() < wait, "no first take");
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
@@ -872,7 +873,7 @@ async fn a_watch_ends_at_a_role_told_after_its_open_and_at_none_before() {
     told.send_replace(None);
     let ended = next().await.expect_err("the word told after the open");
     assert_eq!(ended.code(), Code::Aborted);
-    assert_eq!(service.shared.fence.leader_term(Instant::now()), Some(1));
+    assert_eq!(service.shared.leading(Instant::now()), Some(1));
 }
 
 /// A watch that names two models is told the rows of both and no third
@@ -1157,6 +1158,50 @@ fn a_follower_names_the_holder_its_last_look_saw() {
     assert_eq!(service.leader_info(now), answer("", "", 5, false));
 }
 
+/// The shared state says the identity its elector elects under, whole: a
+/// standby draws its wait between two streams by it. An identity that
+/// carries no address is said as it stands.
+#[test]
+fn the_shared_state_says_the_identity_its_elector_elects_under() {
+    let (_elector, _standing, service) = service(&[Scope::Replication]);
+    assert_eq!(service.shared.identity(), IDENTITY);
+    let alone = Elector::alone("controller-9", PATIENT).expect("the settings are in order");
+    let (_elector, _standing, service) = over(alone, &[Scope::Replication]);
+    assert_eq!(service.shared.identity(), "controller-9");
+}
+
+/// A refused call names its holder by the fence at the call's own
+/// instant. A nanosecond ahead of the lead's opening and a nanosecond past
+/// its end, the record names this replica behind a closed fence and the
+/// refusal names nobody: the instant beside either would name this
+/// replica.
+#[test]
+fn a_refused_call_names_its_holder_by_the_fence_at_the_calls_own_instant() {
+    const NANOSECOND: Duration = Duration::from_nanos(1);
+    // A candidate alone over its lease: its take opens the lead at the
+    // take's own instant, for one renew deadline.
+    let (mut elector, standing, service) = service_alone(&[Scope::Control]);
+    let opens = Instant::now();
+    assert_eq!(
+        elector.tick(opens).expect("the take"),
+        TickOutcome::Acquired { term: 1 }
+    );
+    standing.send_replace(saw(IDENTITY, 1));
+    let ends = elector.fence().turns_at(opens).expect("the lead ends");
+    for (outside, beside) in [(opens - NANOSECOND, opens), (ends + NANOSECOND, ends)] {
+        assert_eq!(service.leader_info(beside), answer(ID, ADDRESS, 1, true));
+        let refused = service
+            .leading(outside)
+            .expect_err("the fence is closed at that instant");
+        let details = RpcStatus::decode(refused.details()).expect("a google.rpc.Status");
+        let [detail] = details.details.as_slice() else {
+            panic!("one detail: {details:?}");
+        };
+        let named = proto::NotLeader::decode(detail.value.as_slice()).expect("a NotLeader");
+        assert_eq!(named.leader_address, "", "at {outside:?}");
+    }
+}
+
 #[test]
 fn a_follower_says_its_lag_and_reads_synced_under_the_bound() {
     let (mut elector, standing, service) = service(&[Scope::Replication]);
@@ -1191,6 +1236,71 @@ fn a_follower_says_its_lag_and_reads_synced_under_the_bound() {
     elector.tick(now).expect("the renewal");
     service.shared.lag.applied(now);
     let led = service.leader_info(now);
+    assert!(led.is_leader && !led.synced && led.sync.is_none());
+}
+
+#[test]
+fn a_follower_under_a_bound_its_clock_cannot_add_reads_synced() {
+    // A candidate alone over its lease: it does not lead until its take,
+    // and its take opens the lead at the take's own instant.
+    let mut elector = Elector::alone(IDENTITY, PATIENT).expect("the settings are in order");
+    let (standing, stood) = watch::channel(ElectionObservation::default());
+    // The lag is the case's own, under the bound of the longest interval
+    // a host states: no clock holds a frame's instant plus it.
+    let (stood, stop, role, _) = bed::unserved(stood);
+    let endless = Arc::new(Lag::new(Duration::from_secs(u64::MAX)));
+    let shared = Shared::new(
+        ID.to_owned(),
+        ADDRESS.to_owned(),
+        &elector,
+        (stood, stop, role, endless),
+        bed::followed(journaled_from(&LeasePlace::Process, 0)),
+        (Arc::new(StageRegistry::builtin()), &LeasePlace::Process),
+        1,
+    )
+    .expect("the decider starts");
+    let service = Service::new(vec![Scope::Replication], Arc::new(shared));
+    let at = Instant::now();
+    service.shared.lag.applied(at);
+    // The sync reads the lag alone, whomever the standing names: nobody
+    // before a look at the lease, nobody at a lease no replica holds, and
+    // another replica that holds it, the last two under term 4.
+    let standings = [
+        (ElectionObservation::default(), "", 0),
+        (saw("", 4), "", 4),
+        (saw("controller-1@10.0.0.8:30100", 4), "10.0.0.8:30100", 4),
+    ];
+    // Under each it is synced from the frame on with no further frame: at
+    // once, a day on, and sixty days on. The answer names whom the standing
+    // names, under the standing's term, and says the frame's age in
+    // milliseconds, at sixty days as the most its field holds.
+    let day = Duration::from_secs(86_400);
+    for (seen, address, term) in standings {
+        standing.send_replace(seen);
+        for (behind, said) in [(Duration::ZERO, 0), (day, 86_400_000), (60 * day, u32::MAX)] {
+            let info = service.leader_info(at + behind);
+            assert!(
+                !info.is_leader && info.synced,
+                "{address:?} {term} {behind:?}"
+            );
+            assert_eq!(
+                (info.address.as_str(), info.term),
+                (address, term),
+                "{behind:?}"
+            );
+            let lag = info.sync.map(|sync| sync.replication_lag_ms);
+            assert_eq!(lag, Some(said), "{address:?} {term} {behind:?}");
+        }
+    }
+
+    // A replica that leads follows nobody under such a bound either: it
+    // is not synced and says no sync state, whatever frame its lag holds.
+    let took = Instant::now();
+    assert_eq!(
+        elector.tick(took).expect("the take"),
+        TickOutcome::Acquired { term: 1 }
+    );
+    let led = service.leader_info(took);
     assert!(led.is_leader && !led.synced && led.sync.is_none());
 }
 
@@ -1434,6 +1544,37 @@ async fn a_call_under_a_take_its_store_has_passed_is_told_to_retry() {
     assert_eq!(
         (refused.code(), refused.message()),
         (Code::Unavailable, super::TAKE_OVER)
+    );
+}
+
+/// The presence table's task runs on with no stop said, and ends at the
+/// stop it is handed: the shared state's own word is not said here. The
+/// case's clock is paused. An hour of it passes with no stop said: a task
+/// that ends by itself inside that hour fails the case. Behind the stop
+/// the task has ended with no more of that clock passed: a task that holds
+/// its stop unread and ends by itself at a later instant fails there.
+#[tokio::test(start_paused = true)]
+async fn the_presence_tables_task_ends_at_the_stop_it_is_handed() {
+    let (_elector, _standing, service) = service_alone(&[Scope::Gateway]);
+    let (stop, stopped) = watch::channel(false);
+    let mut task = JoinSet::new();
+    task.spawn(service.shared.presence_task(stopped));
+    let early = tokio::time::timeout(Duration::from_secs(3_600), task.join_next()).await;
+    assert!(
+        early.is_err(),
+        "the task ended with no stop said: {early:?}"
+    );
+    let said = tokio::time::Instant::now();
+    stop.send(true).expect("the task holds the receiver");
+    tokio::time::timeout(Duration::from_secs(20), task.join_next())
+        .await
+        .expect("the task ends within 20 s of its stop")
+        .expect("one task")
+        .expect("it ended by itself");
+    assert_eq!(
+        said.elapsed(),
+        Duration::ZERO,
+        "the task ended in the instant its stop was said"
     );
 }
 

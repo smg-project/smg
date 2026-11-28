@@ -26,9 +26,9 @@
 //! with none.
 //!
 //! One arm a kind of frame. `Hello` and `GatewayVeto` are served here, and
-//! the lifecycle's three frames in [`lifecycle`]. The other kinds are
-//! refused by name until the step that serves each adds its arm, as the
-//! service refuses an unserved call.
+//! the lifecycle's three frames in [`lifecycle`](super::lifecycle). The
+//! other kinds are refused by name until the step that serves each adds its
+//! arm, as the service refuses an unserved call.
 //!
 //! A gateway's vetoes ride its `Hello`, whole, and are held before the
 //! `Welcome` leaves: a new leader masks for the gateway from its first
@@ -54,16 +54,14 @@ use super::{
     decide,
     floor::{unbelieved, Told, FLOORS_SPENT_MAX, FLOOR_REACH},
     gateways::{over_kinds, Refused, SessionPlace, Vetoed, KINDS_MAX, VETOES_MAX},
-    lifecycle,
     principal::Principal,
-    service::Shared,
+    service::{LeaseHand, Shared},
     wire::millis,
     PROTOCOL_FLOOR, PROTOCOL_VERSION,
 };
 use crate::{
     engine::view::WorkerId,
     service::proto::{self, controller_frame, gateway_frame::Frame},
-    store::Hand,
     tracking::lease::DISPATCH_TTL,
 };
 
@@ -162,7 +160,7 @@ impl Answers {
     /// The `NotLeader` of a replica whose fence read closed: the leader
     /// `Leader` names, under the highest term this replica knows.
     async fn not_leader(&mut self, shared: &Shared) {
-        let leader = shared.leader(None);
+        let leader = shared.leader_elsewhere();
         let frame = controller_frame::Frame::NotLeader(proto::NotLeader {
             leader_address: leader.address,
             successor_id: String::new(),
@@ -265,7 +263,7 @@ async fn session(
     // the open and the loop after the Welcome hears on. Every mark of it
     // is made before the session's read of the fence, so no step after
     // that read is missed.
-    let mut steps = shared.standing.clone();
+    let mut steps = shared.steps();
     steps.mark_unchanged();
     let mut election = true;
     let first = {
@@ -291,7 +289,7 @@ async fn session(
                         // The election is gone with the run loop: the deadline
                         // bounds the wait.
                         election = false;
-                    } else if shared.fence.leader_term(Instant::now()).is_none() {
+                    } else if shared.leading(Instant::now()).is_none() {
                         return Some(not_leading(shared, answers).await);
                     }
                 }
@@ -323,17 +321,14 @@ async fn session(
         return Some(status);
     }
     // One read: the verdict and the term the Welcome carries.
-    let Some(term) = shared.fence.leader_term(now) else {
+    let Some(term) = shared.leading(now) else {
         return Some(not_leading(shared, answers).await);
     };
     if let Some(status) = floor(shared, &principal.subject, first.term_floor, term) {
         return Some(status);
     }
     let gateway = principal.gateway();
-    let seat = match shared
-        .gateways
-        .welcome(gateway, &principal.subject, term, now)
-    {
+    let seat = match shared.welcome(gateway, &principal.subject, term, now) {
         Ok(seat) => seat,
         // The fence closed between this session's read and the table's.
         Err(Refused::Stepped { shown: None, .. }) => {
@@ -369,7 +364,7 @@ async fn session(
         decide_window: decide::WINDOW,
         max_decide_streams: decide::MAX_STREAMS,
         dispatch_ttl_ms: millis(DISPATCH_TTL),
-        grace_period_ms: millis(shared.gateways.grace()),
+        grace_period_ms: millis(seat.grace()),
         leader_poll_ms: millis(LEADER_POLL),
         // The design sends no page: no lease and no pin is restored.
         leases_restored: 0,
@@ -390,7 +385,7 @@ async fn session(
 
     // The session's hand-over at the leases' file: what its frames say of
     // a lease is handed there, and applied before the session leaves.
-    let hand = Hand::new(gateway);
+    let mut hand = shared.hand(gateway);
     let status = loop {
         tokio::select! {
             frame = inbound.message() => {
@@ -416,7 +411,7 @@ async fn session(
         }
     };
     debug!(gateway = %principal.subject, term, ended = ?status.as_ref().map(Status::code), "a gateway's session ended");
-    shared.store.hand_back(hand);
+    hand.back();
     // The seat's drop starts the gateway's grace period.
     drop(seat);
     status
@@ -425,7 +420,7 @@ async fn session(
 /// The fence's verdict at `now` on a session welcomed under `term`:
 /// `None` while the fence shows that term.
 async fn fenced(shared: &Shared, term: u64, now: Instant, answers: &mut Answers) -> Option<Status> {
-    match shared.fence.leader_term(now) {
+    match shared.leading(now) {
         Some(shown) if shown == term => None,
         Some(later) => Some(Status::aborted(format!(
             "this controller leads under term {later} now and welcomed the session under term {term}: say Hello again"
@@ -582,7 +577,7 @@ fn vetoed(seat: &SessionPlace, veto: &proto::GatewayVeto, now: Instant) -> Optio
 async fn judge(
     shared: &Shared,
     subject: &str,
-    hand: &Hand,
+    hand: &LeaseHand,
     term: u64,
     seat: &SessionPlace,
     frame: &proto::GatewayFrame,
@@ -608,13 +603,9 @@ async fn judge(
         Some(Frame::Hello(_)) => Some(Status::failed_precondition(
             "a session stands on this stream: a second Hello needs a new stream",
         )),
-        Some(Frame::Dispatched(dispatched)) => {
-            lifecycle::dispatched(&shared.store, hand, dispatched, now).err()
-        }
-        Some(Frame::Completed(completed)) => {
-            lifecycle::completed(&shared.store, hand, completed).err()
-        }
-        Some(Frame::Released(released)) => lifecycle::released(&shared.store, hand, released).err(),
+        Some(Frame::Dispatched(dispatched)) => hand.dispatched(dispatched, now).err(),
+        Some(Frame::Completed(completed)) => hand.completed(completed).err(),
+        Some(Frame::Released(released)) => hand.released(released).err(),
         Some(Frame::Veto(veto)) => vetoed(seat, veto, now),
         Some(unserved @ (Frame::HelloPage(_) | Frame::SpecAck(_))) => Some(Status::unimplemented(
             format!("{} is not served by this build", kind(unserved)),

@@ -12,7 +12,7 @@ use smg_worker::{
 
 use super::*;
 use crate::{
-    store::{MemoryStore, Registrant, Signals, WorkerFacts, WorkersStore},
+    store::{MemoryStore, Registrant, Signals, WorkerFacts},
     worker_host::{objects::tests::lay_standing, Members},
 };
 
@@ -138,10 +138,14 @@ fn facts(sequence: u64) -> BatchFacts {
 /// Whether the adapter keeps `row` as its own stream's, begun from
 /// nothing: no batch was applied under its state.
 fn begun(sink: &KvAdapter, row: WorkerId) -> bool {
-    let rows = sink.rows.lock();
-    rows.written.get(&row).is_some_and(|written| {
-        written.stream == row && !written.leaving && written.applied.lock().emptied.is_none()
-    })
+    let own = {
+        let rows = sink.rows.lock();
+        let written = rows.written.get(&row);
+        let own = written.filter(|written| written.stream == row && !written.leaving);
+        own.map(|written| Arc::clone(&written.applied))
+    };
+    // The state by itself, outside the rows' lock, as the gauge locks it.
+    own.is_some_and(|applied| applied.lock().emptied.is_none())
 }
 
 /// The header's facts of `batch` at `sequence`, by the collector's rule:

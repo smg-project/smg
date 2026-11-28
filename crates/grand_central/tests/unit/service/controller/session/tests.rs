@@ -47,7 +47,7 @@ use crate::{
             self, controller_frame, gateway_frame::Frame, grand_central_client::GrandCentralClient,
         },
     },
-    store::{HealthSink, LeaseState, LeasesStore},
+    store::{HealthSink, LeaseState, LeasesStore, LookOutcome},
     tracking::lease::LeaseId,
 };
 
@@ -62,6 +62,8 @@ struct Bed {
     elector: Elector,
     standing: watch::Sender<ElectionObservation>,
     shared: Arc<Shared>,
+    /// The store the bed's own `journaled_at` made, which the state holds.
+    store: Arc<crate::store::MemoryStore>,
     addr: SocketAddr,
     /// Aborted at its drop, at the case's end.
     _serving: JoinSet<Result<(), Error>>,
@@ -71,21 +73,24 @@ async fn bed(settings: ElectionSettings) -> Bed {
     bed_with(settings, None, None).await
 }
 
-/// The same; with a ceiling, the presence table holds that many rows
-/// in place of the shared state's stock number.
+/// The same; with a `table`, the presence table is built with that grace
+/// period and that ceiling of rows, in place of the shared state's stock
+/// numbers.
 async fn bed_with(
     settings: ElectionSettings,
-    ceiling: Option<usize>,
+    table: Option<(Duration, usize)>,
     hello_deadline: Option<Duration>,
 ) -> Bed {
     let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
     let (standing, stood) = watch::channel(ElectionObservation::default());
+    let journal = followed(journaled_at(&LeasePlace::Process, 0, 2));
+    let store = Arc::clone(&journal.0);
     let mut shared = Shared::new(
         ID.to_owned(),
         ADDRESS.to_owned(),
         &elector,
         unserved(stood),
-        followed(journaled_at(&LeasePlace::Process, 0, 2)),
+        journal,
         (
             Arc::new(crate::stages::StageRegistry::builtin()),
             &LeasePlace::Process,
@@ -93,12 +98,12 @@ async fn bed_with(
         2,
     )
     .expect("the deciders start");
-    if let Some(ceiling) = ceiling {
+    if let Some((grace, ceiling)) = table {
         shared.gateways = Arc::new(Gateways::new(
-            GRACE_PERIOD,
+            grace,
             ceiling,
             elector.fence(),
-            Arc::clone(&shared.store),
+            Arc::clone(&store),
         ));
     }
     if let Some(hello_deadline) = hello_deadline {
@@ -120,6 +125,7 @@ async fn bed_with(
         elector,
         standing,
         shared,
+        store,
         addr,
         _serving: serving,
     }
@@ -264,7 +270,12 @@ impl<F> Opened<F> {
 impl Opened {
     /// Says `Hello` and takes the `Welcome`, which carries `term`.
     async fn welcomed(&mut self, term: u64) -> proto::Welcome {
-        self.send(hello(GATEWAY)).await;
+        self.welcomed_as(GATEWAY, term).await
+    }
+
+    /// The same, of the gateway `name`.
+    async fn welcomed_as(&mut self, name: &str, term: u64) -> proto::Welcome {
+        self.send(hello(name)).await;
         let answer = self.frame().await;
         assert_eq!(answer.term, term, "{answer:?}");
         match answer.frame {
@@ -347,6 +358,20 @@ async fn a_hello_is_welcomed_under_the_fences_term_and_the_gateway_is_present() 
     // Present from the Welcome, however long the session stands.
     assert!(bed.present(Instant::now()));
     assert!(bed.present(Instant::now() + 100 * GRACE_PERIOD));
+}
+
+/// A `Welcome` tells the grace period of the table its session stands
+/// in: a table built with half the stock period tells its own, and so
+/// does one built with twice the stock period.
+#[tokio::test]
+async fn a_welcome_tells_the_grace_period_of_its_sessions_table() {
+    for grace in [GRACE_PERIOD / 2, GRACE_PERIOD * 2] {
+        let mut bed = bed_with(PATIENT, Some((grace, PRESENT_MAX)), None).await;
+        bed.leads(1);
+        let mut session = open(bed.addr).await;
+        let welcome = session.welcomed(1).await;
+        assert_eq!(u128::from(welcome.grace_period_ms), grace.as_millis());
+    }
 }
 
 /// This build speaks its own protocol version and the one before it. A
@@ -826,6 +851,34 @@ async fn a_second_session_ends_the_first_and_the_last_streams_end_starts_the_gra
     assert!(bed.present(Instant::now()));
 }
 
+/// A session takes its seat under its principal's subject. A gateway whose
+/// row the table holds under that name is welcomed again and takes the
+/// earlier seat's place: under another name the table would refuse it as
+/// another subject's. Two gateways show it, each under its own name.
+#[tokio::test]
+async fn a_session_takes_its_seat_under_its_principals_subject() {
+    let mut bed = bed(PATIENT).await;
+    bed.leads(1);
+    for name in [GATEWAY, "gateway-b"] {
+        // The gateway's row as the table seats it itself, under its own
+        // name.
+        let gateway = told(name).gateway();
+        let earlier = bed
+            .shared
+            .gateways
+            .welcome(gateway, name, 1, Instant::now())
+            .expect("the table seats the gateway");
+        assert!(!earlier.replaced());
+
+        let mut session = open_as(bed.addr, name).await;
+        session.welcomed_as(name, 1).await;
+        assert!(
+            earlier.replaced(),
+            "the session of {name} took the earlier seat's place"
+        );
+    }
+}
+
 /// A `Hello` past the ceiling of present gateways is refused by name,
 /// and the gateway that is present is not disturbed.
 #[tokio::test]
@@ -835,7 +888,7 @@ async fn a_hello_past_the_ceiling_of_present_gateways_is_refused_by_name() {
     assert_eq!(stock.shared.gateways.ceiling(), PRESENT_MAX);
     assert_eq!(stock.shared.hello_deadline, HELLO_DEADLINE);
 
-    let mut bed = bed_with(PATIENT, Some(1), None).await;
+    let mut bed = bed_with(PATIENT, Some((GRACE_PERIOD, 1)), None).await;
     bed.leads(1);
     let mut first = open(bed.addr).await;
     first.welcomed(1).await;
@@ -897,13 +950,14 @@ async fn a_silent_stream_ends_at_the_step_that_finds_the_fence_closed() {
 }
 
 /// One frame of each kind of the lifecycle, applied in order by the
-/// session to its own gateway's leases.
+/// session to its own gateway's leases. The dispatch is dated between
+/// the case's two reads of the clock, around the session.
 #[tokio::test]
 async fn the_lifecycles_three_frames_are_applied_by_the_session() {
     let mut bed = bed(PATIENT).await;
     bed.leads(1);
     let gateway = told(GATEWAY).gateway();
-    let store = Arc::clone(&bed.shared.store);
+    let store = Arc::clone(&bed.store);
     let t0 = Instant::now();
     let served = worker(&store, "http://a:8000");
     // The store's term is the led one, as a leader's is: an id made by
@@ -934,9 +988,14 @@ async fn the_lifecycles_three_frames_are_applied_by_the_session() {
             "a session stands on this stream: a second Hello needs a new stream".to_owned()
         )
     );
+    let behind = Instant::now();
     let state =
         |id: u64| LeasesStore::get(&*store, gateway, LeaseId(id)).map(|record| record.state);
-    assert!(matches!(state(1), Some(LeaseState::Dispatched { .. })));
+    assert!(
+        matches!(state(1), Some(LeaseState::Dispatched { at }) if t0 <= at && at <= behind),
+        "{:?}",
+        state(1)
+    );
     assert_eq!(state(2), None);
     assert_eq!(state(3), None);
 }
@@ -948,7 +1007,7 @@ async fn a_lifecycle_frame_under_a_closed_fence_is_not_applied() {
     let mut bed = bed(PATIENT).await;
     bed.leads(1);
     let gateway = told(GATEWAY).gateway();
-    let store = Arc::clone(&bed.shared.store);
+    let store = Arc::clone(&bed.store);
     store.set_term(1);
     store
         .issue(lease(gateway, 1, Instant::now()))
@@ -976,7 +1035,7 @@ async fn a_replaced_sessions_frame_is_not_applied() {
     let mut bed = bed(PATIENT).await;
     bed.leads(1);
     let gateway = told(GATEWAY).gateway();
-    let store = Arc::clone(&bed.shared.store);
+    let store = Arc::clone(&bed.store);
     let served = worker(&store, "http://a:8000");
     let now = Instant::now();
     // A lease each frame ends where it is applied, under the led term.
@@ -999,7 +1058,7 @@ async fn a_replaced_sessions_frame_is_not_applied() {
     assert!(judge(
         &bed.shared,
         GATEWAY,
-        &super::Hand::new(gateway),
+        &bed.shared.hand(gateway),
         1,
         &seat,
         &report,
@@ -1018,7 +1077,7 @@ async fn a_replaced_sessions_frame_is_not_applied() {
     let status = judge(
         &bed.shared,
         GATEWAY,
-        &super::Hand::new(gateway),
+        &bed.shared.hand(gateway),
         1,
         &seat,
         &late,
@@ -1044,7 +1103,7 @@ async fn a_replaced_sessions_frame_is_not_applied() {
     assert!(judge(
         &bed.shared,
         GATEWAY,
-        &super::Hand::new(gateway),
+        &bed.shared.hand(gateway),
         1,
         &newer,
         &report,
@@ -1062,7 +1121,7 @@ async fn a_lifecycle_frame_under_a_floor_above_the_term_is_not_applied() {
     let mut bed = bed(PATIENT).await;
     bed.leads(1);
     let gateway = told(GATEWAY).gateway();
-    let store = Arc::clone(&bed.shared.store);
+    let store = Arc::clone(&bed.store);
     store.set_term(1);
     store
         .issue(lease(gateway, 1, Instant::now()))
@@ -1087,24 +1146,97 @@ async fn a_lifecycle_frame_under_a_floor_above_the_term_is_not_applied() {
     );
 }
 
+/// A frame of each of the lifecycle's three kinds that reads wrong ends
+/// its session by its field's name.
 #[tokio::test]
 async fn a_lifecycle_frame_that_reads_wrong_ends_the_session_by_its_fields_name() {
     let mut bed = bed(PATIENT).await;
     bed.leads(1);
+    let wrong = [
+        (
+            Frame::Dispatched(proto::Dispatched::default()),
+            "Dispatched.side is 0, which names none this version knows",
+        ),
+        (
+            Frame::Completed(proto::Completed::default()),
+            "Completed.side is 0, which names none this version knows",
+        ),
+        (
+            Frame::Released(proto::Released::default()),
+            "Released.what names neither a lease nor a ticket",
+        ),
+    ];
+    for (kind, named) in wrong {
+        let mut session = open(bed.addr).await;
+        session.welcomed(1).await;
+        session.send(frame(1, Some(kind))).await;
+        assert_eq!(
+            session.status().await,
+            (Code::InvalidArgument, named.to_owned())
+        );
+    }
+}
+
+/// A hand given back stays a hand of its gateway: the frame it hands
+/// next reaches that gateway's lease.
+#[tokio::test]
+async fn a_hand_given_back_hands_on_for_its_gateway() {
+    let mut bed = bed(PATIENT).await;
+    bed.leads(1);
+    let gateway = told(GATEWAY).gateway();
+    let store = Arc::clone(&bed.store);
+    store.set_term(1);
+    store
+        .issue(lease(gateway, 1, Instant::now()))
+        .expect("a lease");
+    let mut hand = bed.shared.hand(gateway);
+    hand.back();
+    hand.released(&a_released(1)).expect("the frame reads");
+    assert_eq!(
+        LeasesStore::get(&*store, gateway, LeaseId(1)).map(|record| record.state),
+        None,
+        "the release reached the gateway's lease"
+    );
+}
+
+/// A session hands back as it ends: a frame its hand left at a watched
+/// file is applied before the session's status leaves, while the file's
+/// decider waits. The case keeps the file's watch itself and no decider
+/// of its bed is sent a job: its next look finds no frame in the ring.
+#[tokio::test]
+async fn a_sessions_end_applies_its_frame_at_a_watched_file_while_its_decider_waits() {
+    let mut bed = bed(PATIENT).await;
+    bed.leads(1);
+    let gateway = told(GATEWAY).gateway();
+    let store = Arc::clone(&bed.store);
+    store.set_term(1);
+    for id in 1..=2 {
+        store
+            .issue(lease(gateway, id, Instant::now()))
+            .expect("a lease");
+    }
+    // The case's thread acts as no decider: its place is at the first
+    // file, the one an id made by hand names.
+    let mut place = store.at_work();
+    assert_eq!(place.look(), LookOutcome::Quiet, "a lease on file");
     let mut session = open(bed.addr).await;
     session.welcomed(1).await;
     session
-        .send(frame(
-            1,
-            Some(Frame::Dispatched(proto::Dispatched::default())),
-        ))
+        .send(frame(1, Some(Frame::Released(a_released(1)))))
         .await;
+    session.send(hello(GATEWAY)).await;
     assert_eq!(
         session.status().await,
         (
-            Code::InvalidArgument,
-            "Dispatched.side is 0, which names none this version knows".to_owned()
+            Code::FailedPrecondition,
+            "a session stands on this stream: a second Hello needs a new stream".to_owned()
         )
+    );
+    assert_eq!(place.look(), LookOutcome::Quiet, "no frame waited");
+    assert_eq!(
+        LeasesStore::get(&*store, gateway, LeaseId(1)).map(|record| record.state),
+        None,
+        "the release was applied"
     );
 }
 
@@ -1305,7 +1437,7 @@ fn veto(worker: WorkerId, kind: i32, for_micros: u32, clear: bool) -> proto::Gat
 /// Whether the store shows the gateway's veto on `worker` now.
 fn vetoed(bed: &Bed, worker: WorkerId) -> bool {
     let gateway = told(GATEWAY).gateway();
-    bed.shared.store.vetoed(gateway, worker, Instant::now())
+    bed.store.vetoed(gateway, worker, Instant::now())
 }
 
 /// Waits, bounded, until the store shows the veto as `stands`.
@@ -1326,7 +1458,7 @@ async fn shows(bed: &Bed, worker: WorkerId, stands: bool) {
 async fn a_veto_frame_sets_its_kinds_veto_and_a_clear_or_a_zero_duration_lifts_it() {
     let mut bed = bed(PATIENT).await;
     bed.leads(1);
-    let w = worker(&bed.shared.store, "http://a:8000");
+    let w = worker(&bed.store, "http://a:8000");
     let mut session = open(bed.addr).await;
     assert_eq!(session.welcomed(1).await.vetoes_restored, 0);
 
@@ -1354,7 +1486,7 @@ async fn a_veto_frame_sets_its_kinds_veto_and_a_clear_or_a_zero_duration_lifts_i
 async fn a_veto_that_meets_a_closed_fence_is_not_applied() {
     let mut bed = bed(PATIENT).await;
     bed.leads(1);
-    let w = worker(&bed.shared.store, "http://a:8000");
+    let w = worker(&bed.store, "http://a:8000");
     let mut session = open(bed.addr).await;
     session.welcomed(1).await;
 
@@ -1374,7 +1506,7 @@ async fn a_veto_that_meets_a_closed_fence_is_not_applied() {
 async fn a_hellos_vetoes_are_held_before_the_welcome_and_a_malformed_list_refuses_it() {
     let mut bed = bed(PATIENT).await;
     bed.leads(1);
-    let w = worker(&bed.shared.store, "http://a:8000");
+    let w = worker(&bed.store, "http://a:8000");
     let assertion = |worker: WorkerId, kind: i32, remaining_micros: u32| proto::VetoAssertion {
         worker_id: worker.0,
         kind,
@@ -1472,7 +1604,7 @@ fn hello_listing(vetoes: Vec<proto::VetoAssertion>) -> proto::GatewayFrame {
 async fn a_hellos_entry_with_nothing_remaining_takes_no_place_among_a_workers_kinds() {
     let mut bed = bed(PATIENT).await;
     bed.leads(1);
-    let w = worker(&bed.shared.store, "http://a:8000");
+    let w = worker(&bed.store, "http://a:8000");
     let kinds = i32::try_from(KINDS_MAX).expect("a small number");
     let mut vetoes: Vec<proto::VetoAssertion> = (1..=kinds)
         .map(|kind| proto::VetoAssertion {
@@ -1508,7 +1640,7 @@ async fn a_veto_of_one_more_than_a_gateway_holds_ends_the_session_by_name() {
     let kinds = i32::try_from(KINDS_MAX).expect("a small number");
     let vetoes: Vec<proto::VetoAssertion> = (0..VETOES_MAX / KINDS_MAX)
         .flat_map(|n| {
-            let w = worker(&bed.shared.store, &format!("http://w{n}:8000"));
+            let w = worker(&bed.store, &format!("http://w{n}:8000"));
             (1..=kinds).map(move |kind| proto::VetoAssertion {
                 worker_id: w.0,
                 kind,
@@ -1516,7 +1648,7 @@ async fn a_veto_of_one_more_than_a_gateway_holds_ends_the_session_by_name() {
             })
         })
         .collect();
-    let one_more = worker(&bed.shared.store, "http://one-more:8000");
+    let one_more = worker(&bed.store, "http://one-more:8000");
     let mut session = open(bed.addr).await;
     session.send(hello_listing(vetoes)).await;
     let welcome = match session.frame().await.frame {
@@ -1545,7 +1677,7 @@ async fn a_veto_of_one_more_than_a_gateway_holds_ends_the_session_by_name() {
 async fn a_veto_of_one_kind_more_than_a_worker_holds_ends_the_session_by_name() {
     let mut bed = bed(PATIENT).await;
     bed.leads(1);
-    let w = worker(&bed.shared.store, "http://a:8000");
+    let w = worker(&bed.store, "http://a:8000");
     let mut session = open(bed.addr).await;
     session.welcomed(1).await;
     let kinds = i32::try_from(KINDS_MAX).expect("a small number");
@@ -1573,7 +1705,7 @@ async fn a_veto_frame_of_a_session_replaced_since_the_question_ends_it_the_same_
     let mut bed = bed(PATIENT).await;
     bed.leads(1);
     let gateway = told(GATEWAY).gateway();
-    let w = worker(&bed.shared.store, "http://a:8000");
+    let w = worker(&bed.store, "http://a:8000");
     let now = Instant::now();
     let seat = bed
         .shared

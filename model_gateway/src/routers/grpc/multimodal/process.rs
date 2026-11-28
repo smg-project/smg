@@ -358,15 +358,22 @@ pub(crate) async fn process_multimodal_plan(
 /// placement, read from the config its video processor is built from (see
 /// [`preprocessor_config_for`]) so the frames the connector picks and the
 /// frames the processor groups answer one config whatever files the
-/// checkpoint ships; the placement under the engine's frame budget.
+/// checkpoint ships; the placement under the engine's frame budget. A rate
+/// the request states (`request_fps`) goes ahead of the rate the engine's
+/// start states (`start_fps`), and that ahead of the config's: it is the
+/// default of the plan's clips, and a part's own rate still wins.
 fn video_sampling(
     spec: &dyn ModelProcessorSpec,
     model_config: &MultimodalModelConfig,
     frame_budget: Option<usize>,
+    start_fps: Option<f64>,
+    request_fps: Option<f64>,
 ) -> (Option<f64>, FrameSampling) {
     let config = preprocessor_config_for(model_config, Modality::Video);
     (
-        spec.default_video_sample_fps_with(config),
+        request_fps
+            .or(start_fps)
+            .or_else(|| spec.default_video_sample_fps_with(config)),
         spec.video_frame_sampling_with(config)
             .with_frame_budget(frame_budget),
     )
@@ -379,6 +386,8 @@ async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> 
         ctx.spec,
         ctx.model_config,
         ctx.components.video_frame_budget,
+        ctx.components.video_start_fps,
+        plan.request_video_fps(),
     );
     let mut tracker = AsyncMultiModalTracker::new(ctx.components.media_connector.clone())
         .with_drain_on_error(ctx.components.drain_fetches_on_error)
@@ -613,7 +622,8 @@ fn intermediate_of(
         .collect::<Vec<_>>();
     Ok(MultimodalIntermediate::try_new(batches)?
         .with_encoder_input_format(spec.encoder_input_format())
-        .with_image_prompt_tokens(image_prompt_tokens))
+        .with_image_prompt_tokens(image_prompt_tokens)
+        .with_language_model_reads_grids(spec.language_model_reads_grids()))
 }
 
 /// The tokens the expansion writes into the prompt for the request's images:

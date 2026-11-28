@@ -4,7 +4,8 @@ from importlib import import_module
 from types import SimpleNamespace
 
 import pytest
-from infra.constants import ENV_STARTUP_TIMEOUT, ConnectionMode, WorkerType
+from infra import worker as worker_module
+from infra.constants import ENV_STARTUP_PROFILE, ENV_STARTUP_TIMEOUT, ConnectionMode, WorkerType
 
 setup = import_module("fixtures.setup_backend")
 
@@ -14,7 +15,11 @@ def fleet(monkeypatch):
     events = []
     clock = [100.0]
     monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
-    monkeypatch.setattr(setup, "get_model_spec", lambda _: {"tp": 1, "startup_timeout": 10})
+    monkeypatch.delenv(ENV_STARTUP_PROFILE, raising=False)
+    # The fleet's readiness bound is `worker_startup_timeout`, which reads the
+    # spec through the worker module: both readers get the stub.
+    for module in (setup, worker_module):
+        monkeypatch.setattr(module, "get_model_spec", lambda _: {"tp": 1, "startup_timeout": 10})
     monkeypatch.setattr(setup.time, "monotonic", lambda: clock[0])
     monkeypatch.setattr(setup, "_worker_start_failures", {})
 
@@ -210,3 +215,17 @@ def test_epd_gateway_wait_takes_the_startup_floor(fleet, monkeypatch):
     assert _gateway_timeout(events) == 900
     backend.close()
     assert [event[0] for event in events[-4:]] == ["shutdown"] + ["stop"] * 3
+
+
+@pytest.fixture
+def exported_profile(monkeypatch):
+    # A startup profile left in the shell, as a profile lane exports it.
+    monkeypatch.setenv(ENV_STARTUP_PROFILE, "vllm-mooncake-pd2")
+
+
+def test_pd_fleet_ignores_a_startup_profile_left_in_the_shell(exported_profile, fleet):
+    events, _, create = fleet
+    backend = create()
+    next(backend)
+    assert [event[2] for event in events[4:8]] == [10, 9, 8, 7]
+    backend.close()

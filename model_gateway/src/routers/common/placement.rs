@@ -24,7 +24,7 @@ use smg_grand_central::{
     document::DecodePick,
     engine::{
         DecisionEngine, InProcess, LentList, PairAdmission, PairLists, PairSide, Phase,
-        PlaceRequest, ShedReason, Unplaced, WorkerLists,
+        PlaceRequest, ShedReason, Unplaced, WorkerLists, BINDING, TARGET_WORKER,
     },
     policies::consistent_hashing::LentRing,
     tracking::{Outcome, Placement, PlacementSide, SideEnd, TransportClass},
@@ -380,6 +380,16 @@ pub(crate) enum PlacementFailure {
     /// model: Grand Central's verdict on the spec, judged from no pool.
     /// Carries the refusal ([`no_plan_bound`]).
     NoPlanBound(Response),
+    /// Grand Central refused the decision: the gateway's own fault and not
+    /// the fleet's state, judged from no pool. Carries the refusal
+    /// ([`decision_failed`]).
+    DecisionFailed(Response),
+    /// Candidates exist and are not shed whole for overload, and Grand
+    /// Central shed the request under this name, the one its answer
+    /// carries. A route answers its client as for [`Self::Unavailable`],
+    /// and the name is for the refusal line of that answer
+    /// ([`shed_under`]).
+    ShedUnder(&'static str),
 }
 
 impl PrefillCandidateError for PlacementFailure {
@@ -1306,9 +1316,8 @@ static ENGINE_REFUSED_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
 /// Writes why Grand Central placed nothing for a request. A decision
 /// the engine refused ([`Unplaced::Refused`]) is the engine's own fault and
 /// not the fleet's state, a stage that panicked among them: its line is
-/// written at `warn`. Every other answer says what the fleet could not
-/// take, which the route's own refusal line reports, and is written at
-/// `debug` under `placed_none`.
+/// written at `warn`. Every other answer is written at `debug` under
+/// `placed_none`.
 fn report_unplaced(model_id: &str, unplaced: &Unplaced, placed_none: &'static str) {
     if let Unplaced::Refused(refused) = unplaced {
         if let Some(admitted) = ENGINE_REFUSED_LOG.admit(model_id) {
@@ -1337,18 +1346,21 @@ enum Declined {
 
 /// Whether Grand Central declined by name the request it did not place
 /// ([`ShedReason::PolicyDeclined`]), and under which name. The gateway reads
-/// the engine's names here and nowhere else. The engine declines an unbound
-/// request under `binding` ahead of either side, so that decline names no
-/// side: a picker of a host's own that took the name declines for a side,
-/// and is read as any other. A shed under the worker the
-/// request names (`target-worker`) is a decline whatever its reason: a
-/// classic pass answers a target that its hash policy finds nowhere as that
-/// policy's decline ([`PlacementFailure::PolicyDeclined`]).
+/// the engine's names here and nowhere else, by the crate's two constants
+/// ([`BINDING`], [`TARGET_WORKER`]). The engine declines an unbound request
+/// under `binding` ahead of either side, so that decline names no side. No
+/// policy spec that names a stage of that name validates. A stage that
+/// answers the name all the same, which only a host's own code can put in
+/// a plan, reads here as the engine's own where it declines for no side. A
+/// shed under the worker the request names (`target-worker`) is a decline
+/// whatever its reason: a classic pass answers a target that its hash
+/// policy finds nowhere as that policy's decline
+/// ([`PlacementFailure::PolicyDeclined`]).
 fn declined(unplaced: &Unplaced) -> Option<Declined> {
     match *unplaced {
         Unplaced::Shed {
             reason: ShedReason::PolicyDeclined,
-            emptied_by: "binding",
+            emptied_by: BINDING,
             side: None,
             ..
         } => Some(Declined::Unbound),
@@ -1358,10 +1370,58 @@ fn declined(unplaced: &Unplaced) -> Option<Declined> {
             ..
         }
         | Unplaced::Shed {
-            emptied_by: emptied_by @ "target-worker",
+            emptied_by: emptied_by @ TARGET_WORKER,
             ..
         } => Some(Declined::By(emptied_by)),
         _ => None,
+    }
+}
+
+/// Why a single placement placed nobody, in the two words a route answers
+/// by. A classic pass says nothing ([`Self::UNSAID`]). Under Grand Central
+/// it is the engine's answer ([`Unplaced`]), read once where the engine is
+/// asked ([`Self::of`]). It holds no more of that answer than a route
+/// answers by, so the fronts' answer keeps the size it had with no miss in
+/// it. The engine's own line keeps the whole answer ([`report_unplaced`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SingleMiss {
+    /// Grand Central shed the request under this name. The one judge reads
+    /// the pool's state, and where that reads unavailable the name is for
+    /// the refusal line of that answer ([`PlacementFailure::ShedUnder`]).
+    Shed(&'static str),
+    /// A miss that names no such word.
+    Unnamed(Unnamed),
+}
+
+/// A single placement's miss that names no word of the engine's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unnamed {
+    /// Nothing is said, and the pool's state answers as it always did: a
+    /// classic pass, and an engine that queued the request or had no worker
+    /// to send it to.
+    Unsaid,
+    /// The policy spec in force binds no single-request plan for the model
+    /// ([`Declined::Unbound`]).
+    Unbound,
+    /// Grand Central refused the decision ([`Unplaced::Refused`]).
+    Refused,
+}
+
+impl SingleMiss {
+    /// The miss of a classic pass, which says nothing.
+    pub(crate) const UNSAID: Self = Self::Unnamed(Unnamed::Unsaid);
+
+    /// What a route answers by, of the engine's answer for a request it
+    /// placed nowhere.
+    fn of(unplaced: &Unplaced) -> Self {
+        match *unplaced {
+            Unplaced::Refused(_) => Self::Unnamed(Unnamed::Refused),
+            Unplaced::Shed { emptied_by, .. } => match declined(unplaced) {
+                Some(Declined::Unbound) => Self::Unnamed(Unnamed::Unbound),
+                Some(Declined::By(_)) | None => Self::Shed(emptied_by),
+            },
+            _ => Self::UNSAID,
+        }
     }
 }
 
@@ -1441,8 +1501,9 @@ fn observe_match_ratio(blocks: u16, of: u16) {
 /// is handed as the engine reads it ([`place_request`]), with `ring`, the
 /// model's hash ring ([`ModelRing`]), and the engine places the request
 /// with one call. A request pinned to `wire` states it as its demand, and
-/// the engine decides among the list's workers on that wire. `None` where
-/// the engine names no worker.
+/// the engine decides among the list's workers on that wire. Where the
+/// engine names no worker the answer is what it says of that
+/// ([`SingleMiss::of`]).
 ///
 /// Records the selection metric under the chosen worker's own transport
 /// label, as a classic selection does, and under the label of the profile
@@ -1484,16 +1545,15 @@ fn placed_by_engine(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
     stated: Stated,
-) -> Option<Placed> {
+) -> Result<Placed, SingleMiss> {
     // Made where the list holds no worker alone: a list with workers pays
     // the test of its length.
     let own;
-    let lent = if lent.workers.is_empty() {
+    let mut lent = lent;
+    if lent.workers.is_empty() {
         own = smg_grand_central::engine::ListCell::default();
-        LentList { cell: &own, ..lent }
-    } else {
-        lent
-    };
+        lent.cell = &own;
+    }
     let mut tried = TriedIds::new();
     tried_ids(lent.workers, inputs.tried, &mut tried);
     let mut request = place_request(
@@ -1512,7 +1572,7 @@ fn placed_by_engine(
         Err(unplaced) => {
             report_unplaced(model_id, unplaced, "Grand Central placed no worker");
             engine_row(seen, || row_name(policies, None, ""), None);
-            return None;
+            return Err(SingleMiss::of(unplaced));
         }
     };
     let counted_under = if placement.profile.is_empty() {
@@ -1536,15 +1596,15 @@ fn placed_by_engine(
         Ok(placement) if owed => {
             let (worker, key) = (Arc::clone(&placement.worker), placement.routing_key);
             let side = Box::new(placement.kept().sides().0);
-            Some(Placed::by_engine(worker, Some(side), key))
+            Ok(Placed::by_engine(worker, Some(side), key))
         }
         Ok(Placement {
             worker,
             routing_key,
             ..
-        }) => Some(Placed::by_engine(worker, None, routing_key)),
+        }) => Ok(Placed::by_engine(worker, None, routing_key)),
         // Answered above, with its report: this arm only completes the match.
-        Err(_) => None,
+        Err(unplaced) => Err(SingleMiss::of(&unplaced)),
     }
 }
 
@@ -1566,7 +1626,7 @@ fn single_by_engine(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
     stated: impl FnOnce() -> Stated,
-) -> Option<Placed> {
+) -> Result<Placed, SingleMiss> {
     let snapshot = registry.get_routing_snapshot(model_id);
     single_of_by_engine(
         engine, policies, model_id, &snapshot, pool, wire, inputs, stated,
@@ -1597,7 +1657,7 @@ fn single_of_by_engine(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
     stated: impl FnOnce() -> Stated,
-) -> Option<Placed> {
+) -> Result<Placed, SingleMiss> {
     let stated = stated();
     let ring = ModelRing::of(engine, policies, model_id, snapshot, &[Phase::Single]);
     let ring = ring.lent();
@@ -1605,9 +1665,10 @@ fn single_of_by_engine(
     placed_by_engine(engine, policies, model_id, lent, ring, wire, inputs, stated)
 }
 
-/// Pick one worker for `model_id` from `pool`, or `None` when nothing is
-/// selectable. Records the selection metric under the chosen worker's own
-/// transport label.
+/// Pick one worker for `model_id` from `pool`, or say what the placement
+/// says of placing nobody ([`SingleMiss`]): a classic pass says nothing, and
+/// the engine says what a route answers by ([`miss_failure`]). Records the
+/// selection metric under the chosen worker's own transport label.
 ///
 /// This function and its sibling ([`select_single_of`]) are thin fronts,
 /// always inlined where a route calls them. Each reads the registry's
@@ -1630,13 +1691,15 @@ pub(crate) fn select_single(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
     stated: impl FnOnce() -> Stated,
-) -> Option<Placed> {
+) -> Result<Placed, SingleMiss> {
     if let Some(engine) = policies.engine() {
         return single_by_engine(
             engine, registry, policies, model_id, pool, wire, inputs, stated,
         );
     }
-    classic_single(registry, policies, model_id, pool, wire, inputs).map(Placed::from)
+    classic_single(registry, policies, model_id, pool, wire, inputs)
+        .map(Placed::from)
+        .ok_or(SingleMiss::UNSAID)
 }
 
 /// [`select_single`] by the classic policies. Never inlined into its front:
@@ -1675,13 +1738,15 @@ pub(crate) fn select_single_of(
     wire: Option<WireConstraint>,
     inputs: PlacementInputs<'_>,
     stated: impl FnOnce() -> Stated,
-) -> Option<Placed> {
+) -> Result<Placed, SingleMiss> {
     if let Some(engine) = policies.engine() {
         return single_of_by_engine(
             engine, policies, model_id, snapshot, pool, wire, inputs, stated,
         );
     }
-    classic_single_of(registry, policies, model_id, snapshot, pool, wire, inputs).map(Placed::from)
+    classic_single_of(registry, policies, model_id, snapshot, pool, wire, inputs)
+        .map(Placed::from)
+        .ok_or(SingleMiss::UNSAID)
 }
 
 /// [`select_single_of`] by the classic policies.
@@ -1927,19 +1992,61 @@ fn overload_fallback(
     Some(selected)
 }
 
-/// Classify a failed single-worker placement from the same pool it drew from.
+/// Classify a failed single-worker placement from what it said of placing
+/// nobody (`miss`) and the same pool it drew from ([`miss_failure`]).
 pub(crate) fn single_failure(
     registry: &WorkerRegistry,
     model_id: &str,
     pool: RoutingPool,
     wire: Option<WireConstraint>,
+    miss: SingleMiss,
 ) -> PlacementFailure {
     let candidates = candidates(registry, model_id, pool, wire);
-    failure_from(
+    miss_failure(
+        miss,
         candidates.as_slice(),
         model_id,
         registry.overload_shed_enabled(),
     )
+}
+
+/// Judge a single placement that placed nobody: what it said of that
+/// ([`SingleMiss`]), then the candidates it drew from. Every single route
+/// answers a miss by this one function, in this order. The pair router's
+/// token count asks it only of a miss that says something. A pool nobody
+/// is in keeps its answer, whatever the engine says: a classic pass answers
+/// a model nobody serves the same. Then Grand Central's own verdict, judged
+/// from no pool: no plan bound ([`no_plan_bound`]), or a decision it
+/// refused ([`decision_failed`]). Then the pool's state ([`failure_from`]),
+/// and where that is neither empty nor a shed, the word the engine shed
+/// the request under ([`PlacementFailure::ShedUnder`]). A miss that says
+/// nothing answers what [`failure_from`] answers. `shedding` is
+/// `--worker-overload-shed`.
+pub(crate) fn miss_failure(
+    miss: SingleMiss,
+    candidates: &[Arc<dyn Worker>],
+    model_id: &str,
+    shedding: bool,
+) -> PlacementFailure {
+    if candidates.is_empty() {
+        return PlacementFailure::NoCandidates;
+    }
+    match miss {
+        SingleMiss::Unnamed(Unnamed::Unbound) => {
+            let refusal = no_plan_bound(model_id, "single-request");
+            return PlacementFailure::NoPlanBound(refusal);
+        }
+        SingleMiss::Unnamed(Unnamed::Refused) => {
+            return PlacementFailure::DecisionFailed(decision_failed(model_id));
+        }
+        SingleMiss::Unnamed(Unnamed::Unsaid) | SingleMiss::Shed(_) => {}
+    }
+    match (failure_from(candidates, model_id, shedding), miss) {
+        (PlacementFailure::Unavailable, SingleMiss::Shed(name)) => {
+            PlacementFailure::ShedUnder(name)
+        }
+        (verdict, _) => verdict,
+    }
 }
 
 /// Classify a failed placement from the candidates it drew from. `shed` is
@@ -2042,6 +2149,42 @@ pub(crate) fn no_plan_bound(model_id: &str, plan: &'static str) -> Response {
     let mut response = error::not_implemented(NO_PLAN_BOUND_CODE, message.clone());
     response.extensions_mut().insert(RefusalReason(message));
     response
+}
+
+/// The client-visible code of [`decision_failed`].
+pub(crate) const DECISION_FAILED_CODE: &str = "grand_central_decision_failed";
+
+/// The 500 for a request whose decision Grand Central refused
+/// ([`Unplaced::Refused`]): the gateway's own fault, not a pool state. It is
+/// marked terminal for the retry layer, because a decision that fails by
+/// the request fails again, and it carries no `Retry-After`: no worker is
+/// down for a client to wait for. Its words say nothing of a worker: an
+/// attempt of the same request ahead of this decision may have asked one.
+/// The engine's own line says why ([`report_unplaced`]).
+pub(crate) fn decision_failed(model_id: &str) -> Response {
+    let mut response = error::internal_error(
+        DECISION_FAILED_CODE,
+        format!(
+            "Grand Central made no decision for model '{model_id}'. The fault is the gateway's \
+             own."
+        ),
+    );
+    mark_non_retryable(&mut response);
+    response
+}
+
+/// The reason a refusal's line names for a request Grand Central shed under
+/// `name` ([`PlacementFailure::ShedUnder`]): one sentence for every route.
+/// `side` is the side of a pair the route answers for. The fleet's own state
+/// chooses that side ahead of the engine's word ([`pair_unplaced`]), so the
+/// sentence says whom the answer is for and not whom the engine named.
+pub(crate) fn shed_under(name: &str, side: Option<&str>) -> String {
+    match side {
+        Some(side) => {
+            format!("Grand Central shed the pair under {name}, answered for its {side} side")
+        }
+        None => format!("Grand Central shed the request under {name}"),
+    }
 }
 
 /// The reason a refusal's line names, when the router gave one (a
@@ -2826,23 +2969,12 @@ fn with_pair_request<R>(
         Some(claimed) => claimed,
         None => &gates,
     };
-    let lists = PairLists {
-        prefill,
-        decode,
-        classes,
-        admission,
-        // No place of a list is stated. A pinned request is held to its
-        // wire by its demand, a side at a time, and the engine asks the
-        // route's rule of a list itself.
-        prefill_places: None,
-        decode_places: None,
-        // The gateway's standing vetoes are on its worker objects, which
-        // the engine reads: none is stated beside a list.
-        prefill_stalled: &[],
-        prefill_held: &[],
-        decode_stalled: &[],
-        decode_held: &[],
-    };
+    // No place of a list is stated. A pinned request is held to its
+    // wire by its demand, a side at a time, and the engine asks the
+    // route's rule of a list itself.
+    // The gateway's standing vetoes are on its worker objects, which
+    // the engine reads: none is stated beside a list.
+    let lists = PairLists::of(prefill, decode, classes, admission);
     // A failed attempt lists both its engines, whichever side failed.
     let (mut tried, mut decodes_tried) = (TriedIds::new(), TriedIds::new());
     tried_ids(prefill.workers, inputs.tried, &mut tried);
@@ -2875,8 +3007,11 @@ fn with_pair_request<R>(
 ///
 /// Prefills all at the request's admission limit answer
 /// [`PlacementFailure::PrefillAtCapacity`], on which the route waits for a
-/// slot and asks again. A request the engine declined by name ([`declined`])
-/// answers by that name. Where the policy spec in force binds no pair plan
+/// slot and asks again. A decision the engine refused is
+/// [`PlacementFailure::DecisionFailed`], judged from no pool and for no
+/// side: a classic pass has no engine to refuse. A request the engine
+/// declined by name ([`declined`]) answers by that name. Where the policy
+/// spec in force binds no pair plan
 /// for the model it is [`PlacementFailure::NoPlanBound`], an answer a
 /// classic pass has none for: it reads no spec. Under any other name it is
 /// [`PlacementFailure::PolicyDeclined`] with the engine's name, where a
@@ -2884,9 +3019,12 @@ fn with_pair_request<R>(
 /// Any other miss is judged from the pools, as a classic pass judges its own
 /// ([`failure_from`]). A side with nobody the request may use and that is
 /// available is the fleet's own state, and it is the role, the prefills
-/// first: a classic pass answers such a fleet the same. Where both sides
-/// have such a worker the fleet explains nothing, and the role is the side
-/// the engine's refusal names, the decode's where it names none.
+/// first: a classic pass answers a side that is down or shed the same.
+/// Where both sides have such a worker the fleet explains nothing, and the
+/// role is the side the engine's refusal names, the decode's where it names
+/// none. Where the role's side is neither empty nor shed whole for
+/// overload, a shed's verdict carries the name the engine shed the pair
+/// under ([`PlacementFailure::ShedUnder`]).
 ///
 /// Records the selection metric of each side under that worker's transport
 /// label and the label of the profile that picked the side, and under the
@@ -3104,6 +3242,13 @@ fn pair_unplaced(
         named.unwrap_or(WorkerRole::Decode)
     };
     row(role);
+    // A decision the engine refused is its own fault: no side's, and no
+    // pool is judged for it. The record keeps the row above, as for a
+    // refusal the pools judge.
+    if let Unplaced::Refused(_) = unplaced {
+        let verdict = PlacementFailure::DecisionFailed(decision_failed(model_id));
+        return fail(WorkerRole::Single, verdict);
+    }
     let pool = if role == WorkerRole::Decode {
         &pairs.decode_pool
     } else {
@@ -3111,7 +3256,15 @@ fn pair_unplaced(
     };
     let judged = admitted_pool(pool, wire, inputs);
     let shedding = registry.overload_shed_enabled();
-    fail(role, failure_from(&judged, model_id, shedding))
+    let verdict = match (failure_from(&judged, model_id, shedding), unplaced) {
+        // The engine's word, for the line of a role whose side is neither
+        // empty nor shed whole for overload.
+        (PlacementFailure::Unavailable, &Unplaced::Shed { emptied_by, .. }) => {
+            PlacementFailure::ShedUnder(emptied_by)
+        }
+        (verdict, _) => verdict,
+    };
+    fail(role, verdict)
 }
 
 /// A pair's decode asked again behind its prefill's answer: the placement
@@ -3576,7 +3729,10 @@ pub(crate) mod tests {
         document::{
             AppliedSpec, DecodePick, KeySourceSpec, OverloadSpec, PolicySpec, RoutingKeySpec,
         },
-        engine::{Candidate, Constraints, Decision, Filter, RequestFacts, Scorer, Target, TieBand},
+        engine::{
+            Candidate, Constraints, Decision, DecisionRefused, Filter, RequestFacts, Scorer,
+            Target, TieBand,
+        },
         stages::{Lifecycle, StageRegistry},
         tracking::{EventSet, Lease, Outcome, ReleaseReason, Side},
     };
@@ -3598,6 +3754,7 @@ pub(crate) mod tests {
         config::types::{
             ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig,
         },
+        middleware::test_support::json_of,
         observability::logging::test_support::test_subscriber,
         policies::{
             hash_ring::HashRing, CacheAwareConfig, CacheAwarePolicy, ConsistentHashingPolicy,
@@ -5744,9 +5901,15 @@ pub(crate) mod tests {
             PlacementInputs::default(),
             Stated::nothing,
         )
-        .is_none());
+        .is_err());
         assert!(matches!(
-            single_failure(&registry, MODEL, RoutingPool::GrpcPipelineRegular, None),
+            single_failure(
+                &registry,
+                MODEL,
+                RoutingPool::GrpcPipelineRegular,
+                None,
+                SingleMiss::UNSAID
+            ),
             PlacementFailure::NoCandidates
         ));
     }
@@ -5970,7 +6133,7 @@ pub(crate) mod tests {
             },
             Stated::nothing,
         )
-        .is_some());
+        .is_ok());
     }
 
     /// The holder of a prompt's prefix keeps it over repeated placements, and
@@ -6107,11 +6270,11 @@ pub(crate) mod tests {
         let shifted = |veto: &str| {
             assert_eq!(
                 target(1).map(|worker| worker.url().to_string()),
-                Some(by_index[2].url().to_string()),
+                Ok(by_index[2].url().to_string()),
                 "{veto}: index 1 names the next available worker"
             );
             assert!(
-                target(2).is_none(),
+                target(2).is_err(),
                 "{veto}: index 2 is past the available workers"
             );
             // That miss is the policy's decline among available workers, and
@@ -6172,7 +6335,7 @@ pub(crate) mod tests {
             assert!(registry.set_worker_overloaded(worker, true));
         }
         assert!(
-            target(5).is_some(),
+            target(5).is_ok(),
             "an all-vetoed pool serves an index past the pool through the fallback"
         );
         for worker in &by_index {
@@ -6251,7 +6414,8 @@ pub(crate) mod tests {
             None,
             inputs,
             Stated::nothing,
-        )?;
+        )
+        .ok()?;
         among
             .iter()
             .position(|member| Arc::ptr_eq(member, worker.worker()))
@@ -7634,6 +7798,101 @@ pub(crate) mod tests {
         heard
     }
 
+    /// A filter that keeps no worker: the engine sheds a request under its
+    /// name.
+    #[derive(Debug)]
+    struct Nobody;
+
+    impl Filter for Nobody {
+        fn name(&self) -> &'static str {
+            "nobody"
+        }
+
+        fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
+            false
+        }
+    }
+
+    /// The engine's three answers that a route answers by, each as a policy
+    /// spec that brings it about on a fleet whose every worker is open. For
+    /// the cases of this module and of the routes.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum Refusing {
+        /// The spec binds no plan of the request's kind for the model.
+        Unbound,
+        /// The engine refuses the decision: a scorer of the spec panics.
+        Faulted,
+        /// The filter named `nobody` keeps no worker.
+        Nobody,
+    }
+
+    impl Refusing {
+        /// Hands `policies` an engine that answers a single request so.
+        pub(crate) fn single_on(self, policies: &PolicyRegistry) {
+            let document = match self {
+                // The pair presets bind pairs alone.
+                Self::Unbound => Self::pair_presets(),
+                Self::Faulted => serde_json::from_str(
+                    r#"{"apiVersion":"smg.policy/v1","generation":1,"profiles":{"p":{"score":["faults"],"pick":"best"}}}"#,
+                )
+                .expect("a policy document"),
+                Self::Nobody => {
+                    let mut document = PolicySpec::preset("round_robin").expect("a stock preset");
+                    for profile in document.profiles.values_mut() {
+                        profile.filter.push("nobody".into());
+                    }
+                    document
+                }
+            };
+            Self::apply(policies, &document);
+        }
+
+        /// Hands `policies` an engine that answers a pair so. Under
+        /// `Faulted` the scorer that panics ranks the decode side, and
+        /// under `Nobody` no prefill passes its profile's filter.
+        pub(crate) fn pair_on(self, policies: &PolicyRegistry) {
+            let document = match self {
+                // A stock preset binds single requests alone.
+                Self::Unbound => PolicySpec::preset("round_robin").expect("a stock preset"),
+                Self::Faulted => {
+                    let mut document = Self::pair_presets();
+                    document.generation = 1;
+                    let decode = document.profiles.get_mut("decode");
+                    let decode = decode.expect("the decode side's profile");
+                    decode.score = vec!["faults".into()];
+                    decode.pick = "best".into();
+                    document
+                }
+                Self::Nobody => {
+                    let mut document = Self::pair_presets();
+                    let prefill = document.profiles.get_mut("prefill");
+                    let prefill = prefill.expect("the prefill's profile");
+                    prefill.filter.push("nobody".into());
+                    document
+                }
+            };
+            Self::apply(policies, &document);
+        }
+
+        fn pair_presets() -> PolicySpec {
+            PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets")
+        }
+
+        /// Turns the engine on under `document`, over the stock stages and
+        /// the two that refuse.
+        fn apply(policies: &PolicyRegistry, document: &PolicySpec) {
+            let mut stages = StageRegistry::builtin();
+            stages
+                .scorer("faults", || Box::new(Faults))
+                .expect("a free name");
+            stages
+                .filter("nobody", || Box::new(Nobody))
+                .expect("a free name");
+            let spec = AppliedSpec::validate_in(document, &stages, &[]);
+            engine_on(policies, spec.expect("the stages hold the two that refuse"));
+        }
+    }
+
     /// One request a hearing engine placed, for a case of another module:
     /// what the stage hears, the request's load guard and the handle on its
     /// end.
@@ -7908,11 +8167,11 @@ pub(crate) mod tests {
 
         let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let unread = || -> Stated { panic!("a classic placement is handed nothing of it") };
-        assert!(select_single(&registry, &classic, MODEL, pool, None, inputs, unread).is_some());
+        assert!(select_single(&registry, &classic, MODEL, pool, None, inputs, unread).is_ok());
         assert!(select_single_of(
             &registry, &classic, MODEL, &snapshot, pool, None, inputs, unread
         )
-        .is_some());
+        .is_ok());
         let pairs = one_pair();
         let index = pairs_of(&pairs, &classic);
         let unread = || -> Stated { panic!("a classic pair is handed nothing of it") };
@@ -7996,25 +8255,20 @@ pub(crate) mod tests {
     }
 
     /// A decision the engine refuses is the engine's own fault, not the
-    /// fleet's state. The placement answers no worker, as for every request
-    /// the engine does not place, and writes the refusal at `warn` with the
-    /// model and the engine's reason.
+    /// fleet's state. The placement answers no worker and says so in its
+    /// miss, and writes the refusal at `warn` with the model and the
+    /// engine's reason. A single route answers it a 500 under its own code,
+    /// marked terminal for the retry layer and with no retry hint, on a
+    /// pool whose every worker is open. Judged from the pool, it read as
+    /// every worker unavailable, with a retry hint. The gateway's own
+    /// selection has no like case: it has no engine to refuse.
     #[test]
     fn a_decision_the_engine_refuses_is_written_at_warn() {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
         let registry = http_registry(&["http://h:1", "http://h:2"]);
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        let mut stages = StageRegistry::builtin();
-        stages
-            .scorer("faults", || Box::new(Faults))
-            .expect("a free name");
-        let document: PolicySpec = serde_json::from_str(
-            r#"{"apiVersion":"smg.policy/v1","generation":1,"profiles":{"p":{"score":["faults"],"pick":"best"}}}"#,
-        )
-        .expect("a policy document");
-        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
-        engine_on(&policies, spec.expect("the stages hold the scorer"));
+        Refusing::Faulted.single_on(&policies);
 
         let placed = select_single(
             &registry,
@@ -8025,7 +8279,20 @@ pub(crate) mod tests {
             PlacementInputs::default(),
             Stated::nothing,
         );
-        assert!(placed.is_none(), "a refused decision places no worker");
+        let miss = placed.expect_err("a refused decision places no worker");
+        assert_eq!(miss, SingleMiss::Unnamed(Unnamed::Refused));
+        let failure = single_failure(&registry, MODEL, RoutingPool::HttpRegular, None, miss);
+        let refusal = match failure {
+            PlacementFailure::DecisionFailed(refusal) => refusal,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(refusal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            DECISION_FAILED_CODE
+        );
+        assert!(refusal.headers().get(RETRY_AFTER).is_none());
+        assert!(!is_retryable_response(&refusal));
         let lines = lines.lock().unwrap();
         let refused: Vec<_> = lines
             .iter()
@@ -8041,6 +8308,255 @@ pub(crate) mod tests {
         }
     }
 
+    /// The fronts' answer is as large with a miss in it as it was with
+    /// none: a placement, the gateway's own or the engine's, writes no word
+    /// more for it. The miss is two words.
+    #[test]
+    fn the_fronts_answer_keeps_its_size_with_a_miss_in_it() {
+        assert_eq!(size_of::<SingleMiss>(), 2 * size_of::<usize>());
+        assert_eq!(
+            size_of::<Result<Placed, SingleMiss>>(),
+            size_of::<Option<Placed>>()
+        );
+    }
+
+    /// A miss holds what a route answers by, of the engine's answer. A
+    /// decline under `binding` is a spec that binds no plan. A decision the
+    /// engine refused is that. Every other shed keeps its name for the
+    /// refusal's line, a decline under another name among them. Any other
+    /// answer says nothing, as the gateway's own selection says nothing of
+    /// a miss (`select_among`, in this file).
+    #[test]
+    fn a_miss_holds_what_a_route_answers_by_of_the_engines_answer() {
+        let shed = |reason, emptied_by| {
+            SingleMiss::of(&Unplaced::Shed {
+                reason,
+                emptied_by,
+                retry_after_secs: 1,
+                side: None,
+            })
+        };
+        let unbound = SingleMiss::Unnamed(Unnamed::Unbound);
+        assert_eq!(shed(ShedReason::PolicyDeclined, BINDING), unbound);
+        let named = SingleMiss::Shed("a-picker");
+        assert_eq!(shed(ShedReason::PolicyDeclined, "a-picker"), named);
+        let target = SingleMiss::Shed(TARGET_WORKER);
+        assert_eq!(shed(ShedReason::NoEndpoints, TARGET_WORKER), target);
+        assert_eq!(
+            shed(ShedReason::NoEndpoints, "health"),
+            SingleMiss::Shed("health")
+        );
+        // A shed under `binding` for another reason is no unbound plan.
+        assert_eq!(
+            shed(ShedReason::NoEndpoints, BINDING),
+            SingleMiss::Shed(BINDING)
+        );
+        assert_eq!(SingleMiss::of(&Unplaced::NoWorkers), SingleMiss::UNSAID);
+        assert_eq!(SingleMiss::of(&Unplaced::Queued), SingleMiss::UNSAID);
+        let refused = Unplaced::Refused(DecisionRefused::PairSide);
+        assert_eq!(
+            SingleMiss::of(&refused),
+            SingleMiss::Unnamed(Unnamed::Refused)
+        );
+    }
+
+    /// The one function's order for a single route. A pool nobody is in
+    /// keeps its answer under every miss, as the gateway's own selection
+    /// answers a model nobody serves (`failure_from`, in this file). Then
+    /// the engine's own verdict, judged from no pool: no plan bound, or a
+    /// decision it refused. The gateway's own selection has no like case
+    /// for either: it reads no spec, and it has no engine to refuse. Then
+    /// the pool's state, where a miss that says nothing answers what
+    /// `failure_from` answers, and a shed's name stands on the verdict of a
+    /// pool that is neither empty nor shed whole for overload. A pool shed
+    /// whole for overload keeps its shed, whatever the engine named. The
+    /// engine's own verdict stands ahead of each state: over an open pool,
+    /// over one that is down and over one shed whole for overload.
+    #[test]
+    fn a_single_miss_is_judged_behind_an_empty_pool_and_ahead_of_the_pools_state() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let pool = candidates(&registry, MODEL, RoutingPool::HttpRegular, None);
+        let pool = pool.as_slice();
+        let unbound = SingleMiss::Unnamed(Unnamed::Unbound);
+        let refused = SingleMiss::Unnamed(Unnamed::Refused);
+        let shed = SingleMiss::Shed("a-filter");
+        for miss in [SingleMiss::UNSAID, unbound, refused, shed] {
+            let verdict = miss_failure(miss, &[], MODEL, false);
+            assert!(
+                matches!(verdict, PlacementFailure::NoCandidates),
+                "{miss:?}: {verdict:?}"
+            );
+        }
+        let verdict = miss_failure(SingleMiss::UNSAID, pool, MODEL, false);
+        assert!(
+            matches!(verdict, PlacementFailure::Unavailable),
+            "{verdict:?}"
+        );
+        let verdict = miss_failure(shed, pool, MODEL, false);
+        assert!(
+            matches!(verdict, PlacementFailure::ShedUnder("a-filter")),
+            "{verdict:?}"
+        );
+        let refusal = match miss_failure(unbound, pool, MODEL, false) {
+            PlacementFailure::NoPlanBound(refusal) => refusal,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(refusal.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            refusal_reason(&refusal),
+            Some("the policy spec in force binds no single-request plan for model 'm'")
+        );
+        let verdict = miss_failure(refused, pool, MODEL, false);
+        assert!(
+            matches!(verdict, PlacementFailure::DecisionFailed(_)),
+            "{verdict:?}"
+        );
+        // The engine's own verdict, whatever the pool's state and the shed's
+        // switch.
+        let engines_own = |state: &str, shedding: bool| {
+            let verdict = miss_failure(unbound, pool, MODEL, shedding);
+            assert!(
+                matches!(verdict, PlacementFailure::NoPlanBound(_)),
+                "{state}: {verdict:?}"
+            );
+            let verdict = miss_failure(refused, pool, MODEL, shedding);
+            assert!(
+                matches!(verdict, PlacementFailure::DecisionFailed(_)),
+                "{state}: {verdict:?}"
+            );
+        };
+        for worker in registry.get_all() {
+            worker.set_status(WorkerStatus::NotReady);
+        }
+        engines_own("a pool that is down", false);
+        let verdict = miss_failure(SingleMiss::UNSAID, pool, MODEL, false);
+        assert!(
+            matches!(verdict, PlacementFailure::Unavailable),
+            "{verdict:?}"
+        );
+        let verdict = miss_failure(shed, pool, MODEL, false);
+        assert!(
+            matches!(verdict, PlacementFailure::ShedUnder("a-filter")),
+            "{verdict:?}"
+        );
+        for worker in registry.get_all() {
+            worker.set_status(WorkerStatus::Ready);
+            registry.set_worker_overloaded(&worker, true);
+        }
+        engines_own("a pool overloaded whole", true);
+        for miss in [SingleMiss::UNSAID, shed] {
+            let verdict = miss_failure(miss, pool, MODEL, true);
+            assert!(
+                matches!(verdict, PlacementFailure::AllOverloaded(_)),
+                "{miss:?}: {verdict:?}"
+            );
+        }
+        assert_eq!(
+            shed_under("a-filter", None),
+            "Grand Central shed the request under a-filter"
+        );
+        assert_eq!(
+            shed_under("a-filter", Some("prefill")),
+            "Grand Central shed the pair under a-filter, answered for its prefill side"
+        );
+    }
+
+    /// The client's words for a decision the engine refused name the model
+    /// and whose fault it is. They say nothing of a worker: a retry's
+    /// decision can fail behind an attempt that asked one.
+    #[tokio::test]
+    async fn a_refused_decisions_answer_says_whose_fault_it_is() {
+        let body = json_of(decision_failed("m")).await;
+        assert_eq!(
+            body["error"]["message"],
+            "Grand Central made no decision for model 'm'. The fault is the gateway's own."
+        );
+    }
+
+    /// A single request that the policy spec in force binds no plan for is
+    /// refused as that, on a pool whose every worker is open: the engine
+    /// declines it under `binding`, the placement says so in its miss, and
+    /// a route answers the 501 of an unbound plan with no retry hint.
+    /// Judged from the pool, it read as every worker unavailable, with a
+    /// retry hint, on a fleet with nobody down. A model nobody serves keeps
+    /// its answer under the same spec. The gateway's own selection has no
+    /// like case: it reads no spec.
+    #[test]
+    fn a_single_request_the_spec_binds_no_plan_for_is_refused_as_that_on_an_open_pool() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        Refusing::Unbound.single_on(&policies);
+        let placed = select_single(
+            &registry,
+            &policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs::default(),
+            Stated::nothing,
+        );
+        let miss = placed.expect_err("no single-request plan binds the model");
+        assert_eq!(miss, SingleMiss::Unnamed(Unnamed::Unbound));
+        let failure = single_failure(&registry, MODEL, RoutingPool::HttpRegular, None, miss);
+        let refusal = match failure {
+            PlacementFailure::NoPlanBound(refusal) => refusal,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(refusal.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            NO_PLAN_BOUND_CODE
+        );
+        assert!(refusal.headers().get(RETRY_AFTER).is_none());
+        let nobody = select_single(
+            &registry,
+            &policies,
+            "a-model-nobody-serves",
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs::default(),
+            Stated::nothing,
+        );
+        let miss = nobody.expect_err("nobody serves the model");
+        let pool = RoutingPool::HttpRegular;
+        let failure = single_failure(&registry, "a-model-nobody-serves", pool, None, miss);
+        assert!(
+            matches!(failure, PlacementFailure::NoCandidates),
+            "{failure:?}"
+        );
+    }
+
+    /// A stage of the spec that keeps nobody, on a pool whose every worker
+    /// is open: the engine sheds the request under the stage's name, the
+    /// placement keeps the name in its miss, and the route's verdict
+    /// carries it for the refusal's line. The client reads the pool's
+    /// answer of today. The gateway's own selection names a policy that
+    /// picked nobody on a pair's route alone (`pair_failure`, in
+    /// `model_gateway/src/routers/grpc/common/stages/worker_selection.rs`):
+    /// on a single route it has no like case.
+    #[test]
+    fn a_stage_that_keeps_nobody_is_named_on_a_single_routes_verdict() {
+        let registry = http_registry(&["http://h:1", "http://h:2"]);
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        Refusing::Nobody.single_on(&policies);
+        let placed = select_single(
+            &registry,
+            &policies,
+            MODEL,
+            RoutingPool::HttpRegular,
+            None,
+            PlacementInputs::default(),
+            Stated::nothing,
+        );
+        let miss = placed.expect_err("no worker passes the filter");
+        assert_eq!(miss, SingleMiss::Shed("nobody"));
+        let failure = single_failure(&registry, MODEL, RoutingPool::HttpRegular, None, miss);
+        assert!(
+            matches!(failure, PlacementFailure::ShedUnder("nobody")),
+            "{failure:?}"
+        );
+    }
+
     /// The guard of an engine's answer counts the request under the routing
     /// value the engine names, whatever key its route reads. The document
     /// here reads the value from the body's own id, which the engine keeps
@@ -8050,13 +8566,9 @@ pub(crate) mod tests {
         let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let mut document = PolicySpec::preset("consistent_hashing").expect("a stock preset");
-        document.bindings[0].routing_key = Some(RoutingKeySpec {
-            sources: vec![KeySourceSpec {
-                rid: true,
-                ..KeySourceSpec::default()
-            }],
-            strip_lineage: false,
-        });
+        let mut source = KeySourceSpec::default();
+        source.rid = true;
+        document.bindings[0].routing_key = Some(RoutingKeySpec::of(vec![source]));
         let spec = AppliedSpec::validate(&document);
         engine_on(&policies, spec.expect("a valid document"));
         let keyed = PlacementInputs {
@@ -8187,7 +8699,7 @@ pub(crate) mod tests {
             inputs,
             Stated::nothing
         )
-        .is_none());
+        .is_err());
     }
 
     /// The wire a request is pinned to, of `runtime` over `connection`.
@@ -8331,7 +8843,7 @@ pub(crate) mod tests {
                         inputs,
                         Stated::nothing,
                     );
-                    seen.insert(placed.map(|placed| placed.url().to_owned()));
+                    seen.insert(placed.ok().map(|placed| placed.url().to_owned()));
                 }
                 seen.into_iter().collect::<Vec<_>>()
             };
@@ -8385,7 +8897,7 @@ pub(crate) mod tests {
                 inputs,
                 Stated::nothing,
             );
-            placed.map(|placed| placed.url().to_owned())
+            placed.ok().map(|placed| placed.url().to_owned())
         };
         let by_classic: Vec<_> = (0..3).map(|number| named(&classic, number)).collect();
         let mut on_wire = by_classic[..2].to_vec();
@@ -8434,7 +8946,7 @@ pub(crate) mod tests {
                     inputs,
                     Stated::nothing,
                 );
-                placed.map(|placed| placed.url().to_owned())
+                placed.ok().map(|placed| placed.url().to_owned())
             };
             for _ in 0..4 {
                 assert_eq!(
@@ -8457,6 +8969,8 @@ pub(crate) mod tests {
     /// prefill's where neither side has one, with the pool's own verdict
     /// and no shed over another wire's overloaded worker
     /// (`a_pool_with_no_worker_on_the_pinned_wire_keeps_its_verdict_under_a_filter`).
+    /// The engine's verdict carries the name it shed the pair under, for
+    /// the refusal's line, and the client reads the same under both.
     #[test]
     fn the_engine_answers_a_pair_with_nobody_on_its_wire_as_classic_does() {
         let pair_engine_on = |policies: &PolicyRegistry| {
@@ -8489,7 +9003,14 @@ pub(crate) mod tests {
         let classic = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let engine = PolicyRegistry::new(PolicyConfig::RoundRobin);
         pair_engine_on(&engine);
-        for policies in [&classic, &engine] {
+        // The pool's verdict, with the name the engine shed the pair under
+        // where it shed one.
+        let word_of = |failure: &PairFailure| match failure.verdict {
+            PlacementFailure::Unavailable => None,
+            PlacementFailure::ShedUnder(name) => Some(name),
+            ref other => panic!("{other:?}"),
+        };
+        for (policies, name) in [(&classic, None), (&engine, Some("wires"))] {
             // Built from raw pools, as a caller with its own candidate
             // lists would.
             let pairs = PdPairIndex::build(
@@ -8516,11 +9037,7 @@ pub(crate) mod tests {
                 .err()
                 .expect("the retained transport has no decode worker");
             assert_eq!(failure.role, WorkerRole::Decode);
-            assert!(
-                matches!(failure.verdict, PlacementFailure::Unavailable),
-                "{:?}",
-                failure.verdict
-            );
+            assert_eq!(word_of(&failure), name);
         }
 
         // The retry's plan was built for a runtime none of the workers
@@ -8537,7 +9054,7 @@ pub(crate) mod tests {
         let only_p1 = |w: &dyn Worker| w.url() == "grpc://p:1";
         let engine = PolicyRegistry::new(PolicyConfig::RoundRobin);
         pair_engine_on(&engine);
-        for policies in [&classic, &engine] {
+        for (policies, name) in [(&classic, None), (&engine, Some("wires"))] {
             let failure = select_pair(
                 &registry,
                 policies,
@@ -8554,11 +9071,7 @@ pub(crate) mod tests {
             .err()
             .expect("no worker on the wire: the pair fails");
             assert_eq!(failure.role, WorkerRole::Prefill);
-            assert!(
-                matches!(failure.verdict, PlacementFailure::Unavailable),
-                "{:?}",
-                failure.verdict
-            );
+            assert_eq!(word_of(&failure), name);
         }
     }
 
@@ -8603,11 +9116,12 @@ pub(crate) mod tests {
     /// The engine's names are read in one function. A decline under
     /// `binding` that names no side is a spec that binds no plan: the engine
     /// declines so ahead of either side. Any other decline names what
-    /// picked nobody, a decline under `binding` for a side among them: a
-    /// host's own picker may bear that name. So does a shed under the worker
-    /// a request names, whatever its reason. A shed for another reason
-    /// under any other name is no decline, and neither is an answer that is
-    /// no shed.
+    /// picked nobody, and so does a shed under the worker a request names,
+    /// whatever its reason. A decline under `binding` for a side is read as
+    /// any other decline: the engine's own names no side, and no policy
+    /// spec that names a stage of that name validates. A shed for another
+    /// reason under any other name is no decline, and neither is an answer
+    /// that is no shed.
     #[test]
     fn the_engines_decline_is_read_by_its_name_in_one_place() {
         let read_for = |reason, emptied_by, side| {
@@ -8641,6 +9155,8 @@ pub(crate) mod tests {
     /// decode's), and the engine the name it sheds such a request under.
     /// Where every prefill is down the request reaches no policy under
     /// either: the prefill's role is unavailable, and nothing declined.
+    /// The engine's verdict carries the name it shed the pair under, its
+    /// health stage's, for the refusal's line.
     #[test]
     fn a_pair_whose_named_worker_is_nowhere_is_declined_for_the_side_it_missed_on() {
         let registry = pd_registry(&[
@@ -8671,12 +9187,14 @@ pub(crate) mod tests {
             )
             .err()
             .expect("the number reaches nobody on a side");
-            let declined = match failure.verdict {
-                PlacementFailure::PolicyDeclined(name) => Some(name),
-                PlacementFailure::Unavailable => None,
+            // What declined, or the name the engine shed the pair under.
+            let (declined, word) = match failure.verdict {
+                PlacementFailure::PolicyDeclined(name) => (Some(name), None),
+                PlacementFailure::Unavailable => (None, None),
+                PlacementFailure::ShedUnder(name) => (None, Some(name)),
                 other => panic!("{other:?}"),
             };
-            (failure.role, declined)
+            (failure.role, declined, word)
         };
         // The second prefill has the one decode, which no second number
         // reaches. No third prefill stands.
@@ -8684,12 +9202,12 @@ pub(crate) mod tests {
         for (number, role) in sides {
             assert_eq!(
                 named(&classic, number),
-                (role, Some("consistent_hashing")),
+                (role, Some("consistent_hashing"), None),
                 "classic, number {number}"
             );
             assert_eq!(
                 named(&engine, number),
-                (role, Some("target-worker")),
+                (role, Some("target-worker"), None),
                 "the engine, number {number}"
             );
         }
@@ -8698,9 +9216,9 @@ pub(crate) mod tests {
                 worker.set_status(WorkerStatus::NotReady);
             }
         }
-        for policies in [&classic, &engine] {
-            assert_eq!(named(policies, 0), (WorkerRole::Prefill, None));
-        }
+        assert_eq!(named(&classic, 0), (WorkerRole::Prefill, None, None));
+        let by_engine = (WorkerRole::Prefill, None, Some("healthy"));
+        assert_eq!(named(&engine, 0), by_engine);
     }
 
     /// A side that a stage of the spec empties is the role the gateway
@@ -8709,36 +9227,16 @@ pub(crate) mod tests {
     /// refusal names the side, and the pools give the verdict alone. Here
     /// no prefill passes its profile's filter, and the prefill's role is
     /// unavailable. Judged from the pools alone, the open prefill made this
-    /// the decode's role. With the one decode down the fleet's own state is
-    /// the answer again, as a classic placement gives it: the decode's
-    /// role, whatever side the engine names.
+    /// the decode's role. The verdict carries the name the engine shed the
+    /// pair under, the filter's, for the refusal's line. The gateway's own
+    /// pair selection names a policy that picked nobody (`pair_pass`, in
+    /// this file), and no stage: it has none. With the one decode down the
+    /// fleet's own state is the answer again, as a classic placement gives
+    /// it: the decode's role, whatever side the engine names.
     #[test]
     fn a_side_its_stages_empty_is_the_role_answered_though_its_pool_stands_open() {
-        #[derive(Debug)]
-        struct Nobody;
-        impl Filter for Nobody {
-            fn name(&self) -> &'static str {
-                "nobody"
-            }
-
-            fn keep(&self, _: &RequestFacts<'_>, _: &Candidate, _: &Constraints<'_>) -> bool {
-                false
-            }
-        }
-        let mut stages = StageRegistry::builtin();
-        stages
-            .filter("nobody", || Box::new(Nobody))
-            .expect("a free name");
-        let mut document =
-            PolicySpec::pair_presets("round_robin", "round_robin").expect("the pair presets");
-        let prefill = document.profiles.get_mut("prefill");
-        prefill
-            .expect("the prefill's profile")
-            .filter
-            .push("nobody".into());
-        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        engine_on(&policies, spec.expect("the stages hold the filter"));
+        Refusing::Nobody.pair_on(&policies);
         let registry = pd_registry(&[
             ("grpc://p:1", WorkerType::Prefill, Some("NixlConnector")),
             ("grpc://d:1", WorkerType::Decode, Some("NixlConnector")),
@@ -8748,7 +9246,7 @@ pub(crate) mod tests {
             .expect("no prefill passes its filter");
         assert_eq!(failure.role, WorkerRole::Prefill);
         assert!(
-            matches!(failure.verdict, PlacementFailure::Unavailable),
+            matches!(failure.verdict, PlacementFailure::ShedUnder("nobody")),
             "{:?}",
             failure.verdict
         );
@@ -8775,7 +9273,9 @@ pub(crate) mod tests {
         let kind = match failure.verdict {
             PlacementFailure::NoCandidates => "no candidates",
             PlacementFailure::AllOverloaded(_) => "all overloaded",
-            PlacementFailure::Unavailable => "unavailable",
+            // The engine's word is for the refusal's line alone: the
+            // client reads unavailable, as a classic pass's client does.
+            PlacementFailure::Unavailable | PlacementFailure::ShedUnder(_) => "unavailable",
             PlacementFailure::PolicyDeclined(_) => "declined",
             other => panic!("{other:?}"),
         };
@@ -8786,10 +9286,9 @@ pub(crate) mod tests {
     /// stock pair of two rotations under that word, on `policies`.
     fn shedding_pair_engine_on(policies: &PolicyRegistry) {
         let mut sheds = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
-        sheds.bindings[0].overload = Some(OverloadSpec {
-            shed_when_all_vetoed: true,
-            ..OverloadSpec::default()
-        });
+        let mut overload = OverloadSpec::default();
+        overload.shed_when_all_vetoed = true;
+        sheds.bindings[0].overload = Some(overload);
         engine_on(
             policies,
             AppliedSpec::validate(&sheds).expect("a valid document"),
@@ -10316,7 +10815,7 @@ pub(crate) mod tests {
                 let pool = RoutingPool::HttpRegular;
                 let stated = Stated::nothing;
                 let none = select_single(&registry, &policies, MODEL, pool, None, refused, stated);
-                assert!(none.is_none(), "the request's rule takes no worker");
+                assert!(none.is_err(), "the request's rule takes no worker");
                 (picked, traced_rows(), cache_trace::captured_selections())
             })
             .await;
@@ -10545,6 +11044,32 @@ pub(crate) mod tests {
         }
     }
 
+    /// A traced pair whose decision the engine refuses keeps its one row,
+    /// with no worker, though no pool is judged for its answer: the row of
+    /// the side the fleet's state names, as for a refusal the pools judge,
+    /// and the decodes' where both sides stand open. Without it the record
+    /// of a decision that failed named no candidate at all, where a single
+    /// request's names its pool.
+    #[tokio::test]
+    async fn a_traced_pair_whose_decision_the_engine_refuses_keeps_its_row() {
+        let registry = one_pair();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        Refusing::Faulted.pair_on(&policies);
+        let (failure, rows) = cache_trace::scope(true, async {
+            let placed = pair_from(&registry, &policies);
+            let failure = placed.err().expect("a refused decision places no pair");
+            (failure, traced_rows())
+        })
+        .await;
+        assert_eq!(failure.role, WorkerRole::Single);
+        assert!(
+            matches!(failure.verdict, PlacementFailure::DecisionFailed(_)),
+            "{:?}",
+            failure.verdict
+        );
+        assert_eq!(rows, [by_engine("round_robin", "", &["grpc://d:1"])]);
+    }
+
     // ---- a pair under Grand Central ----------------------------------------------------------
 
     /// One prefill and one decode on one KV transport.
@@ -10619,13 +11144,9 @@ pub(crate) mod tests {
         let document = PolicySpec::pair_presets("round_robin", "round_robin");
         let mut document = document.expect("the pair presets");
         document.generation = 1;
-        document.bindings[0].routing_key = Some(RoutingKeySpec {
-            sources: vec![KeySourceSpec {
-                rid: true,
-                ..KeySourceSpec::default()
-            }],
-            strip_lineage: false,
-        });
+        let mut source = KeySourceSpec::default();
+        source.rid = true;
+        document.bindings[0].routing_key = Some(RoutingKeySpec::of(vec![source]));
         let spec = AppliedSpec::validate(&document);
         engine_on(policies, spec.expect("a valid document"));
     }
@@ -10703,30 +11224,30 @@ pub(crate) mod tests {
     /// A pair's decision the engine refuses is written at `warn` as a
     /// single request's is, with the model and the engine's reason, and the
     /// pair placement answers no pair. The stage that fails here ranks the
-    /// decode side.
+    /// decode side. The failure is no side's and no pool's: the 500 of a
+    /// decision the engine refused, where the decode's role read as
+    /// unavailable on a fleet with nobody down. The gateway's own pair
+    /// selection has no like case: it has no engine to refuse.
     #[test]
     fn a_pairs_decision_the_engine_refuses_is_written_at_warn() {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let _subscriber = test_subscriber(EventLines(tracing::Level::WARN, Arc::clone(&lines)));
         let registry = one_pair();
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
-        let mut stages = StageRegistry::builtin();
-        stages
-            .scorer("faults", || Box::new(Faults))
-            .expect("a free name");
-        let document = PolicySpec::pair_presets("round_robin", "round_robin");
-        let mut document = document.expect("the pair presets");
-        document.generation = 1;
-        let decode = document.profiles.get_mut("decode");
-        let decode = decode.expect("the decode side's profile");
-        decode.score = vec!["faults".into()];
-        decode.pick = "best".into();
-        let spec = AppliedSpec::validate_in(&document, &stages, &[]);
-        engine_on(&policies, spec.expect("the stages hold the scorer"));
+        Refusing::Faulted.pair_on(&policies);
 
-        assert!(
-            pair_from(&registry, &policies).is_err(),
-            "a refused decision places no pair"
+        let failure = pair_from(&registry, &policies)
+            .err()
+            .expect("a refused decision places no pair");
+        assert_eq!(failure.role, WorkerRole::Single);
+        let refusal = match failure.verdict {
+            PlacementFailure::DecisionFailed(refusal) => refusal,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(refusal.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error::extract_error_code_from_response(&refusal),
+            DECISION_FAILED_CODE
         );
         let lines = lines.lock().unwrap();
         let refused: Vec<_> = lines
@@ -10952,10 +11473,9 @@ pub(crate) mod tests {
         // and its engine decides under that word.
         let shedding = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let mut sheds = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
-        sheds.bindings[0].overload = Some(OverloadSpec {
-            shed_when_all_vetoed: true,
-            ..OverloadSpec::default()
-        });
+        let mut overload = OverloadSpec::default();
+        overload.shed_when_all_vetoed = true;
+        sheds.bindings[0].overload = Some(overload);
         engine_on(
             &shedding,
             AppliedSpec::validate(&sheds).expect("a valid document"),

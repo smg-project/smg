@@ -456,7 +456,7 @@ async fn a_membership_entry_with_no_wire_form_is_logged_once_and_told_to_no_watc
 
     let leader = leader();
     let id = leader.register(0, 1, "model-a");
-    let row = WorkersStore::get(leader.store.as_ref(), id).expect("the row");
+    let row = leader.store.get(id).expect("the row");
     let mut streams = [
         leader.watch(Start::Snapshot, &[]),
         leader.watch(Start::Snapshot, &[]),

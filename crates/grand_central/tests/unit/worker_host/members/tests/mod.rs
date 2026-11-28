@@ -20,7 +20,7 @@ use crate::{
         Constraints, InProcess, LentList, Request, RequestFacts, RequestMaker, WorkerId,
         WorkerLists,
     },
-    store::{MemoryStore, Registrant, WorkerFacts, WorkersStore},
+    store::{MemoryStore, Registrant, WorkerFacts},
     worker_host::Objects,
 };
 

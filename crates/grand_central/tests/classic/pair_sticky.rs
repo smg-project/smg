@@ -15,9 +15,9 @@
 //! with an open partner, then the decode over the picked prefill's open
 //! partners (`pair_pass` in
 //! `model_gateway/src/routers/common/placement.rs`). Its sticky map places
-//! a role whose policy does not read the key itself, under the key tagged
-//! by its model and its role (`sticky_for` and `select_sticky` in
-//! `model_gateway/src/policies/registry.rs`).
+//! a role whose policy does not keep the key's handling to itself, under
+//! the key tagged by its model and its role (`sticky_for` and
+//! `select_sticky` in `model_gateway/src/policies/registry.rs`).
 //!
 //! The replay places each request through the one call of a host in
 //! process ([`InProcess::place`]), under the engine of the document a
@@ -31,8 +31,12 @@
 //! the document names. A placement is told sent on both sides and then
 //! ended, as its host tells it: a side's pin is written at its dispatch.
 //!
-//! [`REFUSED`] names each recorded row the settings write no document for:
-//! a pair of which one side's policy reads the key itself.
+//! A pair with one side under `consistent_hashing` replays too. That policy
+//! keeps the key's handling to itself, and the settings' rule names the
+//! other side (`sessions.sides`). So the engine pins that side alone and
+//! the hash side stays its own policy's.
+//! A gateway lends the engine its own ring, which no sheet records: such a
+//! row is lent one built from its recorded answers ([`ByAnswers`]).
 
 use std::sync::Arc;
 
@@ -46,6 +50,7 @@ use smg_grand_central::{
         HeaderRead, InProcess, LentList, ListCell, PairAdmission, PairLists, PartnerClasses,
         PlaceRequest, Unplaced, WorkerId, WorkerLists,
     },
+    policies::consistent_hashing::LentRing,
     tracking::{Outcome as Ended, Side as Sent, TransportClass},
 };
 use smg_worker::{
@@ -54,7 +59,7 @@ use smg_worker::{
     worker::{HealthCheckConfig, WorkerStatus, WorkerType},
 };
 
-use super::pair_select::{differences, why, Here, Outcome, Replayed};
+use super::pair_select::{differences, why, Answer, Here, Outcome, Replayed};
 
 /// What a sheet's head names these rows.
 pub const POLICY: &str = "pair-sticky";
@@ -210,12 +215,94 @@ struct Bed<'r> {
     /// engine: nothing for a sequence row, the draw's number for a drawn
     /// one.
     run: &'r str,
+    /// The ring the row's host lends, where a side runs the hash policy.
+    ring: Option<ByAnswers>,
+}
+
+/// The address of a row's worker: its side and its place in the side's
+/// list.
+fn address(side: &str, at: usize) -> String {
+    format!("http://{side}-{at}:8000")
+}
+
+/// A caller's ring built from a row's recorded answers, for a row with a
+/// side under the hash policy. A gateway lends the engine its own ring
+/// ([`PlaceRequest::ring`]), which hashes a key's text and its workers'
+/// addresses, and no row records where a key stands on it. Here a key
+/// stands at its place among the row's keys.
+///
+/// Its walk first reaches the hash side's workers that answered its
+/// requests, in the order the row first names them. That side's other
+/// workers follow in the list's order. The order behind the answers is
+/// this replay's own.
+#[derive(Debug)]
+struct ByAnswers {
+    /// Each key of the row, as its run states it, and the addresses its
+    /// walk reaches, in order.
+    walks: Vec<(String, Vec<String>)>,
+}
+
+impl ByAnswers {
+    /// The ring of `row` for the keys as `run` states them. `None` for a
+    /// row neither side of which runs the hash policy, and for one whose
+    /// outcome is no sequence of answers.
+    fn of(row: &Row, run: &str) -> Option<Self> {
+        let (side, name, listed) = match (row.prefill_policy.as_str(), row.decode_policy.as_str()) {
+            (RING, _) => (0, "prefill", row.prefills.len()),
+            (_, RING) => (1, "decode", row.decodes.len()),
+            _ => return None,
+        };
+        let Outcome::Sequence(answers) = &row.outcome else {
+            return None;
+        };
+        // A header's key goes ahead of the key of the request's id.
+        let keys = row.steps.iter().filter_map(|step| match step {
+            Step::Pick { key, id, .. } => Some(key.as_deref().or(id.as_deref())),
+            _ => None,
+        });
+        let mut reached: Vec<(String, Vec<usize>)> = Vec::new();
+        for (key, answer) in keys.zip(answers) {
+            let (Some(key), Answer::Pair(pair)) = (key, answer) else {
+                continue;
+            };
+            let key = format!("{key}{run}");
+            let known = reached.iter().position(|(placed, _)| *placed == key);
+            let at = known.unwrap_or_else(|| {
+                reached.push((key, Vec::new()));
+                reached.len() - 1
+            });
+            if !reached[at].1.contains(&pair[side]) {
+                reached[at].1.push(pair[side]);
+            }
+        }
+        let walks = reached.into_iter().map(|(key, first)| {
+            let rest = (0..listed).filter(|at| !first.contains(at));
+            let walk = first.iter().copied().chain(rest);
+            (key, walk.map(|at| address(name, at)).collect())
+        });
+        Some(Self {
+            walks: walks.collect(),
+        })
+    }
+}
+
+impl LentRing for ByAnswers {
+    fn position(&self, key: &str) -> u64 {
+        let at = self.walks.iter().position(|(placed, _)| placed == key);
+        at.unwrap_or(self.walks.len()) as u64
+    }
+
+    fn walk(&self, position: u64, take: &mut dyn FnMut(&str) -> bool) {
+        if let Some((_, walk)) = self.walks.get(position as usize) {
+            let _ = walk.iter().any(|address| take(address));
+        }
+    }
 }
 
 /// One worker object of a row's list, in the row's state, with the requests
 /// the router holds on it as its object's own count.
 fn object(side: &str, at: usize, role: WorkerType, member: &Member) -> Arc<dyn Worker> {
-    let object = <BasicWorkerBuilder>::new(format!("http://{side}-{at}:8000"))
+    let object = <BasicWorkerBuilder>::new(address(side, at))
         .worker_type(role)
         .model(ModelCard::new(MODEL))
         .health_config(HealthCheckConfig {
@@ -262,6 +349,7 @@ impl<'r> Bed<'r> {
             classes: PartnerClasses::number(row.decodes.len(), partners.iter().map(Vec::as_slice)),
             cells: [ListCell::default(), ListCell::default()],
             run,
+            ring: ByAnswers::of(row, run),
         }
     }
 
@@ -280,26 +368,12 @@ impl<'r> Bed<'r> {
         tried: Option<[usize; 2]>,
     ) -> Result<Here, &'static str> {
         let [prefill_cell, decode_cell] = &self.cells;
-        let lists = PairLists {
-            prefill: LentList {
-                workers: &self.prefills,
-                cell: prefill_cell,
-                facts: None,
-            },
-            decode: LentList {
-                workers: &self.decodes,
-                cell: decode_cell,
-                facts: None,
-            },
-            classes: &self.classes,
-            admission: &Open,
-            prefill_places: None,
-            decode_places: None,
-            prefill_stalled: &[],
-            prefill_held: &[],
-            decode_stalled: &[],
-            decode_held: &[],
-        };
+        let lists = PairLists::of(
+            LentList::of(&self.prefills, prefill_cell),
+            LentList::of(&self.decodes, decode_cell),
+            &self.classes,
+            &Open,
+        );
         let (key, id) = (key.map(|key| self.key(key)), id.map(|id| self.key(id)));
         let keyed;
         let headers: &dyn HeaderRead = match &key {
@@ -314,13 +388,12 @@ impl<'r> Bed<'r> {
                 .map(|worker| WorkerId::from_address(worker.url()))
                 .to_vec()
         });
-        let request = PlaceRequest {
-            headers,
-            request_id: id.as_deref(),
-            attempt: u8::from(!tried.is_empty()),
-            tried: &tried,
-            ..PlaceRequest::of(model, WorkerLists::Pair(lists))
-        };
+        let mut request = PlaceRequest::of(model, WorkerLists::Pair(lists));
+        request.headers = headers;
+        request.request_id = id.as_deref();
+        request.attempt = u8::from(!tried.is_empty());
+        request.tried = &tried;
+        request.ring = self.ring.as_ref().map(|ring| ring as &dyn LentRing);
         let mut placement = match self.engine.place(&request) {
             Ok(placement) => placement,
             // A shed by its reason, its stage and its side, as the pair
@@ -448,51 +521,12 @@ fn replayed(row: &Row, spec: &PolicySpec) -> Result<Replayed, String> {
     Ok(Replayed::Counts(counts))
 }
 
-/// A recorded row the routing settings write no document for, and the
-/// side their refusal names: the one whose policy reads the routing key
-/// itself. The gateway's sticky map places the other side alone
-/// (`sticky_for`), and the override's rule stands on a pair's binding for
-/// both sides. The row keeps what the gateway answers.
-struct Refused {
-    row: &'static str,
-    side: &'static str,
-}
-
-const REFUSED: &[Refused] = &[
-    Refused {
-        row: "sticky-pair-a-hash-prefill-is-the-rings-beside-a-pinned-decode",
-        side: "prefill",
-    },
-    Refused {
-        row: "sticky-pair-a-hash-decode-is-the-rings-beside-a-pinned-prefill",
-        side: "decode",
-    },
-];
-
 /// What of one row's outcome this crate does not replay: nothing when its
-/// answers are the recorded ones, or when [`REFUSED`] names the row and the
-/// settings refuse it by the override's setting and its entry's side. A
-/// refused row the settings write a document for is a defect too: its
-/// entry no longer holds.
+/// answers are the recorded ones.
 fn replay(row: &Row) -> Vec<String> {
-    let refused = REFUSED.iter().find(|refused| refused.row == row.name);
-    let spec = match (spec(row), refused) {
-        (Ok(spec), None) => spec,
-        (Ok(_), Some(_)) => {
-            return vec![
-                "the settings write its document now: take the row out of REFUSED".to_string(),
-            ]
-        }
-        (Err(refusal), Some(refused)) => {
-            let side = format!("the {} side's policy", refused.side);
-            let named = refusal.contains("routing_key_override.enabled") && refusal.contains(&side);
-            return if named {
-                Vec::new()
-            } else {
-                vec![format!("refused in other words: {refusal}")]
-            };
-        }
-        (Err(refusal), None) => return vec![format!("refused here: {refusal}")],
+    let spec = match spec(row) {
+        Ok(spec) => spec,
+        Err(refusal) => return vec![format!("refused here: {refusal}")],
     };
     match replayed(row, &spec) {
         Ok(here) => differences(&row.outcome, &here),
@@ -528,8 +562,8 @@ pub fn replay_rows(text: &str, source: &str) -> (usize, Vec<String>) {
 /// still replays a row of each form: a key's pair kept past the loads and
 /// apart under two models, a key from the request's id, a key's turns and
 /// retries, the map's own assignments, a cap, a worker down and up, a
-/// decode that is no partner of the new prefill, a retry, and the
-/// settings' refusal of a pair with a hash side.
+/// decode that is no partner of the new prefill, a retry, and a hash
+/// prefill beside a pinned decode.
 #[test]
 fn the_sticky_pair_rows_replay_answer_for_answer() {
     let (rows, found) = replay_rows(INLINE, "inline");
@@ -565,6 +599,79 @@ fn a_drawn_row_is_replayed_over_a_hundredth_of_its_recorded_draws() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("recorded over 599999 draws"), "{found:?}");
 }
+
+/// Two rows of this crate's own, which no gateway recorded: a worker of a
+/// hash side that stops being routable and starts again, a row for each
+/// side. The key goes to the next worker of its ring's walk and comes back
+/// to its own, as a ring places it.
+///
+/// A pin does not: under the sticky map's `delegate` a pinned side stays
+/// with the worker placed last, as the row of a prefill down says
+/// ([`INLINE`]). The other side keeps its pin all along. The gateway's
+/// sticky map leaves a role under the hash policy to that policy
+/// (`sticky_for` in `model_gateway/src/policies/registry.rs`).
+#[test]
+fn a_hash_sides_key_follows_its_ring_past_a_worker_down_and_back() {
+    let (rows, found) = replay_rows(OWN, "own");
+    assert_eq!(rows, 2);
+    assert_eq!(found, Vec::<String>::new());
+}
+
+/// Rows in a sheet's form that state a ring's walk by their answers
+/// ([`ByAnswers`]). A walk is the first worker a key's requests name, then
+/// the one they name while that worker is down.
+const OWN: &str = r#"{
+  "rows": [
+    {
+      "name": "a-hash-prefill-down-is-the-rings-next-and-up-its-own-again",
+      "prefill_policy": "consistent_hashing",
+      "decode_policy": "power_of_two:least_requests",
+      "assignment": "delegate",
+      "prefills": [
+        {"in_flight": 3, "state": "free", "transport": null},
+        {"in_flight": 1, "state": "free", "transport": null},
+        {"in_flight": 2, "state": "free", "transport": null}
+      ],
+      "decodes": [
+        {"in_flight": 2, "state": "free", "transport": null},
+        {"in_flight": 0, "state": "free", "transport": null},
+        {"in_flight": 1, "state": "free", "transport": null}
+      ],
+      "steps": [
+        {"pick": {"key": "k1", "model": "m"}},
+        {"down": ["prefill", 2]},
+        {"pick": {"key": "k1", "model": "m"}},
+        {"up": ["prefill", 2]},
+        {"pick": {"key": "k1", "model": "m"}}
+      ],
+      "outcome": {"sequence": [{"pair": [2, 1]}, {"pair": [0, 1]}, {"pair": [2, 1]}]}
+    },
+    {
+      "name": "a-hash-decode-down-is-the-rings-next-and-up-its-own-again",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "consistent_hashing",
+      "assignment": "delegate",
+      "prefills": [
+        {"in_flight": 3, "state": "free", "transport": null},
+        {"in_flight": 1, "state": "free", "transport": null},
+        {"in_flight": 2, "state": "free", "transport": null}
+      ],
+      "decodes": [
+        {"in_flight": 2, "state": "free", "transport": null},
+        {"in_flight": 0, "state": "free", "transport": null},
+        {"in_flight": 1, "state": "free", "transport": null}
+      ],
+      "steps": [
+        {"pick": {"key": "k1", "model": "m"}},
+        {"down": ["decode", 0]},
+        {"pick": {"key": "k1", "model": "m"}},
+        {"up": ["decode", 0]},
+        {"pick": {"key": "k1", "model": "m"}}
+      ],
+      "outcome": {"sequence": [{"pair": [1, 0]}, {"pair": [1, 2]}, {"pair": [1, 0]}]}
+    }
+  ]
+}"#;
 
 /// Rows copied from the recorded sheet, whole.
 pub const INLINE: &str = r#"{

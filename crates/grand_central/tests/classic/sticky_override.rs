@@ -719,9 +719,8 @@ mod sends {
     use smg_grand_central::{
         document::{AppliedSpec, Assignment},
         engine::{
-            Constraints, DecisionEngine, HashSeeds, Identity, InProcess, LentList, ListCell,
-            PlacedBy, PromptHashes, Request, RequestFacts, RequestMaker, SessionVerdict,
-            WorkerLists,
+            DecisionEngine, HashSeeds, Identity, InProcess, LentList, ListCell, PlacedBy,
+            PromptHashes, Request, RequestFacts, RequestMaker, SessionVerdict, WorkerLists,
         },
         store::GatewayId,
         tracking::{self, DecisionGuard, TransportClass},
@@ -790,11 +789,7 @@ mod sends {
     /// `list` lent with `cell`, the cell its host keeps beside it: the host
     /// states nothing of its workers.
     fn lent<'a>(list: &'a Arc<[Arc<dyn Worker>]>, cell: &'a ListCell) -> LentList<'a> {
-        LentList {
-            workers: list,
-            cell,
-            facts: None,
-        }
+        LentList::of(list, cell)
     }
 
     /// A gateway's side of its engines: one list of worker objects, the
@@ -893,11 +888,7 @@ mod sends {
                 prompt.write_to(&mut facts);
             }
             let asks = Asks {
-                request: Request {
-                    id: b"request",
-                    facts,
-                    constraints: Constraints::default(),
-                },
+                request: Request::of(b"request", facts),
                 members,
                 loads: &self.loads,
             };

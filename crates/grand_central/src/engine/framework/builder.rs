@@ -60,8 +60,8 @@ impl EngineBuilder {
 
     /// The count of sends that an earlier profile's stages asked for under
     /// `settings`. A later profile under the same two settings reads that
-    /// one: the engine records a send in every count, so two counts under
-    /// one pair of settings would hold the same sends.
+    /// one: the engine tells every count each send it counts, so two counts
+    /// under one pair of settings would be told the same sends.
     pub(crate) fn sent_under(&self, settings: SentSettings) -> Option<Arc<DispatchCredit>> {
         let mut counts = self.sent_credits.iter();
         counts.find(|count| count.settings == settings).cloned()

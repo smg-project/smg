@@ -1,7 +1,7 @@
 //! The cases of a pair's frame at its prefill. A pair's ask [`decide_pair`]
 //! for a pair at its prefill, and the two that file its leases ask
-//! [`issue_pair`] behind it. One case holds the document's pairing at a
-//! pair's first decision and at its decode call.
+//! [`issue_pair`] behind it. Two cases go on to a decode call: one holds
+//! the document's pairing there too, and one a controller's pair classes.
 
 use super::*;
 
@@ -389,6 +389,20 @@ fn transport_member(
     role: Role,
     transport: &str,
 ) -> WorkerId {
+    let stated = DemandFacts::default();
+    paired_member(store, objects, name, role, transport, stated)
+}
+
+/// [`transport_member`] for a worker that states `stated` for a request's
+/// hard demands.
+pub(super) fn paired_member(
+    store: &MemoryStore,
+    objects: &Objects<Members>,
+    name: &str,
+    role: Role,
+    transport: &str,
+    stated: DemandFacts,
+) -> WorkerId {
     let key = format!("http://{name}:8000");
     let descriptor = PairingDescriptor {
         transport: Some(transport.to_owned()),
@@ -404,6 +418,7 @@ fn transport_member(
         dp_size: 1,
         max_running: Some(4),
         pairing: Some(Arc::new(descriptor)),
+        demand_facts: stated,
         ..WorkerFacts::default()
     };
     written_ready(store, objects, facts)
@@ -470,7 +485,7 @@ fn a_pair_and_its_decode_call_pair_by_the_classes_of_the_documents_pairing() {
 /// A ready member `name` of [`PAIRED`] on `role`'s side, on the gRPC wire,
 /// written through `objects`, whose registration names the engine kind
 /// `kind`: none where it is empty.
-fn kind_member(
+pub(super) fn kind_member(
     store: &MemoryStore,
     objects: &Objects<Members>,
     name: &str,

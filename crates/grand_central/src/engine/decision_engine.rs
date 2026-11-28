@@ -30,12 +30,6 @@
 //!   decisions that meet at a list's first ask wait for the one that fills
 //!   its cell (`ListCell`).
 
-#![expect(
-    clippy::exhaustive_enums,
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::time::Instant;
 #[cfg(feature = "in-process")]
 use std::{borrow::Cow, fmt, sync::Arc};
@@ -97,6 +91,15 @@ pub trait RequestMaker {
     /// the other. A panic here is the shadow's fault, and the time it
     /// takes is the shadow's: spent, like the rest of a shadow's run,
     /// ahead of a later ask of the same call.
+    ///
+    /// There, for a side's shadow profile one of whose filters declares
+    /// the ring need ([`Needs::ring`](crate::document::spec::Needs::ring)),
+    /// it asks this ahead of the shadow's filters, which read the answer:
+    /// it asks whether or not they keep a worker, and once a decision.
+    /// Beside a pair the pair's default made, the decode's shadow makes no
+    /// run of its own and follows the default's step: the engine asks
+    /// this for such a profile there, and the filters that step asks read
+    /// the answer.
     fn shadow_ring<'w>(
         &'w self,
         spec: &'w AppliedSpec,
@@ -609,10 +612,19 @@ pub struct HeldDecode {
 /// The answer is written where its host reads it and matched at once: it
 /// is not kept, so the two forms differ in size freely. A whole decision in
 /// a box would be an allocation a decision.
+///
+/// The enum is closed: a `match` that covers these two forms needs no arm
+/// for the rest, and a third form would be a breaking change. Where a host
+/// keeps an arm for the rest, an `else` or an `if let`, a third form would
+/// be taken as the rest is.
 #[derive(Debug)]
 #[expect(
     clippy::large_enum_variant,
     reason = "matched where it is returned; a boxed decision would allocate at each one"
+)]
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "closed by its doc: a match that covers both forms needs no arm for the rest"
 )]
 pub enum Decided {
     /// A pick of which nothing is owed ([`AlonePick`]): the host sends to
@@ -809,6 +821,7 @@ pub trait DecisionEngine {
 /// A request and its constraints as the host holds them. A door reads
 /// these facts in process. A link carries them to the controller.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct Request<'a> {
     /// The request's id as the host states it: its lease keeps the id's
     /// fingerprint.
@@ -820,6 +833,23 @@ pub struct Request<'a> {
     pub facts: RequestFacts<'a>,
     /// What the host alone knows.
     pub constraints: Constraints<'a>,
+}
+
+impl<'a> Request<'a> {
+    /// A request's id and its facts, under the constraints' default. It takes
+    /// the facts: a request of default facts names no model, and the engine
+    /// finds a request's binding by its model. A host that knows more assigns
+    /// its constraints. It checks nothing. Code outside this crate starts
+    /// here: the record gains fields, so no literal of it builds there.
+    #[inline]
+    #[must_use]
+    pub fn of(id: &'a [u8], facts: RequestFacts<'a>) -> Self {
+        Self {
+            id,
+            facts,
+            constraints: Constraints::default(),
+        }
+    }
 }
 
 /// A decision as its host takes it.

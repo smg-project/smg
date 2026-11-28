@@ -39,9 +39,9 @@ pub(crate) mod view;
 pub(crate) mod warm_up;
 
 pub use decision::{
-    Decision, DecodePlacing, LiftedVeto, Overlap, OverlapSource, Pair, PairSide, Pick, PlacedBy,
-    Queue, ShadowKind, Shed, ShedReason, Survivors, Target, Targets, Trace, BINDING, MAX_TARGETS,
-    TARGET_WORKER, TRACE_TOP,
+    refuses_under, Decision, DecodePlacing, LiftedVeto, Overlap, OverlapSource, Pair, PairSide,
+    Pick, PlacedBy, Queue, ShadowKind, Shed, ShedReason, Survivors, Target, Targets, Trace,
+    BINDING, MAX_TARGETS, TARGET_WORKER, TRACE_TOP,
 };
 pub use decision_engine::{
     AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, DecodeRefused,
@@ -84,8 +84,8 @@ pub use prompt_hashes::{HashSeeds, PromptHashes};
 pub use records::{decide, worker_id, worker_rank, DecisionClock, Live, PoolRecords};
 pub use shadow::{ShadowCount, ShadowSide, SHADOW_ROWS};
 pub use sticky_sessions::{
-    DecodeVerdict, SessionExpiry, SessionPins, SessionRule, SessionTable, SessionVerdict,
-    ABSENT_WORKER_PIN_TTL_MICROS,
+    DecodeVerdict, SessionExpiry, SessionPins, SessionRule, SessionSides, SessionTable,
+    SessionVerdict, ABSENT_WORKER_PIN_TTL_MICROS,
 };
 pub use view::{
     fingerprint, key_of_session, permille, AffinityFacts, AffinityHolder, AffinityRows, Candidate,

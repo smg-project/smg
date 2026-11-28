@@ -564,6 +564,11 @@ fn block_of(ways_in: &[WayIn<'_>], content: Grammar, close: &str, count: Count<'
             triggers.push(trigger.to_string());
         }
     }
+    // The text between two calls is written inside the block: none stands between two blocks.
+    let count = Count {
+        between: count.between.map(|_| ""),
+        ..count
+    };
     count.triggered(triggers, tags)
 }
 
@@ -627,6 +632,8 @@ pub enum GrammarStart {
 struct Count<'a> {
     at_least_one: bool,
     one: bool,
+    /// What the table's layout says its template writes between two calls, where it says.
+    between: Option<&'a str>,
     /// The terminal that ends the turn wherever the model stands (Kimi K3's message close), or
     /// nothing for a table whose turn a stop token ends.
     last: &'a str,
@@ -664,6 +671,29 @@ impl Count<'_> {
     /// Tags `triggers` open in free text, as many as the count lets the model write; with one
     /// call, each tag's end carries the end of the turn.
     fn triggered(&self, triggers: Vec<String>, tags: Vec<Tag>) -> Grammar {
+        // Free text after a required call is read as content beside it, so several required
+        // calls take none; only a table that says what its template writes between calls.
+        if let (true, false, Some(between)) = (self.at_least_one, self.one, self.between) {
+            let calls = if between.is_empty() {
+                self.separated(tags)
+            } else {
+                // That text may follow each call, once or twice (a group's own template may
+                // write it twice where the table's writes it once): between two calls and before
+                // the turn ends.
+                let spacing =
+                    Grammar::Optional(Box::new(Grammar::ConstString(between.to_string())));
+                Grammar::Plus(Box::new(Grammar::Sequence(vec![
+                    Grammar::Or(tags.into_iter().map(Grammar::Tag).collect()),
+                    spacing.clone(),
+                    spacing,
+                ])))
+            };
+            return if self.last.is_empty() {
+                calls
+            } else {
+                Grammar::Sequence(vec![calls, Grammar::ConstString(self.last.to_string())])
+            };
+        }
         let tags = tags
             .into_iter()
             .map(|tag| Tag {
@@ -803,6 +833,9 @@ impl Format {
         let count = Count {
             at_least_one: options.at_least_one,
             one: options.one_call,
+            between: self
+                .layout()
+                .and_then(|layout| layout.between_calls.as_deref()),
             last: self.turn_end(),
         };
         // The markers are the syntaxes' with a region of calls; xLAM's list has none.
@@ -2612,14 +2645,16 @@ mod tests {
         for format in [formats::qwen3(CallSyntax::Json), formats::qwen2_5()] {
             let grammar = format.grammar(&tools, true, false).expect("a grammar");
             let payload = grammar.payload();
-            assert_eq!(
-                payload["format"]["type"],
-                "triggered_tags",
-                "{}",
-                format.name()
-            );
-            assert_eq!(payload["format"]["triggers"], value!(["<tool_call>"]));
-            let tags = payload["format"]["tags"].as_array().expect("tags");
+            // Qwen3 says the newline between calls: its calls repeat, the newline allowed after each.
+            let tags = if format.layout().is_some() {
+                assert_eq!(payload["format"]["type"], "plus");
+                &payload["format"]["content"]["elements"][0]["elements"]
+            } else {
+                assert_eq!(payload["format"]["type"], "triggered_tags");
+                assert_eq!(payload["format"]["triggers"], value!(["<tool_call>"]));
+                &payload["format"]["tags"]
+            };
+            let tags = tags.as_array().expect("tags");
             assert_eq!(tags.len(), 3, "a nameless tool has no tag");
             assert_eq!(
                 tags[0]["begin"],
@@ -5414,46 +5449,47 @@ mod tests {
 
     #[test]
     fn a_table_that_bounds_the_answers_whitespace_writes_the_bound_on_its_schema_alone() {
-        // LFM2.5's table bounds the runs of whitespace in a JSON answer; the bound is written on
+        // LFM2.5's table and MiniMax M3's bound the runs of whitespace in a JSON answer, written on
         // the answer's schema node, for every start and whether or not the prompt left the thought
         // open, for a schema and for `json_object`'s bare object alike, and nowhere else: the
         // calls' values are the schema's, and a table that does not bound keeps the node as it was.
-        let lfm = formats::lfm2_5();
         let schema =
             Arc::new(value!({"type": "object", "properties": {"city": {"type": "string"}}}));
-        for reasoning_open in [false, true] {
-            for start in [
-                GrammarStart::Unknown,
-                GrammarStart::AfterReasoning,
-                GrammarStart::FirstToken,
-            ] {
-                for schema in [&schema, &Arc::new(value!({"type": "object"}))] {
-                    let answer = lfm
-                        .answer_grammar_for(schema, reasoning_open, start)
-                        .expect("an answer")
-                        .payload();
-                    let node = json_schema_node(&answer["format"]).expect("the schema node");
-                    assert_eq!(node["json_schema"], **schema, "{answer}");
-                    assert_eq!(
-                        node["max_whitespace_cnt"], 32,
-                        "reasoning_open={reasoning_open} {start:?}: {answer}"
-                    );
+        for table in [formats::lfm2_5(), formats::minimax_m3()] {
+            for reasoning_open in [false, true] {
+                for start in [
+                    GrammarStart::Unknown,
+                    GrammarStart::AfterReasoning,
+                    GrammarStart::FirstToken,
+                ] {
+                    for schema in [&schema, &Arc::new(value!({"type": "object"}))] {
+                        let answer = table
+                            .answer_grammar_for(schema, reasoning_open, start)
+                            .expect("an answer")
+                            .payload();
+                        let node = json_schema_node(&answer["format"]).expect("the schema node");
+                        assert_eq!(node["json_schema"], **schema, "{answer}");
+                        assert_eq!(
+                            node["max_whitespace_cnt"], 32,
+                            "reasoning_open={reasoning_open} {start:?}: {answer}"
+                        );
+                    }
                 }
+                let calls = table
+                    .grammar_for(
+                        &weather_tools(),
+                        Options {
+                            at_least_one: true,
+                            reasoning_open,
+                            thought_closed: false,
+                            one_call: false,
+                            start: GrammarStart::Unknown,
+                        },
+                    )
+                    .expect("a tag")
+                    .payload_text();
+                assert!(!calls.contains("max_whitespace_cnt"), "{calls}");
             }
-            let calls = lfm
-                .grammar_for(
-                    &weather_tools(),
-                    Options {
-                        at_least_one: true,
-                        reasoning_open,
-                        thought_closed: false,
-                        one_call: false,
-                        start: GrammarStart::Unknown,
-                    },
-                )
-                .expect("a tag")
-                .payload_text();
-            assert!(!calls.contains("max_whitespace_cnt"), "{calls}");
         }
         let qwen = formats::qwen3(CallSyntax::Json)
             .answer_grammar_for(&schema, false, GrammarStart::Unknown)

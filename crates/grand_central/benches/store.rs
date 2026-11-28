@@ -16,7 +16,7 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use smg_grand_central::{
-    engine::{Role, WorkerId},
+    engine::WorkerId,
     store::{
         identity, GatewayId, HealthSink, MembershipChange, MemoryStore, Position, Registrant,
         WorkerFacts, WorkerRow, WorkerStatus, WorkersStore,
@@ -61,8 +61,14 @@ fn populated() -> (MemoryStore, Vec<WorkerId>) {
             id
         })
         .collect();
+    // Each registration landed: the store's epoch counts the writes it took.
+    assert_eq!(
+        WorkersStore::epoch(&store),
+        WORKERS,
+        "a registration did not land"
+    );
     store.publish_now();
-    filled::filled(&store, "m", Role::Single, ids.len());
+    filled::filled(&store, &ids, "m");
     (store, ids)
 }
 
@@ -108,7 +114,6 @@ fn remove(c: &mut Criterion) {
                     }
                 }
                 let id = ids[ids.len() / 2];
-                assert!(WorkersStore::get(&store, id).is_some(), "the row stands");
                 let epoch = WorkersStore::epoch(&store) + 1;
                 (store, id, epoch)
             },

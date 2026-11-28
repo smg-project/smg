@@ -5,6 +5,11 @@
 //! `MiniMax-M3.1-Flash` reads with it (the same tokenizer and wire; its template differs only
 //! outside the wire, as `docs/tables.md` notes).
 //!
+//! A JSON answer's whitespace is bounded to runs of thirty-two characters, as the LFM2.5 table's
+//! is (`formats/lfm2_5.rs`): held to a schema's JSON, the model can drift into whitespace between
+//! two tokens until the budget ends; the bound ends the run and leaves pretty-printing its room.
+//! The figure is that table's, not one measured on this model.
+//!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
@@ -50,6 +55,7 @@ pub fn minimax_m3() -> Format {
         .transition("calls", "calls_close", "after_calls")
         .calls(CallSyntax::Xml)
         .opens_turn("]~b]ai\n")
+        .bounds_answer_whitespace(32)
 }
 
 #[cfg(test)]

@@ -5,11 +5,15 @@
 
 use std::{
     any::Any,
+    cell::OnceCell,
     collections::HashMap,
     fmt::Debug,
     sync::{atomic::AtomicU64, Arc},
 };
 
+// `Lease` and `Membership` are named only by doc links of this module.
+#[cfg(doc)]
+use crate::tracking::lease::{Lease, Membership};
 use crate::{
     document::spec::{Assignment, Needs},
     engine::{
@@ -20,8 +24,8 @@ use crate::{
         },
         sticky_sessions::{self, Claim, SessionRule, SessionTable, SessionVerdict},
         view::{
-            mean_in_flight, AffinityFacts, AffinityRows, Candidate, Constraints, LoadReportCutoff,
-            Phase, PoolFacts, RequestFacts, Session, WorkerId,
+            mean_in_flight, AffinityRows, Candidate, Constraints, LoadReportCutoff, Phase,
+            PoolFacts, RequestFacts, Session, WorkerId,
         },
         warm_up::WarmUpRule,
     },
@@ -38,7 +42,7 @@ use crate::{
     },
     tracking::{
         dispatch_credit::DispatchCredit,
-        lease::{EventKind, EventSet, Lease, Membership, Outcome, ReleaseReason, Side, Signal},
+        lease::{EventKind, EventSet},
     },
     Draw,
 };
@@ -47,14 +51,20 @@ mod alone;
 mod builder;
 mod encode;
 mod engines;
+mod issuing;
 mod keyed;
+mod pair_pools;
 mod places;
+mod profiles;
 mod vetoed;
 
 pub use alone::{AloneProfile, InTheWay, NotAlone, Place};
 pub use encode::{EncodeItems, EncodePlaced, EncodePool, EncoderFacts};
 use engines::{run_engines, run_owned};
+#[cfg(feature = "in-process")]
+pub(crate) use issuing::{Issuing, Stood};
 pub use keyed::PoolRows;
+pub use pair_pools::{FirstPartners, FirstPartnersError, PairPools, PairTable, PairTableError};
 use vetoed::{AllVetoed, Count, Half};
 
 /// Drops candidates before scoring. A `soft` filter steps aside when it would
@@ -65,6 +75,10 @@ use vetoed::{AllVetoed, Count, Half};
 /// decision that draws first asks a profile made of them alone about a row
 /// in one test, with no call a filter.
 pub trait Filter: Any + Send + Sync + Debug {
+    /// The filter's one name for its whole life. The registry asks it of a
+    /// factory that takes no parameter, once, and the validator of each
+    /// filter it takes from a factory. The engine asks it at a shed, of
+    /// the filter that left a request no row.
     fn name(&self) -> &'static str;
 
     fn keep(&self, facts: &RequestFacts<'_>, candidate: &Candidate, cx: &Constraints<'_>) -> bool;
@@ -102,8 +116,14 @@ pub trait Filter: Any + Send + Sync + Debug {
     /// ([`RequestFacts::ring`]) declares [`Needs::ring`], and a live
     /// profile one of whose scorers places by the ring shows it the ring
     /// and the request's place on it. A pair side's shadow that reads a
-    /// ring where neither live side does is lent that ring for its
-    /// scoring half alone: its filters are shown no ring and no place.
+    /// ring where neither live side does is lent that ring. Where one of
+    /// its filters declares the need, every stage of the shadow's own run
+    /// is shown what its lender answers: the ring and the shadow's place
+    /// on it, or the facts as they stand where it answers none. So are
+    /// the hard filters a prefill's shadow asks once more at its admission
+    /// limit's test, and those a side's shadow asks in the steps of the
+    /// pair's default that it follows. Where no filter declares it, the
+    /// scoring half alone is: the filters are shown no ring and no place.
     ///
     /// Asked only while the stage's generation is built, perhaps more than
     /// once there. The answer stands for that generation: no decision and
@@ -265,6 +285,9 @@ impl ScoreFront {
 /// what the guest takes from a candidate outside them is the guest's own.
 /// The returned [`TieBand`] is the band of the written values.
 pub trait Scorer: Lifecycle + Debug {
+    /// The scorer's one name for its whole life. The registry asks it of a
+    /// factory that takes no parameter, once, and the validator of each
+    /// scorer it takes from a factory.
     fn name(&self) -> &'static str;
 
     fn score(
@@ -622,6 +645,11 @@ pub enum DrawUnit {
 /// belongs to `kept[i]` and `band` is the profile's tie band; the picker
 /// pushes its pick first and its alternates after it, and allocates nothing.
 pub trait Picker: Lifecycle + Debug {
+    /// The picker's one name for its whole life. The registry asks it of a
+    /// factory that takes no parameter, once, and the validator of each
+    /// picker it takes from a factory. The engine asks it where it is
+    /// built, to tell the crate's own pickers, and at a shed: a request
+    /// the picker gave no target is declined under it.
     fn name(&self) -> &'static str;
 
     /// Names the set the picker compares, before the scorers run: it moves
@@ -921,7 +949,8 @@ pub struct WeightedScorer {
 impl WeightedScorer {
     /// A scorer with its weight: the record's two fields, so nothing is left
     /// for a caller to assign today. Code outside this crate starts here:
-    /// the record gains fields, so no literal of it builds there.
+    /// the record gains fields, so no literal of it builds there. The
+    /// scorer's name is not checked here ([`Engine::new`]).
     #[must_use]
     pub fn of(scorer: Box<dyn Scorer>, weight: f32) -> Self {
         Self { scorer, weight }
@@ -952,7 +981,8 @@ pub struct Profile {
 impl Profile {
     /// A profile of one picker, with no filter and no scorer: a caller
     /// assigns the two lists over it. Code outside this crate starts here:
-    /// the record gains fields, so no literal of it builds there.
+    /// the record gains fields, so no literal of it builds there. The
+    /// stages' names are not checked here ([`Engine::new`]).
     #[must_use]
     pub fn of(name: String, picker: Box<dyn Picker>) -> Self {
         Self {
@@ -2753,17 +2783,36 @@ fn run_side(
     score_survivors(profile, index, facts, pool, candidates, buf, first)
 }
 
+/// `facts` with the ring and the places a lender answered, where it
+/// answered any. A shadow's run ([`run_side_lent`]), the admission
+/// limit's test behind it and the steps of the pair's default that a
+/// side's shadow follows (`shadow_side`) all state the request through
+/// this, so each judges on the facts the run shows its filters.
+fn with_lent<'f>(
+    facts: &RequestFacts<'f>,
+    lent: Option<(&'f dyn LentRing, &'f [u64])>,
+) -> Option<RequestFacts<'f>> {
+    lent.map(|(ring, places)| RequestFacts {
+        ring: Some(ring),
+        ring_positions: places,
+        ..*facts
+    })
+}
+
 /// [`run_side`] for a pair side's shadow, which may be stated a place of
-/// its own on the ring its request lends ([`Engine::side_ring_profile`]):
-/// `lent` is asked between the two halves, behind the filter half. A set
-/// the filters emptied ends where every side's does ([`single_emptied`]),
-/// in the all-vetoed rule's pick or in a shed, and asks nothing: no stage
-/// would read the place. The filter half reads `facts` as they stand: a
-/// filter is shown no ring and no place here, one of the host's own that
-/// declares the ring need ([`Filter::needs`]) too, which a live profile
-/// shows both. The scoring half reads them with the ring and the places
-/// `lent` answers, where it answers any. Out of line: a shadow's run
-/// alone enters here.
+/// its own on the ring its request lends ([`Engine::side_ring_profile`]).
+/// Under a profile none of whose filters declares the ring need
+/// ([`Filter::needs`]), `lent` is asked between the two halves, behind the
+/// filter half. A set the filters emptied ends where every side's does
+/// ([`single_emptied`]), in the all-vetoed rule's pick or in a shed, and
+/// asks nothing: no stage would read the place. The filter half reads
+/// `facts` as they stand, with no ring and no place, and the scoring half
+/// reads them with the ring and the places `lent` answers, where it
+/// answers any. Under a profile with such a filter (`ahead`), `lent` is
+/// asked ahead of the filter half and both halves read what it answers,
+/// as the stages of a live profile do, or `facts` as they stand where it
+/// answers none: the lender is then asked for a set the filters may
+/// empty. Out of line: a shadow's run alone enters here.
 #[expect(
     clippy::too_many_arguments,
     reason = "a side's run, beside what its shadow is lent"
@@ -2777,17 +2826,17 @@ fn run_side_lent<'l>(
     cx: &Constraints<'_>,
     buf: &mut Buffers,
     first: Option<(WorkerId, u16)>,
+    ahead: bool,
     lent: &dyn Fn() -> Option<(&'l dyn LentRing, &'l [u64])>,
 ) -> Decision {
     let candidates = set.candidates;
-    if let Some(emptied_by) = filter(profile, facts, cx, buf, set) {
-        return single_emptied(index, facts, pool, candidates, emptied_by, buf);
+    let state = || with_lent(facts, lent());
+    let stated = if ahead { state() } else { None };
+    let shown = stated.as_ref().unwrap_or(facts);
+    if let Some(emptied_by) = filter(profile, shown, cx, buf, set) {
+        return single_emptied(index, shown, pool, candidates, emptied_by, buf);
     }
-    let stated = lent().map(|(ring, places)| RequestFacts {
-        ring: Some(ring),
-        ring_positions: places,
-        ..*facts
-    });
+    let stated = if ahead { stated } else { state() };
     let facts = stated.as_ref().unwrap_or(facts);
     score_survivors(profile, index, facts, pool, candidates, buf, first)
 }
@@ -3207,9 +3256,11 @@ fn run_drawn(
 /// The crate's own picker that keys a rotation by the rows a whole pass
 /// kept, by name: its `pick` takes the turn of the set of those rows
 /// ([`Picker::pick_among`]) and hands out the row at the turn and the rows
-/// kept behind it. In a document a host's stage takes no built-in's name
-/// and states its own ([`StageRegistry`](crate::stages::StageRegistry)), so
-/// there a picker of this name is the crate's. An engine built in code
+/// kept behind it. In an engine built from a document a host's stage takes
+/// no built-in's name and states its own at every build
+/// ([`StageRegistry`](crate::stages::StageRegistry)), so there a picker
+/// that answers one name for its life ([`Picker::name`]) and bears this
+/// name is the crate's. An engine built in code
 /// holds whatever picker its host handed it, and no word a picker says of
 /// itself tells that its turn among a set is the turn its `pick` takes: so
 /// the name is read only for an engine whose builder says a catalog made
@@ -3248,10 +3299,13 @@ impl Engine {
 /// a row of the pool through the test it is handed and in no other way: it
 /// reads the pool's size, draws places, and asks the test about the row at
 /// each. So its draw may be asked over rows whose records are not written
-/// yet ([`run_drawn_written`]). A host's stage takes no built-in's name and
-/// states its own ([`StageRegistry`](crate::stages::StageRegistry)), so a
-/// picker of one of these names is the crate's, and a host's own picker
-/// that draws first is handed every record written.
+/// yet ([`run_drawn_written`]). In an engine built from a document a host's
+/// stage takes no built-in's name and states its own at every build
+/// ([`StageRegistry`](crate::stages::StageRegistry)). So there a picker
+/// that answers one name for its life ([`Picker::name`]) and bears one of
+/// these names is the crate's, and a host's own picker that draws first is
+/// handed every record written. An engine built in code is read by the
+/// same names, and nothing holds its pickers off them ([`Engine::new`]).
 #[cfg(feature = "in-process")]
 const DRAWS_BY_ITS_TEST: [&str; 6] = [
     "power-of-two",
@@ -3267,7 +3321,8 @@ const DRAWS_BY_ITS_TEST: [&str; 6] = [
 /// sessions. A profile of the engine's own filters, no scorer and one of
 /// these reads a row's fixed half, its report and its vetoes, and nothing
 /// else of it ([`Engine::rows_stand`]). A picker of one of these names is
-/// the crate's, as one of [`DRAWS_BY_ITS_TEST`] is.
+/// the crate's where one of [`DRAWS_BY_ITS_TEST`] is, under that list's
+/// bound.
 #[cfg(feature = "in-process")]
 const PICKS_BY_NO_COUNT: [&str; 2] = ["random", "round-robin"];
 
@@ -3292,6 +3347,23 @@ const PICKS_BY_NO_COUNT: [&str; 2] = ["random", "round-robin"];
 /// turn's draw is asked there by its own rule.
 #[cfg(feature = "in-process")]
 const DRAWS_TWO: [&str; 2] = ["power-of-two", "power-of-two-count-first"];
+
+/// One side of a pair asked by its draw: the
+/// fixed rows of its list, the buffer a record is written into, and the
+/// writer of one record.
+#[cfg(feature = "in-process")]
+pub(crate) type DrawnSide<'a> = (
+    &'a [Candidate],
+    &'a mut [Candidate],
+    &'a mut dyn FnMut(&Candidate, &mut Candidate),
+);
+
+/// What [`Engine::pair_drawn_for`] answers: the pair's two profiles.
+#[cfg(feature = "in-process")]
+#[derive(Clone, Copy)]
+pub(crate) struct PairDrawn {
+    profiles: [u16; 2],
+}
 
 /// The smallest pool over which a picker that draws two rows
 /// ([`DRAWS_TWO`]) is asked to draw before the pool's records are written
@@ -3528,6 +3600,95 @@ fn run_drawn_written(
     decision
 }
 
+/// One side of a pair by its draw ([`Engine::decide_pair_drawn`]): the two
+/// rows the seed's stream draws over `fixed`, each written at its place
+/// (`write`) and put to the profile's tests, then scored and ordered as
+/// [`run_drawn_written`] orders a single's.
+///
+/// The whole pass decides a pair's side at every pool size, so the draw
+/// keeps the pass's rule at every size, as a single's does under
+/// [`DRAW_FROM`] rows alone: the request's seed is read as it came, so two
+/// rows that tie are ordered by it, and the first row a test refuses ends
+/// the draw. `None` where the draw names no pick: the caller decides the
+/// pair whole, by a stream nothing was drawn from.
+#[cfg(feature = "in-process")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the draw's inputs and the host's two halves of a row: the fixed rows, the buffer and the write"
+)]
+#[inline(never)]
+fn run_side_drawn_written(
+    engine: &Engine,
+    index: u16,
+    facts: &RequestFacts<'_>,
+    pool: &PoolFacts<'_>,
+    fixed: &[Candidate],
+    rows: &mut [Candidate],
+    write: &mut dyn FnMut(&Candidate, &mut Candidate),
+    cx: &Constraints<'_>,
+    buf: &mut Buffers,
+) -> Option<Pick> {
+    let at = usize::from(index);
+    let (profile, tests) = (&engine.profiles[at], engine.row_tests[at]);
+    debug_assert_eq!(fixed.len(), rows.len(), "one buffer row a fixed row");
+    #[cfg(debug_assertions)]
+    for (row, fixed) in rows.iter_mut().zip(fixed) {
+        *row = unwritten(fixed);
+    }
+    // A request held to places is the whole pass's.
+    if places::stated(cx) {
+        return None;
+    }
+    buf.reserve(fixed.len());
+    buf.kept.clear();
+    let masked = tests.is_some_and(|tests| tests.masked(cx));
+    let mut refused = false;
+    // The row a draw lands on, written at its place: the written record
+    // is the one the tests are asked about.
+    let mut ask = |fixed: &Candidate| {
+        let kept = rows.get_mut(fixed.position as usize).is_some_and(|row| {
+            write(fixed, row);
+            let row = &*row;
+            match tests {
+                Some(tests) => tests.keeps(facts, row, cx) && !(masked && cx.masks(row.position)),
+                None => profile.filters.iter().all(|f| f.keep(facts, row, cx)),
+            }
+        });
+        refused |= !kept;
+        kept
+    };
+    // The stream is the draw's own: the order below reads the seed of
+    // `facts`, which no draw moved.
+    let mut draw = Draw::new(facts.seed);
+    let drew = profile
+        .picker
+        .draw_first(facts, pool, fixed, &mut ask, &mut buf.kept, &mut draw);
+    if !drew || refused {
+        return None;
+    }
+    let band = combine(
+        profile,
+        facts,
+        rows,
+        &buf.kept,
+        &mut buf.scores,
+        &mut buf.stage,
+    );
+    let mut targets = Targets::new();
+    profile
+        .picker
+        .order_drawn(facts, rows, &buf.kept, &buf.scores, band, &mut targets);
+    if targets.is_empty() {
+        return None;
+    }
+    let trace = trace_drawn(index, facts, pool, rows, &buf.kept, buf.traced());
+    Some(Pick {
+        targets,
+        trace,
+        session_verdict: SessionVerdict::None,
+    })
+}
+
 /// The whole pass of an encode item of the `epd` plan: the plan's rules
 /// filter the encode pool before the profile's ([`filter`]). Out of line,
 /// so the decision's entry builds one set for every other request and the
@@ -3563,7 +3724,10 @@ pub enum Plan {
     /// the open encoders of the chosen prefill's class that take the
     /// request's media, once per encode item or once for the items taken
     /// as one. A request with items that no encoder is open to is refused
-    /// ahead of the pair. The binding's `profile` is the prefill side and
+    /// ahead of the pair. The pair of a request with items is picked among
+    /// the prefills whose class holds an open encoder that takes its media.
+    /// A decode without the vision a request asks of it is no candidate of
+    /// the pair either. The binding's `profile` is the prefill side and
     /// `decode_profile` the decode side. The encode side rides the plan,
     /// so a binding keeps the pair's two fields.
     Epd {
@@ -3660,10 +3824,10 @@ pub struct Binding {
     pub decode_shadow: Option<u16>,
     /// Sticky sessions: a keyed request stays on the worker its key was
     /// placed on (design 4.6), under the `single` plan and on each side of
-    /// a pair, by the side's own session. A document states the rule: code
-    /// outside this crate builds none ([`SessionRule`]), so a binding it
-    /// makes leaves this `None`, or takes the rule of a document's binding
-    /// ([`Engine::binding`]).
+    /// a pair the rule covers, by the side's own session. A document states
+    /// the rule: code outside this crate builds none ([`SessionRule`]), so
+    /// a binding it makes leaves this `None`, or takes the rule of a
+    /// document's binding ([`Engine::binding`]).
     pub sessions: Option<SessionRule>,
 }
 
@@ -4198,6 +4362,11 @@ pub struct Engine {
     /// request's binding is resolved.
     #[cfg(feature = "in-process")]
     written_least: usize,
+    /// Whether some binding's pair may be asked by its draw
+    /// ([`Entry::pair_drawn`]): a document with no such binding is told so
+    /// at one load, before a pair's decision asks anything of its request.
+    #[cfg(feature = "in-process")]
+    pairs_drawn: bool,
     /// Whether no stage of any profile and no sessions rule's assignment
     /// reads a count a worker object alone holds ([`Self::rows_stand`]).
     #[cfg(feature = "in-process")]
@@ -4212,7 +4381,9 @@ pub struct Engine {
     /// The stages that keep a number of the reports
     /// ([`Lifecycle::keeps_loads`]), each by its place: listed once at the
     /// build, so a publication asks no stage whether it keeps them.
-    keepers: Vec<Keeper>,
+    keepers: Vec<StagePlace>,
+    /// The stages that take each word of a lease, each by its place.
+    takers: Takers,
     /// One tally for each two send settings a profile's stages read
     /// under: a later engine's tally under the same two shares its
     /// entries, and one under two that no tally here has takes a copy of
@@ -4233,32 +4404,36 @@ pub struct Engine {
     stage_table: Option<u64>,
     /// The kinds of event the document takes, but for its counts of sends
     /// ([`Lifecycle::hears`] adds those): each stage's answer, asked once at
-    /// the build, with the engine's own. A word of a request is told to
-    /// every profile's stages, so the answer is the document's.
+    /// the build, with the engine's own. A request's word may go to a
+    /// stage of any profile that takes it ([`Takers`]), so the answer is
+    /// the document's.
     hears: EventSet,
     /// The stages' answers alone, as [`Self::hears`] folds them, without
     /// the engine's own ([`Self::hears_beside_table`]).
     stages_hear: EventSet,
 }
 
-/// A stage that keeps a number of the reports, by its place in the engine.
+/// A stage by its place in the engine. The engine lists by it the stages
+/// that keep a number of the reports ([`Lifecycle::keeps_loads`]) and the
+/// stages that take each word of a lease ([`Takers`]). A place names any
+/// scorer a profile holds, and its picker: a list leaves out none of them
+/// for where it stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Keeper {
+enum StagePlace {
     /// The scorer at `stage` of the profile at `profile`.
-    Scorer { profile: u16, stage: u16 },
+    Scorer { profile: usize, stage: usize },
     /// The picker of the profile at `profile`.
-    Picker { profile: u16 },
+    Picker { profile: usize },
 }
 
-impl Keeper {
-    /// The stages of `profiles` that say they keep the reports, in the
-    /// profiles' order, a profile's scorers ahead of its picker.
-    fn of(profiles: &[Profile]) -> Vec<Self> {
+impl StagePlace {
+    /// The stages of `profiles` that say they keep the reports, by their
+    /// places: in the profiles' order, a profile's scorers ahead of its
+    /// picker.
+    fn keepers(profiles: &[Profile]) -> Vec<Self> {
         let mut keepers = Vec::new();
-        // Inclusive ranges: a walk over as many stages as a place can
-        // name ends with the list, where an open range steps past its end.
-        for (at, profile) in (0..=u16::MAX).zip(profiles) {
-            for (stage, weighted) in (0..=u16::MAX).zip(&profile.scorers) {
+        for (at, profile) in profiles.iter().enumerate() {
+            for (stage, weighted) in profile.scorers.iter().enumerate() {
                 if weighted.scorer.keeps_loads() {
                     keepers.push(Self::Scorer { profile: at, stage });
                 }
@@ -4268,6 +4443,95 @@ impl Keeper {
             }
         }
         keepers
+    }
+
+    /// The stage at this place of `profiles`, the list the place was read
+    /// of.
+    #[inline(always)]
+    fn stage(self, profiles: &[Arc<Profile>]) -> &dyn Lifecycle {
+        match self {
+            Self::Scorer { profile, stage } => &*profiles[profile].scorers[stage].scorer,
+            Self::Picker { profile } => &*profiles[profile].picker,
+        }
+    }
+
+    /// The place of the profile the stage is of.
+    #[cfg(feature = "in-process")]
+    #[inline(always)]
+    fn profile(self) -> usize {
+        let (Self::Scorer { profile, .. } | Self::Picker { profile }) = self;
+        profile
+    }
+
+    /// The stage's place in its profile: a scorer's among the scorers,
+    /// and none for the picker.
+    #[cfg(feature = "in-process")]
+    fn within(self) -> Option<usize> {
+        match self {
+            Self::Scorer { stage, .. } => Some(stage),
+            Self::Picker { .. } => None,
+        }
+    }
+}
+
+/// The stages that take each word of a lease ([`Lifecycle::hears`]), by
+/// their places and in the engine's order. They are listed once, at the
+/// build. A word told to the stages walks its list and no other stage: a
+/// document of many profiles pays such a word by the stages that take it,
+/// and not by the profiles it holds.
+#[derive(Debug, Default)]
+struct Takers {
+    issued: Vec<StagePlace>,
+    dispatched: Vec<StagePlace>,
+    completed: Vec<StagePlace>,
+    released: Vec<StagePlace>,
+}
+
+impl Takers {
+    /// Lists the stage at `place` under each word of a lease in `hears`,
+    /// the stage's own answer.
+    fn list(&mut self, place: StagePlace, hears: EventSet) {
+        let lists = [
+            (EventKind::Issued, &mut self.issued),
+            (EventKind::Dispatched, &mut self.dispatched),
+            (EventKind::Completed, &mut self.completed),
+            (EventKind::Released, &mut self.released),
+        ];
+        for (kind, list) in lists {
+            if hears.contains(kind) {
+                list.push(place);
+            }
+        }
+    }
+
+    /// The stages listed under the word `kind`, by their places and in
+    /// the engine's order. A change of membership and a signal are no
+    /// words of a lease: no stage is listed under either.
+    #[inline(always)]
+    fn of(&self, kind: EventKind) -> &[StagePlace] {
+        match kind {
+            EventKind::Issued => &self.issued,
+            EventKind::Dispatched => &self.dispatched,
+            EventKind::Completed => &self.completed,
+            EventKind::Released => &self.released,
+            EventKind::Membership | EventKind::Signal => &[],
+        }
+    }
+
+    /// Every word's list, each once: what two builds are compared by
+    /// ([`Engine::listed`]). The order of the answer is no part of it. The
+    /// pattern names each field of the record: where the compare is built,
+    /// under the `in-process` feature, a list added to the record does not
+    /// build until the pattern names it.
+    #[cfg(feature = "in-process")]
+    fn every(&self) -> [&[StagePlace]; 4] {
+        let Self {
+            issued,
+            dispatched,
+            completed,
+            released,
+        } = self;
+        [issued, dispatched, completed, released]
     }
 }
 
@@ -4537,6 +4801,11 @@ impl Marks {
     /// reads it for its prefill profile ([`Engine::weighs`]). No single
     /// decision does: each of its masked reads names other marks.
     const WEIGHS: u16 = 1 << 13;
+    /// A filter declares the ring need ([`Filter::needs`]). The run of a
+    /// pair side's shadow that is lent a ring reads it: it asks its
+    /// lender ahead of such a profile's filter half ([`run_side_lent`]).
+    /// No other decision reads it.
+    const RING_FILTER: u16 = 1 << 14;
 
     fn of(profile: &Profile, order: Order) -> Self {
         let scoped = if profile.scoped() { Self::SCOPED } else { 0 };
@@ -4614,11 +4883,18 @@ impl Marks {
         } else {
             0
         };
+        let ring_filter = if profile.filters.iter().any(|filter| filter.needs().ring) {
+            Self::RING_FILTER
+        } else {
+            0
+        };
         // The three marks no run of the engine reads.
         let for_hosts = by_reports | key_place | other_place;
         // What says when the profile draws, and how.
         let draws = draws_first | joined | turns;
-        Self(scoped | by_assignment | draws | ranked | engines | owns | for_hosts | weighs)
+        // The two marks a pair's decision alone reads.
+        let for_pairs = weighs | ring_filter;
+        Self(scoped | by_assignment | draws | ranked | engines | owns | for_hosts | for_pairs)
     }
 
     /// A profile whose requests take their list's own turn first.
@@ -4629,6 +4905,11 @@ impl Marks {
     /// A scorer that weighs load against affinity by a gate of its own.
     const fn weighs(self) -> bool {
         self.0 & Self::WEIGHS != 0
+    }
+
+    /// A filter that declares the ring need.
+    const fn ring_filter(self) -> bool {
+        self.0 & Self::RING_FILTER != 0
     }
 
     /// Whether no stage asks anything before the profile's run: no scope
@@ -4773,6 +5054,14 @@ struct Entry {
     /// pair's decision alone. A pair under no rule whose pickers pick
     /// tests this one byte a decision and runs its two profiles as it did.
     sides_placed: bool,
+    /// Whether each side of the binding's pair may be asked by its draw
+    /// ([`Engine::pair_drawn_for`]): the plan pairs, and each side's profile
+    /// is a pick of two that draws first, asks nothing ahead of its draw
+    /// and keeps a row by the engine's one folded test of it. Written once
+    /// when the engine is built: a pair's decision reads this one byte and
+    /// then asks of its request and its two lists alone.
+    #[cfg(feature = "in-process")]
+    pair_drawn: bool,
 }
 
 /// The sides of a pair that run under the pair's binding whatever binding
@@ -4873,513 +5162,6 @@ struct AssignmentStages {
     least_requests: LeastRequests,
     fewest_sessions: FewestSessions,
     best: Best,
-}
-
-/// The two pools of a pair decision: the open prefills and the decodes, each
-/// row carrying its pair class; the pair table, which says which classes
-/// pair; and beside each pool its affinity column, by the candidate's index,
-/// empty for a side nothing reads it on, and its signal cells, none for a
-/// side whose stages read no signal.
-#[derive(Clone, Copy, Default)]
-#[non_exhaustive]
-pub struct PairPools<'a> {
-    pub prefills: &'a [Candidate],
-    pub decodes: &'a [Candidate],
-    /// The prefills' affinity facts: what the prefill side's stages find in
-    /// [`RequestFacts::affinity`].
-    pub prefill_affinity: &'a [AffinityFacts],
-    /// The decodes' affinity facts, the same for the decode side's stages.
-    pub decode_affinity: &'a [AffinityFacts],
-    /// The prefills' signal cells: what the prefill side's stages find in
-    /// [`RequestFacts::signal_cells`].
-    pub prefill_signal_cells: Option<&'a SignalCells>,
-    /// The decodes' signal cells, the same for the decode side's stages.
-    pub decode_signal_cells: Option<&'a SignalCells>,
-    /// The decode classes each prefill class pairs with. Left at its
-    /// default, classes pair by their number.
-    pub table: PairTable<'a>,
-    /// The partners each prefill class is paired with first. Left at its
-    /// default, no partner goes first.
-    pub first: FirstPartners<'a>,
-    /// Whether the pools are a part of the lists the request's caller
-    /// lent. Two things make a part. A hard demand its door judged left
-    /// each side the workers that meet it. Or the encode pass is laid for
-    /// the request, which states an item or holds its decode to the ones
-    /// that take images: the pass hands the pair the workers its
-    /// encoders and its images leave. Three writers say so, each from
-    /// the test it already makes: the pair's door and the encode door
-    /// where the request states a demand, and the encode pass where it
-    /// is laid.
-    ///
-    /// Nothing else makes a part. The places a host states for a side are
-    /// its own word of its list. The workers a route's rule takes are the
-    /// call's places for its later decisions. Under both the pools are
-    /// whole.
-    ///
-    /// Behind a part a pair's decision does not ask its one question of a
-    /// shed ([`Engine::decide_pair`]). Private to the crate: a host of its
-    /// own builds the pools from their default, which says whole.
-    pub(crate) part: bool,
-}
-
-/// Which pair classes pair: for each prefill class, the decode classes it
-/// pairs with. A worker stands once in its pool and carries one class
-/// ([`Candidate::pair_class`]): prefills that pair with the same decodes
-/// share one, and so do decodes that pair with the same prefills. The table
-/// names classes, never rows or positions, so one table serves every pool
-/// narrowed from the same workers.
-///
-/// The default is no table: a prefill class then pairs with the decode
-/// class of its own number, as under a host that gives a decode the class
-/// of the prefills it partners.
-///
-/// A host builds a table ([`PairTable::new`]) and can ask once whether it
-/// is one the engine honours whole ([`PairTable::validate`]). How a decision
-/// reads it is the engine's own.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct PairTable<'a> {
-    /// Where each prefill class's list ends in `classes`.
-    ends: &'a [u32],
-    /// The lists, one after another.
-    classes: &'a [u32],
-}
-
-impl<'a> PairTable<'a> {
-    /// A table over the host's two slices. `classes` holds the lists one
-    /// after another, prefill class 1's first, and `ends[k - 1]` is where
-    /// prefill class `k`'s list ends in it. A list names decode classes in
-    /// ascending order.
-    ///
-    /// A host numbers its decode classes densely from 1, each named by some
-    /// list, so a list's classes are the numbers from 1 to the count of the
-    /// lists' entries. What a list names outside them is no class of the
-    /// table, and no decode pairs through it: class 0, which is outside any
-    /// pairing, and a number above the count. A decision keeps one bit a
-    /// class number up to that count, never more.
-    ///
-    /// Nothing is checked here, so a decision of a release build pays for no
-    /// check: a table that fails [`PairTable::validate`] costs it the pairs the
-    /// table misnames and a set of at most the table's own size, never the
-    /// process.
-    pub const fn new(ends: &'a [u32], classes: &'a [u32]) -> Self {
-        Self { ends, classes }
-    }
-
-    /// No table was handed: classes pair by their number.
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.ends.is_empty()
-    }
-
-    /// The decode classes prefill class `class` pairs with, ascending: its
-    /// list under a table, its own number under none. Every read of a pair
-    /// decision asks here, but for the width's walk: it reads each list's
-    /// last entry by the same cut ([`Self::cut`]), and asks here list by
-    /// list once a last entry stands above the count. Class 0 pairs with
-    /// nothing, as does a class the table holds no list for, and a list is
-    /// read up to the count of the lists' entries: a number above it is no
-    /// class of the table. The class is lent, so that under no table the
-    /// list is the number itself.
-    pub(crate) fn of<'c>(&self, class: &'c u32) -> &'c [u32]
-    where
-        'a: 'c,
-    {
-        if *class == 0 {
-            return &[];
-        }
-        if self.is_empty() {
-            return std::slice::from_ref(class);
-        }
-        let list = self.list(*class as usize - 1);
-        // A list ascends, so the numbers above the count are its end.
-        let held = |listed: &u32| *listed as usize <= self.classes.len();
-        match list.last() {
-            Some(last) if !held(last) => &list[..list.partition_point(held)],
-            _ => list,
-        }
-    }
-
-    /// The list of the prefill class at `at`, as the host handed it; empty
-    /// for a class the table holds no list for.
-    fn list(&self, at: usize) -> &'a [u32] {
-        let Some(&end) = self.ends.get(at) else {
-            return &[];
-        };
-        let start = at.checked_sub(1).map_or(0, |before| self.ends[before]);
-        self.cut(start as usize, end as usize)
-    }
-
-    /// The entries from `start` up to `end`: the one cut of a list out of
-    /// the lists' entries, empty where the two ends do not hold.
-    /// [`Self::list`] cuts by a class's own two ends, and the width's walk
-    /// by the end it passed last.
-    fn cut(&self, start: usize, end: usize) -> &'a [u32] {
-        self.classes.get(start..end).unwrap_or(&[])
-    }
-
-    /// The table's prefill classes.
-    fn prefill_classes(&self) -> std::ops::RangeInclusive<u32> {
-        1..=self.ends.len() as u32
-    }
-
-    /// The width of a set of bits over the table's decode classes: one past
-    /// the largest class a list names, which is at most the count of the
-    /// lists' entries ([`PairTable::of`]). A table costs a decision a set
-    /// of its own size, whatever numbers it names. Lists ascend, so a
-    /// list's last entry is its largest; the width is capped at the count
-    /// all the same, so the bound stands for a list out of order too.
-    ///
-    /// One walk of the lists' ends reads each list's last entry by the cut
-    /// a list's own read makes ([`Self::cut`]). The walk stays out of line
-    /// and calls nothing on its way, so the routine that asks is compiled
-    /// as it was without a table's walk in it. The first last entry above
-    /// the count ends the walk: [`Self::width_by_lists`] answers.
-    #[inline(never)]
-    fn width(&self) -> usize {
-        let count = self.classes.len();
-        let (mut largest, mut start) = (0u32, 0usize);
-        for &end in self.ends {
-            let end = end as usize;
-            if let Some(&last) = self.cut(start, end).last() {
-                if last as usize > count {
-                    return self.width_by_lists();
-                }
-                largest = largest.max(last);
-            }
-            start = end;
-        }
-        Self::capped(largest, count)
-    }
-
-    /// The width of a table with a list's last entry above the count of
-    /// the entries: each list's own read says where it ends
-    /// ([`PairTable::of`]), list by list. Cold and out of line: a table a
-    /// host numbers from one up never comes here.
-    #[cold]
-    #[inline(never)]
-    fn width_by_lists(&self) -> usize {
-        let largest = self
-            .prefill_classes()
-            .filter_map(|class| self.of(&class).last().copied())
-            .max()
-            .unwrap_or(0);
-        Self::capped(largest, self.classes.len())
-    }
-
-    /// One past `largest`, and at most one past `count`: the width's cap,
-    /// apart from the lists so that a case asks it. A list's read ends at
-    /// the count ([`PairTable::of`]), so no table hands the width a larger
-    /// number while the library's search answers as it does today.
-    fn capped(largest: u32, count: usize) -> usize {
-        (largest as usize).min(count) + 1
-    }
-
-    /// Whether this is a table the engine honours whole, and the first
-    /// clause it fails when it is not: the ends ascend and the last stands
-    /// where the lists end, and each list names its classes in ascending
-    /// order, none of them class 0 and none above the count of the lists'
-    /// entries. The default, no table, is valid.
-    ///
-    /// One question, two askers: a host asks it once where it builds a
-    /// table, in every build, and a debug build asks it where a decision
-    /// takes one.
-    pub fn validate(&self) -> Result<(), PairTableError> {
-        self.laid_out(true)
-    }
-
-    /// The clauses of [`Self::validate`], the last of them only where
-    /// `counted`: lists that name some of a table's classes hold numbers
-    /// above their own count ([`FirstPartners::within`]).
-    fn laid_out(&self, counted: bool) -> Result<(), PairTableError> {
-        if !self.ends.windows(2).all(|pair| pair[0] <= pair[1]) {
-            return Err(PairTableError::EndsDescend);
-        }
-        // Every entry stands in a list, so the count a read holds a list
-        // to is the lists' own.
-        let entries = self.classes.len();
-        let end = self.ends.last().map_or(0, |&end| end as usize);
-        if end > entries {
-            return Err(PairTableError::EndPastLists);
-        }
-        if end < entries {
-            return Err(PairTableError::EntriesPastEnds);
-        }
-        for list in (0..self.ends.len()).map(|at| self.list(at)) {
-            if !list.windows(2).all(|pair| pair[0] < pair[1]) {
-                return Err(PairTableError::ListOutOfOrder);
-            }
-            if list.first() == Some(&0) {
-                return Err(PairTableError::ClassZero);
-            }
-            if counted && list.last().is_some_and(|&last| last as usize > entries) {
-                return Err(PairTableError::NumberAboveCount);
-            }
-        }
-        Ok(())
-    }
-
-    /// The prefill classes with a partner, ascending, into `classes`. `open`
-    /// is the class of each decode the decode profile's hard filters keep.
-    /// Under a table the question is asked once a prefill class, each
-    /// stopping at the first open class it lists, and of no class when no
-    /// decode is open. Under none the open classes are the answer: a class
-    /// pairs with its own number.
-    fn partnered(
-        &self,
-        open: impl Iterator<Item = u32>,
-        classes: &mut Vec<u32>,
-        marks: &mut ClassBits,
-    ) {
-        classes.clear();
-        if self.is_empty() {
-            classes.extend(open);
-            classes.sort_unstable();
-            classes.dedup();
-            return;
-        }
-        // A number above the table's width is no class of the table.
-        let width = self.width();
-        marks.reset(width);
-        // The decodes are read until every number from one to the width
-        // less one has an open decode: no decode behind that one opens a
-        // class, and `open` is not asked for it.
-        let mut closed = width.saturating_sub(1);
-        let mut any = false;
-        for class in open {
-            if class == 0 || class as usize >= width || marks.has(class) {
-                continue;
-            }
-            marks.insert(class);
-            any = true;
-            closed -= 1;
-            if closed == 0 {
-                break;
-            }
-        }
-        if any {
-            classes.extend(
-                self.prefill_classes()
-                    .filter(|class| self.of(class).iter().any(|&listed| marks.has(listed))),
-            );
-        }
-    }
-
-    /// Turns the prefill classes in `classes` into the decode classes they
-    /// pair with, both ascending. Under no table nothing moves: a class
-    /// pairs with its own number.
-    fn listed(&self, classes: &mut Vec<u32>, marks: &mut ClassBits) {
-        if self.is_empty() {
-            return;
-        }
-        marks.reset(self.width());
-        for class in classes.iter() {
-            for &listed in self.of(class) {
-                marks.insert(listed);
-            }
-        }
-        classes.clear();
-        classes.extend(marks.classes());
-    }
-}
-
-/// The clause of [`PairTable::validate`] a host's table fails.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum PairTableError {
-    #[error("an end stands before the end of the list before it")]
-    EndsDescend,
-    #[error("an end stands past the lists")]
-    EndPastLists,
-    #[error("the lists hold entries past the last end")]
-    EntriesPastEnds,
-    #[error("a list names its classes out of ascending order")]
-    ListOutOfOrder,
-    #[error("a list names class 0")]
-    ClassZero,
-    #[error("a list names a number above the count of the lists' entries")]
-    NumberAboveCount,
-}
-
-/// The partners each prefill class is paired with first: for each prefill
-/// class, a part of the decode classes its list in the pair table names
-/// ([`PairTable`]). While one of them is open, the pair is made among the
-/// prefills that have one open and their first partners, and a request
-/// waits where such a prefill is held back by its admission limit alone.
-/// Every other pair is made only while no prefill has a first partner
-/// open ([`Engine::decide_pair`]). The default is none: every partner
-/// stands alike.
-///
-/// The lists name classes of the pair table and not all of them, so they
-/// are no table of their own. A host asks once, where it builds the two,
-/// whether they stand within its table ([`FirstPartners::within`]).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FirstPartners<'a> {
-    /// The lists in a table's storage, read as the host handed them.
-    lists: PairTable<'a>,
-}
-
-impl<'a> FirstPartners<'a> {
-    /// The first partners over the host's two slices, laid out as a pair
-    /// table's are ([`PairTable::new`]): `classes` holds the lists one
-    /// after another, prefill class 1's first, and `ends[k - 1]` is where
-    /// prefill class `k`'s list ends in it. A list names decode classes in
-    /// ascending order. Nothing is checked here.
-    pub const fn new(ends: &'a [u32], classes: &'a [u32]) -> Self {
-        Self {
-            lists: PairTable::new(ends, classes),
-        }
-    }
-
-    /// The first partners of prefill class `class`, as the host handed
-    /// them: none for class 0 and for a class the lists do not reach.
-    pub(crate) fn of(&self, class: u32) -> &'a [u32] {
-        match class.checked_sub(1) {
-            Some(at) => self.lists.list(at as usize),
-            None => &[],
-        }
-    }
-
-    /// The prefill classes with an open first partner, ascending, into
-    /// `classes`, and whether there is one. `marks` holds the open decode
-    /// classes as `table`'s own pass left them ([`PairTable::partnered`]).
-    /// Under no table that pass marks nothing, and no first partner is
-    /// read.
-    fn open(&self, table: &PairTable<'_>, marks: &ClassBits, classes: &mut Vec<u32>) -> bool {
-        if table.is_empty() {
-            return false;
-        }
-        classes.clear();
-        let open = |class: &u32| self.of(*class).iter().any(|&listed| marks.has(listed));
-        classes.extend(self.lists.prefill_classes().filter(open));
-        !classes.is_empty()
-    }
-
-    /// Whether these are first partners of `table`, and the first clause
-    /// they fail when they are not. The lists are laid out as a table's
-    /// are, by the table's own clauses but for its count
-    /// ([`PairTable::validate`]): the ends ascend and the last stands where
-    /// the lists end, and each list names its classes in ascending order,
-    /// none of them class 0. Then each class a list names is a partner of
-    /// its prefill class in `table`. The default, none, stands within
-    /// every table.
-    ///
-    /// A host asks it once where it builds the two, and a debug build asks
-    /// it where a decision takes them.
-    pub fn within(&self, table: &PairTable<'_>) -> Result<(), FirstPartnersError> {
-        self.lists
-            .laid_out(false)
-            .map_err(FirstPartnersError::Lists)?;
-        let partners = |class: u32| {
-            let listed = table.of(&class);
-            let partner = |named: &u32| listed.binary_search(named).is_ok();
-            self.of(class).iter().all(partner)
-        };
-        if self.lists.prefill_classes().all(partners) {
-            Ok(())
-        } else {
-            Err(FirstPartnersError::NoPartner)
-        }
-    }
-}
-
-/// The clause of [`FirstPartners::within`] a host's first partners fail.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum FirstPartnersError {
-    #[error("the first partners' lists: {0}")]
-    Lists(PairTableError),
-    #[error("a first partner is no partner of its prefill class in the pair table")]
-    NoPartner,
-}
-
-impl<'a> PairPools<'a> {
-    /// The two pools with nothing beside them: no affinity column, no
-    /// signal cells and no pair table, so classes pair by their number.
-    /// A caller assigns what it holds beside its pools over it:
-    /// `let mut pools = PairPools::of(prefills, decodes); pools.table = table;`.
-    #[must_use]
-    pub fn of(prefills: &'a [Candidate], decodes: &'a [Candidate]) -> Self {
-        Self {
-            prefills,
-            decodes,
-            ..Self::default()
-        }
-    }
-
-    /// The decode classes a prefill of `class` is paired among: its first
-    /// partners where the pair is made among those (`firsts`), else every
-    /// class its list in the table names.
-    fn partners<'c>(&self, class: &'c u32, firsts: bool) -> &'c [u32]
-    where
-        'a: 'c,
-    {
-        if firsts {
-            self.first.of(*class)
-        } else {
-            self.table.of(class)
-        }
-    }
-
-    /// One side of the pair as its stages read it: the side's pool, and the
-    /// request's facts with the side's phase, its draw sequence and its own
-    /// pool's affinity column and signal cells, and with no rows named:
-    /// those index neither pool. `None` when that column was not filled
-    /// for that pool ([`column_fits`]). The one place a pair's column and
-    /// cells meet their pool, so no call site hands one side's with the
-    /// other side's candidates.
-    ///
-    /// A side reads its own places on a lent ring in the one list
-    /// ([`RequestFacts::ring_positions`]): the decode side's own where the
-    /// request states them apart
-    /// ([`RequestFacts::decode_ring_positions`]), which neither side's
-    /// facts carry on. So a stage is never shown the other side's list.
-    fn side(
-        self,
-        side: PairSide,
-        facts: &RequestFacts<'a>,
-    ) -> Option<(&'a [Candidate], RequestFacts<'a>)> {
-        let (pool, affinity, signal_cells, phase, seed, ring_positions) = match side {
-            PairSide::Prefill => (
-                self.prefills,
-                self.prefill_affinity,
-                self.prefill_signal_cells,
-                Phase::Prefill,
-                facts.seed,
-                facts.ring_positions,
-            ),
-            // The decode side draws its own sequence, derived from the
-            // request's seed: one seed on both sides made the decode picker
-            // replay the prefill picker's draws, so the decode chosen
-            // followed the prefill chosen (random over four prefills of four
-            // decodes each reached four of the sixteen). The decision still
-            // replays from the trace's seed.
-            PairSide::Decode => (
-                self.decodes,
-                self.decode_affinity,
-                self.decode_signal_cells,
-                Phase::Decode,
-                Draw::new(facts.seed).next_u64(),
-                facts.decode_ring_positions.unwrap_or(facts.ring_positions),
-            ),
-        };
-        debug_assert_indexed(pool);
-        debug_assert_cells(signal_cells, pool);
-        column_fits(affinity, pool).then(|| {
-            let facts = RequestFacts {
-                phase,
-                seed,
-                affinity,
-                named: None,
-                // The side's own cells: the request's would be read by
-                // another pool's positions.
-                signal_cells,
-                // The side's own places, in the one list a stage reads.
-                ring_positions,
-                decode_ring_positions: None,
-                ..*facts
-            };
-            (pool, facts)
-        })
-    }
 }
 
 /// Whether the request carries a column of its own or names rows. A pair
@@ -5566,6 +5348,13 @@ impl Engine {
     /// a decision scope under the single plan. An engine holds at most
     /// 65,535 profiles: the position past them marks a decision made ahead
     /// of every profile ([`Trace::NO_PROFILE`]).
+    ///
+    /// The stages are taken as handed: no name is checked here. A host that
+    /// builds its engine in code keeps its stages off the names the engine
+    /// refuses under ([`refuses_under`](crate::engine::refuses_under)) and
+    /// off the stock stages' names, which the engine reads as its own. A
+    /// document's validation holds what a stage answers at its build to
+    /// both.
     pub fn new(
         profiles: Vec<Profile>,
         bindings: Vec<Binding>,
@@ -5714,7 +5503,7 @@ impl Engine {
             .zip(&row_tests)
             .map(|(profile, &folded)| profile.named_by(folded))
             .collect();
-        let keepers = Keeper::of(&profiles);
+        let keepers = StagePlace::keepers(&profiles);
         // The engine's own: the session table follows a dispatch, and at a
         // release takes back the claim of a decision its commit refused,
         // where a binding states a sessions rule. At an issue the engine
@@ -5727,13 +5516,22 @@ impl Engine {
         } else {
             EventSet::NONE
         };
-        let stages_hear = profiles.iter().fold(EventSet::NONE, |hears, profile| {
-            let stages = profile
-                .scorers
-                .iter()
-                .map(|weighted| weighted.scorer.hears());
-            stages.fold(hears.union(profile.picker.hears()), EventSet::union)
-        });
+        // Each scorer and picker is asked once what it takes, a profile's
+        // picker ahead of its scorers. Its answer is in the document's,
+        // and lists it under each word of a lease it names: a profile's
+        // scorers ahead of its picker, the order the words are told in.
+        let mut takers = Takers::default();
+        let mut stages_hear = EventSet::NONE;
+        for (at, profile) in profiles.iter().enumerate() {
+            let picker = profile.picker.hears();
+            for (stage, weighted) in profile.scorers.iter().enumerate() {
+                let hears = weighted.scorer.hears();
+                stages_hear = stages_hear.union(hears);
+                takers.list(StagePlace::Scorer { profile: at, stage }, hears);
+            }
+            stages_hear = stages_hear.union(picker);
+            takers.list(StagePlace::Picker { profile: at }, picker);
+        }
         let hears = stages_hear.union(own);
         let shadows = bindings
             .iter()
@@ -5784,6 +5582,8 @@ impl Engine {
         // delegate to: the assignment that places is written beside each
         // binding here, once, so no decision asks. The binding itself keeps
         // the rule as the spec declared it.
+        #[cfg(feature = "in-process")]
+        let mut pairs_drawn = false;
         let bindings = bindings
             .into_iter()
             .map(|binding| {
@@ -5815,11 +5615,51 @@ impl Engine {
                 let sides_placed = binding.sessions.is_some()
                     || assigned(binding.profile)
                     || binding.decode_profile.is_some_and(assigned);
+                // A side its rule leaves out is its profile's alone, and a
+                // picker that leaves the placement to the rule has no
+                // stages to place it by. A document's check refuses that
+                // binding. One built in code stops a debug build here.
+                debug_assert!(
+                    binding.sessions.is_none_or(|rule| {
+                        let decode = binding.decode_profile.unwrap_or(binding.profile);
+                        (rule.sides.covers(false) || !assigned(binding.profile))
+                            && (rule.sides.covers(true) || !assigned(decode))
+                    }),
+                    "a picker that places by the sessions rule on a side the rule's sides leave out"
+                );
+                // Each side of a pair may be asked by its draw where its
+                // profile is a pick of two that draws first, asks nothing
+                // ahead of the draw and folds its filters into one test.
+                #[cfg(feature = "in-process")]
+                let pair_drawn = matches!(binding.plan, Plan::PdPair | Plan::Epd { .. })
+                    && [
+                        binding.profile,
+                        binding.decode_profile.unwrap_or(binding.profile),
+                    ]
+                    .into_iter()
+                    .all(|index| {
+                        let at = usize::from(index);
+                        profiles
+                            .get(at)
+                            .is_some_and(|profile| DRAWS_TWO.contains(&profile.picker.name()))
+                            && row_tests.get(at).is_some_and(Option::is_some)
+                            && marks.get(at).is_some_and(|marks| {
+                                marks.asks_nothing_first()
+                                    && marks.ahead() == Marks::DRAWS_FIRST
+                                    && !marks.by_assignment()
+                            })
+                    });
+                #[cfg(feature = "in-process")]
+                {
+                    pairs_drawn |= pair_drawn;
+                }
                 Entry {
                     glob: binding.pattern().glob(),
                     placing: placed_by(declared, by_assignment),
                     vetoed: AllVetoed::default(),
                     sides_placed,
+                    #[cfg(feature = "in-process")]
+                    pair_drawn,
                     binding,
                 }
             })
@@ -5853,11 +5693,14 @@ impl Engine {
             #[cfg(feature = "in-process")]
             written_least,
             #[cfg(feature = "in-process")]
+            pairs_drawn,
+            #[cfg(feature = "in-process")]
             rows_stand,
             seat_flags: (u8::from(keeping) * KEEPS_SLOT_STATE) | (u8::from(shadows) * SHADOWS),
             explain_sample: 0,
             max_report_age_ms: None,
             keepers,
+            takers,
             sent_credits: Vec::new(),
             #[cfg(feature = "in-process")]
             sent_of: Vec::new(),
@@ -5978,8 +5821,8 @@ impl Engine {
             filters.chain(scorers).chain([picker]).collect::<Vec<_>>()
         };
         // The standing profiles' places by their names, read once: each
-        // profile finds its twin at one lookup. That search no longer grows
-        // by the profiles' square; the walk of the counts below still may.
+        // profile finds its twin at one lookup. The walk of the counts
+        // below reads the profiles for each count's readers.
         let mut places = HashMap::with_capacity(standing.profiles.len());
         for (at, stood) in standing.profiles.iter().enumerate() {
             places.entry(stood.name.as_str()).or_insert(at);
@@ -6026,20 +5869,50 @@ impl Engine {
     /// `standing` holds of its profile at `stood`: each table an engine
     /// folds from a profile's stages at its making and reads in their
     /// place, and whether a stage asked its build for the profile's count
-    /// of sends. Two tables are not compared. The profile's needs are its
-    /// stages' own, which its caller compares stage by stage, less a
-    /// sample the marks rule. Whether its draw may be asked first is read
-    /// of the marks and the picker's name. A table added to the making is
-    /// added here.
+    /// of sends. The lists of the stages that keep reports and that take
+    /// each word are such tables ([`Self::listed`]): a stage kept is told
+    /// as the build that made it listed it, and not as its twin of the
+    /// later build answered. Three tables are not compared. The profile's
+    /// needs are its stages' own, which its caller compares stage by
+    /// stage, less a sample the marks rule. Whether its draw may be asked
+    /// first is read of the marks and the picker's name. Whether a whole
+    /// pass turns its set is read of the picker's name, in an engine a
+    /// document's build made, and no other engine keeps a profile. A table
+    /// added to the making is added here.
     #[cfg(feature = "in-process")]
     fn read_as(&self, at: usize, standing: &Self, stood: usize) -> bool {
         let asked = |of: &Self, at: usize| of.sent_of.get(at).is_some_and(Option::is_some);
+        // Asked last: the two engines' lists are searched only where the
+        // profile's other tables agree.
+        let listed = || {
+            let mut lists = self.listed(at).zip(standing.listed(stood));
+            lists.all(|(here, there)| here.eq(there))
+        };
         self.marks[at] == standing.marks[stood]
             && self.orders[at] == standing.orders[stood]
             && self.named_by[at] == standing.named_by[stood]
             && self.row_tests[at] == standing.row_tests[stood]
             && self.head_places[at] == standing.head_places[stood]
             && asked(self, at) == asked(standing, stood)
+            && listed()
+    }
+
+    /// What the build listed of the profile at `at`: of the list of the
+    /// stages that keep reports and of each word's list, the profile's
+    /// stages by their places in it. Each list is in the engine's order,
+    /// so a profile's stages stand together in it. Two engines answer
+    /// their lists in one order, and no more is asked of that order.
+    #[cfg(feature = "in-process")]
+    fn listed(
+        &self,
+        at: usize,
+    ) -> impl Iterator<Item = impl Iterator<Item = Option<usize>> + '_> + '_ {
+        let lists = std::iter::once(self.keepers.as_slice()).chain(self.takers.every());
+        lists.map(move |list| {
+            let from = list.partition_point(|place| place.profile() < at);
+            let upto = list.partition_point(|place| place.profile() <= at);
+            list[from..upto].iter().map(|place| place.within())
+        })
     }
 
     /// An engine of no binding that holds this engine's profiles and
@@ -6054,8 +5927,9 @@ impl Engine {
     /// engine: the profile objects, the generations they were made
     /// under, the counts of sends and the session table. Every other
     /// table of it is an empty engine's and says nothing of these
-    /// profiles: a word that reads one, as a load report's telling reads
-    /// its keepers, is not for it.
+    /// profiles: a word that reads one is not for it, as a load report's
+    /// telling reads its keepers and a lease's word the stages that take
+    /// it.
     #[cfg(feature = "in-process")]
     pub(crate) fn hearing(&self, made: impl Fn(u64) -> bool) -> Engine {
         let mut hearing = Engine::new(Vec::new(), Vec::new(), self.generation, Needs::default());
@@ -6232,11 +6106,12 @@ impl Engine {
 
     /// Whether any profile of this generation holds a stage that keeps
     /// state a decider ([`crate::engine`]): a plugin's kept instance is
-    /// its decider's, and every profile's stages hear every lease. Under
-    /// such a generation a host that seats its callers by thread decides
-    /// each request at its model's decider, so that state has one writer
-    /// a model and hears a model's leases whole. It is one read: under a
-    /// generation with none a host looks nothing up.
+    /// its decider's, and a stage may hear a word it takes of a lease
+    /// whichever profile decided it. Under such a generation a host that
+    /// seats its callers by thread decides each request at its model's
+    /// decider, so that state has one writer a model and hears a model's
+    /// leases whole. It is one read: under a generation with none a host
+    /// looks nothing up.
     ///
     /// The fact is read from the mark of a stage that opens a decision's
     /// scope. A stage kind that keeps state a decider and opens none
@@ -6388,8 +6263,9 @@ impl Engine {
     /// states no place when it is made, so the side's shadow is asked for
     /// its own inside its run, as a single binding's is
     /// ([`Self::shadow_ring_profile`]). A side's run asks behind its
-    /// filter half ([`run_side_lent`]): a shadow that says none ahead of
-    /// its profile ([`Self::shadow_side`]) and one whose set the filters
+    /// filter half where no filter of its profile declares the ring need
+    /// ([`run_side_lent`]): a shadow that says none ahead of its profile
+    /// ([`Self::shadow_side`]) and, there, one whose set the filters
     /// emptied are asked nothing. `None` under every other binding: beside
     /// a live side that reads the ring, a side's shadow reads the place
     /// the two live sides state, or none ([`Self::unlent`]). Each side's
@@ -6594,10 +6470,6 @@ impl Engine {
             .and_then(|index| self.profile_needs.get(usize::from(index)))
             .copied()
             .unwrap_or_default()
-    }
-
-    pub fn profiles(&self) -> &[Arc<Profile>] {
-        &self.profiles
     }
 
     /// The first binding that matches, as the spec orders them, and as the
@@ -7373,6 +7245,8 @@ impl Engine {
             placing,
             vetoed,
             sides_placed: _,
+            #[cfg(feature = "in-process")]
+                pair_drawn: _,
         } = entry;
         // The single plan's rows, under the binding's word for a pool the
         // overload veto empties: every path below filters this set.
@@ -8425,14 +8299,26 @@ impl Engine {
     /// Whether a side of a pair is placed by its binding's sessions rule or
     /// by the assignment its own picker leaves the placement to, and not by
     /// the side's profile alone ([`Self::placed_side`]): a request with a
-    /// session key under a rule, and every request of such a picker. The
+    /// session key under a rule that covers the side
+    /// ([`SessionRule::sides`]), and every request of such a picker. The
     /// entry's byte is asked first ([`Entry::sides_placed`]): a pair under
     /// no rule, each side's picker its own, runs its two profiles as it
-    /// did, behind that one test.
+    /// did, behind that one test. A side the rule does not cover is its
+    /// profile's: the rule's run alone reads a pin, claims one or leaves a
+    /// verdict for a dispatch to write by. A document's check keeps a
+    /// picker that leaves the placement to the rule on a side it covers.
     #[inline(always)]
-    fn places_side(&self, entry: &Entry, index: u16, facts: &RequestFacts<'_>) -> bool {
+    fn places_side(
+        &self,
+        entry: &Entry,
+        index: u16,
+        side: PairSide,
+        facts: &RequestFacts<'_>,
+    ) -> bool {
+        let covers = |rule: &SessionRule| rule.sides.covers(side == PairSide::Decode);
         entry.sides_placed
-            && ((entry.binding.sessions.is_some() && !facts.session_key.is_none())
+            && ((entry.binding.sessions.as_ref().is_some_and(covers)
+                && !facts.session_key.is_none())
                 || self.marks[usize::from(index)].by_assignment())
     }
 
@@ -8554,10 +8440,11 @@ impl Engine {
     /// name `written-rows` before either scope opens, as [`Self::decide`]
     /// declines it. A pair side carries no pin.
     ///
-    /// Under the binding's sessions rule each side follows its key's pin by
-    /// the side's own session, and a side whose picker leaves the placement
-    /// to the rule is placed by the assignment. The pick states the prefill
-    /// side's verdict, and its first target's pair the decode side's
+    /// Under the binding's sessions rule each side the rule covers follows
+    /// its key's pin by the side's own session. A side whose picker leaves
+    /// the placement to the rule is placed by the assignment. The pick
+    /// states the prefill side's verdict, and its first target's pair the
+    /// decode side's
     /// ([`Pair::decode_verdict`](super::decision::Pair::decode_verdict)).
     /// A claim of the prefill side names the prefill the pair formed on,
     /// before any dispatch, and a decision that sheds leaves none.
@@ -8595,6 +8482,18 @@ impl Engine {
     /// pair's default, a prefill at its limit with no open partner makes no
     /// request wait: its refusal is named by what its partners' own stages
     /// say, as the refusal of a prefill under its limit is.
+    ///
+    /// Behind the pair's default and its question of saturation, where no
+    /// prefill at the request's places stands but for its limit, the limit
+    /// names no shed: its name is the word a host waits on for room. The
+    /// prefill side's stage is read there with the limit set aside
+    /// (`vetoed::Half::emptied_limit_aside`): a prefill at its limit stays
+    /// in that pass until another filter refuses it. So where the prefill
+    /// side's profile lists the limit among its filters changes no answer
+    /// there, under filters whose word on a row does not turn on how
+    /// often they are asked. The gateway's own pair selection asks its
+    /// overload shed ahead of its capacity test (`pair_pass` in
+    /// `model_gateway/src/routers/common/placement.rs`).
     ///
     /// Where the prefill side's run sheds, no default pairs and no prefill
     /// waits on its limit alone, one question says whether the request is
@@ -8853,28 +8752,29 @@ impl Engine {
         // again where the second run needs it. Chosen behind the test, the
         // classes were chosen by value, and a pair under no rule paid 9
         // instructions for it.
-        let mut prefill = if self.places_side(entry, binding.profile, &prefill_facts) {
-            self.placed_prefill(
-                firsts,
-                binding,
-                prefill_profile,
-                &prefill_facts,
-                pool,
-                prefills,
-                run_cx,
-                scratch,
-            )
-        } else {
-            run_profile(
-                prefill_profile,
-                binding.profile,
-                &prefill_facts,
-                pool,
-                Set::side(prefills, None, Some(shown)),
-                run_cx,
-                &mut scratch.single,
-            )
-        };
+        let mut prefill =
+            if self.places_side(entry, binding.profile, PairSide::Prefill, &prefill_facts) {
+                self.placed_prefill(
+                    firsts,
+                    binding,
+                    prefill_profile,
+                    &prefill_facts,
+                    pool,
+                    prefills,
+                    run_cx,
+                    scratch,
+                )
+            } else {
+                run_profile(
+                    prefill_profile,
+                    binding.profile,
+                    &prefill_facts,
+                    pool,
+                    Set::side(prefills, None, Some(shown)),
+                    run_cx,
+                    &mut scratch.single,
+                )
+            };
         if firsts {
             let stands = match &prefill {
                 Decision::Pick(_) => true,
@@ -8906,7 +8806,12 @@ impl Engine {
                 std::mem::swap(&mut scratch.classes, &mut scratch.firsts);
             } else {
                 firsts = false;
-                prefill = if self.places_side(entry, binding.profile, &prefill_facts) {
+                prefill = if self.places_side(
+                    entry,
+                    binding.profile,
+                    PairSide::Prefill,
+                    &prefill_facts,
+                ) {
                     self.placed_prefill(
                         false,
                         binding,
@@ -8941,14 +8846,20 @@ impl Engine {
             // then to the admission limit's shed, for a prefill with an open
             // partner alone, and then to the one question that says whether
             // the request is shed as saturated: the count of the list the
-            // gateway's own pair selection judges. Every other shed has no
-            // endpoint, and is named by the stage that left a pass nobody:
-            // the prefill side's where no prefill stands but for its
-            // admission limit, "partnered" for a class with no decode at all
-            // and for a routable prefill of class 0, and else what the
-            // decode pool's own stages say about the partners of the
-            // prefills that stand so (those were dropped by the partnered
-            // test alone). A picker's decline passes through.
+            // gateway's own pair selection judges, asked over whole lists
+            // alone. Every other shed is named by a stage. It is the
+            // prefill side's where no prefill stands but for its admission
+            // limit, read with that limit set aside, and "none" where that
+            // pass ends at no stage. It is "partnered" for a class with no
+            // decode at all and for a routable prefill of class 0, and else
+            // what the decode pool's own stages say about the partners of
+            // the prefills that stand so (those were dropped by the
+            // partnered test alone). Where those stages name none, the
+            // prefill's own shed stands. Over whole lists each such shed
+            // has no endpoint, and where its stage is the overload veto,
+            // the list judged names it again ([`Half::refused_room`]).
+            // Behind a part a pass the overload veto ended is shed as
+            // saturated. A picker's decline passes through.
             if let Decision::Shed(prefill_shed) = &prefill {
                 if prefill_shed.reason != ShedReason::PolicyDeclined {
                     // A refused pool vetoed on every usable worker goes to
@@ -9071,17 +8982,27 @@ impl Engine {
                         scratch.shed_over = Some(over);
                         return shed(reason_of(veto), veto, prefill_shed.trace).of_side(side);
                     }
-                    // Else the request has no endpoint, and the stage that
-                    // left a pass nobody names the shed: the prefill side's
-                    // where no prefill of the request's stands but for its
-                    // limit, `partnered` where those that stand pair with no
-                    // decode, and else what the decode pool's own stages say
-                    // about the partners of the prefills that stand.
+                    // Else the shed takes a first name. Where no prefill of
+                    // the request's stands but for its limit it is the
+                    // stage that leaves the prefill side's pass nobody, the
+                    // limit aside, and `none` where that pass ends at no
+                    // stage. Where those that stand pair with no decode it
+                    // is `partnered`. Else it is what the decode pool's own
+                    // stages say about the partners of the prefills that
+                    // stand, and the prefill's own shed stands where they
+                    // name none. A first name that is the overload veto's
+                    // sheds as saturated behind a part, and over whole
+                    // lists gives way to the name the list judged gives
+                    // it, below. Every other shed has no endpoint.
                     let named = if routable == 0 {
-                        let whole = Set::side(prefills, None, None);
+                        // The limit's name says a wait for room, and no
+                        // prefill here stands but for its limit. So the
+                        // side's stage is read by a pass that sets the
+                        // limit aside, wherever the profile lists it: a
+                        // prefill at its limit stays in that pass until
+                        // another filter refuses it.
                         let buf = &mut scratch.single;
-                        let stage = filter(prefill_profile, &prefill_facts, run_cx, buf, whole);
-                        Some(stage.unwrap_or(NO_STAGE))
+                        Some(takes.emptied_limit_aside(buf).unwrap_or(NO_STAGE))
                     } else if scratch.classes.is_empty() {
                         Some(PARTNERED)
                     } else {
@@ -9164,28 +9085,29 @@ impl Engine {
             // own, so no host callback is needed to narrow the set.
             let partners = pools.partners(&class, firsts);
             let partners = Set::side(decodes, Some(partners), None).ruled(vetoed);
-            let mut decision = if self.places_side(entry, decode_index, &decode_facts) {
-                self.placed_side::<true>(
-                    binding,
-                    decode_index,
-                    decode_profile,
-                    &decode_facts,
-                    pool,
-                    partners,
-                    decode_cx,
-                    scratch,
-                )
-            } else {
-                run_profile(
-                    decode_profile,
-                    decode_index,
-                    &decode_facts,
-                    pool,
-                    partners,
-                    decode_cx,
-                    &mut scratch.decode,
-                )
-            };
+            let mut decision =
+                if self.places_side(entry, decode_index, PairSide::Decode, &decode_facts) {
+                    self.placed_side::<true>(
+                        binding,
+                        decode_index,
+                        decode_profile,
+                        &decode_facts,
+                        pool,
+                        partners,
+                        decode_cx,
+                        scratch,
+                    )
+                } else {
+                    run_profile(
+                        decode_profile,
+                        decode_index,
+                        &decode_facts,
+                        pool,
+                        partners,
+                        decode_cx,
+                        &mut scratch.decode,
+                    )
+                };
             match &mut decision {
                 // The decode's pick becomes the pair's where it stands: its
                 // targets name the prefill, its trace is the prefill's, and
@@ -9279,6 +9201,148 @@ impl Engine {
             None => shed(ShedReason::NoEndpoints, PARTNERS, prefill_pick.trace),
         }
         .of_side(PairSide::Decode)
+    }
+
+    /// Whether some binding's pair may be asked by its draw: what a pair's
+    /// decision asks first, at one load ([`Self::pair_drawn_for`] asks the
+    /// rest of the request's own binding).
+    #[cfg(feature = "in-process")]
+    pub(crate) const fn pairs_drawn(&self) -> bool {
+        self.pairs_drawn
+    }
+
+    /// Whether each side of a pair may be
+    /// asked by its draw ([`run_side_drawn_written`]), which writes the records
+    /// it asks about and no other. Both profiles are a pick of two whose
+    /// filters fold into one test of a row, each list holds its profile's
+    /// floor of rows, and the request states nothing the pair's whole
+    /// decision reads beside its two picks. Asked before a record is
+    /// written; answers the two profiles.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn pair_drawn_for(
+        &self,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        rows: [usize; 2],
+        cx: &Constraints<'_>,
+    ) -> Option<PairDrawn> {
+        if carries_a_column(facts) || counts_no_place(cx) || !facts.session_key.is_none() {
+            return None;
+        }
+        let entry = self.pair_entry(facts.model)?;
+        if !entry.pair_drawn {
+            return None;
+        }
+        let binding = &entry.binding;
+        let decode_index = binding.decode_profile.unwrap_or(binding.profile);
+        for (index, rows) in [(binding.profile, rows[0]), (decode_index, rows[1])] {
+            let at = usize::from(index);
+            if rows < self.written_from.get(at).copied().unwrap_or(usize::MAX)
+                || (self.marks[at].first() & (Marks::ENGINES | Marks::OWNS) != 0
+                    && !pool.engines.is_empty())
+            {
+                return None;
+            }
+        }
+        if self
+            .weighing_lift(binding.profile, entry.vetoed, cx)
+            .is_some()
+        {
+            return None;
+        }
+        Some(PairDrawn {
+            profiles: [binding.profile, decode_index],
+        })
+    }
+
+    /// A pair's decision where each side is
+    /// asked by its draw: [`Self::pair_drawn_for`] said yes, both lists
+    /// stand, and every row of a side pairs with every row of the other.
+    /// The prefill by the draw of its profile, then the decode by the draw
+    /// of its own, joined as [`Self::decide_pair`] joins its two picks.
+    /// `None` where a side's draw answers no pick: the caller then decides
+    /// whole, over records it writes itself.
+    #[cfg(feature = "in-process")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pair's facts, each side's rows with its writer, and the engine's scratch"
+    )]
+    pub(crate) fn decide_pair_drawn(
+        &self,
+        drawn: PairDrawn,
+        facts: &RequestFacts<'_>,
+        pool: &PoolFacts<'_>,
+        prefills: DrawnSide<'_>,
+        decodes: DrawnSide<'_>,
+        cx: &Constraints<'_>,
+        scratch: &mut Scratch,
+    ) -> Option<Decision> {
+        let PairDrawn {
+            profiles: [prefill_index, decode_index],
+        } = drawn;
+        scratch.shed_over = None;
+        scratch.single.lifted = LiftedVeto::None;
+        let prefill_facts = RequestFacts {
+            phase: Phase::Prefill,
+            named: None,
+            signal_cells: None,
+            decode_ring_positions: None,
+            ..*facts
+        };
+        let decode_facts = RequestFacts {
+            phase: Phase::Decode,
+            seed: Draw::new(facts.seed).next_u64(),
+            named: None,
+            signal_cells: None,
+            ring_positions: facts.decode_ring_positions.unwrap_or(facts.ring_positions),
+            decode_ring_positions: None,
+            ..*facts
+        };
+        let (fixed, rows, write) = prefills;
+        let prefill_rows = fixed.len();
+        let prefill = run_side_drawn_written(
+            self,
+            prefill_index,
+            &prefill_facts,
+            pool,
+            fixed,
+            rows,
+            write,
+            cx,
+            &mut scratch.single,
+        );
+        let prefill_pick = prefill?;
+        let prefill_target = prefill_pick.targets.iter().next()?;
+        let (fixed, rows, write) = decodes;
+        let mut decision = Decision::Pick(run_side_drawn_written(
+            self,
+            decode_index,
+            &decode_facts,
+            pool,
+            fixed,
+            rows,
+            write,
+            cx,
+            &mut scratch.decode,
+        )?);
+        let Decision::Pick(paired) = &mut decision else {
+            return None;
+        };
+        let Pick {
+            targets,
+            trace,
+            session_verdict,
+        } = paired;
+        let placed = prefill_pick.targets.placing();
+        targets.pair_under(prefill_target, *session_verdict, placed);
+        let lifted = trace.lifted;
+        *trace = prefill_pick.trace;
+        // The whole pass counts the prefills it keeps, and a pair that
+        // draws is asked only where it keeps every one of them.
+        trace.survivors = Survivors::counted(prefill_rows as u32);
+        trace.lifted = lifted;
+        *session_verdict = prefill_pick.session_verdict;
+        Some(decision)
     }
 
     /// A pair's answer over two lists of which one holds no row: one side
@@ -9420,8 +9484,18 @@ impl Engine {
     /// ([`Self::side_ring_profile`]), asked of `lends` behind the filter
     /// half of its run ([`run_side_lent`]): a shadow whose set the filters
     /// emptied, which the all-vetoed rule steers or sheds, asks nothing.
-    /// Neither does the pair's default that a side's shadow follows: no
-    /// step of it scores.
+    /// Neither does the pair's default that a side's shadow follows, where
+    /// no filter of the profile declares the ring need: no step of it
+    /// scores.
+    ///
+    /// A shadow profile with a filter that declares the ring need
+    /// ([`Filter::needs`]) asks ahead of the filter half of its run,
+    /// whatever its filters then keep, and once a decision: a prefill's
+    /// shadow that runs again reads the answer of its first run. The
+    /// steps of the pair's default that a side's shadow follows show its
+    /// filters that answer too. The prefill's shadow reads the answer of
+    /// its run there. The decode's, which makes no run of its own beside
+    /// a pair the default made, asks for it there.
     ///
     /// The decode's shadow is put to the binding's all-vetoed rule by the
     /// binding's word, as its live side is ([`Set::ruled`]): where a veto
@@ -9441,7 +9515,8 @@ impl Engine {
     ///
     /// - Among first partners, the admission limit's test of the prefills
     ///   shown. Where one of them waits on its limit, the shed is the
-    ///   limit's and names the prefill side.
+    ///   limit's and names the prefill side. The test reads the facts the
+    ///   shadow's run showed its filters.
     /// - Among first partners, its run over every open class.
     /// - The default's first step, which answers its prefill
     ///   ([`vetoed::shadow_prefill`]). The live decode profile stands on
@@ -9518,7 +9593,7 @@ impl Engine {
         let lives = live_sides(&entry.binding);
         // A side its binding's sessions rule or its picker's assignment
         // placed: a shadow's run is put to neither.
-        if self.places_side(entry, lives[side.index()], facts) {
+        if self.places_side(entry, lives[side.index()], side, facts) {
             return None;
         }
         // The place stated on a lent ring is the two live sides' where
@@ -9528,8 +9603,16 @@ impl Engine {
         let facts = unlent.as_ref().unwrap_or(facts);
         let (prefills, prefill_facts) = pools.side(PairSide::Prefill, facts)?;
         let (decodes, decode_facts) = pools.side(PairSide::Decode, facts)?;
-        // The shadow's own place, asked behind the filter half alone.
-        let lent = || self.side_ring_profile(at, side).and_then(lends);
+        // The shadow's own place, asked behind the filter half, or ahead
+        // of it where a filter of the profile declares the ring need. It
+        // is asked once: a run of the side that follows reads the answer.
+        let asked = OnceCell::new();
+        let lent = || *asked.get_or_init(|| self.side_ring_profile(at, side).and_then(lends));
+        let ahead = self.marks[usize::from(index)].ring_filter();
+        // What the hard filters asked outside a run of the side are shown:
+        // the lender's answer where a filter of the profile declares the
+        // ring need, as in that run.
+        let ahead_lent = || if ahead { lent() } else { None };
         // The mark the pair's decision left on the prefill's buffer: the
         // tier the pair's default paired in, and none beside a pair the
         // profiles made ([`Self::decide_pair`]).
@@ -9556,7 +9639,8 @@ impl Engine {
                     Decision::Pick(_) | Decision::Queue(_) => false,
                 };
                 // The shadow's own run over the prefills of `classes`. It asks
-                // for its place behind its filter half ([`run_side_lent`]).
+                // for its place behind its filter half, or ahead of it
+                // ([`run_side_lent`]).
                 let own = |classes: &[u32], buf: &mut Buffers| {
                     let set = Set::side(prefills, None, Some(classes));
                     run_side_lent(
@@ -9568,6 +9652,7 @@ impl Engine {
                         run_cx,
                         buf,
                         None,
+                        ahead,
                         &lent,
                     )
                 };
@@ -9577,10 +9662,17 @@ impl Engine {
                 // but for its admission limit keeps the request under the
                 // limit's stage. Else the side runs again over every open
                 // class, which stand in `firsts` behind that decision's
-                // swap.
-                let takes = Half::new(profile, index, &prefill_facts, prefills, run_cx);
+                // swap. The limit's test asks the hard filters on the facts
+                // the run showed them: with what the lender answered that
+                // run where one of them declares the ring need. The answer
+                // stands, and the lender is asked nothing more.
                 let firsts_shed = scratch.among_first && refused(&run);
-                let waits = firsts_shed && takes.waits_among(&scratch.classes);
+                let waits = firsts_shed && {
+                    let stated = with_lent(&prefill_facts, ahead_lent());
+                    let shown = stated.as_ref().unwrap_or(&prefill_facts);
+                    let takes = Half::new(profile, index, shown, prefills, run_cx);
+                    takes.waits_among(&scratch.classes)
+                };
                 if waits {
                     // The limit's shed names the prefill side, as the live
                     // decision's does.
@@ -9599,8 +9691,13 @@ impl Engine {
                 if !waits && refused(&run) {
                     let live_decode = lives[PairSide::Decode.index()];
                     let live_decode_profile = self.profiles.get(usize::from(live_decode))?;
+                    // The shadow's own hard filters are asked there on the
+                    // facts its run showed them, as the limit's test asks
+                    // them.
+                    let stated = with_lent(&prefill_facts, ahead_lent());
+                    let shown = stated.as_ref().unwrap_or(&prefill_facts);
                     let sides = [
-                        Half::new(profile, index, &prefill_facts, prefills, cx),
+                        Half::new(profile, index, shown, prefills, cx),
                         Half::new(
                             live_decode_profile,
                             live_decode,
@@ -9646,6 +9743,7 @@ impl Engine {
                         decode_cx,
                         &mut scratch.decode,
                         None,
+                        ahead,
                         &lent,
                     )
                 } else {
@@ -9654,8 +9752,14 @@ impl Engine {
                     // requests, in the pass of the tier the mark names.
                     // The shadow's is that step's answer over the decodes
                     // its own profile's hard filters keep in that pass,
-                    // every partner alike.
-                    let half = Half::new(profile, index, &decode_facts, decodes, decode_cx);
+                    // every partner alike. Where one of them declares the
+                    // ring need, they read what the shadow's lender
+                    // answers, as the filters of its own run do. The
+                    // lender is asked here: no run of the shadow's stands
+                    // beside such a pair.
+                    let stated = with_lent(&decode_facts, ahead_lent());
+                    let shown = stated.as_ref().unwrap_or(&decode_facts);
+                    let half = Half::new(profile, index, shown, decodes, decode_cx);
                     half.usable(defaulted, steers, &mut scratch.decode);
                     let (table, buf) = (&pools.table, &mut scratch.decode);
                     match vetoed::paired_decode::<true>(&half, table, class, pool, buf) {
@@ -9690,7 +9794,8 @@ impl Engine {
     /// ([`Self::shadow_side`]): held against both live sides, or against
     /// the decode's own alone where each side is stated its own places
     /// ([`Self::unlent`]). And it is asked its own place of `lends` as a
-    /// side's is there: behind the filter half of its run.
+    /// side's is there: behind the filter half of its run, or ahead of it
+    /// where a filter of the profile declares the ring need.
     ///
     /// `first_decode` is the decode the pair's first decision named, as
     /// that call is handed it. A shadow profile that keeps such a decode
@@ -9742,7 +9847,7 @@ impl Engine {
         // placed, as at the pair's decision.
         let entry = self.bindings.get(at as usize)?;
         let lives = live_sides(&entry.binding);
-        if self.places_side(entry, lives[side.index()], facts) {
+        if self.places_side(entry, lives[side.index()], side, facts) {
             return None;
         }
         let profile = self.profiles.get(usize::from(index))?;
@@ -9768,6 +9873,7 @@ impl Engine {
             decode_cx,
             &mut scratch.decode,
             first_decode.filter(|_| keeps_its_first(profile)),
+            self.marks[usize::from(index)].ring_filter(),
             &|| self.side_ring_profile(at, side).and_then(lends),
         ))
     }
@@ -9916,7 +10022,7 @@ impl Engine {
         scratch.among_first = firsts;
         let partners = pools.partners(&class, firsts);
         let partners = Set::side(decodes, Some(partners), None).ruled(entry.vetoed);
-        let mut decision = if self.places_side(entry, index, &decode_facts) {
+        let mut decision = if self.places_side(entry, index, PairSide::Decode, &decode_facts) {
             // The rule's run reads no `first_decode`: a session's first
             // decision claimed its decode in the session table, and the
             // key's pin answers this call.
@@ -9969,485 +10075,6 @@ impl Engine {
 fn all_reports_current(candidates: &[Candidate], now_micros: u64, max_age_ms: u64) -> bool {
     let cutoff = LoadReportCutoff::new(now_micros, max_age_ms);
     candidates.iter().all(|row| cutoff.load(row).is_some())
-}
-
-impl Engine {
-    /// The session table's part of a dispatch ([`Lifecycle::on_dispatched`]): the
-    /// session pin follows the dispatched worker of the side, the decode
-    /// of a pair target on the decode side and the target itself
-    /// otherwise. A dispatch is told in parts: the counts of sends, this
-    /// table, then the stages ([`Self::dispatched_stages`]), so a stage's
-    /// call that unwinds leaves the table's entry written. Every teller of
-    /// a dispatch keeps that order, the trait's own entry among them.
-    ///
-    /// The table is handed the instant the lease was issued under
-    /// ([`Lease::issued_micros`]). A dispatch elsewhere withdraws the claim
-    /// that lease's decision made, and no later decision's claim on the
-    /// same worker.
-    pub(crate) fn dispatched_table(&self, lease: &Lease, target: &Target, side: Side) {
-        let dispatched = match (side, target.pair) {
-            (Side::Decode, Some(pair)) => pair.decode_id,
-            _ => target.id,
-        };
-        if lease.session_verdict != SessionVerdict::None {
-            let (verdict, at) = (lease.session_verdict, lease.issued_micros);
-            self.sessions
-                .dispatched(lease.session, verdict, dispatched, at);
-        }
-    }
-
-    /// The session table's part of a release ([`Lifecycle::on_released`]): a
-    /// commit that refused every target leaves the decision's claim no
-    /// worker to move to, and the claim goes with it. A release is told in
-    /// parts, as a dispatch is: this table, then the stages
-    /// ([`Self::released_stages`]). An engine in its host's process tells
-    /// the table each side a pair's release ends ahead of any stage, a
-    /// decode stated for later among them: no stage hears that side's end,
-    /// and the pair's first decision made its claim.
-    ///
-    /// The table is handed the instant the lease was issued under
-    /// ([`Lease::issued_micros`]). The claim that goes is the one that
-    /// lease's decision made: a refusal told late leaves a later decision's
-    /// claim on the same worker.
-    pub(crate) fn released_table(&self, lease: &Lease, reason: ReleaseReason) {
-        if reason == ReleaseReason::CommitFailed {
-            if let SessionVerdict::Claimed(claimed) = lease.session_verdict {
-                let at = lease.issued_micros;
-                self.sessions
-                    .move_claim(lease.session, claimed, WorkerId(0), at);
-            }
-        }
-    }
-
-    /// The session table's part of a decode call that states a verdict of
-    /// its key ([`SessionTable::told_under`]). The call read `key` at `at`,
-    /// its own instant, and tells its words under `issued`, the instant of
-    /// the lease its pair's first decision issued. A claim it made, of
-    /// `claimed`, takes that date. `first` is the worker that decision
-    /// claimed for `key`, `WorkerId(0)` where it claimed none. The pair's
-    /// decode entries ask here, so they read no table of the engine's.
-    #[cfg(feature = "in-process")]
-    #[inline]
-    pub(crate) fn told_under(
-        &self,
-        key: Session,
-        claimed: Option<WorkerId>,
-        at: u64,
-        issued: u64,
-        first: WorkerId,
-    ) {
-        self.sessions.told_under(key, claimed, at, issued, first);
-    }
-
-    /// The stages' part of a release, behind the table's
-    /// ([`Self::released_table`]).
-    pub(crate) fn released_stages(&self, lease: &Lease, reason: ReleaseReason) {
-        tell_released(&self.profiles, lease, reason);
-    }
-
-    /// Records a dispatch in each profile tally that stages read. A tally
-    /// asks `present` only where the send would enter a rank it does not
-    /// know: a served controller asks its worker objects there, so a late
-    /// report enters no rank behind a removal. An engine whose profiles
-    /// read no sends asks nothing.
-    #[inline]
-    pub(crate) fn dispatched_sent(
-        &self,
-        lease: &Lease,
-        target: &Target,
-        side: Side,
-        since_decision_micros: u32,
-        present: impl Fn() -> bool,
-    ) {
-        match self.sent_credits.as_slice() {
-            [] => {}
-            // One count is the common document: its record runs in line
-            // behind the caller's telling.
-            [one] => one.dispatched(lease, target, side, since_decision_micros, present),
-            _ => self.credit_dispatch(lease, target, side, since_decision_micros, present),
-        }
-    }
-
-    /// Out of line: a document of several counts is rare. One count is
-    /// told in line ([`Self::dispatched_sent`]).
-    #[inline(never)]
-    fn credit_dispatch(
-        &self,
-        lease: &Lease,
-        target: &Target,
-        side: Side,
-        since_decision_micros: u32,
-        present: impl Fn() -> bool,
-    ) {
-        for credit in &self.sent_credits {
-            credit.dispatched(lease, target, side, since_decision_micros, &present);
-        }
-    }
-
-    /// The stages' part of a dispatch: each profile's scorers and its
-    /// picker hear it.
-    // In line at its callers: as a call it costs a pair's decision 41
-    // instructions, counted with Callgrind.
-    #[inline(always)]
-    pub(crate) fn dispatched_stages(
-        &self,
-        lease: &Lease,
-        target: &Target,
-        side: Side,
-        since_decision_micros: u32,
-    ) {
-        tell_dispatched(&self.profiles, lease, target, side, since_decision_micros);
-    }
-}
-
-/// A release told to the stages of `profiles`, in their order: each
-/// profile's scorers, then its picker.
-#[inline(always)]
-fn tell_released<'p>(
-    profiles: impl IntoIterator<Item = &'p Arc<Profile>>,
-    lease: &Lease,
-    reason: ReleaseReason,
-) {
-    for profile in profiles {
-        for w in &profile.scorers {
-            w.scorer.on_released(lease, reason);
-        }
-        profile.picker.on_released(lease, reason);
-    }
-}
-
-/// A dispatch told to the stages of `profiles`, in their order: each
-/// profile's scorers, then its picker.
-#[inline(always)]
-fn tell_dispatched<'p>(
-    profiles: impl IntoIterator<Item = &'p Arc<Profile>>,
-    lease: &Lease,
-    target: &Target,
-    side: Side,
-    since_decision_micros: u32,
-) {
-    for profile in profiles {
-        for w in &profile.scorers {
-            w.scorer
-                .on_dispatched(lease, target, side, since_decision_micros);
-        }
-        profile
-            .picker
-            .on_dispatched(lease, target, side, since_decision_micros);
-    }
-}
-
-/// A lease's issue told to the stages of `profiles`, in their order: each
-/// profile's scorers, then its picker.
-#[inline(always)]
-fn tell_issued<'p>(
-    profiles: impl IntoIterator<Item = &'p Arc<Profile>>,
-    lease: &Lease,
-    decision: &Decision,
-) {
-    for profile in profiles {
-        for w in &profile.scorers {
-            w.scorer.on_decision_issued(lease, decision);
-        }
-        profile.picker.on_decision_issued(lease, decision);
-    }
-}
-
-/// An end told to the stages of `profiles`, in their order: each profile's
-/// scorers, then its picker.
-#[inline(always)]
-fn tell_completed<'p>(
-    profiles: impl IntoIterator<Item = &'p Arc<Profile>>,
-    lease: &Lease,
-    outcome: &Outcome,
-) {
-    for profile in profiles {
-        for w in &profile.scorers {
-            w.scorer.on_completed(lease, outcome);
-        }
-        profile.picker.on_completed(lease, outcome);
-    }
-}
-
-/// What an engine kept of the stages that stood by an earlier generation
-/// ([`Engine::stood_by`]): the engine's session table, and each of its
-/// profiles whose object was made below a generation. It hears the words
-/// of a lease issued under that earlier generation.
-///
-/// It holds nothing of its own. A word told to the stages walks the
-/// engine's profiles beside the generations they were made under, in the
-/// engine's order, and tells the ones that stood. So an engine keeps no
-/// list for an earlier generation, whatever the number of generations its
-/// profiles were made under: a document that gained one profile at each
-/// of a thousand applies holds a thousand profiles once.
-///
-/// A host that tells leases off a file of its own names the engine whole
-/// as one too (`Engine::stands`): every profile hears, under no
-/// generation's bound, so a profile made under the last generation a
-/// document can bear hears as any other.
-#[cfg(feature = "in-process")]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Stood<'a> {
-    engine: &'a Engine,
-    /// A profile made under a generation below this one hears. With
-    /// none, every profile hears: the engine whole.
-    below: Option<u64>,
-}
-
-#[cfg(feature = "in-process")]
-impl<'a> Stood<'a> {
-    /// The profiles that stood, in the engine's order.
-    #[inline]
-    fn profiles(self) -> impl Iterator<Item = &'a Arc<Profile>> {
-        let made = self.engine.profiles.iter().zip(&self.engine.born);
-        made.filter(move |(_, born)| self.below.is_none_or(|below| **born < below))
-            .map(|(profile, _)| profile)
-    }
-}
-
-/// What hears a lease's words at the engine that issued it: that engine's
-/// session table, and its stages. An engine whole is one: the engine in
-/// force hears the leases of its own generation. What a later engine kept
-/// of the stages that stood by the lease's generation is the other
-/// ([`Stood`]): the same table, and no stage built since. The rule of a
-/// lease's words tells either in its one order
-/// ([`lease_events`](super::lease_events)).
-#[cfg(feature = "in-process")]
-pub(crate) trait Issuing: Copy {
-    /// The session table's part of a dispatch
-    /// ([`Engine::dispatched_table`]).
-    fn dispatched_table(self, lease: &Lease, target: &Target, side: Side);
-
-    /// The stages' part of a dispatch ([`Engine::dispatched_stages`]).
-    fn dispatched_stages(self, lease: &Lease, target: &Target, side: Side, since_micros: u32);
-
-    /// The session table's part of a release ([`Engine::released_table`]).
-    fn released_table(self, lease: &Lease, reason: ReleaseReason);
-
-    /// The stages' part of a release ([`Engine::released_stages`]).
-    fn released_stages(self, lease: &Lease, reason: ReleaseReason);
-
-    /// A lease's issue, told to the stages
-    /// ([`Lifecycle::on_decision_issued`]).
-    fn decision_issued(self, lease: &Lease, decision: &Decision);
-
-    /// A lease's end, told to the stages ([`Lifecycle::on_completed`]).
-    fn completed(self, lease: &Lease, outcome: &Outcome);
-
-    /// A release whole, as [`Lifecycle::on_released`] tells it: the
-    /// session table, then the stages.
-    #[inline(always)]
-    fn released(self, lease: &Lease, reason: ReleaseReason) {
-        self.released_table(lease, reason);
-        self.released_stages(lease, reason);
-    }
-}
-
-#[cfg(feature = "in-process")]
-impl Issuing for &Engine {
-    #[inline(always)]
-    fn dispatched_table(self, lease: &Lease, target: &Target, side: Side) {
-        Engine::dispatched_table(self, lease, target, side);
-    }
-
-    #[inline(always)]
-    fn dispatched_stages(self, lease: &Lease, target: &Target, side: Side, since_micros: u32) {
-        Engine::dispatched_stages(self, lease, target, side, since_micros);
-    }
-
-    #[inline(always)]
-    fn released_table(self, lease: &Lease, reason: ReleaseReason) {
-        Engine::released_table(self, lease, reason);
-    }
-
-    #[inline(always)]
-    fn released_stages(self, lease: &Lease, reason: ReleaseReason) {
-        Engine::released_stages(self, lease, reason);
-    }
-
-    #[inline(always)]
-    fn decision_issued(self, lease: &Lease, decision: &Decision) {
-        self.on_decision_issued(lease, decision);
-    }
-
-    #[inline(always)]
-    fn completed(self, lease: &Lease, outcome: &Outcome) {
-        self.on_completed(lease, outcome);
-    }
-}
-
-// The session table is the engine's own, whatever generation a lease is
-// of. A word's stages are the profiles that stood.
-#[cfg(feature = "in-process")]
-impl Issuing for Stood<'_> {
-    #[inline]
-    fn dispatched_table(self, lease: &Lease, target: &Target, side: Side) {
-        self.engine.dispatched_table(lease, target, side);
-    }
-
-    fn dispatched_stages(self, lease: &Lease, target: &Target, side: Side, since_micros: u32) {
-        tell_dispatched(self.profiles(), lease, target, side, since_micros);
-    }
-
-    #[inline]
-    fn released_table(self, lease: &Lease, reason: ReleaseReason) {
-        self.engine.released_table(lease, reason);
-    }
-
-    fn released_stages(self, lease: &Lease, reason: ReleaseReason) {
-        tell_released(self.profiles(), lease, reason);
-    }
-
-    fn decision_issued(self, lease: &Lease, decision: &Decision) {
-        tell_issued(self.profiles(), lease, decision);
-    }
-
-    fn completed(self, lease: &Lease, outcome: &Outcome) {
-        tell_completed(self.profiles(), lease, outcome);
-    }
-}
-
-impl Engine {
-    /// Tells a host's reports, each as the host shows it to decisions, to
-    /// every stage that keeps a number of the reports
-    /// ([`Lifecycle::keeps_loads`]), and to no other stage. `reports` is
-    /// run once for each such stage and hands every report to the call it
-    /// is given. An engine with no such stage never runs it: a load
-    /// snapshot that tells nobody walks no row. A plugin that watches
-    /// signals hears of a snapshot's reports no more than it did before a
-    /// stage kept any. The engine over worker lists is the one host that
-    /// tells reports.
-    #[cfg(feature = "in-process")]
-    pub(crate) fn tell_loads(&self, reports: impl Fn(&mut dyn FnMut(&Signal<'_>))) {
-        for keeper in &self.keepers {
-            match *keeper {
-                Keeper::Scorer { profile, stage } => {
-                    let scorer = &self.profiles[usize::from(profile)].scorers[usize::from(stage)];
-                    reports(&mut |report| scorer.scorer.on_signal(report));
-                }
-                Keeper::Picker { profile } => {
-                    let picker = &self.profiles[usize::from(profile)].picker;
-                    reports(&mut |report| picker.on_signal(report));
-                }
-            }
-        }
-    }
-
-    /// Whether a stage that keeps the reports ([`Lifecycle::keeps_loads`])
-    /// keeps a signal's column too ([`Needs::signal_cells`]). Such a stage
-    /// reads a told report's named values by its column. A host states the
-    /// values of a report it tells under this word: every stage that keeps
-    /// reports is told them, or none is. It converts none under an engine
-    /// that answers no. It asks once, where it makes its value of the
-    /// document.
-    #[cfg(feature = "in-process")]
-    pub(crate) fn keepers_read_signals(&self) -> bool {
-        self.keepers.iter().any(|keeper| match *keeper {
-            Keeper::Scorer { profile, stage } => {
-                let scorer = &self.profiles[usize::from(profile)].scorers[usize::from(stage)];
-                scorer.scorer.needs().signal_cells
-            }
-            Keeper::Picker { profile } => {
-                let picker = &self.profiles[usize::from(profile)].picker;
-                picker.needs().signal_cells
-            }
-        })
-    }
-
-    /// The stages' part of a change of membership
-    /// ([`Lifecycle::on_membership`]): the tallies of sends and each
-    /// profile's scorers and its picker hear it, and the session table does
-    /// not. The engine over a host's worker lists tells this part alone: a
-    /// leave there takes no pin away. A session's pin stands on a worker
-    /// that is gone until the session's idle time or two other workers end
-    /// it, and is a routable pin again once a worker stands under its id.
-    pub(crate) fn membership_stages(&self, change: &Membership<'_>) {
-        for credit in &self.sent_credits {
-            credit.membership(change);
-        }
-        for profile in &self.profiles {
-            for w in &profile.scorers {
-                w.scorer.on_membership(change);
-            }
-            profile.picker.on_membership(change);
-        }
-    }
-}
-
-impl Lifecycle for Engine {
-    fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
-        tell_issued(&self.profiles, lease, decision);
-    }
-
-    #[inline(always)]
-    fn on_dispatched(
-        &self,
-        lease: &Lease,
-        target: &Target,
-        side: Side,
-        since_decision_micros: u32,
-    ) {
-        self.dispatched_sent(lease, target, side, since_decision_micros, || true);
-        self.dispatched_table(lease, target, side);
-        self.dispatched_stages(lease, target, side, since_decision_micros);
-    }
-
-    fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
-        tell_completed(&self.profiles, lease, outcome);
-    }
-
-    fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
-        self.released_table(lease, reason);
-        self.released_stages(lease, reason);
-    }
-
-    fn on_membership(&self, change: &Membership<'_>) {
-        match change {
-            // The pins of a worker that left stand for the absence's
-            // time: its key may be registered again, and a host that
-            // knows says which way ([`Engine::pins_follow`],
-            // [`Engine::pins_forget`]).
-            Membership::Removed(worker) => self.sessions.left(*worker),
-            Membership::Replaced { old, new } => {
-                self.sessions.left(*old);
-                self.sessions.returned(*new);
-            }
-            // A join under an id that left ends its absence, whoever tells
-            // it: the worker is back as it was, and its pins stand.
-            Membership::Added(worker) => self.sessions.returned(*worker),
-            Membership::Snapshot(workers) => self.sessions.returned_all(workers),
-            _ => {}
-        }
-        self.membership_stages(change);
-    }
-
-    fn on_signal(&self, signal: &Signal<'_>) {
-        for profile in &self.profiles {
-            for w in &profile.scorers {
-                w.scorer.on_signal(signal);
-            }
-            profile.picker.on_signal(signal);
-        }
-    }
-
-    fn keeps_loads(&self) -> bool {
-        !self.keepers.is_empty()
-    }
-
-    fn needs_lifecycle(&self) -> bool {
-        self.profiles.iter().any(|profile| {
-            profile.picker.needs_lifecycle()
-                || profile.scorers.iter().any(|w| w.scorer.needs_lifecycle())
-        })
-    }
-
-    /// The words the document takes: a stage's, the session table's at a
-    /// dispatch and at a release under a sessions rule, the record of
-    /// dispatched prefixes at an issue, and a count of sends at a
-    /// dispatch. Folded at the build: one read here.
-    fn hears(&self) -> EventSet {
-        self.with_sends(self.hears)
-    }
 }
 
 #[cfg(test)]

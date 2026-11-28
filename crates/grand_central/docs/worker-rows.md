@@ -1,6 +1,6 @@
 # Worker rows and jobs
 
-The controller keeps one row a worker. This page covers a row's bounds, the door a host writes rows through and the controller's probes. It also covers the worker jobs of a host that keeps the store in its own process.
+The controller keeps one row a worker. This page covers a row's bounds, the door a host writes rows through, what a host reads back and the controller's probes. It also covers the worker jobs of a host that keeps the store in its own process.
 
 [Run the service](service.md#worker-discovery) covers worker discovery, and [Embed the engine](embedding.md#worker-objects) the worker objects a host keeps beside its rows.
 
@@ -41,7 +41,10 @@ A host's registration and removal steps write rows at a membership door, `worker
 
 - A health loop's refresh of a worker has an entry of its own, `MembershipWriter::refreshed`.
 - The entry asks no maker, and the row keeps the maker it has.
-- The refreshed worker may differ from its row in its labels and its pairing descriptor. One that states any other fact is refused, and nothing is written.
+- The refreshed worker may differ in its labels and its pairing descriptor from its row, or from the object `worker_host::object` builds of the row. One that states any other fact is refused, and nothing is written.
+- That object holds a part of a second as a whole one, a threshold of zero as one, and a runtime's name as the worker crate reads it. The row keeps its own word of every fact that object holds narrower.
+- The pair rule and the encode classes read a row's runtime name as that object does. A name that is not empty and that the worker crate does not know is the exception. The object holds no runtime for it, and the two rules compare it as written.
+- A wait wider than a row holds reads as the widest number a row holds. Where the row's object waits past that number, a worker that waits longer still passes as that object.
 - The controller's door reads no descriptor of the worker. The row keeps the one it has, so a refresh there moves labels alone.
 - Labels that change are bounded as a registration's are. Equal labels with an equal descriptor write nothing.
 - A row that is draining takes no refresh.
@@ -51,6 +54,17 @@ A host's registration and removal steps write rows at a membership door, `worker
 - A fact that its log does not carry to a standby. Those are a pairing descriptor, an empty zone, an encode offer's empty connector, and a zero where the row means none.
 - A worker of the host-local ZMQ wire whose row names no gateway, as it refuses a control call's registration of that wire.
 - One gateway holds that socket, and such a row would stand in every gateway's pool.
+
+**What a host reads back.**
+
+- A host that keeps worker objects reads a row off their holder, `worker_host::Objects`: each call builds the row again, a copy of its facts.
+- `Objects::read_row` reads a row by its id, and `Objects::read_row_under` by its exact registration key.
+- `Objects::checkpoint` cuts the rows that the holder and the store both hold, in one turn of the holder. It states the log's place, or the default place for a store that keeps no log. It takes the store that the holder's write calls tell.
+- Each read takes the holder's turn, so a writer of a row waits for it and no decision does.
+- Code that runs inside that turn calls none of these reads: the read never returns there. The store calls its journal inside the turn of a holder's write of a row, `Journal::released` too, and of its cut (`Journal::head`).
+- A row read so carries the models its worker object serves now. A row read alone carries the status that object states, and a row of the cut carries the status the store holds.
+- The cut reads the place with the store's word in one hold of the store's lock: the rows that stand, their statuses and the epoch.
+- Models that a host sets on worker objects through the registry are read row by row. A cut may hold one object's new list beside another's old one, and a list the log holds no word of yet.
 
 ## Probes
 

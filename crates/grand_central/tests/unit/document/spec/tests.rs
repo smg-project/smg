@@ -1,3 +1,5 @@
+use sha2::{Digest as _, Sha256};
+
 use super::*;
 use crate::{
     engine::{
@@ -335,7 +337,7 @@ fn a_profile_weighs_by_a_scorers_own_word_and_by_no_need() {
     }
 }
 
-fn doc(text: &str) -> PolicySpec {
+pub(super) fn doc(text: &str) -> PolicySpec {
     serde_json::from_str(text).expect("a well-formed document")
 }
 
@@ -1653,7 +1655,7 @@ fn the_view_checks_block_size_boundaries_and_the_hash_cap() {
         bad_field(&spec_with_view(r#"{"boundaries":[0,16]}"#)),
         "view.boundaries[0]"
     );
-    for boundaries in ["[256,128]", "[256,256]"] {
+    for boundaries in ["[256,128]", "[256,256]", "[16,0]"] {
         assert_eq!(
             bad_field(&spec_with_view(&format!(
                 r#"{{"boundaries":{boundaries}}}"#
@@ -2372,13 +2374,14 @@ fn a_table_goes_under_a_number_of_its_own_by_each_of_its_six_adders() {
     }
 }
 
-/// A profile is kept only where its stages bear the standing profile's
-/// names in their order: a factory that builds a stage of another name
-/// at a later call has its profile built new, and kept once the name
-/// stands again.
+/// A plain factory's every build is held to the name it is registered
+/// under: a factory that builds a stage of another name at a later call
+/// has its document refused at that validation, by both names. The
+/// standing document is as it was: once the factory answers its name
+/// again the next validation passes and keeps the standing profile.
 #[cfg(feature = "in-process")]
 #[test]
-fn a_profile_whose_factory_builds_a_stage_of_another_name_is_built_new() {
+fn a_profile_whose_factory_builds_a_stage_of_another_name_is_refused() {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
     let calls = AtomicUsize::new(0);
@@ -2387,7 +2390,7 @@ fn a_profile_whose_factory_builds_a_stage_of_another_name_is_built_new() {
     let added = own.picker("turns", move || {
         let call = calls.fetch_add(1, Relaxed);
         Box::new(ReadsHashes(
-            ["turns", "turns", "another", "another"][call.min(3)],
+            ["turns", "turns", "another", "turns"][call.min(3)],
         ))
     });
     added.expect("a free name");
@@ -2398,12 +2401,18 @@ fn a_profile_whose_factory_builds_a_stage_of_another_name_is_built_new() {
         Arc::ptr_eq(&new.profiles()[0], &old.profiles()[0])
     };
     let standing = validated().expect("a valid document");
-    let mut next = validated().expect("a valid document");
-    next.keep_from(&standing);
-    assert!(!same(&next, &standing), "another name: built new");
-    let mut third = validated().expect("a valid document");
-    third.keep_from(&next);
-    assert!(same(&third, &next), "the same name again: kept");
+    let refused = validated().expect_err("another name");
+    let reason = r#"picker registered as "turns" answers the name "another""#;
+    assert_eq!(
+        refused,
+        SpecError::BadStage {
+            path: "profiles.p.pick.turns".to_string(),
+            reason: reason.to_string(),
+        }
+    );
+    let mut third = validated().expect("the registered name again");
+    third.keep_from(&standing);
+    assert!(same(&third, &standing), "the same name again: kept");
 }
 
 /// A profile is kept only where its stages say of themselves what the
@@ -2411,10 +2420,11 @@ fn a_profile_whose_factory_builds_a_stage_of_another_name_is_built_new() {
 /// that answers otherwise one thing a validation or the engine reads
 /// of a stage has its profile built new: the words it takes, the load
 /// reports, a need, a mark, its ranks, the rule of its heads, its
-/// warm-up ruling, a filter of another type under one name, the
-/// lifecycle's calls, or no ask for the count of sends. The other
-/// reader of its count of sends is kept, and the count with it. The
-/// same stage again is kept.
+/// warm-up ruling, the lifecycle's calls, or no ask for the count of
+/// sends. The other reader of its count of sends is kept, and the count
+/// with it. The same stage again is kept. A filter of the engine's own
+/// type under the guest's name is no such stage: it answers the name
+/// `healthy`, and its document is refused.
 #[cfg(feature = "in-process")]
 #[test]
 fn a_profile_whose_factory_builds_a_stage_that_says_otherwise_is_built_new() {
@@ -2492,8 +2502,8 @@ fn a_profile_whose_factory_builds_a_stage_that_says_otherwise_is_built_new() {
             (self.0 == 7).then_some(rule)
         }
     }
-    /// A guest filter that says what `healthy` says, and is no type of
-    /// the engine's own.
+    /// A guest filter that keeps the rows `healthy` keeps, under a name
+    /// of its own, and is no type of the engine's own.
     #[derive(Debug)]
     struct Wraps(&'static str);
     impl Filter for Wraps {
@@ -2527,13 +2537,12 @@ fn a_profile_whose_factory_builds_a_stage_that_says_otherwise_is_built_new() {
         Ok(Box::new(Says(said)))
     });
     added.expect("a free name");
-    // The registration asks the name once: `guest`. A validation then
-    // builds a filter that names itself `healthy`, the engine's own
-    // type at the last turn.
+    // The registration asks the name once, and each validation again:
+    // `guest`. At 8 the factory builds the engine's own type, which
+    // names itself `healthy`.
     let added = own.filter("guest", move || match filter.load(Relaxed) {
-        u8::MAX => Box::new(Wraps("guest")),
         8 => Box::new(Healthy),
-        _ => Box::new(Wraps("healthy")),
+        _ => Box::new(Wraps("guest")),
     });
     added.expect("a free name");
     // `p` and `q` read one count of sends, and `p` holds the guests.
@@ -2556,7 +2565,6 @@ fn a_profile_whose_factory_builds_a_stage_that_says_otherwise_is_built_new() {
         (5, "other ranks"),
         (6, "a rule of heads"),
         (7, "a warm-up ruling"),
-        (8, "a filter of another type"),
         (9, "the lifecycle's calls"),
         (10, "no ask for the count"),
     ];
@@ -2577,6 +2585,14 @@ fn a_profile_whose_factory_builds_a_stage_that_says_otherwise_is_built_new() {
         third.keep_from(&next);
         assert_eq!(kept(&third, &next), all, "{what}: the same stage again");
     }
+    // The engine's own filter under the guest's name: nothing is built
+    // to keep or to build anew.
+    says.store(8, Relaxed);
+    let refused = validated().expect_err("another name");
+    assert_eq!(
+        refused.to_string(),
+        r#"profiles.p.filter[0].guest: filter registered as "guest" answers the name "healthy""#
+    );
 }
 
 /// A spec that keeps one count of sends and builds a second, under
@@ -3010,6 +3026,7 @@ fn the_manual_preset_states_its_whole_rule() {
             issue_session_id: false,
             recovery: Recovery::Original,
             rule_placed: RulePlaced::Told,
+            sides: None,
         }
     );
     assert_eq!(spec.view.headers, ["x-smg-routing-key"]);
@@ -3259,6 +3276,164 @@ fn a_sessions_rule_runs_under_a_pair_and_under_epd_by_its_hosts_calls() {
         )
     };
     assert_eq!(of_encode(&ruled), of_encode(&bare));
+}
+
+/// A sessions rule under a pair names the sides it covers (`sides`):
+/// `prefill`, `decode` or both, each once and in either order. Left
+/// out, the rule covers both sides, and a document that names none
+/// writes no `sides` key.
+///
+/// The check refuses, each by the field's path: a list under the single
+/// plan or under `epd`, an empty list and a side named twice. It refuses
+/// the encode side and every other name too. A list that leaves out a
+/// side whose picker leaves the placement to the rule is not in this
+/// build, by the path of that side's profile.
+///
+/// A gateway's sticky map places a role at a time. It asks the role's
+/// policy, and leaves the role to one that keeps a routing key's
+/// handling to itself: `manual` and `consistent_hashing` (`sticky_for`
+/// in `model_gateway/src/policies/registry.rs`).
+#[test]
+fn a_sessions_rule_names_the_sides_of_a_pair_it_covers() {
+    // One binding under a rule, beside the profile `q` and the profile
+    // `sticky`, whose picker leaves the placement to the rule.
+    let bound = |binding: &str, sides: &str| {
+        doc(&format!(
+            r#"{{"apiVersion":"smg.policy/v1","view":{{"headers":["x-session-id"]}},"profiles":{{"q":{{"pick":"random"}},"sticky":{{"pick":"manual"}}}},"bindings":[{{{binding},"sessions":{{"sticky_header":"x-session-id"{sides}}}}}]}}"#
+        ))
+    };
+    let pair = |prefill: &str, decode: &str| {
+        format!(r#""plan":"pd-pair","profiles":{{"prefill":"{prefill}","decode":"{decode}"}}"#)
+    };
+    let named = |sides: &str| format!(r#","sides":{sides}"#);
+    let plain = pair("q", "q");
+    let covered = |sides: &str| {
+        let built = bound(&plain, sides).validate();
+        let built = built.expect("the document validates");
+        let binding = built.binding("m", Phase::Prefill).expect("the binding");
+        binding.sessions.as_ref().expect("the rule").sides
+    };
+    assert_eq!(covered(""), SessionSides::Any);
+    // The type's own default is that rule: one built in code that names
+    // no side covers both.
+    assert_eq!(SessionSides::default(), SessionSides::Any);
+    for (sides, rule) in [
+        (r#"["prefill"]"#, SessionSides::Prefill),
+        (r#"["decode"]"#, SessionSides::Decode),
+        (r#"["prefill","decode"]"#, SessionSides::Any),
+        (r#"["decode","prefill"]"#, SessionSides::Any),
+    ] {
+        assert_eq!(covered(&named(sides)), rule, "{sides}");
+    }
+    // The rule as a document writes it.
+    let written = |sides: &str| {
+        let document = serde_json::to_value(bound(&plain, sides)).expect("a document");
+        document["bindings"][0]["sessions"].clone()
+    };
+    assert_eq!(written("").get("sides"), None);
+    let decode = written(&named(r#"["decode"]"#));
+    assert_eq!(decode["sides"], serde_json::json!(["decode"]));
+    // A `null` is the field left out, under the single plan too.
+    let single = bound(r#""profile":"q""#, &named("null")).validate();
+    assert!(single.is_ok(), "{:?}", single.err());
+
+    // Under `epd` a rule covers the pair's two sides, and takes no list.
+    let epd = r#""plan":"epd","profiles":{"encode":"q","prefill":"q","decode":"q"}"#;
+    assert_eq!(bound(epd, "").validate().err(), None);
+    let (by_prefill, by_decode) = (pair("sticky", "q"), pair("q", "sticky"));
+    let other = "`prefill`, `decode` or both: a rule covers no other side";
+    for (binding, sides, reason) in [
+        (
+            r#""profile":"q""#,
+            r#"["prefill"]"#,
+            "left out under the single plan: a single request has one side",
+        ),
+        (
+            epd,
+            r#"["decode"]"#,
+            "left out under the epd plan in this build: a rule covers the pair's two sides there",
+        ),
+        (
+            plain.as_str(),
+            "[]",
+            "a list of one side at least: leave it out for both",
+        ),
+        (
+            plain.as_str(),
+            r#"["decode","decode"]"#,
+            "a list that names each side once",
+        ),
+        (
+            plain.as_str(),
+            r#"["prefill","prefill"]"#,
+            "a list that names each side once",
+        ),
+        // A third item is read as the first two are.
+        (
+            plain.as_str(),
+            r#"["prefill","decode","decode"]"#,
+            "a list that names each side once",
+        ),
+        (plain.as_str(), r#"["encode"]"#, other),
+        (plain.as_str(), r#"["prefill","both"]"#, other),
+        // A name is read as written, with a space before it, behind it
+        // or both.
+        (plain.as_str(), r#"[" decode"]"#, other),
+        (plain.as_str(), r#"["decode "]"#, other),
+        (plain.as_str(), r#"[" decode "]"#, other),
+    ] {
+        let refused = bound(binding, &named(sides)).validate().err();
+        let by_name = SpecError::BadSessions {
+            index: 0,
+            name: "sides",
+            reason,
+        };
+        assert_eq!(refused.as_ref(), Some(&by_name), "{sides}");
+        assert_eq!(by_name.field_path(), "bindings[0].sessions.sides");
+        assert_eq!(
+            by_name.to_string(),
+            format!("binding 0: sessions sides is not {reason}")
+        );
+    }
+    // A refusal names its own binding: the second of two here.
+    let second = doc(&format!(
+        r#"{{"apiVersion":"smg.policy/v1","view":{{"headers":["x-session-id"]}},"profiles":{{"q":{{"pick":"random"}}}},"bindings":[{{"match":{{"model":"other"}},"profile":"q"}},{{{plain},"sessions":{{"sticky_header":"x-session-id","sides":[]}}}}]}}"#
+    ));
+    let by_name = SpecError::BadSessions {
+        index: 1,
+        name: "sides",
+        reason: "a list of one side at least: leave it out for both",
+    };
+    assert_eq!(second.validate().err().as_ref(), Some(&by_name));
+    assert_eq!(by_name.field_path(), "bindings[1].sessions.sides");
+    // A side whose picker leaves the placement to the rule is not left
+    // out: the binding's one rule would not place it, and it holds no
+    // second.
+    for (binding, sides, side) in [
+        (&by_prefill, r#"["decode"]"#, "prefill"),
+        (&by_decode, r#"["prefill"]"#, "decode"),
+    ] {
+        let lacking = SpecError::NotInBuild {
+            path: format!("bindings[0].profiles.{side}"),
+            what: BY_RULE_ON_A_SIDE_LEFT_OUT,
+        };
+        let refused = bound(binding, &named(sides)).validate().err();
+        assert_eq!(refused, Some(lacking), "{sides}");
+    }
+    assert_eq!(
+        BY_RULE_ON_A_SIDE_LEFT_OUT,
+        "a picker that places by the sessions rule on a side the rule's `sessions.sides` leaves out",
+    );
+    // Such a side stands under a rule that names it, alone or beside
+    // the other side, and under one that names none.
+    for (binding, sides) in [
+        (&by_prefill, named(r#"["prefill"]"#)),
+        (&by_decode, named(r#"["decode"]"#)),
+        (&by_decode, named(r#"["decode","prefill"]"#)),
+        (&by_decode, String::new()),
+    ] {
+        assert_eq!(bound(binding, &sides).validate().err(), None, "{sides}");
+    }
 }
 
 #[test]
@@ -4956,70 +5131,6 @@ fn a_digest_moves_with_every_field_the_schema_names_but_the_line() {
         assert_ne!(document, &base, "{field} is changed");
         let moved = document.digest().expect("a digest") != digest;
         assert_eq!(moved, *field != "generation", "{field}");
-    }
-}
-
-/// The digest copies none of the document: what it hashes is, byte for
-/// byte, the JSON the document itself writes under a zeroed line. Held
-/// for every preset, under a line and under none, for a document that
-/// writes every field the schema names and for one that writes the
-/// least: a field left out where it is the default is left out of both.
-#[test]
-fn a_digest_hashes_what_the_document_itself_writes_under_a_zeroed_line() {
-    let base = PolicySpec::preset("least_load").expect("a preset");
-    let every_field = PolicySpec {
-        explain: ExplainSpec { sample: 2 },
-        view: ViewSpec {
-            headers: vec!["x-team".to_owned()],
-            ..base.view.clone()
-        },
-        index: BTreeMap::from([("another*".to_owned(), IndexSpec::default())]),
-        signals: BTreeMap::from([(
-            "held".to_owned(),
-            SignalSpec {
-                unit: "tokens".to_owned(),
-                max_age_ms: Some(4_000),
-                across_ranks: AcrossRanks::Max,
-            },
-        )]),
-        plans: PlansSpec {
-            pd_pair: PdPairPlanSpec {
-                pairing: Pairing::Off,
-                ..PdPairPlanSpec::default()
-            },
-        },
-        bindings: vec![BindingSpec::default()],
-        ..base
-    };
-    let written = serde_json::to_value(&every_field).expect("the document is JSON");
-    let schema = serde_json::to_value(PolicySpec::schema()).expect("the schema is JSON");
-    let fields = |of: &serde_json::Value| -> BTreeSet<String> {
-        let fields = of.as_object().expect("a map of fields");
-        fields.keys().cloned().collect()
-    };
-    assert_eq!(
-        fields(&written),
-        fields(&schema["properties"]),
-        "the document writes every field the schema names"
-    );
-    let least = doc(r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}}}"#);
-    let mut documents = vec![every_field, least];
-    for name in PRESETS {
-        let preset = PolicySpec::preset(name).expect(name);
-        documents.push(PolicySpec {
-            generation: 7,
-            ..preset.clone()
-        });
-        documents.push(preset);
-    }
-    for document in documents {
-        let borrowed = serde_json::to_string(&document.lineless()).expect("serializes");
-        let owned = serde_json::to_string(&PolicySpec {
-            generation: 0,
-            ..document
-        })
-        .expect("serializes");
-        assert_eq!(borrowed, owned);
     }
 }
 

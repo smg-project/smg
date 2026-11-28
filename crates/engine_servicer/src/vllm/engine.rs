@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use engine_zmq_adapter::structured_outputs_backend_from_config;
 use openai_protocol::worker::RuntimeType;
 
 use super::State;
@@ -30,10 +29,7 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
         inputs,
         |client| {
             client.adopt_tokenizer_eos(state.tokenizer());
-            client.set_structured_outputs_support(
-                structured_outputs_backend_from_config(&state.model.structured_outputs_backend)
-                    .into(),
-            );
+            client.set_structured_outputs_support(super::structured_outputs_support(&state.model));
             // The model's vocabulary, widened where vLLM's frontend widens
             // it by the tokenizer's largest id (a multimodal placeholder can
             // lie past the model's).

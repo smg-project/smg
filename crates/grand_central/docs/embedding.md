@@ -42,7 +42,7 @@ A host decides at one of two levels: the engine alone, or the engine with bookin
 - A decode or an encode request is refused as `DecisionRefused::PairSide` where it is a side of its plan's pair, or hands more than one list.
 - The engine catches a stage's panic in a decision and counts it (`DecisionEngine::faults`). A panic in the live decision answers `DecisionRefused::Faulted`, and a shadow's costs its request nothing.
 - It also catches a stage's panic at a lease's word or at a change of membership, and counts it apart (`InProcess::unheard`). The request, the registration or the removal goes on.
-- The drop of a retired stage can panic outside that catch: [Updating a document](../REFERENCE.md#updating-a-document) says where it unwinds.
+- The drop of a retired stage can panic outside that catch: [A replaced spec](guarantees.md#a-replaced-spec) says where it unwinds.
 
 **What a pick says of the prefix.**
 
@@ -78,16 +78,17 @@ A host that keeps one `InProcess` for its life gives it a later spec with `InPro
 
 **What stands across the call.**
 
-- The session table and the record of sent prompts stand.
+- The session table stands.
+- The record of sent prefixes stands as a rule: [The record of sent prefixes](#the-record-of-sent-prefixes) names the new specs that can start one anew.
 - The stages of a profile whose name and text did not change stand too, with what they hold.
 - That holds where the new spec changes no `signals`, and its `view` is the same or differs in its header list alone.
-- A profile is built anew too where one of its stages, built again, describes itself otherwise than the standing one. A host's own factory may build such a stage.
+- A profile is built anew too where one of its stages, built again, describes itself otherwise than the standing one. A host's own factory may build such a stage. A stage built again under another name is refused at validation.
 - A host with a stage table of its own validates both specs over the one table. A table built anew for each spec keeps no stage.
-- The paragraph "What a new document keeps" of [Updating a document](../REFERENCE.md#updating-a-document) has the rules, a tally of sends among them.
+- [What a new spec keeps](guarantees.md#what-a-new-spec-keeps) has the rules, a tally of sends among them.
 
 **What starts anew.**
 
-- Every other stage is built new by its factory. A tally of sends it reads follows the reference's rules named above.
+- Every other stage is built new by its factory. A tally of sends it reads follows the rules named above.
 - Before the call returns, the engine tells each scorer and picker built new the workers that stand in the registry the host handed. A filter hears no membership.
 - A stage that panics at that word is held and counted (`InProcess::unheard`), and the stages behind it do not hear the word.
 - A stage that stands is told none of them again by the call. The engine's task reads the registry whole once more at its next upkeep.
@@ -179,15 +180,16 @@ For example, after the prefill is sent, call `guard.dispatched(sent_at)` and the
 - A pick carries the decode side's lease under the pair's id, and a shed carries none.
 - That lease keeps the generation and the time of the pair's first issue.
 - The guard counts the decode's dispatch from the first decision.
-- Behind a new spec the engine in force decides the side. It tells the issue to the stages it kept since the pair's spec, on a controller and in its host's own process alike.
+- Behind a new spec the engine in force decides the side. It tells the issue only to stages it kept since the pair's spec.
 - A refusal comes back as `DecisionRefused::Decode` with its reason, and a decision that panics as `DecisionRefused::Faulted`.
 
 ### What a stage hears
 
-- A scorer or a picker hears a side's issue and its dispatch unless the sessions rule keeps that side's pick from the profile, or a stage panics as below. Each side of a pair answers for itself.
+- The engine tells a scorer or a picker a side's issue and its dispatch only where it names them (`Lifecycle::hears`). `InProcess` tells neither where the sessions rule keeps that side's pick from the profile. Each side of a pair answers for itself.
+- The engine reads what a stage names when the engine is built, and a plugin's fallback stage may hear more: [What a stateful stage hears](extending.md#what-a-stateful-stage-hears) has both rules.
 - A plugin bound as a scorer or a picker hears the events its spec lists (`PluginSpec::observes`, `GrpcPluginSpec::observes`), and none by default.
 - A filter hears no word of a lease.
-- A stage that keeps state by issue hears the issue of each decode it is told of, before that decode's dispatch.
+- As a rule a stage that keeps state by issue hears the issue of each decode it is told of, before that decode's dispatch.
 - Under a pair asked with `decode_later`, a decode call issues the decode side. That issue is the one the stage hears.
 - A decode sent with no call goes out as the first pick's. The stage hears its issue at that dispatch, just ahead of the dispatch's own word.
 - A stage that a later spec built new hears none of these words: it never heard the pair's issue.
@@ -329,7 +331,8 @@ The lists below take the rows in that order.
 ### Feeding the store and the cache index
 
 - An embedded host can implement or use the store's ingress traits for health and leases.
-- One that keeps no worker objects reads its membership through `WorkersStore`, which holds no write, and writes a row as a decided change (`MemoryStore::follow`).
+- One that keeps no worker objects writes a row as a decided change (`MemoryStore::follow`). Its own write hands that call the default place, `Position::default()`. A journaled store journals that write only under a term it took.
+- That host reads no row of the store: it keeps the rows it handed the store. `WorkersStore` gives it the epoch of the store's last write, and holds no write.
 - It feeds cache events through the worker host, under the `worker-host` feature.
 - It hands the holder of its worker objects the KV tables (`worker_host::KvTables`, `Objects::with_kv_tables`). `worker_host::KvHost` over that holder gives each event subscription its row.
 - The holder makes a row's lane where it states the row's facts, and retires it where the row leaves. A row has a lane under its first model, while its signals ask for events.
@@ -346,22 +349,22 @@ The lists below take the rows in that order.
 
 ### The record of sent prefixes
 
-- A standalone controller's engine keeps a record of the prefixes sent to its workers. It keeps the records by model, for a pool whose prefix stage reads sent prefixes, under an index of the kind `tree`.
+- A standalone controller's engine keeps a record of the prefixes sent to its workers. It keeps the records by model, for a pool whose prefix stage reads sent prefixes.
 - A stage that says `source: index` reads cache events alone, and no such record.
 - A decision can write a placement there: a single request's, and each side of a pair's.
 - It writes for the first target its maker says the caller sends to. On the stock controller that is the pick's first. Under an encode request it writes none where the maker says the caller sends to a placed encoder no more.
 - It writes none for a pick the sessions rule keeps from the profile.
-- A model's record takes its room from the index's `max_size`, and has room for one placement at least. [Index](policy-spec.md#index) has the rule.
+- A model's record takes its room from the index's `max_size`, and has room for one placement at least. The index's `kind` says how the record is keyed. [Index](policy-spec.md#index) has both rules.
 - A placement is a prediction made at the decision.
 - A decision turned back after its lease's issue keeps the placement it wrote. A later request with that prefix can read it as a predicted hit, which must exceed the stage's `threshold`.
 - A decision does not wait to write its placement: a write that meets the record's lock held is kept by its thread and written behind the thread's next picks. A write that eight newer ones push out, or that its thread ends with, is left out.
 - Which record names a request's holders, this one or the model's KV tables, is by the profile's prefix stages and by the request. [The cache records](design.md#45-the-cache-records) in the design has the rule.
 - The store tells the engine each word of its membership. The record forgets a worker that left, was replaced, stopped serving a model or changed its role.
-- The record stands across a new spec.
+- As a rule the record stands across a new spec. A new spec can start a model's record anew: one that states another `kind` for the model's index, or other `view.boundaries` under a `hash` index.
 - A standby starts with an empty record.
-- A text request is recorded as a token request is, by the hashes of its windows.
+- Under a `tree` index a text request is recorded as a token request is, by the hashes of its windows. Under `hash` it is not recorded.
 - Readers of the record wait for a writer. Under many callers that never pause, a fleet whose requests mostly grow decides slower than one that reads no record.
-- A host with a store of its own keeps the same record with the crate's `PrefixPredictor`. It folds a request's keys once (`PrefixPredictor::fold_into`), reads by a shared reference, and writes with a tick of the host's clock.
+- A host with a store of its own keeps a `tree` index's record with the crate's `PrefixPredictor`. It folds a request's keys once (`PrefixPredictor::fold_into`), reads by a shared reference, and writes with a tick of the host's clock.
 
 ### Hashing a request
 

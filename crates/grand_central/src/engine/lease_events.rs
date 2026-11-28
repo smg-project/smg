@@ -11,13 +11,17 @@
 //! the same form (`Sides::with_held_single`, `Sides::with_held_pair`), so
 //! [`single`] and [`pair`] are the one rule of a lease's words under either
 //! host. The host says who hears ([`Hearers`]). Behind a later document's
-//! start the stages that document kept hear a lease's words, and every
-//! count of sends in force takes its dispatch, under either host. Each
+//! start the stages that document kept hear a lease's words of the kinds
+//! they name, and every count of sends in force takes its dispatch, under
+//! either host. Each
 //! keeps one engine object across its documents. A host that holds its
 //! decisions names the hearers by the document in force ([`of_host`]), and
 //! a controller by the one its store's standing world holds. What hears at
 //! the issuing engine is one of two things ([`Issuing`]): an engine whole,
 //! or the stages a later engine kept that stood by the lease's generation.
+//! A host that holds its decisions names the first as the engine itself,
+//! and a controller names either as a `Stood`, the first under no bound
+//! (`Engine::stands`).
 //!
 //! A request its binding's sessions rule keeps from the profile is told to
 //! the session table at its dispatch, and to no stage ahead of its end
@@ -69,7 +73,7 @@ use crate::tracking::lease::{Lease, Said, Side};
 /// ([`Pair::decode_placing`](super::decision::Pair::decode_placing)). The
 /// askers are a pair's dispatch ([`pair`]), its two issues and a later
 /// decode's, and each side's write of where the prompt went
-/// (`in_process::pair`). A decode asked again states its own word of
+/// (`in_process::overlap`). A decode asked again states its own word of
 /// the decode side, and keeps the word of the pair it is held by where it
 /// names that pair's decode: the decision that put the request there
 /// stands. A gateway's sticky map places each role of a pair under that

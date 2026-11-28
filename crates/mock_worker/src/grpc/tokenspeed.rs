@@ -239,7 +239,7 @@ impl TokenSpeedScheduler for MockScheduler {
         if let Some(recorded) = script::recorded_info(MODEL_INFO_CALL) {
             let mut info = ts::GetModelInfoResponse::decode(recorded.as_slice())
                 .map_err(|e| Status::internal(format!("the recorded model info: {e}")))?;
-            if self.cfg.tokenizer_path != self.cfg.model_id {
+            if super::own_tokenizer(&self.cfg) {
                 info.tokenizer_path.clone_from(&self.cfg.tokenizer_path);
             }
             return Ok(Response::new(info));
@@ -282,9 +282,12 @@ impl TokenSpeedScheduler for MockScheduler {
     ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
         self.overrides.server_info().refusal("server info")?;
         if let Some(recorded) = script::recorded_info(SERVER_INFO_CALL) {
-            return ts::GetServerInfoResponse::decode(recorded.as_slice())
-                .map(Response::new)
-                .map_err(|e| Status::internal(format!("the recorded server info: {e}")));
+            let mut info = ts::GetServerInfoResponse::decode(recorded.as_slice())
+                .map_err(|e| Status::internal(format!("the recorded server info: {e}")))?;
+            // A gateway publishes this entry beside the tokenizer path of
+            // the model info.
+            super::state_tokenizer(&self.cfg, info.server_args.as_mut(), "tokenizer");
+            return Ok(Response::new(info));
         }
         Ok(Response::new(ts::GetServerInfoResponse {
             server_args: self.server_args(),
@@ -1323,5 +1326,39 @@ mod tests {
             );
         }
         assert_eq!(cached, [Some(0), Some(64), Some(16), Some(16)]);
+    }
+
+    /// A list and an object an info patch sets reach a client of this wire
+    /// as a list and a struct in the server args, as an engine servicer's do.
+    #[tokio::test]
+    async fn a_patched_list_and_object_reach_the_server_args_in_their_kinds() {
+        use prost_types::value::Kind;
+
+        let (service, _stop) = service(65_382);
+        let patch = serde_json::json!({
+            "weight_version": ["a", "b"],
+            "kv_cache_dtype": {"bits": 8},
+        });
+        service.overrides.patch_info(patch.as_object().unwrap());
+        let info = service
+            .get_server_info(Request::new(ts::GetServerInfoRequest {}))
+            .await
+            .expect("info")
+            .into_inner();
+        let args = info.server_args.expect("server args").fields;
+        let kind = |key: &str| args.get(key).and_then(|value| value.kind.as_ref());
+        assert!(
+            matches!(kind("weight_version"), Some(Kind::ListValue(list)) if list.values.len() == 2),
+            "a list of two members: {:?}",
+            kind("weight_version")
+        );
+        assert!(
+            matches!(
+                kind("kv_cache_dtype"),
+                Some(Kind::StructValue(entry)) if entry.fields.contains_key("bits")
+            ),
+            "a struct with its member: {:?}",
+            kind("kv_cache_dtype")
+        );
     }
 }

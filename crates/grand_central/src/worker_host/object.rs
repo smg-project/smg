@@ -124,6 +124,24 @@ pub(super) fn external(engine_kind: &str) -> bool {
     engine_kind.parse() == Ok(smg_worker::worker::RuntimeType::External)
 }
 
+/// The runtime the pair rule and the encode rule read of a row that names
+/// `engine_kind`, by the worker crate's own reader of a name. A kind that
+/// reader takes for a runtime is the worker crate's one name of it, so
+/// every spelling the reader knows of a runtime is one name. A kind it
+/// takes for no runtime is no name: the empty string. A kind it does not
+/// know stays as the row states it, and an empty one is no name either.
+/// One thing stays apart there: the two rules hold such a kind, unless it
+/// is empty, for a runtime, and two spellings of it for two, where the
+/// row's object holds no runtime ([`builder`]).
+#[cfg(feature = "in-process")]
+pub(super) fn runtime(engine_kind: &str) -> &str {
+    match engine_kind.parse::<smg_worker::worker::RuntimeType>() {
+        Ok(read) if read.is_specified() => read.as_str(),
+        Ok(_) => "",
+        Err(_) => engine_kind,
+    }
+}
+
 /// Whether an object built from a row that states `overload` and
 /// `engine_kind` states a threshold of `defaults`:
 /// an engine's row that names none for a signal `defaults` state. The rows

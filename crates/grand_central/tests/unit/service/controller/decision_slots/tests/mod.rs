@@ -56,9 +56,11 @@ use crate::{
     stages::{lifecycle::Lifecycle, registry::StageRegistry},
     store::{
         DecodeIssue, DecodeMark, GatewayId, HealthSink, LeaseState, LeasesStore, MembershipChange,
-        MemoryStore, Registrant, WorkerFacts, WorkerStatus, WorkersStore,
+        MemoryStore, Registrant, WorkerFacts, WorkerStatus,
     },
-    tracking::lease::{Dispatch, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL},
+    tracking::lease::{
+        Dispatch, EventKind, EventSet, Lease, LeaseId, ReleaseReason, Said, Side, DISPATCH_TTL,
+    },
     worker_host::{tests::stand, Members, Objects},
 };
 
@@ -69,16 +71,12 @@ impl DecisionSlots {
     }
 }
 
-mod asked_again;
 mod busy;
-mod decode;
 pub(crate) mod encode;
 mod faults;
 mod fence;
 mod gateway;
-mod give_up;
 mod leases;
-mod marks;
 mod measured;
 mod named;
 mod pair;
@@ -269,7 +267,7 @@ pub(crate) fn written_ready(
         written,
         MembershipChange::Registered { .. } | MembershipChange::Replaced { .. }
     ) {
-        let row = objects.record(id).expect("the record the write laid");
+        let row = objects.read_row(id).expect("the row the write laid");
         objects.connect_row(store, id, row.revision);
     }
     id
@@ -690,7 +688,7 @@ async fn a_worker_whose_object_leaves_ready_is_passed_by_at_the_next_decision() 
     let (store, objects) = (Arc::clone(&bed.store), Arc::clone(&bed.reads.objects));
     let set = |worker: WorkerId, status: WorkerStatus| {
         if status == WorkerStatus::Draining {
-            let row = WorkersStore::get(&*store, worker).expect("the row");
+            let row = store.get(worker).expect("the row");
             assert!(objects.drain_row(&store, worker, row.revision));
         } else {
             stand(&objects, &store, worker, status);
@@ -894,7 +892,7 @@ async fn sent_one_prefix() -> (Bed, WorkerId, WorkerFacts) {
     let mut bed = bed(Some(preset("cache_aware", 1)), true, (1, 8), []);
     let sent = picked(&bed.ask(hashed(1, 100)).await);
     assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
-    let row = WorkersStore::get(&*bed.store, sent).expect("the row");
+    let row = bed.store.get(sent).expect("the row");
     (bed, sent, row.facts)
 }
 
@@ -927,7 +925,7 @@ async fn a_worker_that_left_behind_an_apply_is_named_for_no_prefix_it_held_befor
     let next = preset("cache_aware", 2);
     bed.store.apply(next).expect("a later generation");
     assert_eq!(sent_prefixes(&bed), Some(vec![sent]));
-    let row = WorkersStore::get(&*bed.store, sent).expect("the row");
+    let row = bed.store.get(sent).expect("the row");
     bed.store.remove(sent, row.revision).expect("removed");
     assert_eq!(
         sent_prefixes(&bed),
@@ -1061,6 +1059,10 @@ impl Lifecycle for Told {
 
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
         self.0.lock().push((lease.id.0, Some(reason)));
+    }
+
+    fn hears(&self) -> EventSet {
+        EventSet::of([EventKind::Issued, EventKind::Released])
     }
 }
 
@@ -1386,7 +1388,7 @@ fn sides_of(answer: &proto::DecideAnswer) -> Vec<(u64, proto::Side, u32)> {
 /// objects count it.
 fn booked<const N: usize>(bed: &Bed, workers: [WorkerId; N]) -> [usize; N] {
     workers.map(|id| {
-        let row = WorkersStore::get(&*bed.store, id).expect("the row");
+        let row = bed.store.get(id).expect("the row");
         let object = bed.reads.objects.registry().get_by_url(&row.facts.key);
         object.expect("its object").load()
     })
