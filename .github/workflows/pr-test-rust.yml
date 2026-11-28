@@ -2149,6 +2149,41 @@ jobs:
       servicer_impl: ${{ matrix.servicer_impl || '' }}
     secrets: inherit
 
+  # SGLang Mooncake uses the original four-GPU PR slice: two TP1 workers
+  # per pool plus runtime assembly, window and mismatch cases. The harness
+  # starts its own gateway and workers; no separate gateway lane is needed.
+  e2e-4gpu-pd-sglang-amd:
+    name: e2e-4gpu-pd-sglang-amd (sglang-mooncake)
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && vars.SMG_RUN_AMD_SGLANG_PD4 == 'true'
+      && vars.SMG_RUNNER_AMD_GPU_4 != ''
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: sglang
+      gpu_tier: "4"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_4 }}
+      # Inherit the reference row's engineering limits; AMD timing is unmeasured.
+      timeout: 50
+      test_timeout: 42
+      test_dirs: e2e_test/router/test_pd_topologies.py
+      # Keep selection, floor and 50/42 limits in sync with the default
+      # e2e-4gpu-pd SGLang slice above; these are inherited engineering values.
+      test_filter: '-k "(2p2d and not http) or AssembledAtRuntime or SmallWindow or MismatchedTransport or MismatchedProtocol"'
+      min_selected: 14
+      kv_backend: mooncake
+      gpu_vendor: amd
+      container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --ulimit memlock=-1:-1 --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
   # --- CPU E2E: the classes on the scripted mock worker ---
 
   # The chat suite's classes that carry the mock engine marker, on the
@@ -2605,7 +2640,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, build-go-ffi, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, build-go-ffi, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-4gpu-pd-sglang-amd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     # A hosted runner, never a self-hosted pool: this job runs on a cancelled
     # run too, and a cancelled run is complete only once it has run. Until
@@ -2700,6 +2735,7 @@ jobs:
                 "${{ needs.e2e-4gpu-gateway.result }}" =~ $bad || \
                 "${{ needs.e2e-4gpu-epd.result }}" =~ $bad || \
                 "${{ needs.e2e-4gpu-pd.result }}" =~ $bad || \
+                "${{ needs.e2e-4gpu-pd-sglang-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-cpu-mock.result }}" =~ $bad || \
                 "${{ needs.e2e-vendor.result }}" =~ $bad || \
                 "${{ needs.go-unit-tests.result }}" =~ $bad || \
