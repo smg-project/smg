@@ -186,9 +186,8 @@ For example, after the prefill is sent, call `guard.dispatched(sent_at)` and the
 ### What a stage hears
 
 - A scorer or a picker hears a side's issue and its dispatch only where it names them (`Lifecycle::hears`). It hears them then unless the sessions rule keeps that side's pick from the profile, or a stage panics as below. Each side of a pair answers for itself.
-- The engine asks a stage what it names once, when the engine is built. A stage whose answer changes later is told by its first answer.
+- The engine reads what a stage names when the engine is built, and a plugin's fallback stage may hear more: [What a stateful stage hears](extending.md#what-a-stateful-stage-hears) has both rules.
 - A plugin bound as a scorer or a picker hears the events its spec lists (`PluginSpec::observes`, `GrpcPluginSpec::observes`), and none by default.
-- A plugin's fallback stage hears every word its plugin's stage is told, whatever the fallback itself names.
 - A filter hears no word of a lease.
 - A stage that keeps state by issue hears the issue of each decode it is told of, before that decode's dispatch.
 - Under a pair asked with `decode_later`, a decode call issues the decode side. That issue is the one the stage hears.

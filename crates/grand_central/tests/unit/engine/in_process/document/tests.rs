@@ -543,9 +543,9 @@ fn a_prompt_goes_back_to_its_worker_under_the_next_document() {
     }
 }
 
-/// The `random` preset under the generation `number`, after `edit`. Ahead
-/// of `edit` its profile is picked by the `hears` of `stages`
-/// ([`hearing_stages`]): an `edit` may name another picker.
+/// The `random` preset as `edit` leaves it. Ahead of `edit` it bears the
+/// generation `number`, and its profile is picked by the `hears` of
+/// `stages` ([`hearing_stages`]): an `edit` may turn either.
 fn hearing_over(
     stages: &StageRegistry,
     number: u64,
@@ -1082,7 +1082,10 @@ impl Scorer for Switched {
 /// name the word, so two lists that differ are both filled. The preset's
 /// own `random` names none: a word that neither scorer names has an empty
 /// list. Where the list is empty in both engines, the lists behind it are
-/// compared still. Where the later build filled it, the two differ.
+/// compared still. Where the later build filled it, the two differ. Each
+/// pass is held to its picker: under `hears` the table built one for each
+/// document and the one in force heard the issue and the dispatch, and
+/// under `random` it built none.
 ///
 /// A dispatch under the later document then reaches the scorers that
 /// named it at the build that made them, and no other. Where the two named
@@ -1097,10 +1100,10 @@ fn a_later_document_keeps_a_profile_its_build_listed_as_the_standing_one() {
     let answers = [Says::First, Says::Second, Says::Reports];
     let answers: Vec<Says> = answers.into_iter().chain(kinds.map(Says::Also)).collect();
     // Each answer under each of the two pickers.
-    let passes = ["hears", "random"].into_iter();
-    let passes = passes.flat_map(|pick| answers.iter().map(move |&later| (pick, later)));
+    let picks = ["hears", "random"].into_iter();
+    let passes = picks.flat_map(|pick| answers.iter().map(move |&later| (pick, later)));
     for (pick, later) in passes {
-        let (mut stages, _) = hearing_stages();
+        let (mut stages, picked) = hearing_stages();
         // The scorers' lists, in the order the table built the scorers:
         // a document's first and its second, by turns.
         let scored = Arc::new(Mutex::new(Vec::new()));
@@ -1171,6 +1174,20 @@ fn a_later_document_keeps_a_profile_its_build_listed_as_the_standing_one() {
                 told,
                 "{pick}, {later:?}: the scorer at {at}"
             );
+        }
+        // The pass's picker is each document's own. Under `hears` the
+        // table built one for each of the two, and the one of the profile
+        // in force heard the issue and the dispatch: it stands in every
+        // word's list. Under `random` the table built none.
+        if pick == "hears" {
+            let in_force = usize::from(!kept);
+            assert_eq!(picked.lock().len(), 2, "{later:?}: a picker a document");
+            let heard = words(&picked, in_force);
+            assert_eq!(heard, ["issued", "dispatched"], "{later:?}: in force");
+            let other = words(&picked, 1 - in_force);
+            assert!(other.is_empty(), "{later:?}: the other document's");
+        } else {
+            assert!(picked.lock().is_empty(), "{later:?}: no `hears` is built");
         }
     }
 }

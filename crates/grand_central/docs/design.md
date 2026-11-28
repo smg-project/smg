@@ -498,7 +498,7 @@ pub trait Picker: Lifecycle {
 pub trait Lifecycle {
     // on_decision_issued, on_dispatched, on_completed, on_released, on_membership, on_signal
     // hears: which of the first four the engine tells the stage. By default all four where
-    // needs_lifecycle is true, and none otherwise. Asked once, when the engine is built
+    // needs_lifecycle is true, and none otherwise. The engine reads the answer when it is built
 }
 ```
 
