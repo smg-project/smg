@@ -33,13 +33,15 @@
 //! that finishes the request, so a per-thread pool would never see its
 //! buffers again. The lock is held for one push or pop per buffer.
 //!
-//! At rest: the pool has no clock and no task of its own. A host calls
-//! [`trim_if_quiet`] on a period, and at the second call in a row with no
-//! take between them the idle buffers are freed, so a process at rest behind
-//! a burst of images gives back what the burst left; the requests after that
-//! take fresh buffers once. A take pays one add under the lock it already
-//! holds. A host that never calls it keeps the idle buffers for the life of
-//! the process.
+//! Giving back: the pool has no clock and no task of its own. A host calls
+//! [`trim_if_quiet`] on a period, and each call frees, class by class, the
+//! idle buffers no take reached since the call before, so a process behind
+//! a burst of images gives back what its load no longer uses: all of it at
+//! rest, after two calls, and what a lighter load leaves idle while that
+//! load runs. A load that rises again takes fresh buffers once. A take pays
+//! one compare under the lock it already holds, and one store when its class
+//! holds fewer than at any take since the last call. A host that never calls
+//! it keeps the idle buffers for the life of the process.
 //!
 //! In a debug build a buffer is handed out filled with [`SENTINEL`] rather
 //! than a previous request's bytes, so a producer that left a byte unwritten
@@ -82,11 +84,9 @@ struct Idle {
     classes: [Vec<Vec<u8>>; CLASSES],
     /// The capacity of every idle buffer below the top class together.
     held: usize,
-    /// The takes so far, served or not: what two calls of
-    /// [`BufferPool::trim_if_quiet`] compare.
-    takes: u64,
-    /// `takes` as the last such call read it; `None` before the first.
-    seen: Option<u64>,
+    /// The fewest idle buffers each class held since the last call of
+    /// [`BufferPool::trim_if_quiet`]: the ones no take reached in between.
+    low: [usize; CLASSES],
 }
 
 /// The process's pool.
@@ -156,8 +156,7 @@ impl BufferPool {
             inner: Mutex::new(Idle {
                 classes: [const { Vec::new() }; CLASSES],
                 held: 0,
-                takes: 0,
-                seen: None,
+                low: [0; CLASSES],
             }),
         }
     }
@@ -220,8 +219,13 @@ impl BufferPool {
     fn kept(&self, capacity: usize) -> Option<Vec<u8>> {
         let index = (capacity / SMALLEST).trailing_zeros() as usize;
         let mut idle = self.idle();
-        idle.takes = idle.takes.wrapping_add(1);
         let kept = idle.classes[index].pop();
+        // What the class holds idle now: the fewest of a period is what no
+        // take of it reached.
+        let left = idle.classes[index].len();
+        if left < idle.low[index] {
+            idle.low[index] = left;
+        }
         if kept.is_some() && capacity != LARGEST {
             idle.held -= capacity;
         }
@@ -241,7 +245,8 @@ impl BufferPool {
             let mut idle = self.idle();
             // The top class stays out of the bound, where one of its buffers
             // would take the room of many smaller ones, and keeps a single
-            // idle buffer, since the pool frees what it keeps only at rest.
+            // idle buffer, since the pool frees a buffer it keeps only after
+            // a period in which no take reached it.
             let top = capacity == LARGEST;
             let full = if top {
                 !idle.classes[index].is_empty()
@@ -261,20 +266,33 @@ impl BufferPool {
         drop(turned_away);
     }
 
-    /// Frees every idle buffer when no take came since the call before this
-    /// one and returns the bytes of capacity freed; otherwise notes the takes
-    /// so far and returns 0, as the first call always does.
+    /// Frees, in each class, the buffers that stayed idle since the call
+    /// before this one, the coldest ones, and returns the bytes of capacity
+    /// freed: as many as the fewest the class held idle in between. With no
+    /// take of the class in between that is every buffer it held at that
+    /// call; the first call frees nothing.
     pub(crate) fn trim_if_quiet(&self) -> usize {
-        // The buffers are freed after the lock is released.
-        let freed = {
+        // The room for what each class gives up is made before the lock is
+        // taken for the move: a class's low only falls between two calls, so
+        // the move allocates nothing while it holds the lock.
+        let low = self.idle().low;
+        let mut freed: [Vec<Vec<u8>>; CLASSES] =
+            std::array::from_fn(|index| Vec::with_capacity(low[index]));
+        {
             let mut idle = self.idle();
-            let takes = idle.takes;
-            if idle.seen.replace(takes) != Some(takes) {
-                return 0;
+            let idle = &mut *idle;
+            for (index, out) in freed.iter_mut().enumerate() {
+                let class = &mut idle.classes[index];
+                // The stack hands out its top, so the bottom is the coldest.
+                let cold = idle.low[index].min(class.len()).min(out.capacity());
+                out.extend(class.drain(..cold));
+                idle.low[index] = class.len();
+                if index + 1 != CLASSES {
+                    idle.held -= cold * (SMALLEST << index);
+                }
             }
-            idle.held = 0;
-            std::mem::take(&mut idle.classes)
-        };
+        }
+        // The buffers are freed after the lock is released.
         freed.iter().flatten().map(Vec::capacity).sum()
     }
 
@@ -306,19 +324,22 @@ pub fn recycle(buf: Vec<u8>) {
     shared().recycle(buf);
 }
 
-/// Frees what the process's pool holds idle once the pool has been quiet,
-/// for a host to call on a period. At the second call in a row with no take
-/// between them every idle buffer is freed, the top class's one too, and the
-/// bytes of capacity freed are returned; any other call returns 0. A take
-/// of a pooled length reads no clock for this: it counts itself under the
-/// lock it already holds. The requests after a trim take fresh buffers once,
-/// and what the pool keeps under load (up to [`BOUND`] below the top class
-/// and one buffer of it) is unchanged. A host that never calls this keeps
-/// the idle buffers for the life of the process.
+/// Frees what the process's pool held idle since the call before this one,
+/// for a host to call on a period, and returns the bytes of capacity freed.
+/// Each class gives up as many buffers as the fewest it held idle in
+/// between, the coldest ones: every one of them when no take of the class
+/// came, the top class's too, and none of those the takes of the period
+/// used. So a pool at rest is empty after two calls, and a light load after
+/// a burst keeps what it uses, not what the burst left. A take of a pooled
+/// length reads no clock for this: it notes what its class holds under the
+/// lock it already holds. A load that rises again takes fresh buffers once,
+/// and what the pool may keep (up to [`BOUND`] below the top class and one
+/// buffer of it) is unchanged. A host that never calls this keeps the idle
+/// buffers for the life of the process.
 ///
 /// Two calls in a row are compared whoever makes them, so a process calls
 /// this from one place: a second caller on a period of its own would cut the
-/// quiet of the first short.
+/// period of the first short.
 pub fn trim_if_quiet() -> usize {
     shared().trim_if_quiet()
 }
@@ -525,7 +546,7 @@ mod tests {
         drop(pool.take(SMALLEST));
         pool.recycle(Vec::with_capacity(SMALLEST));
         pool.recycle(Vec::with_capacity(LARGEST));
-        // The first call only notes the takes so far.
+        // The first call only notes what each class holds.
         assert_eq!(pool.trim_if_quiet(), 0);
         assert_eq!(pool.held(), SMALLEST);
         assert_eq!(pool.trim_if_quiet(), SMALLEST + LARGEST);
@@ -537,20 +558,36 @@ mod tests {
     }
 
     #[test]
-    fn a_take_between_two_trims_keeps_the_idle_buffers() {
+    fn a_trim_frees_what_no_take_reached_since_the_one_before() {
         let pool = BufferPool::new();
-        pool.recycle(Vec::with_capacity(SMALLEST));
-        pool.recycle(Vec::with_capacity(SMALLEST));
+        for _ in 0..5 {
+            pool.recycle(Vec::with_capacity(SMALLEST));
+        }
+        pool.recycle(Vec::with_capacity(2 * SMALLEST));
+        // The first call frees nothing and notes what each class holds.
         assert_eq!(pool.trim_if_quiet(), 0);
-        // One of the two is taken: the other stays for the takes that follow.
-        drop(pool.take(SMALLEST));
+        // Two requests at a time use two of the five, over and over.
+        for _ in 0..3 {
+            let (one, other) = (pool.take(SMALLEST), pool.take(SMALLEST));
+            pool.recycle(one);
+            pool.recycle(other);
+        }
+        // The three no take reached go, and the class no take asked: the two
+        // in use stay for the takes that follow.
+        assert_eq!(pool.trim_if_quiet(), 3 * SMALLEST + 2 * SMALLEST);
+        assert_eq!(pool.held(), 2 * SMALLEST);
+        assert_eq!(pool.idle().classes[0].len(), 2);
+        // A period that uses both keeps both.
+        let (one, other) = (pool.take(SMALLEST), pool.take(SMALLEST));
+        pool.recycle(one);
+        pool.recycle(other);
         assert_eq!(pool.trim_if_quiet(), 0);
-        assert_eq!(pool.held(), SMALLEST);
-        // A take the pool could not serve counts as well: it is in use.
-        drop(pool.take(2 * SMALLEST));
-        assert_eq!(pool.trim_if_quiet(), 0);
-        assert_eq!(pool.held(), SMALLEST);
+        assert_eq!(pool.held(), 2 * SMALLEST);
+        // A period that uses one keeps one, and one with no take keeps none.
+        pool.recycle(pool.take(SMALLEST));
         assert_eq!(pool.trim_if_quiet(), SMALLEST);
+        assert_eq!(pool.trim_if_quiet(), SMALLEST);
+        assert_eq!(pool.held(), 0);
     }
 
     #[test]

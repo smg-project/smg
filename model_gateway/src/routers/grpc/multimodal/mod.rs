@@ -310,15 +310,15 @@ pub(crate) fn log_mm_timing_enabled() -> bool {
     mm_settings().log_mm_timing.value
 }
 
-/// How often the media crate's buffer pool is asked to trim. It frees its
-/// idle buffers at the second tick in a row with no take between them, so
-/// 30 to 60 seconds after the last image request took a buffer.
+/// How often the media crate's buffer pool is asked to trim. Each tick
+/// frees the idle buffers no take reached since the tick before, so a
+/// buffer goes 30 to 60 seconds after the last image request needed it.
 const POOL_TRIM_EVERY: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Trims the media crate's buffer pool for the life of the process: a
-/// gateway at rest behind a burst of image requests gives back the buffers
-/// the burst left idle, up to the pool's bound and its one buffer of the top
-/// class.
+/// gateway behind a burst of image requests gives back the buffers its load
+/// no longer uses, all of them at rest, up to the pool's bound and its one
+/// buffer of the top class.
 #[expect(
     clippy::disallowed_methods,
     reason = "a tick for the life of the process; nothing waits for it at shutdown"
@@ -362,7 +362,7 @@ impl Drop for TrimRole {
 async fn trim_on_a_period(held: &'static AtomicBool, trim: impl Fn() -> usize) {
     let mut tick = tokio::time::interval(POOL_TRIM_EVERY);
     // A late tick is not caught up: two ticks stay a period apart, so a
-    // trim always follows a whole period with no take.
+    // trim frees only what a whole period left idle.
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut role = None;
     loop {
