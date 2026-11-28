@@ -15,7 +15,7 @@ use dashmap::{mapref::entry::Entry, DashMap, DashSet};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, field, warn};
 
-use self::slots::{Kept, Outcomes, Waiter, WaiterSlot};
+use self::slots::{Hold, Holders, Kept, Outcomes, Waiter, WaiterSlot};
 use super::WorkerJobAsker;
 use crate::{registry::WorkerId, worker::JobStatus};
 
@@ -105,6 +105,9 @@ pub struct JobQueue<H: JobHost> {
     host: Weak<H>,
     /// Job status tracking by worker URL
     status_map: Arc<DashMap<String, JobStatus>>,
+    /// How many holders each URL has: what tells a claim that goes back
+    /// whether it held the URL alone.
+    holders: Arc<Holders>,
     /// Semaphore to limit concurrent job execution
     concurrency_limit: Arc<Semaphore>,
     /// The waiters of [`Self::submit_and_wait`], by job key: a job's outcome
@@ -114,7 +117,8 @@ pub struct JobQueue<H: JobHost> {
     /// under the same key.
     next_waiter_id: AtomicU64,
     /// The jobs kept per key while another job holds it (`submit_or_defer`).
-    /// That job's completion runs them in turn (`run_kept`).
+    /// That job's completion runs them in turn (`run_kept`), and so does a
+    /// claim that held the key alone and goes back (`KeptTurn`).
     kept: Arc<DashMap<String, Kept<H::Job>>>,
     /// Cancel marks by id. A job reads and clears only the mark it owns.
     cancelled_before_start: Arc<DashSet<WorkerId>>,
@@ -130,6 +134,8 @@ pub struct JobQueue<H: JobHost> {
 struct Queued<J> {
     job: J,
     waiter: Option<u64>,
+    /// The job's hold on its key, from its submission to its end.
+    hold: Hold,
 }
 
 /// Why [`JobQueue::submit_and_wait`] returned no success message.
@@ -256,6 +262,61 @@ mod slots {
             }
         }
     }
+
+    /// How many holders each key has. A holder is a claim from its write, a
+    /// plain submission from its start, and the job of either to its end; a
+    /// kept job holds its key while it runs. The status entry does not show
+    /// them all (a job of another type can take a holder's entry and end): a
+    /// claim that goes back with no holder left held the key alone.
+    #[derive(Default)]
+    pub struct Holders(DashMap<String, usize>);
+
+    impl Holders {
+        /// Counts a holder of the key: a claim written there or a plain
+        /// submission.
+        pub(super) fn hold(&self, key: &str) {
+            *self.0.entry(key.to_string()).or_default() += 1;
+        }
+
+        /// Whether no holder is left under the key.
+        pub(super) fn free(&self, key: &str) -> bool {
+            !self.0.contains_key(key)
+        }
+    }
+
+    /// One holder's count under a key, given back when it is dropped: with a
+    /// submission that ends before its slot, at a job's end, or with a job
+    /// the dispatcher never ran.
+    pub struct Hold {
+        pub(super) holders: Arc<Holders>,
+        key: String,
+    }
+
+    impl Hold {
+        /// The hold of a submission or a job under `key`. A `claimed` one was
+        /// counted when its claim was written; a plain one is counted here.
+        pub(super) fn of(holders: &Arc<Holders>, key: &str, claimed: bool) -> Self {
+            if !claimed {
+                holders.hold(key);
+            }
+            Self {
+                holders: Arc::clone(holders),
+                key: key.to_string(),
+            }
+        }
+    }
+
+    impl Drop for Hold {
+        fn drop(&mut self) {
+            let key = std::mem::take(&mut self.key);
+            if let Entry::Occupied(mut count) = self.holders.0.entry(key) {
+                *count.get_mut() -= 1;
+                if *count.get() == 0 {
+                    count.remove();
+                }
+            }
+        }
+    }
 }
 
 /// A claimed submission's hold on its own status entry while it waits for a
@@ -273,6 +334,27 @@ impl<H: JobHost> Drop for Claim<'_, H> {
     fn drop(&mut self) {
         if !self.held {
             JobQueue::<H>::record_own_status(&self.queue.status_map, self.url, self.job_type, None);
+        }
+    }
+}
+
+/// The kept jobs' turn at the end of a submission whose claim was made with
+/// no job in flight under its URL (`claim_unless_in_flight`). A claim that
+/// goes back without its job leaves no completion to run the jobs kept behind
+/// it, so they get their turn here if no other holder is left under the URL
+/// at that moment: never beside a job in flight or ahead of another claim's
+/// job. A submission that queued its job holds the URL through that job,
+/// whose end runs them. A plain submission declares one too: dropped before
+/// its slot, it leaves no completion either.
+struct KeptTurn<'a, H: JobHost> {
+    queue: &'a JobQueue<H>,
+    url: &'a str,
+}
+
+impl<H: JobHost> Drop for KeptTurn<'_, H> {
+    fn drop(&mut self) {
+        if self.queue.holders.free(self.url) {
+            self.queue.run_kept_without_holder(self.url);
         }
     }
 }
@@ -298,6 +380,7 @@ impl<H: JobHost> JobQueue<H> {
             tx,
             host: host.clone(),
             status_map: status_map.clone(),
+            holders: Arc::default(),
             concurrency_limit: concurrency_limit.clone(),
             outcomes: outcomes.clone(),
             next_waiter_id: AtomicU64::new(1),
@@ -376,7 +459,7 @@ impl<H: JobHost> JobQueue<H> {
     /// The check and claim are one step, so only the caller that holds the
     /// claim can prepare the job and pass it to [`Self::submit_claimed`].
     pub fn claim_if_idle(&self, job: &H::Job) -> bool {
-        Self::claim(&self.status_map, job.key(), job.job_type())
+        Self::claim(&self.status_map, &self.holders, job.key(), job.job_type())
     }
 
     /// Submit a job whose URL the caller claimed with [`Self::claim_if_idle`].
@@ -387,7 +470,14 @@ impl<H: JobHost> JobQueue<H> {
     }
 
     /// A claim blocks jobs of the same type. Different types can share a key.
-    fn claim(status_map: &DashMap<String, JobStatus>, url: &str, job_type: &'static str) -> bool {
+    /// The claim written is counted a holder ahead of its entry, under the
+    /// entry's lock, so nothing meets the entry before its count.
+    fn claim(
+        status_map: &DashMap<String, JobStatus>,
+        holders: &Holders,
+        url: &str,
+        job_type: &'static str,
+    ) -> bool {
         match status_map.entry(url.to_string()) {
             Entry::Occupied(e)
                 if e.get().job_type == job_type
@@ -396,6 +486,7 @@ impl<H: JobHost> JobQueue<H> {
                 false
             }
             entry => {
+                holders.hold(url);
                 entry.insert(JobStatus::pending(job_type, url));
                 true
             }
@@ -415,10 +506,10 @@ impl<H: JobHost> JobQueue<H> {
     pub async fn submit_unless_in_flight(&self, job: H::Job) -> Result<bool, String> {
         let worker_url = job.key().to_string();
         let job_type = job.job_type();
-        if !Self::claim_unless_in_flight(&self.status_map, &worker_url, job_type) {
+        if !Self::claim_unless_in_flight(&self.status_map, &self.holders, &worker_url, job_type) {
             return Ok(false);
         }
-        self.submit_inner(job, true, None).await.map(|()| true)
+        self.submit_then_turn(job, &worker_url).await.map(|()| true)
     }
 
     /// Submit `job` unless a registration is pending or processing under its
@@ -438,6 +529,7 @@ impl<H: JobHost> JobQueue<H> {
                 return Ok(false);
             }
             entry => {
+                self.holders.hold(&worker_url);
                 entry.insert(JobStatus::pending(job_type, &worker_url));
             }
         }
@@ -448,16 +540,20 @@ impl<H: JobHost> JobQueue<H> {
     /// kept jobs in order. If the holder ended before the job was kept, this
     /// call tries to submit the next kept job. Returns `Ok(true)` when it
     /// submits from the same group it kept. Non-removals share a group and
-    /// removals are grouped by asker for this answer.
+    /// removals are grouped by asker for this answer. A holder that claimed
+    /// the key through this function or [`Self::submit_unless_in_flight`] and
+    /// left before its own job was queued (a caller dropped on a full queue)
+    /// runs the kept jobs too, if no other holder is left at that moment.
     pub async fn submit_or_defer(&self, job: H::Job) -> Result<bool, String> {
         let worker_url = job.key().to_string();
-        if Self::claim_unless_in_flight(&self.status_map, &worker_url, job.job_type()) {
-            return self.submit_inner(job, true, None).await.map(|()| true);
+        let holders = &self.holders;
+        if Self::claim_unless_in_flight(&self.status_map, holders, &worker_url, job.job_type()) {
+            return self.submit_then_turn(job, &worker_url).await.map(|()| true);
         }
         let removal_asker = job.is_removal().then(|| job.asker().cloned());
         Self::keep(&self.kept, &worker_url, job);
         let Some(next) = Self::take_next(&self.kept, &worker_url, |next| {
-            Self::claim_unless_in_flight(&self.status_map, &worker_url, next.job_type())
+            Self::claim_unless_in_flight(&self.status_map, holders, &worker_url, next.job_type())
         }) else {
             return Ok(false);
         };
@@ -468,7 +564,7 @@ impl<H: JobHost> JobQueue<H> {
         } else {
             removal_asker.is_none()
         };
-        self.submit_inner(next, true, None).await.map(|()| own)
+        self.submit_then_turn(next, &worker_url).await.map(|()| own)
     }
 
     /// Keeps `job` for `url` under the rules of [`Kept`].
@@ -506,10 +602,14 @@ impl<H: JobHost> JobQueue<H> {
         status_map: &Arc<DashMap<String, JobStatus>>,
         kept: &DashMap<String, Kept<H::Job>>,
         cancelled_before_start: &DashSet<WorkerId>,
+        holders: &Arc<Holders>,
     ) {
         while let Some(job) = Self::take_next(kept, worker_url, |next| {
-            Self::claim_unless_in_flight(status_map, worker_url, next.job_type())
+            Self::claim_unless_in_flight(status_map, holders, worker_url, next.job_type())
         }) {
+            // The hold the job's claim took ends with the job, before the
+            // next kept job is claimed.
+            let _hold = Hold::of(holders, worker_url, true);
             let job_type = job.job_type();
             debug!(
                 asker = job.asker().map(field::debug),
@@ -553,9 +653,43 @@ impl<H: JobHost> JobQueue<H> {
         }
     }
 
+    /// Gives the jobs kept under `url` their turn when a claim made with no
+    /// job in flight under it went back without its job: no completion is
+    /// left to run them. They run as at a job's end ([`Self::run_kept`]), on a
+    /// task of their own. Outside a runtime (a caller dropped after the
+    /// runtime's end) nothing runs.
+    fn run_kept_without_holder(&self, url: &str) {
+        let (Some(host), Ok(runtime)) = (self.host(), tokio::runtime::Handle::try_current()) else {
+            return;
+        };
+        let url = url.to_string();
+        let status_map = self.status_map.clone();
+        let kept = self.kept.clone();
+        let marks = self.cancelled_before_start.clone();
+        let holders = self.holders.clone();
+        // The runtime's handle, not `tokio::spawn`, which panics where a
+        // claim is dropped outside a runtime. The task is detached like the
+        // one that runs the kept jobs at a job's end: a shutdown cuts a kept
+        // removal off mid-drain there and here alike.
+        runtime.spawn(async move {
+            Self::run_kept(&url, &host, &status_map, &kept, &marks, &holders).await;
+        });
+    }
+
+    /// `submit_inner` for the job of a claim made with no job in flight under
+    /// `url` (`claim_unless_in_flight`). The kept jobs' turn is declared
+    /// first, so it comes after the submission gave its hold back and took
+    /// its claim out: a kept job started there finds the URL free.
+    async fn submit_then_turn(&self, job: H::Job, url: &str) -> Result<(), String> {
+        let _turn = KeptTurn { queue: self, url };
+        self.submit_inner(job, true, None).await
+    }
+
     /// Any in-flight job under the key blocks the claim, whatever its type.
+    /// The claim written is counted a holder under the entry's lock.
     fn claim_unless_in_flight(
         status_map: &DashMap<String, JobStatus>,
+        holders: &Holders,
         url: &str,
         job_type: &'static str,
     ) -> bool {
@@ -564,6 +698,7 @@ impl<H: JobHost> JobQueue<H> {
                 false
             }
             entry => {
+                holders.hold(url);
                 entry.insert(JobStatus::pending(job_type, url));
                 true
             }
@@ -590,6 +725,14 @@ impl<H: JobHost> JobQueue<H> {
         // Extract values before moving job
         let job_type = job.job_type();
         let worker_url = job.key().to_string();
+        // A plain submission that ends before its slot leaves no completion:
+        // the kept jobs get their turn behind it, as behind a claim that goes
+        // back. Declared first, so the turn comes after the hold is given
+        // back.
+        let _turn = (!claimed).then(|| KeptTurn {
+            queue: self,
+            url: &worker_url,
+        });
         // A claimed submission holds its entry only as long as it lives:
         // ended or dropped before a slot is held, the claim goes with it. A
         // plain one builds no guard (built eagerly, a guard would drop at once
@@ -600,6 +743,9 @@ impl<H: JobHost> JobQueue<H> {
             job_type,
             held: false,
         });
+        // A plain submission holds the URL from here, a claimed one from its
+        // claim. The hold goes with a submission that ends before its slot.
+        let hold = Hold::of(&self.holders, &worker_url, claimed);
         let Some(host) = self.host() else {
             return Err(format!("Job queue shutting down: {} dropped", H::NAME));
         };
@@ -619,7 +765,7 @@ impl<H: JobHost> JobQueue<H> {
         // Record pending status
         Self::write_pending(&self.status_map, &worker_url, job_type, claimed);
         host.accepted(&job);
-        permit.send(Queued { job, waiter });
+        permit.send(Queued { job, waiter, hold });
 
         let (queue_depth, available_permits) = self.get_load_info();
         debug!(
@@ -736,7 +882,7 @@ impl<H: JobHost> JobQueue<H> {
         cancelled_before_start: Arc<DashSet<WorkerId>>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        let Queued { job, waiter } = queued;
+        let Queued { job, waiter, hold } = queued;
         let job_type = job.job_type();
         let worker_url = job.key().to_string();
         let start = std::time::Instant::now();
@@ -794,12 +940,18 @@ impl<H: JobHost> JobQueue<H> {
                     Self::end_mark(&status_map, &cancelled_before_start, &id);
                 }
                 Self::deliver_outcome(&outcomes, &worker_url, waiter, result);
+                // The job's hold ends before the kept jobs' turn: a claim that
+                // refuses this turn and then goes back finds no holder left
+                // and gives them theirs.
+                let holders = Arc::clone(&hold.holders);
+                drop(hold);
                 Self::run_kept(
                     &worker_url,
                     &host,
                     &status_map,
                     &kept,
                     &cancelled_before_start,
+                    &holders,
                 )
                 .await;
             }
