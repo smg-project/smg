@@ -13,13 +13,19 @@ on:
 permissions:
   contents: read
 
-# One group per PR and one per branch (main, release/*): a newer push cancels the
-# superseded run. On a branch this tests HEAD rather than every intermediate commit: back-to-back
-# merges otherwise stack full GPU matrices on one runner pool and time each
-# other out. Re-run an intermediate commit via workflow_dispatch if needed.
+# One group per pull request and one per branch (main, release/*). A pull
+# request's newer push cancels its superseded run (keep the pull request form
+# in sync with cancel-pr-workflows.yml). A branch run (push to main or
+# release/*, or workflow_dispatch) runs to completion instead of being killed
+# mid-matrix by the next merge: GitHub Actions keeps at most one in-progress
+# run and one pending run per group, so back-to-back merges never stack GPU
+# matrices on the runner pool — later pushes replace the single pending run at
+# zero compute cost while the active run finishes, records a branch verdict for
+# version-only inheritance and release checks, and saves the build-wheel Rust
+# cache on main.
 concurrency:
   group: gateway-tests-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref_name }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   GENAI_BENCH_IMAGE: ghcr.io/moirai-internal/genai-bench:0.0.4
@@ -669,11 +675,20 @@ jobs:
   # uploaded and summarized.
   benchmarks:
     needs: [build-wheel, detect-changes]
-    # Neither for a docs-only change nor for a version-only one: its numbers are
-    # the commit's it inherits the card tier from.
+    # Opt-in on pull requests via the `ci:bench` label (read from the event
+    # like `ci:full`, so labelling after a push takes effect on the next push
+    # or close/reopen) or automatically when the PR modifies the PR benchmark
+    # harness; runs on push and workflow_dispatch except for docs-only or
+    # version-only changes (whose numbers are the commit's it inherits the card
+    # tier from).
     if: >-
       needs.detect-changes.outputs.docs-only != 'true'
       && needs.detect-changes.outputs.card-tier-from == ''
+      && (
+        github.event_name != 'pull_request'
+        || contains(github.event.pull_request.labels.*.name, 'ci:bench')
+        || needs.detect-changes.outputs.bench-harness == 'true'
+      )
     runs-on: ${{ vars.SMG_RUNNER_GPU_4 || '4-gpu-h100' }}
     container: ${{ vars.SMG_CI_GPU_CONTAINER_IMAGE }}
     continue-on-error: true
@@ -736,7 +751,9 @@ jobs:
           retention-days: 7
 
   # Initial advisory AMD PR performance slice: same regular HTTP/gRPC test,
-  # four TP1 workers and thresholds as NVIDIA. PD performance remains separate.
+  # four TP1 workers and thresholds as NVIDIA. Opt-in via the `ci:bench` label
+  # (or changes to the PR benchmark harness) like `benchmarks`, in addition to
+  # the AMD repo variables. PD performance remains separate.
   benchmarks-amd:
     needs: [build-wheel, detect-changes]
     if: >-
@@ -745,6 +762,10 @@ jobs:
       && vars.SMG_RUN_AMD_ON_PRS == 'true'
       && vars.SMG_RUN_AMD_PR_BENCHMARK == 'true'
       && github.event_name == 'pull_request'
+      && (
+        contains(github.event.pull_request.labels.*.name, 'ci:bench')
+        || needs.detect-changes.outputs.bench-harness == 'true'
+      )
       && needs.build-wheel.result == 'success'
       && needs.detect-changes.result == 'success'
       && needs.detect-changes.outputs.docs-only != 'true'
@@ -837,6 +858,8 @@ jobs:
       # request can affect (every shard on a push or a dispatch); '[]' skips the job.
       rust-shards: ${{ steps.rust-shards.outputs.rust-shards }}
       dependencies: ${{ steps.filter.outputs.dependencies }}
+      # Whether the pull request modifies the PR benchmark harness itself.
+      bench-harness: ${{ steps.filter.outputs.bench-harness }}
       # The GPU e2e lanes' decisions, one per area, from the tier table (the same step).
       skip-chat-one-engine: ${{ steps.lanes.outputs.skip-chat-one-engine }}
       skip-chat-completions: ${{ steps.lanes.outputs.skip-chat-completions }}
@@ -1070,6 +1093,16 @@ jobs:
               - '.cargo/audit.toml'
               - 'scripts/ci_cargo_audit.sh'
               - '.github/workflows/pr-test-rust.yml'
+            # The PR benchmark harness: automatically runs the advisory
+            # benchmark job(s) on PRs that modify the harness itself, excluding
+            # docs and the nightly-only / disabled Go benchmark scripts.
+            bench-harness:
+              - 'e2e_test/benchmarks/**'
+              - '!e2e_test/benchmarks/**/*.md'
+              - '!e2e_test/benchmarks/test_nightly_perf.py'
+              - '!e2e_test/benchmarks/nightly_summarize.py'
+              - '!e2e_test/benchmarks/test_go_bindings_perf.py'
+              - 'scripts/ci/validate_pr_benchmark.py'
 
       # The version-only shortcut: a change that moves nothing but the release version
       # carriers (scripts/ci_version_only.py: the manifests' version lines and workspace
@@ -2605,7 +2638,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, build-go-ffi, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, build-go-ffi, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-chat-python-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-cpu-mock, e2e-vendor, go-unit-tests, go-bindings-e2e]
     if: always()
     # A hosted runner, never a self-hosted pool: this job runs on a cancelled
     # run too, and a cancelled run is complete only once it has run. Until
