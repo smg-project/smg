@@ -29,14 +29,40 @@ use std::{
 use axum::response::Response;
 use llm_multimodal::{
     hub::HubFetchError, AudioClip, EncoderFieldLayouts, EncoderInputFormat, ImageFrame,
-    MediaConnectorError, MediaErrorCode, MediaFault, Modality, MultiModalError, PlaceholderRange,
-    PreprocessedEncoderInputs, VideoClip,
+    MediaConnectorError, MediaErrorCode, MediaFault, Modality, ModelMetadata, ModelRegistry,
+    MultiModalError, PlaceholderRange, PreprocessedEncoderInputs, VideoClip,
 };
 use llm_tokenizer::{Encoding, TokenizerTrait};
 
 use crate::routers::{
     common::retry::mark_non_retryable, error, grpc::proto_wrapper::VLLM_MROPE_GRID_KEYS,
 };
+
+/// Whether the prepared images or videos of `model_id` carry the grid
+/// tensors of [`MultimodalIntermediate::has_mrope_grids`]: its spec, found
+/// from its `tokenizer` and `config` as the pipeline finds it, lays out a
+/// grid field ([`VLLM_MROPE_GRID_KEYS`]) for one of them. `None` if no spec
+/// matches the model.
+pub(crate) fn model_media_carries_mrope_grids(
+    specs: &ModelRegistry,
+    model_id: &str,
+    tokenizer: &dyn TokenizerTrait,
+    config: &MultimodalModelConfig,
+) -> Option<bool> {
+    let tokenizer = RegistryTokenizer(tokenizer);
+    let metadata = ModelMetadata {
+        model_id,
+        tokenizer: &tokenizer,
+        config: &config.config,
+    };
+    let spec = specs.lookup(&metadata)?;
+    let lays_out_grids = |modality| {
+        let layouts = spec.encoder_field_layouts_for(modality);
+        let mut fields = layouts.model_specific.keys();
+        fields.any(|field| VLLM_MROPE_GRID_KEYS.contains(&field.as_str()))
+    };
+    Some(lays_out_grids(Modality::Image) || lays_out_grids(Modality::Video))
+}
 
 /// Bridges the gateway's tokenizer to the model registry's local tokenizer
 /// seam: `llm-multimodal` deliberately depends on no tokenizer crate, so the

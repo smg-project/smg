@@ -7,6 +7,6 @@ mod preparation;
 mod request_building;
 mod response_processing;
 
-pub(crate) use preparation::GeneratePreparationStage;
+pub(crate) use preparation::{refuses_media, GeneratePreparationStage};
 pub(crate) use request_building::GenerateRequestBuildingStage;
 pub(crate) use response_processing::GenerateResponseProcessingStage;

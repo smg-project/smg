@@ -7,7 +7,7 @@ use axum::{
 };
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
-    model_card::ModelCard,
+    model_card::ModelCard, worker::WorkerStatus,
 };
 use serde_json::{json, Value};
 use smg_worker::identity::basic::WorkerType;
@@ -303,4 +303,120 @@ async fn native_selectors_pin_mixed_fleets_and_preserve_http_only_routing() {
             assert_eq!(response["lora_path"], "adapter");
         }
     }
+}
+
+/// An adapter request goes only to a family whose SGLang workers can serve.
+/// The regular family's SGLang worker is down, so the PD family gets every
+/// request. The ready vLLM worker gives no weight, because adapter requests
+/// do not go to it.
+#[test]
+fn an_adapter_request_goes_to_the_family_that_can_serve_it() {
+    use RuntimeType::{Sglang, Vllm};
+    use WorkerStatus::{NotReady, Ready};
+    let registry = Arc::new(WorkerRegistry::new());
+    for (port, role, runtime, status) in [
+        (9640, WorkerType::Regular, Sglang, NotReady),
+        (9641, WorkerType::Regular, Vllm, Ready),
+        (9642, WorkerType::Prefill, Sglang, Ready),
+        (9643, WorkerType::Decode, Sglang, Ready),
+    ] {
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
+                    .model(ModelCard::new("base"))
+                    .worker_type(role)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(runtime)
+                    .status(status)
+                    .build(),
+            ))
+            .unwrap();
+    }
+    let mut gateway = Gateway::new(registry);
+    gateway.enable_igw = true;
+    gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(Capture("grpc")));
+    gateway.register_router(router_ids::GRPC_PD, Arc::new(Capture("grpc_pd")));
+
+    for draw in 0..100 {
+        let router = gateway
+            .select_router_for_adapter("base", Some("adapter"), EpdDemand::Pair)
+            .expect("the pair serves the adapter");
+        assert_eq!(router.router_type(), "grpc_pd", "draw {draw}");
+    }
+}
+
+/// The adapter draw sees the request's media. It counts only SGLang
+/// workers, and SGLang has no encode role, so the EPD router cannot use the
+/// ready encode worker. An adapter request with media goes to the regular
+/// family, and the EPD family still takes text.
+#[test]
+fn an_adapter_request_with_media_needs_an_encode_worker_the_epd_router_can_use() {
+    let registry = Arc::new(WorkerRegistry::new());
+    for (port, role) in [
+        (9650, WorkerType::Regular),
+        (9651, WorkerType::Encode),
+        (9652, WorkerType::Prefill),
+        (9653, WorkerType::Decode),
+    ] {
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new(format!("http://127.0.0.1:{port}"))
+                    .model(ModelCard::new("base"))
+                    .worker_type(role)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .runtime_type(RuntimeType::Sglang)
+                    .status(WorkerStatus::Ready)
+                    .build(),
+            ))
+            .unwrap();
+    }
+    let mut gateway = Gateway::new(registry);
+    gateway.enable_igw = true;
+    gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(Capture("grpc")));
+    gateway.register_router(router_ids::GRPC_EPD, Arc::new(Capture("grpc_epd")));
+
+    let draw = |epd| {
+        gateway
+            .select_router_for_adapter("base", Some("adapter"), epd)
+            .expect("a family serves the adapter")
+            .router_type()
+    };
+    for draw_index in 0..100 {
+        assert_eq!(
+            draw(EpdDemand::PairAndEncoder { vision: true }),
+            "grpc",
+            "draw {draw_index}"
+        );
+    }
+    let text: Vec<_> = (0..100).map(|_| draw(EpdDemand::Pair)).collect();
+    assert!(
+        text.contains(&"grpc_epd"),
+        "the EPD family took no text: {text:?}"
+    );
+}
+
+/// Every family of the adapter draw is a gRPC family. A generate request with
+/// media still goes to one of them, which refuses it with its own `400`, as
+/// before.
+#[test]
+fn an_adapter_generate_request_with_media_still_goes_to_a_grpc_family() {
+    let registry = Arc::new(WorkerRegistry::new());
+    registry
+        .register(Arc::new(
+            BasicWorkerBuilder::new("http://127.0.0.1:9660")
+                .model(ModelCard::new("base"))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Sglang)
+                .status(WorkerStatus::Ready)
+                .build(),
+        ))
+        .unwrap();
+    let mut gateway = Gateway::new(registry);
+    gateway.enable_igw = true;
+    gateway.register_router(router_ids::GRPC_REGULAR, Arc::new(Capture("grpc")));
+    let router = gateway
+        .select_router_for_adapter("base", Some("adapter"), EpdDemand::GrpcRefused)
+        .expect("the gRPC family answers the refusal");
+    assert_eq!(router.router_type(), "grpc");
 }

@@ -2798,24 +2798,15 @@ impl WorkerSelectionStage {
         }
         // References go to E only; P consumes EC and D consumes KV. Diagnose
         // permanent constraints against membership, not transient health.
-        let compatible = |encoder: &Arc<dyn Worker>, worker: &dyn Worker| {
-            let runtime = worker.metadata().spec.runtime_type;
-            encoder.metadata().spec.runtime_type == runtime
-                && (PdProtocol::encode_handoff(runtime) != Some(EncodeHandoff::Push)
-                    || worker.worker_type() != &WorkerType::Prefill
-                    || ec_pair(encoder.as_ref(), worker))
-        };
+        let compatible =
+            |encoder: &Arc<dyn Worker>, worker: &dyn Worker| encodes_for(encoder.as_ref(), worker);
         let registered_ec = |worker: &dyn Worker| {
             !needs_encode
                 || registered_encode
                     .iter()
                     .any(|e| capable(e) && compatible(e, worker))
         };
-        let decode_vision = |worker: &dyn Worker| {
-            worker.metadata().spec.runtime_type != RuntimeType::Vllm
-                || worker.worker_type() != &WorkerType::Decode
-                || vision_capable(worker)
-        };
+        let decode_vision = decode_takes_vision;
         let pairs = snapshot.pd_pairs(PdWire::Grpc, self.policy_registry.pd_pairing_mode());
         let ec_pair_exists = pair_admitted_by(&pairs, demand.wire, &registered_ec);
         if !ec_pair_exists && pair_admitted_by(&pairs, demand.wire, &|_| true) {
@@ -2942,6 +2933,33 @@ fn ec_role(worker: &dyn Worker, role: &str) -> bool {
         && labels
             .get("ec_connector")
             .is_some_and(|value| !value.is_empty())
+}
+
+/// Whether `encoder` can encode media for `worker`, a prefill or decode
+/// worker. Both have the same runtime, and that runtime has an encode role.
+/// Under a push handoff, a prefill worker also takes the encoder's EC
+/// transfer. The EPD selection uses this rule, and so does the gateway's
+/// family draw.
+pub(crate) fn encodes_for(encoder: &dyn Worker, worker: &dyn Worker) -> bool {
+    let runtime = worker.metadata().spec.runtime_type;
+    encoder.metadata().spec.runtime_type == runtime
+        && match PdProtocol::encode_handoff(runtime) {
+            Some(EncodeHandoff::Push) => {
+                worker.worker_type() != &WorkerType::Prefill || ec_pair(encoder, worker)
+            }
+            Some(EncodeHandoff::Rendezvous) => true,
+            None => false,
+        }
+}
+
+/// Whether `worker` can take the decode side of a request whose media
+/// carries mRoPE grids: a vLLM decode worker needs a vision encoder, and
+/// every other worker takes it. The EPD selection uses this rule, and so
+/// does the gateway's family draw.
+pub(crate) fn decode_takes_vision(worker: &dyn Worker) -> bool {
+    worker.metadata().spec.runtime_type != RuntimeType::Vllm
+        || worker.worker_type() != &WorkerType::Decode
+        || vision_capable(worker)
 }
 
 /// EC producers and consumers must speak the same transfer protocol.
