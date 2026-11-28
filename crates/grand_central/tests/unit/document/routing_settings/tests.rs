@@ -2,8 +2,9 @@ use serde_json::json;
 
 use super::{translation::label_refused, *};
 use crate::{
-    document::spec::{
-        AppliedSpec, BindingSpec, IndexSpec, OverloadSpec, PlanName, Recovery, PRESETS,
+    document::{
+        applied::AppliedSpec,
+        spec::{BindingSpec, IndexSpec, OverloadSpec, PlanName, Recovery, PRESETS},
     },
     engine::{
         framework::{InTheWay, Place, Plan},

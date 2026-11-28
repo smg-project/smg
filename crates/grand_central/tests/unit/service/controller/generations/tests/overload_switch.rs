@@ -16,11 +16,11 @@ use super::{
 };
 use crate::{
     document::{
+        applied::AppliedSpec,
         operator::{
             test_support::{standing, stock},
             DocumentManager, Format, SpecRejected,
         },
-        spec::AppliedSpec,
     },
     engine::view::WorkerId,
     service::elector::Fence,

@@ -14,11 +14,12 @@ use super::{
 };
 use crate::{
     document::{
+        applied::AppliedSpec,
         operator::{
             test_support::{bound_to, standing, stock, LEAST_LOAD, RANDOM},
             ApplyOutcome,
         },
-        spec::{AppliedSpec, Digest, PolicySpec, SpecError},
+        spec::{Digest, PolicySpec, SpecError},
     },
     service::elector::Elector,
     stages::registry::StageRegistry,

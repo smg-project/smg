@@ -21,7 +21,10 @@ use smg_worker::{
 
 use super::*;
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec, ShadowSpec},
+    document::{
+        applied::AppliedSpec,
+        spec::{PolicySpec, ShadowSpec},
+    },
     engine::{
         decision::{LiftedVeto, ShedReason, Targets, SUBSET_HINT},
         decision_engine::{DecisionEngine, HeldDecision, HeldDecode},

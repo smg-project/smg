@@ -7,7 +7,7 @@ use super::{
     bed, booked, busy, frame_for, leading, outcome, pair_of, phased, written_ready, GATEWAY, MODEL,
 };
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         view::{Role, WireModes, WorkerId},
         DemandFacts,

@@ -94,7 +94,10 @@ use super::{
 #[cfg(feature = "controller")]
 use crate::store::Position;
 use crate::{
-    document::spec::{AppliedSpec, Digest, PolicySpec, SpecError},
+    document::{
+        applied::AppliedSpec,
+        spec::{Digest, PolicySpec, SpecError},
+    },
     engine::{framework, framework::Engine},
     stages::registry::StageRegistry,
     store::{MemoryStore, StaleGeneration},

@@ -8,7 +8,10 @@ use tokio::{sync::watch, task::JoinSet, time::timeout};
 
 use super::{over_kinds, Gateways, Refused, SessionPlace, Vetoed, KINDS_MAX, VETOES_MAX};
 use crate::{
-    document::spec::{AppliedSpec, Assignment, PolicySpec, Recovery, RulePlaced},
+    document::{
+        applied::AppliedSpec,
+        spec::{Assignment, PolicySpec, Recovery, RulePlaced},
+    },
     engine::{
         sticky_sessions::{SessionRule, SessionVerdict},
         view::{Role, Session, WorkerId},

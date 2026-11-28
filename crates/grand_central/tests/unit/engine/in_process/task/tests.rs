@@ -24,7 +24,7 @@ use tokio::{
 };
 
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},
         in_process::{

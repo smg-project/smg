@@ -76,7 +76,7 @@ use super::{admitted, hold_to_rule, Call, PlaceRequest, Unplaced, WorkerRule, AS
 #[cfg(feature = "controller")]
 use crate::engine::decision::{Decision, Shed};
 use crate::{
-    document::spec::AppliedSpec,
+    document::applied::AppliedSpec,
     engine::{
         decision::{PairSide, ShedReason, TARGET_WORKER},
         in_process::Loaded,
@@ -200,7 +200,7 @@ pub(crate) fn reached(
 
 /// One call for a single request over `list`, under a document one of
 /// whose bindings names a target source
-/// ([`AppliedSpec::names_target`](crate::document::spec::AppliedSpec::names_target)).
+/// ([`AppliedSpec::names_target`](crate::document::applied::AppliedSpec::names_target)).
 /// A request that names no worker is placed as under any other document
 /// ([`super::single`]): its binding has no such source, or it carries no
 /// text under the header.

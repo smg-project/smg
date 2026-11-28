@@ -23,7 +23,7 @@ use smg_worker::{
 
 use super::{handed, id, in_id_order, started, told, url, Follow, MODEL};
 use crate::{
-    document::spec::AppliedSpec,
+    document::applied::AppliedSpec,
     engine::{
         decision_engine::{DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists},
         in_process::{

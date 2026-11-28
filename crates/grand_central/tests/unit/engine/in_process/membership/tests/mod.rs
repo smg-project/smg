@@ -32,7 +32,7 @@ use tokio::{
 
 use super::{Follow, Members};
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         decision_engine::DecisionEngine,
         in_process::{

@@ -78,7 +78,7 @@ use smg_worker::load::state::LoadSnapshot;
 
 use super::{place::Made, Loaded, PoolMembers};
 use crate::{
-    document::spec::AppliedSpec,
+    document::applied::AppliedSpec,
     engine::{
         decision::Decision,
         decision_engine::{Request, RequestMaker},

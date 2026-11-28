@@ -19,7 +19,10 @@ use parking_lot::Mutex;
 
 use super::{InForce, Loaded, SpecHandle};
 use crate::{
-    document::spec::{AppliedSpec, BindingSpec, Match, PolicySpec},
+    document::{
+        applied::AppliedSpec,
+        spec::{BindingSpec, Match, PolicySpec},
+    },
     engine::{
         decision::{Decision, Target, Targets},
         decision_engine::{DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists},

@@ -22,7 +22,10 @@ use super::{
     *,
 };
 use crate::{
-    document::spec::{AppliedSpec, KeySourceSpec, PolicySpec, RoutingKeySpec, ShadowSpec},
+    document::{
+        applied::AppliedSpec,
+        spec::{KeySourceSpec, PolicySpec, RoutingKeySpec, ShadowSpec},
+    },
     engine::{
         decision_engine::{Decided, DecisionEngine, WorkerLists},
         framework::Place,

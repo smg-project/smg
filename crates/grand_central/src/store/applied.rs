@@ -38,7 +38,7 @@ use std::{ops::Deref, time::Instant};
 use crate::engine::in_process::{InProcess, Loaded, SpecHandle};
 #[cfg(not(feature = "in-process"))]
 use crate::stages::Lifecycle;
-use crate::{document::spec::AppliedSpec, store::StaleGeneration, tracking::lease::Membership};
+use crate::{document::applied::AppliedSpec, store::StaleGeneration, tracking::lease::Membership};
 
 /// The panics the engine of one store held under its own catches, as one
 /// read of the store answers them ([`MemoryStore::stats`]). A store keeps

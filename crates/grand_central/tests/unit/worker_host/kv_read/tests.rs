@@ -5,7 +5,7 @@ use smg_worker::{
 
 use super::*;
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         decision::{Decision, Shed, ShedReason, Trace},
         view::{AffinityHolder, RequestFacts, WorkerId},

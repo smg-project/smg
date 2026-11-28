@@ -2,7 +2,7 @@ use kv_index::{compute_request_content_hashes, salt::namespace_seed, XXH3_SEED};
 
 use super::{prompt_token_count, HashSeeds, PromptHashes};
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::view::{HashKind, RequestFacts, TEXT_BYTES_PER_TOKEN},
 };
 

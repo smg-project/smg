@@ -11,7 +11,10 @@ use smg_worker::identity::basic::Worker;
 use tokio::{runtime::Builder, task::yield_now};
 
 use crate::{
-    document::spec::{AffinitySource, AppliedSpec, PolicySpec, ScoreSpec, ScoreStage},
+    document::{
+        applied::AppliedSpec,
+        spec::{AffinitySource, PolicySpec, ScoreSpec, ScoreStage},
+    },
     engine::{
         decision_engine::DecisionEngine,
         in_process::{

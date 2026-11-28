@@ -4,9 +4,11 @@ use std::sync::{
 };
 
 use crate::{
-    document::spec::{
-        AppliedSpec, Assignment, Needs, OverloadSpec, PolicySpec, PrefixAffinityParams, Recovery,
-        RulePlaced,
+    document::{
+        applied::AppliedSpec,
+        spec::{
+            Assignment, Needs, OverloadSpec, PolicySpec, PrefixAffinityParams, Recovery, RulePlaced,
+        },
     },
     engine::{
         decision::{Decision, LiftedVeto, ShedReason, Survivors, Targets},

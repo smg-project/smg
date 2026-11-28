@@ -12,8 +12,9 @@ use smg_worker::{
 
 use super::{super::InProcess, *};
 use crate::{
-    document::spec::{
-        AppliedSpec, Assignment, PolicySpec, RulePlaced, ScoreStage, ShadowSpec, WarmupSliceParams,
+    document::{
+        applied::AppliedSpec,
+        spec::{Assignment, PolicySpec, RulePlaced, ScoreStage, ShadowSpec, WarmupSliceParams},
     },
     engine::{
         decision::{LiftedVeto, Overlap, PlacedBy, Target, Targets, MAX_TARGETS},

@@ -9,11 +9,12 @@ use super::{
 };
 use crate::{
     document::{
+        applied::AppliedSpec,
         operator::{
             test_support::{bound_to, standing, stock, LEAST_LOAD, RANDOM},
             ApplyOutcome, EnforceRefused, NotHeld, OnFile, SpecRejected,
         },
-        spec::{AppliedSpec, PolicySpec},
+        spec::PolicySpec,
     },
     service::{
         controller::{

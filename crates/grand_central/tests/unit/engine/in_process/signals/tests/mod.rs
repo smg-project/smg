@@ -31,7 +31,10 @@ use smg_worker::{
 use tokio::{net::TcpListener, task::JoinSet};
 
 use crate::{
-    document::spec::{AcrossRanks, AppliedSpec, Needs, PolicySpec, ShadowSpec, SignalSpec},
+    document::{
+        applied::AppliedSpec,
+        spec::{AcrossRanks, Needs, PolicySpec, ShadowSpec, SignalSpec},
+    },
     engine::{
         decision::Decision,
         decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},

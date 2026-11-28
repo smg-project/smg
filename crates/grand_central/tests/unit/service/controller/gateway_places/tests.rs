@@ -12,7 +12,7 @@ use smg_worker::{identity::basic::Worker, registry::WorkerRegistry, test_support
 
 use super::{Asking, GatewayPlaces, Held, Taken};
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         decision::{SUBSET_HINT, WIRES},
         in_process::{InProcess, PoolMembers},

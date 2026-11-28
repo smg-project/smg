@@ -81,7 +81,7 @@ use super::{
     wire::{spent_keys, Checked, FrameLists, ItemsPlaced, Lists},
 };
 use crate::{
-    document::{spec::AppliedSpec, KeySources},
+    document::{applied::AppliedSpec, KeySources},
     engine::{
         decision::{shed, Decision, Pair, Pick, ShedReason, Target, TARGET_WORKER},
         decision_engine::{DecisionRefused, DecodeRefused, WorkerLists},

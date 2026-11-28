@@ -65,7 +65,7 @@ use rustc_hash::FxHashMap;
 #[cfg(feature = "in-process")]
 use crate::engine::in_process::Loaded;
 use crate::{
-    document::spec::{AppliedSpec, ViewLists},
+    document::{applied::AppliedSpec, spec::ViewLists},
     engine::view::{Role, WorkerId},
     store::{
         applied::Applied,

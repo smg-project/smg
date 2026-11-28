@@ -13,7 +13,10 @@ use super::{
     written,
 };
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec, ShadowSpec, PRESETS},
+    document::{
+        applied::AppliedSpec,
+        spec::{PolicySpec, ShadowSpec, PRESETS},
+    },
     engine::{
         decision::{Decision, ShadowKind, ShedReason},
         decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},

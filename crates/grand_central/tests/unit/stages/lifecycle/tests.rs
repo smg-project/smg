@@ -2,7 +2,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec, PRESETS},
+    document::{
+        applied::AppliedSpec,
+        spec::{PolicySpec, PRESETS},
+    },
     engine::view::{Health, WorkerId},
     tracking::lease::EventKind,
 };

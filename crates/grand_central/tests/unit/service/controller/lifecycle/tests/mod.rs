@@ -18,7 +18,7 @@ use super::{
     class, completed, dispatch, dispatched, outcome, reason, release, released, side, tells, told,
 };
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         decision::{Pair, Target, Targets},
         framework::{Picker, TieBand},

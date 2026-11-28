@@ -2,6 +2,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::*;
 use crate::{
+    document::applied::AppliedSpec,
     engine::{
         view::HashKind, Candidate, Constraints, Filter, PoolFacts, RequestFacts, Targets, TieBand,
     },

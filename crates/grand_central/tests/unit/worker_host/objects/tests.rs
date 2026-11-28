@@ -212,7 +212,7 @@ fn retry_demanding(
     use std::time::Instant;
 
     use crate::{
-        document::spec::AppliedSpec,
+        document::applied::AppliedSpec,
         engine::{Constraints, Decided, Demands, Request, RequestFacts, RequestMaker, WorkerLists},
     };
 
@@ -266,7 +266,7 @@ fn retry_demanding(
 #[test]
 fn a_stored_workers_demand_facts_are_lent_and_hold_a_retry_to_its_runtime() {
     use crate::{
-        document::spec::{AppliedSpec, PolicySpec},
+        document::{applied::AppliedSpec, spec::PolicySpec},
         engine::{Decision, DemandFacts, InProcess, Role, ShedReason},
     };
 
@@ -346,7 +346,7 @@ fn a_stored_workers_demand_facts_are_lent_and_hold_a_retry_to_its_runtime() {
 #[test]
 fn a_registration_that_changes_a_runtime_moves_the_retries_that_demand_it() {
     use crate::{
-        document::spec::{AppliedSpec, PolicySpec},
+        document::{applied::AppliedSpec, spec::PolicySpec},
         engine::{Decision, DemandFacts, InProcess, Role, ShedReason},
         worker_host::{
             membership_writer::tests::HolderDoor, MembershipWriteOutcome, MembershipWriter,

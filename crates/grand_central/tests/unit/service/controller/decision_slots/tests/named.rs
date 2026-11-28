@@ -8,7 +8,7 @@ use super::{
     sides_of, Bed, Step, GATEWAY, MODEL,
 };
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::view::{Role, WireModes, WorkerId},
     service::proto::{self, busy::Reason, decision::Outcome},
     store::{LeaseState, LeasesStore, WorkersStore},

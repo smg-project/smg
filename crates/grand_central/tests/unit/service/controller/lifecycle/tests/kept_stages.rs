@@ -26,7 +26,7 @@ use super::{
     a_completed, a_dispatched, a_released, counted, issued, issued_on, keyed, open, worker, A, KEY,
 };
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         decision::{Pair, Target, Targets},
         framework::{Picker, TieBand},

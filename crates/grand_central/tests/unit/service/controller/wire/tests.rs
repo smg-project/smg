@@ -3,7 +3,7 @@ use super::{
     MAX_ITEMS,
 };
 use crate::{
-    document::spec::{AppliedSpec, MAX_BLOCK_HASHES},
+    document::{applied::AppliedSpec, spec::MAX_BLOCK_HASHES},
     engine::{
         decision::{
             self, Decision, LiftedVeto, Pair, Pick, Queue, Shed, ShedReason, Survivors, Target,

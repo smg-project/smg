@@ -8,7 +8,10 @@ use smg_worker::{
 
 use super::*;
 use crate::{
-    document::spec::{AppliedSpec, DecodePick, PolicySpec},
+    document::{
+        applied::AppliedSpec,
+        spec::{DecodePick, PolicySpec},
+    },
     engine::{
         decision::{Decision, Target, Targets},
         decision_engine::{DecisionEngine, Request, RequestMaker, WorkerLists},

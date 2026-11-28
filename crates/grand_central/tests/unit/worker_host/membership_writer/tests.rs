@@ -13,7 +13,7 @@ use super::{
     MembershipWriter, Over, Precondition, Remover, RowRevision, Stated, Turn,
 };
 use crate::{
-    document::spec::{AppliedSpec, PolicySpec},
+    document::{applied::AppliedSpec, spec::PolicySpec},
     engine::{
         demands::DemandFacts,
         view::{Role, WireModes, WorkerId},
@@ -674,7 +674,10 @@ mod decided {
 
     use super::{door, stated, URL};
     use crate::{
-        document::spec::{AppliedSpec, Pairing, PolicySpec},
+        document::{
+            applied::AppliedSpec,
+            spec::{Pairing, PolicySpec},
+        },
         engine::{
             Constraints, DecideOutcome, Decided, Decision, Demands, InProcess, PairLists, Phase,
             Request, RequestFacts, RequestMaker, Role, ShedReason, WorkerId, WorkerLists,

@@ -12,7 +12,7 @@ use smg_worker::{
 };
 
 use super::*;
-use crate::document::spec::{AppliedSpec, PolicySpec};
+use crate::document::{applied::AppliedSpec, spec::PolicySpec};
 
 impl PublishedList {
     /// Whether the cell holds a value: whether a decision or the

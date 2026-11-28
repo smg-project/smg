@@ -91,7 +91,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smg_worker::identity::basic::Worker;
 
 use crate::{
-    document::spec::{AppliedSpec, IndexKind},
+    document::{applied::AppliedSpec, spec::IndexKind},
     engine::{
         decision::{Decision, Overlap, Target},
         decision_engine::{TextKey, TokenKey},

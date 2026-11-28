@@ -14,7 +14,10 @@ use super::{Replica, DECODE, MODEL, PREFILL, STRAY};
 #[cfg(debug_assertions)]
 use crate::store::pairing::{Member, PairClasses};
 use crate::{
-    document::spec::{AppliedSpec, Pairing, PolicySpec},
+    document::{
+        applied::AppliedSpec,
+        spec::{Pairing, PolicySpec},
+    },
     engine::{
         Constraints, Decision, InProcess, PairAdmission, PairLists, Phase, Request, RequestFacts,
         Role, WireModes, WorkerId,

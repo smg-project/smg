@@ -29,7 +29,10 @@ use tokio::{
 };
 
 use crate::{
-    document::spec::{AcrossRanks, AppliedSpec, Needs, PolicySpec, ShadowSpec, SignalSpec},
+    document::{
+        applied::AppliedSpec,
+        spec::{AcrossRanks, Needs, PolicySpec, ShadowSpec, SignalSpec},
+    },
     engine::{
         decision::Targets,
         framework::{Picker, Scorer, TieBand},

@@ -14,10 +14,7 @@ use smg_worker::{
 };
 
 use crate::{
-    document::{
-        spec::{AppliedSpec, PolicySpec},
-        Assignment,
-    },
+    document::{applied::AppliedSpec, spec::PolicySpec, Assignment},
     engine::{
         decision::Decision,
         decision_engine::{DecideOutcome, DecisionEngine, Request, RequestMaker, WorkerLists},
