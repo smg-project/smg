@@ -38,11 +38,11 @@ These rules hold for the whole spec:
 | `signals` | Named values of a worker's report. See [Signals](#signals). | Empty |
 | `plans.pd-pair` | The rules of a pair. See [Prefill and decode](#prefill-and-decode). | See there |
 | `bindings` | The bindings, in order. See [Bindings](#bindings). | Empty |
-| `explain.sample` | Each deciding thread keeps every Nth pick or shed it counts, for explain. N is 0 to 4294967295. | `0`: keeps none |
+| `explain.sample` | Each deciding thread keeps every Nth pick or shed it counts, for explain. The count can start over: see [Explain](metrics.md#explain). N is 0 to 4294967295. | `0`: keeps none |
 
 A `generation` of zero asks the service to number the spec. See [Updating a policy spec](guarantees.md#updating-a-spec).
 
-In a host's own process the engine counts a request only where an id names it. See [Explain and metrics](../REFERENCE.md#explain-and-metrics).
+In a host's own process the engine counts a request only where an id names it. See [Explain and metrics](metrics.md#explain).
 
 ## Profiles
 
@@ -480,7 +480,7 @@ A `single` binding can name a second profile, as in `shadow: next`.
 - Each scrape reads the engine once, and no request does.
 - A binding that names a shadow has its series from the first scrape: the four kinds, for each side it is counted by.
 - A single request's decision whose lease fails to issue counts no shadow.
-- [Gateway routing metrics](../REFERENCE.md#gateway-routing-metrics) has the series.
+- [Gateway routing metrics](metrics.md#gateway-routing-metrics) has the series.
 
 **When a shadow is skipped.** These rules are a `single` binding's:
 
