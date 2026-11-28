@@ -50,7 +50,7 @@ impl PoolRecords {
             rows.resize(self.len(), Candidate::default());
         }
         let rows = &mut rows[..self.len()];
-        let singly = Singly::new(self, workers, live);
+        let singly = Singly::new(&self.reported, workers, live);
         let mut write = |fixed: &Candidate, row: &mut Candidate| singly.write(fixed, row);
         let decision = engine.decide_drawn(
             drawn,
@@ -62,7 +62,7 @@ impl PoolRecords {
             cx,
             scratch,
         );
-        singly.paid();
+        self.paid(workers, live, singly.looked_up());
         decision
     }
 
@@ -99,7 +99,7 @@ impl PoolRecords {
             rows.resize(self.len(), Candidate::default());
         }
         let rows = &mut rows[..self.len()];
-        let singly = Singly::new(self, workers, live);
+        let singly = Singly::new(&self.reported, workers, live);
         let mut write = |fixed: &Candidate, row: &mut Candidate| singly.write(fixed, row);
         let claimed = engine.decide_claimed(
             drawn,
@@ -111,7 +111,7 @@ impl PoolRecords {
             cx,
             scratch,
         );
-        singly.paid();
+        self.paid(workers, live, singly.looked_up());
         claimed
     }
 }

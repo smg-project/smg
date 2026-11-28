@@ -1,6 +1,6 @@
 //! A pair's decision by each side's draw, as the records' own
 //! ([`PoolRecords::decide_pair_drawn`]), with the inputs of one side
-//! ([`DrawnRecords`]).
+//! beside its records ([`DrawnWorkers`]).
 //!
 //! The decision reads both lists' fixed rows and writes a row as a
 //! single's draw does ([`Singly`]): private items of the parent module,
@@ -18,12 +18,11 @@ use crate::engine::{
     view::{Candidate, Constraints, RequestFacts},
 };
 
-/// One side of a pair whose records are
-/// written as its draw asks about them: its list's records, the workers
-/// the list was made from, how they are read, and the stamp a pair writes
-/// on a record beside a single's.
-pub(crate) type DrawnRecords<'a> = (
-    &'a PoolRecords,
+/// The workers of one side of a pair whose records are written as its
+/// draw asks about them: the workers its list was made from, how they
+/// are read, and the stamp a pair writes on a record beside a single's.
+/// The side's records stand beside them.
+type DrawnWorkers<'a> = (
     &'a [Arc<dyn Worker>],
     &'a Live<'a>,
     &'a dyn Fn(&mut Candidate),
@@ -47,13 +46,13 @@ impl PoolRecords {
         engine: &Engine,
         facts: &RequestFacts<'_>,
         cx: &Constraints<'_>,
-        [prefills, decodes]: [DrawnRecords<'_>; 2],
+        [prefills, decodes]: [(&Self, DrawnWorkers<'_>); 2],
         (admits, pairs): (&mut dyn FnMut() -> bool, &dyn Fn() -> bool),
         rows: [&mut Vec<Candidate>; 2],
         scratch: &mut Scratch,
     ) -> Option<Decision> {
-        let (prefills, prefill_workers, prefill_live, prefill_stamp) = prefills;
-        let (decodes, decode_workers, decode_live, decode_stamp) = decodes;
+        let (prefills, (prefill_workers, prefill_live, prefill_stamp)) = prefills;
+        let (decodes, (decode_workers, decode_live, decode_stamp)) = decodes;
         if prefill_live.rest || prefills.has_ranks() || decodes.has_ranks() {
             return None;
         }
@@ -83,8 +82,8 @@ impl PoolRecords {
         if decode_rows.len() < decodes.len() {
             decode_rows.resize(decodes.len(), Candidate::default());
         }
-        let prefill_singly = Singly::new(prefills, prefill_workers, prefill_live);
-        let decode_singly = Singly::new(decodes, decode_workers, decode_live);
+        let prefill_singly = Singly::new(&prefills.reported, prefill_workers, prefill_live);
+        let decode_singly = Singly::new(&decodes.reported, decode_workers, decode_live);
         let mut write_prefill = |fixed: &Candidate, row: &mut Candidate| {
             prefill_singly.write(fixed, row);
             prefill_stamp(row);
@@ -110,8 +109,8 @@ impl PoolRecords {
             cx,
             scratch,
         );
-        prefill_singly.paid();
-        decode_singly.paid();
+        prefills.paid(prefill_workers, prefill_live, prefill_singly.looked_up());
+        decodes.paid(decode_workers, decode_live, decode_singly.looked_up());
         decision
     }
 }

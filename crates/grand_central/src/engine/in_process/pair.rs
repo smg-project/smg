@@ -696,8 +696,11 @@ impl<'a> PairLists<'a> {
                     facts,
                     cx,
                     [
-                        (prefill_records, workers, &live, &prefill_stamp),
-                        (decode_records, decode_workers, &decode_live, &decode_stamp),
+                        (prefill_records, (workers, &live, &prefill_stamp)),
+                        (
+                            decode_records,
+                            (decode_workers, &decode_live, &decode_stamp),
+                        ),
                     ],
                     (&mut admits, &pairs),
                     [&mut *prefills, &mut *decodes],

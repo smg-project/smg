@@ -1365,6 +1365,21 @@ impl PoolRecords {
         Some(converted)
     }
 
+    /// Pays `looked_up`, the records one decision wrote without the
+    /// list's rows ([`Singly::looked_up`]), toward the conversion of the
+    /// list's reports ([`LookUps`]): the draw that pays the last of the
+    /// list's length converts them, and the draws behind it copy the
+    /// rows. A decision that reads no snapshot of reports pays nothing.
+    // In line at its callers: as a call it costs a plain draw 16
+    // instructions and a pair's two sides 45, counted with Callgrind.
+    #[inline(always)]
+    fn paid(&self, workers: &[Arc<dyn Worker>], live: &Live<'_>, looked_up: u32) {
+        if let (Some(loads), true) = (live.loads, looked_up > 0) {
+            let held = self.reported.load();
+            let _ = self.convert(workers, loads, live, &held, looked_up);
+        }
+    }
+
     /// One worker's record for one decision: the record [`Self::write`]
     /// writes at `position`, for a caller that reads a few workers of a
     /// pool and not the pool. `None` for a position past the list.
@@ -1383,7 +1398,7 @@ impl PoolRecords {
         let fixed = self.fixed.get(position as usize)?;
         workers.get(position as usize)?;
         let mut row = *fixed;
-        Singly::new(self, workers, live).write(fixed, &mut row);
+        Singly::new(&self.reported, workers, live).write(fixed, &mut row);
         Some(row)
     }
 
@@ -1593,11 +1608,10 @@ impl LookUps {
 ///
 /// It holds the list's rows for the decision where they are of the
 /// decision's snapshot ([`Reported`]), read once. Where the list holds
-/// none, each record is written by a look-up of its worker's report, and a
-/// draw pays those toward the list's conversion at its end
-/// ([`Self::paid`]).
+/// none, each record is written by a look-up of its worker's report, and
+/// the list's records pay those toward the list's conversion at a draw's
+/// end ([`PoolRecords::paid`]).
 struct Singly<'a> {
-    pool: &'a PoolRecords,
     workers: &'a [Arc<dyn Worker>],
     live: &'a Live<'a>,
     /// The list's rows, where they are of the decision's snapshot.
@@ -1607,15 +1621,21 @@ struct Singly<'a> {
 }
 
 impl<'a> Singly<'a> {
-    fn new(pool: &'a PoolRecords, workers: &'a [Arc<dyn Worker>], live: &'a Live<'a>) -> Self {
+    /// The writer over `workers` as `live` reads them, with the rows of
+    /// the list's slot `reported` where they are of the decision's
+    /// snapshot.
+    fn new(
+        reported: &ArcSwapOption<Reported>,
+        workers: &'a [Arc<dyn Worker>],
+        live: &'a Live<'a>,
+    ) -> Self {
         let held = live.loads.and_then(|loads| {
-            let held = pool.reported.load();
+            let held = reported.load();
             held.as_deref()
                 .is_some_and(|reported| reported.is_of(loads))
                 .then_some(held)
         });
         Self {
-            pool,
             workers,
             live,
             held,
@@ -1623,20 +1643,11 @@ impl<'a> Singly<'a> {
         }
     }
 
-    /// Pays the decision's look-ups toward the conversion of its list's
-    /// reports ([`LookUps`]): the draw that pays the last of the list's
-    /// length converts them, and the draws behind it copy the rows.
-    // In line at its callers: as a call it costs a draw 20 instructions,
-    // counted with Callgrind.
-    #[inline(always)]
-    fn paid(&self) {
-        let looked_up = self.looked_up.get();
-        if let (Some(loads), true) = (self.live.loads, looked_up > 0) {
-            let held = self.pool.reported.load();
-            let _ = self
-                .pool
-                .convert(self.workers, loads, self.live, &held, looked_up);
-        }
+    /// How many records the decision wrote without the list's rows: what
+    /// the list's records pay toward the conversion of its reports
+    /// ([`LookUps`]).
+    fn looked_up(&self) -> u32 {
+        self.looked_up.get()
     }
 
     /// Writes into `row` the record of the worker `fixed` is the fixed
