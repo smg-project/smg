@@ -36,6 +36,7 @@ from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 from smg_grpc_servicer.constrained_decoding import (
     VLLM_SCHEMA_BACKENDS,
     answer_schema_in_place_of_tag,
+    answer_schema_the_engine_judges,
     structural_tag_vocabulary,
 )
 from smg_grpc_servicer.kv_relay import Engine, relay
@@ -107,6 +108,15 @@ try:
     from vllm.version import __version__ as VLLM_VERSION
 except Exception:  # pragma: no cover - version lookup is best-effort
     VLLM_VERSION = ""
+# The engine's own validation of a request under xgrammar, the features
+# xgrammar lacks and the conversion itself: a pinned xgrammar refuses by it
+# and `auto` falls back by it; None on a release that has none.
+try:
+    from vllm.v1.structured_output.backend_xgrammar import (
+        validate_xgrammar_grammar as _XGRAMMAR_VALIDATES,
+    )
+except Exception:  # pragma: no cover - a release without it still starts
+    _XGRAMMAR_VALIDATES = None
 
 
 def _valid_cpu_ec_handle(handle) -> bool:
@@ -1365,6 +1375,21 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 schema = answer_schema_in_place_of_tag(
                     params.structural_tag, structured_outputs_backend, VLLM_SCHEMA_BACKENDS
                 )
+                if schema is None:
+                    # The engine validates a request: it is handed one of its
+                    # own that holds the plain schema alone.
+                    schema = answer_schema_the_engine_judges(
+                        params.structural_tag,
+                        structured_outputs_backend,
+                        _XGRAMMAR_VALIDATES
+                        and (
+                            lambda plain: _XGRAMMAR_VALIDATES(
+                                SamplingParams(
+                                    structured_outputs=StructuredOutputsParams(json=plain)
+                                )
+                            )
+                        ),
+                    )
                 if schema is not None:
                     logger.debug(
                         "a structural tag that is a JSON answer's schema alone goes to the "

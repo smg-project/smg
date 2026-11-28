@@ -37,6 +37,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 # The `server_args` keys (SGLang, TokenSpeed) and the `GetServerInfo` fields
@@ -268,12 +269,17 @@ SGLANG_SCHEMA_BACKENDS = ("llguidance", "outlines")
 
 
 def answer_schema_in_place_of_tag(
-    structural_tag: str, grammar_backend: str, schema_backends: tuple[str, ...]
+    structural_tag: str,
+    grammar_backend: str,
+    schema_backends: tuple[str, ...],
+    bounded: bool = False,
 ) -> str | None:
     """The JSON schema to send in place of a structural tag that is a JSON
     answer's schema alone, where the engine's resolved ``grammar_backend`` is
     one of its ``schema_backends``; None for every other tag and backend,
-    which leaves the tag as it came.
+    which leaves the tag as it came. With ``bounded`` only a tag whose node
+    bounds the white space counts, and a tag that never names the bound is
+    left unparsed.
 
     A structural tag is spelled for xgrammar, and a caller that bounds the
     white space of a JSON answer wraps its schema in a tag of that one node.
@@ -288,6 +294,8 @@ def answer_schema_in_place_of_tag(
     grammar writes an object's properties in."""
     if str(grammar_backend).strip().split(":", 1)[0] not in schema_backends:
         return None
+    if bounded and '"max_whitespace_cnt"' not in structural_tag:
+        return None
     try:
         tag = json.loads(structural_tag)
     except ValueError:
@@ -298,6 +306,42 @@ def answer_schema_in_place_of_tag(
     excludes = node.get("excludes")
     if node.get("style", "json") != "json" or (isinstance(excludes, list) and excludes):
         return None
-    if "json_schema" not in node:
+    if "json_schema" not in node or (bounded and "max_whitespace_cnt" not in node):
         return None
     return json.dumps(node["json_schema"], separators=(",", ":"), ensure_ascii=False)
+
+
+def answer_schema_the_engine_judges(
+    structural_tag: str,
+    grammar_backend: str,
+    validate: Callable[[str], None] | None,
+) -> str | None:
+    """The JSON schema to send in place of a structural tag that is a JSON
+    answer's schema alone and bounds its white space
+    (:func:`answer_schema_in_place_of_tag`) where vLLM runs xgrammar, pinned
+    or as the first backend of ``auto``, and the engine's own validation
+    refuses that schema under xgrammar; None under every other backend, for
+    every other tag, and where the engine takes the schema, which leaves the
+    tag.
+
+    The engine validates a plain schema alone: one with a feature xgrammar
+    lacks, or one xgrammar fails to convert, is refused under a pinned
+    xgrammar and falls to the second backend under ``auto``. Inside a tag the
+    first goes to xgrammar unjudged, with the feature dropped, and the second
+    is refused under ``auto`` too, whose second backend reads no such tag.
+    Such a schema goes as the schema, so the engine answers it as it did
+    before a tag carried the bound; a tag without the bound is not one the
+    bound brought and stays a tag. ``validate`` hands a plain schema to the
+    engine's own validation, which raises where it refuses: no rule of the
+    engine is kept here, and an error of any kind reads as a refusal. An
+    engine that has none (None) gets the schema for every such tag."""
+    schema = answer_schema_in_place_of_tag(
+        structural_tag, grammar_backend, ("auto", "xgrammar"), bounded=True
+    )
+    if schema is None or validate is None:
+        return schema
+    try:
+        validate(schema)
+    except Exception:
+        return schema
+    return None

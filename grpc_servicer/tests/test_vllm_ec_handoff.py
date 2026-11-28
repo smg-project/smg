@@ -368,28 +368,60 @@ def _converter():
         "StructuredOutputsParams": dict,
         "RequestOutputKind": SimpleNamespace(DELTA="delta", FINAL_ONLY="final_only"),
         "logger": logging.getLogger(__name__),
+        "_XGRAMMAR_VALIDATES": _xgrammar_validates,
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
     return namespace["_sampling_params_from_proto"]
 
 
+_SCHEMAS = {
+    "plain": '{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}',
+    "lacked": '{"type":"array","items":{"type":"string"},"uniqueItems":true}',
+    "unconverted": '{"type":"string","pattern":"(?=a)a"}',
+}
+
+
+def _xgrammar_validates(request):
+    """In place of the engine's own validation of a request under xgrammar:
+    it raises for a schema with a feature xgrammar lacks and for one the
+    conversion fails on, each with an error of its own kind."""
+    schema = request.structured_outputs["json"]
+    if schema == _SCHEMAS["lacked"]:
+        raise ValueError("a feature xgrammar lacks")
+    if schema == _SCHEMAS["unconverted"]:
+        raise RuntimeError("the conversion failed")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("backend", "sent_as"),
+    ("backend", "schema", "bound", "sent_as"),
     [
-        ("guidance", "json"),
-        ("outlines", "json"),
-        ("lm-format-enforcer", "json"),
-        ("xgrammar", "structural_tag"),
-        ("auto", "structural_tag"),
+        ("guidance", "plain", "bound", "json"),
+        ("outlines", "plain", "bound", "json"),
+        ("lm-format-enforcer", "plain", "bound", "json"),
+        ("guidance", "lacked", "free", "json"),
+        ("xgrammar", "plain", "bound", "structural_tag"),
+        ("auto", "plain", "bound", "structural_tag"),
+        ("xgrammar", "lacked", "bound", "json"),
+        ("auto", "lacked", "bound", "json"),
+        ("xgrammar", "unconverted", "bound", "json"),
+        ("auto", "unconverted", "bound", "json"),
+        ("xgrammar", "lacked", "free", "structural_tag"),
+        ("auto", "lacked", "free", "structural_tag"),
     ],
 )
-async def test_an_answer_tag_reaches_another_backend_as_its_schema(backend, sent_as):
+async def test_an_answer_tag_reaches_another_backend_as_its_schema(backend, schema, bound, sent_as):
     """A structural tag is spelled for xgrammar: one that is a JSON answer's
     schema alone reaches an engine started with another backend as that
-    schema, and stays a tag under xgrammar and the engine's default."""
-    schema = '{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}'
-    tag = '{"format":{"type":"json_schema","json_schema":' + schema + ',"max_whitespace_cnt":32}}'
+    schema, and stays a tag under xgrammar and the engine's default. There
+    the engine validates a plain schema alone: one with a feature xgrammar
+    lacks, or one it fails to convert, is refused under a pinned xgrammar
+    and falls back under the default, so such a schema goes as the schema
+    and is answered as before a tag carried the bound. A tag without the
+    bound is not asked of the engine: it stays the tag it was before."""
+    schema = _SCHEMAS[schema]
+    bound = ',"max_whitespace_cnt":32' if bound == "bound" else ""
+    tag = '{"format":{"type":"json_schema","json_schema":' + schema + bound + "}}"
     request = pb.GenerateRequest(
         request_id="tag-test",
         tokenized=pb.TokenizedInput(input_ids=[1, 2]),
@@ -428,3 +460,15 @@ async def test_an_answer_tag_reaches_another_backend_as_its_schema(backend, sent
     context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
     assert [reply async for reply in handler(servicer, request, context)] == []
     assert seen == [{sent_as: schema if sent_as == "json" else tag}]
+
+
+def test_an_engine_without_the_judge_gets_the_schema_for_an_answer_tag():
+    """An engine release that holds no judge of a schema keeps the reading it
+    had before a tag carried the bound: under xgrammar, pinned or the
+    engine's default, every tag that is a JSON answer's schema alone goes as
+    that schema; another backend is not this function's."""
+    schema = '{"type":"object"}'
+    tag = '{"format":{"type":"json_schema","json_schema":' + schema + ',"max_whitespace_cnt":32}}'
+    for backend in ("auto", "xgrammar"):
+        assert constrained_decoding.answer_schema_the_engine_judges(tag, backend, None) == schema
+    assert constrained_decoding.answer_schema_the_engine_judges(tag, "guidance", None) is None

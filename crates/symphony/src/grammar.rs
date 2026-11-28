@@ -5414,46 +5414,47 @@ mod tests {
 
     #[test]
     fn a_table_that_bounds_the_answers_whitespace_writes_the_bound_on_its_schema_alone() {
-        // LFM2.5's table bounds the runs of whitespace in a JSON answer; the bound is written on
+        // LFM2.5's table and MiniMax M3's bound the runs of whitespace in a JSON answer, written on
         // the answer's schema node, for every start and whether or not the prompt left the thought
         // open, for a schema and for `json_object`'s bare object alike, and nowhere else: the
         // calls' values are the schema's, and a table that does not bound keeps the node as it was.
-        let lfm = formats::lfm2_5();
         let schema =
             Arc::new(value!({"type": "object", "properties": {"city": {"type": "string"}}}));
-        for reasoning_open in [false, true] {
-            for start in [
-                GrammarStart::Unknown,
-                GrammarStart::AfterReasoning,
-                GrammarStart::FirstToken,
-            ] {
-                for schema in [&schema, &Arc::new(value!({"type": "object"}))] {
-                    let answer = lfm
-                        .answer_grammar_for(schema, reasoning_open, start)
-                        .expect("an answer")
-                        .payload();
-                    let node = json_schema_node(&answer["format"]).expect("the schema node");
-                    assert_eq!(node["json_schema"], **schema, "{answer}");
-                    assert_eq!(
-                        node["max_whitespace_cnt"], 32,
-                        "reasoning_open={reasoning_open} {start:?}: {answer}"
-                    );
+        for table in [formats::lfm2_5(), formats::minimax_m3()] {
+            for reasoning_open in [false, true] {
+                for start in [
+                    GrammarStart::Unknown,
+                    GrammarStart::AfterReasoning,
+                    GrammarStart::FirstToken,
+                ] {
+                    for schema in [&schema, &Arc::new(value!({"type": "object"}))] {
+                        let answer = table
+                            .answer_grammar_for(schema, reasoning_open, start)
+                            .expect("an answer")
+                            .payload();
+                        let node = json_schema_node(&answer["format"]).expect("the schema node");
+                        assert_eq!(node["json_schema"], **schema, "{answer}");
+                        assert_eq!(
+                            node["max_whitespace_cnt"], 32,
+                            "reasoning_open={reasoning_open} {start:?}: {answer}"
+                        );
+                    }
                 }
+                let calls = table
+                    .grammar_for(
+                        &weather_tools(),
+                        Options {
+                            at_least_one: true,
+                            reasoning_open,
+                            thought_closed: false,
+                            one_call: false,
+                            start: GrammarStart::Unknown,
+                        },
+                    )
+                    .expect("a tag")
+                    .payload_text();
+                assert!(!calls.contains("max_whitespace_cnt"), "{calls}");
             }
-            let calls = lfm
-                .grammar_for(
-                    &weather_tools(),
-                    Options {
-                        at_least_one: true,
-                        reasoning_open,
-                        thought_closed: false,
-                        one_call: false,
-                        start: GrammarStart::Unknown,
-                    },
-                )
-                .expect("a tag")
-                .payload_text();
-            assert!(!calls.contains("max_whitespace_cnt"), "{calls}");
         }
         let qwen = formats::qwen3(CallSyntax::Json)
             .answer_grammar_for(&schema, false, GrammarStart::Unknown)
