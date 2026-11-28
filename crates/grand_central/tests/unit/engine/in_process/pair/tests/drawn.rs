@@ -203,6 +203,38 @@ fn a_pick_of_two_pair_is_decided_by_its_draws_as_the_whole_pass_decides_it() {
     }
 }
 
+/// A snapshot of one report a worker of `host`, every queue empty.
+fn reported(host: &Host) -> Arc<LoadSnapshot> {
+    let report = |side: &str, at| {
+        let url = format!("grpc://{side}-{at}:9000");
+        (url, one_rank_load(0, 0.1, 1_000.0))
+    };
+    let prefills = (0..host.prefills.len()).map(|at| report("prefill", at));
+    let decodes = (0..host.decodes.len()).map(|at| report("decode", at));
+    LoadSnapshot::from_loads_for_test(prefills.chain(decodes).collect())
+}
+
+/// Each side of a drawn pair pays the records it wrote without its
+/// list's rows toward its own list's conversion: two a decision. So the
+/// prefill list of eight converts at the fourth decision and the decode
+/// list of sixteen at the eighth, and the decisions behind copy the rows.
+#[test]
+fn each_side_of_a_drawn_pair_pays_toward_its_own_lists_conversion() {
+    let host = drawing(8, 16);
+    let (loads, classes) = (reported(&host), every(8, 16));
+    let converted = || {
+        host.lists
+            .each_ref()
+            .map(|list| host.engine.conversions(list.lent()))
+    };
+    for decision in 1..=40_u64 {
+        let asks = host.asks_by(&classes, (decision, false), Some(Arc::clone(&loads)));
+        let _ = host.first(&asks);
+        let want = [u64::from(decision >= 4), u64::from(decision >= 8)];
+        assert_eq!(converted(), want, "decision {decision}");
+    }
+}
+
 #[test]
 fn a_request_or_a_list_the_draw_is_not_asked_of_is_decided_whole() {
     let host = drawing(8, 8);
