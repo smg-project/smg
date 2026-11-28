@@ -225,14 +225,14 @@ impl Bed {
         let mut document = PolicySpec::preset("round_robin").map_err(|err| err.to_string())?;
         document.generation = 1;
         let profile = document.profiles.keys().next().cloned();
-        document.bindings = vec![BindingSpec {
-            profile: Some(profile.ok_or("the preset's profile")?),
-            overload: Some(OverloadSpec {
-                shed_when_all_vetoed: shed,
-                ..OverloadSpec::default()
-            }),
-            ..BindingSpec::default()
-        }];
+        let mut binding = BindingSpec::default();
+        binding.profile = Some(profile.ok_or("the preset's profile")?);
+        binding.overload = Some({
+            let mut overload = OverloadSpec::default();
+            overload.shed_when_all_vetoed = shed;
+            overload
+        });
+        document.bindings = vec![binding];
         let applied = AppliedSpec::validate(&document).map_err(|err| err.to_string())?;
         let engine = InProcess::new(applied);
         let objects: Result<Vec<_>, String> = (0..)

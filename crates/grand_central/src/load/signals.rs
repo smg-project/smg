@@ -42,7 +42,7 @@ const VALUE_MAGNITUDE_LIMIT: f64 = {
 
 /// Whether `value` is one a decision may read: a finite number of
 /// magnitude at most 1e15. The crate's one write of a cell holds a
-/// report's value to it ([`SignalCells::write`]).
+/// report's value to it ([`SignalColumn::write`]).
 #[cfg(feature = "in-process")]
 pub(crate) fn in_range(value: f64) -> bool {
     value.is_finite() && value.abs() <= VALUE_MAGNITUDE_LIMIT
@@ -153,7 +153,7 @@ impl SignalCells {
 
     /// The cells of `rows` rows of `signals` cells each, every one with no
     /// value: what a reader of the rows' reports writes the stated values
-    /// into ([`Self::write`]). The room the cells held is kept.
+    /// into ([`SignalColumn::write`]). The room the cells held is kept.
     #[cfg(feature = "in-process")]
     pub(crate) fn blank(&mut self, rows: usize, signals: usize) {
         let signals = counted(signals) as usize;
@@ -161,35 +161,22 @@ impl SignalCells {
             .resize(rows.saturating_mul(signals), SignalCell::NONE);
     }
 
-    /// One value a report states for the row at `position` under `column`,
-    /// in `unit`, sampled at `sampled_at_micros`, and whether it was
-    /// written. It is written where a decision may read it: the unit is
-    /// the column's, byte for byte, and the value is in range
-    /// ([`in_range`]). A place outside the cells takes nothing.
+    /// `cell` put for the row at `position` under `column`, and whether it
+    /// was put: a place outside the cells takes nothing. A column past a
+    /// row's cells is outside them too: it would land on the next row's
+    /// cell. It tests no value: its one caller does
+    /// ([`SignalColumn::write`]).
     #[cfg(feature = "in-process")]
-    pub(crate) fn write(
-        &mut self,
-        position: u32,
-        column: &SignalColumn,
-        unit: &str,
-        value: f64,
-        sampled_at_micros: u64,
-    ) -> bool {
-        if column.unit() != unit || !in_range(value) {
-            return false;
-        }
-        let place = u64::from(position) * u64::from(self.signals) + u64::from(column.column);
+    fn set(&mut self, position: u32, column: u16, cell: SignalCell) -> bool {
+        let place = u64::from(position) * u64::from(self.signals) + u64::from(column);
         let held = usize::try_from(place)
             .ok()
-            .filter(|_| u32::from(column.column) < self.signals)
+            .filter(|_| u32::from(column) < self.signals)
             .and_then(|place| self.cells.get_mut(place));
         let Some(held) = held else {
             return false;
         };
-        *held = SignalCell {
-            value,
-            sampled_at_micros,
-        };
+        *held = cell;
         true
     }
 
@@ -357,6 +344,30 @@ impl SignalColumn {
         self.held(signals.0, 0).copied()
     }
 
+    /// One value a report states for the row of `cells` at `position`
+    /// under this column, in `unit`, sampled at `sampled_at_micros`, and
+    /// whether it was written. It is written where a decision may read it:
+    /// the unit is the column's, byte for byte, and the value is in range
+    /// ([`in_range`]). A place outside the cells takes nothing.
+    #[cfg(feature = "in-process")]
+    pub(crate) fn write(
+        &self,
+        cells: &mut SignalCells,
+        position: u32,
+        unit: &str,
+        value: f64,
+        sampled_at_micros: u64,
+    ) -> bool {
+        if self.unit() != unit || !in_range(value) {
+            return false;
+        }
+        let cell = SignalCell {
+            value,
+            sampled_at_micros,
+        };
+        cells.set(position, self.column, cell)
+    }
+
     /// The oldest sample instant a decision still reads of the signal: one
     /// value for every row of a decision, where an age is a subtraction a
     /// row. A pass takes it once.
@@ -412,6 +423,47 @@ pub(crate) fn column_named<'a>(
 /// and its coefficient.
 pub(crate) type SignalTerm = (SignalColumn, f64);
 
+/// The most terms of a short sum. A stage seldom sums more signals, and
+/// a pass over a short sum makes this many places for its instants, not
+/// one a signal a document may declare ([`MAX_SIGNALS`]).
+const SHORT_SUM: usize = 8;
+
+/// Each term's oldest instant still read, in the terms' order. A pass
+/// writes every place it makes, so it makes the fewer: a short sum's
+/// ([`SHORT_SUM`]), or one a signal a document may declare for a longer
+/// sum.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a short sum leaves the long one's room unwritten, and a box would allocate in a decision"
+)]
+enum OldestInstants {
+    Short([u64; SHORT_SUM]),
+    Long([u64; MAX_SIGNALS]),
+}
+
+impl OldestInstants {
+    /// `N` places: each of `terms`' oldest instants still read at the
+    /// facts' instant in its term's place, and zero in a place past the
+    /// terms, which no term reads.
+    #[inline(always)]
+    fn places<const N: usize>(facts: &RequestFacts<'_>, terms: &[SignalTerm]) -> [u64; N] {
+        let mut oldest = [0; N];
+        for (oldest, (signal, _)) in oldest.iter_mut().zip(terms) {
+            *oldest = signal.oldest(facts);
+        }
+        oldest
+    }
+
+    /// The places, in the terms' order.
+    #[inline(always)]
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            Self::Short(oldest) => oldest,
+            Self::Long(oldest) => oldest,
+        }
+    }
+}
+
 /// One pass's reads of the signals a stage sums. Once a pass: the facts'
 /// cells, and each term's oldest instant still read. Once a row: the
 /// row's cells ([`Self::row`]). A term is then an index, a test and a
@@ -419,8 +471,7 @@ pub(crate) type SignalTerm = (SignalColumn, f64);
 pub(crate) struct SignalSums<'a> {
     cells: Option<&'a SignalCells>,
     terms: &'a [SignalTerm],
-    /// Each term's oldest instant still read, in the terms' order.
-    oldest: [u64; MAX_SIGNALS],
+    oldest: OldestInstants,
 }
 
 impl<'a> SignalSums<'a> {
@@ -430,14 +481,24 @@ impl<'a> SignalSums<'a> {
             terms.len() <= MAX_SIGNALS,
             "a sum names a declared signal once"
         );
-        let mut oldest = [0; MAX_SIGNALS];
-        for (oldest, (signal, _)) in oldest.iter_mut().zip(terms) {
-            *oldest = signal.oldest(facts);
-        }
-        Self {
-            cells: facts.signal_cells,
-            terms,
-            oldest,
+        let cells = facts.signal_cells;
+        // Each size makes the whole value where it stands: one made in
+        // either size and moved behind that would copy the long sum's
+        // room for a short sum too.
+        if terms.len() <= SHORT_SUM {
+            let oldest = OldestInstants::Short(OldestInstants::places(facts, terms));
+            Self {
+                cells,
+                terms,
+                oldest,
+            }
+        } else {
+            let oldest = OldestInstants::Long(OldestInstants::places(facts, terms));
+            Self {
+                cells,
+                terms,
+                oldest,
+            }
         }
     }
 
@@ -457,7 +518,7 @@ impl<'a> SignalSums<'a> {
             return (sum, self.terms.is_empty());
         };
         let mut whole = true;
-        for ((signal, coefficient), &oldest) in self.terms.iter().zip(&self.oldest) {
+        for ((signal, coefficient), &oldest) in self.terms.iter().zip(self.oldest.as_slice()) {
             match signal.among(cells, oldest) {
                 Some(value) => sum += value * coefficient,
                 None => whole = false,

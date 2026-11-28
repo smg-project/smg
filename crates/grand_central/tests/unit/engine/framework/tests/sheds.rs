@@ -104,16 +104,18 @@ fn an_empty_pool_is_emptied_by_no_stage() {
     }
 }
 
+/// The prefills' classes are 7 and 8. Class 7's decode is over its
+/// thresholds, and class 9's healthy decode partners no prefill. The
+/// decode list is not wholly over its thresholds, so the request is not
+/// shed as saturated, under either word of the binding: it has no
+/// endpoint, and the shed names `partnered`, for the decode with room
+/// that pairs with nobody. With that decode over its thresholds too, a
+/// binding that sheds answers saturation.
 #[test]
-fn a_saturated_class_sheds_as_saturated_whatever_the_other_classes_hold() {
-    // The prefills' classes are 7 and 8; class 7's decode is overloaded
-    // and class 9's healthy decode partners no prefill: saturation.
-    let engine = Engine::new(
-        vec![strict_profile()],
-        vec![pair_binding()],
-        1,
-        Needs::default(),
-    );
+fn a_class_over_its_thresholds_beside_a_decode_apart_is_no_saturation() {
+    let steering = strict_pair_engine();
+    let mut shedding = strict_pair_engine();
+    shedding.shed_when_all_vetoed(0);
     let mut prefills = [candidate(0, 0), candidate(1, 0)];
     prefills[0].pair_class = 7;
     prefills[1].pair_class = 8;
@@ -121,13 +123,17 @@ fn a_saturated_class_sheds_as_saturated_whatever_the_other_classes_hold() {
     decodes[0].pair_class = 7;
     decodes[0].health.overloaded = true;
     decodes[1].pair_class = 9;
-    match decide_pair(&engine, &prefills, &decodes) {
-        Decision::Shed(shed) => {
-            assert_eq!(shed.emptied_by, "not-overloaded");
-            assert_eq!(shed.reason, ShedReason::Saturated);
-        }
-        other => panic!("a saturated class answered {other:?}"),
+    for engine in [&steering, &shedding] {
+        assert_eq!(
+            shed_of(&decide_pair(engine, &prefills, &decodes)),
+            Some((ShedReason::NoEndpoints, PARTNERED))
+        );
     }
+    decodes[1].health.overloaded = true;
+    assert_eq!(
+        shed_of(&decide_pair(&shedding, &prefills, &decodes)),
+        Some((ShedReason::Saturated, "not-overloaded"))
+    );
 }
 
 #[test]
@@ -172,10 +178,12 @@ fn an_unroutable_prefills_partners_do_not_name_the_shed() {
 }
 
 #[test]
-fn a_routable_prefills_saturated_partner_names_the_shed_past_an_unroutable_one() {
-    // The mirror case: the draining prefill's partner is healthy, so the
-    // prefill walk never reaches "partnered"; the routable prefill's
-    // partner is overloaded and names the shed.
+fn a_routable_prefills_partner_over_its_thresholds_beside_a_free_decode_is_no_saturation() {
+    // The mirror case: the draining prefill's partner is healthy, and
+    // the routable prefill's partner is over its thresholds. The decode
+    // list is not wholly over them: the request has no endpoint, and
+    // the shed names "partnered", for the healthy decode, which pairs
+    // with no prefill that stands.
     let engine = Engine::new(
         vec![strict_profile()],
         vec![pair_binding()],
@@ -192,10 +200,10 @@ fn a_routable_prefills_saturated_partner_names_the_shed_past_an_unroutable_one()
     decodes[1].pair_class = 2;
     match decide_pair(&engine, &prefills, &decodes) {
         Decision::Shed(shed) => {
-            assert_eq!(shed.emptied_by, "not-overloaded");
-            assert_eq!(shed.reason, ShedReason::Saturated);
+            assert_eq!(shed.emptied_by, PARTNERED);
+            assert_eq!(shed.reason, ShedReason::NoEndpoints);
         }
-        other => panic!("a routable prefill with a saturated partner answered {other:?}"),
+        other => panic!("a routable prefill beside a free decode apart answered {other:?}"),
     }
 }
 

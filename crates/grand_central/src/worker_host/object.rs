@@ -117,25 +117,48 @@ pub(super) fn thresholds(overload: &Overload) -> OverloadUpdate {
     }
 }
 
-/// Whether `facts` state the external runtime: an endpoint of another
+/// Whether `engine_kind` names the external runtime: an endpoint of another
 /// party's API. A host's default thresholds are no such row's
 /// ([`Objects::with_overload_thresholds`](super::Objects::with_overload_thresholds)).
-pub(super) fn external(facts: &WorkerFacts) -> bool {
-    facts.engine_kind.parse() == Ok(smg_worker::worker::RuntimeType::External)
+pub(super) fn external(engine_kind: &str) -> bool {
+    engine_kind.parse() == Ok(smg_worker::worker::RuntimeType::External)
 }
 
-/// Whether an object built from `facts` states a threshold of `defaults`:
+/// The runtime the pair rule and the encode rule read of a row that names
+/// `engine_kind`, by the worker crate's own reader of a name. A kind that
+/// reader takes for a runtime is the worker crate's one name of it, so
+/// every spelling the reader knows of a runtime is one name. A kind it
+/// takes for no runtime is no name: the empty string. A kind it does not
+/// know stays as the row states it, and an empty one is no name either.
+/// One thing stays apart there: the two rules hold such a kind, unless it
+/// is empty, for a runtime, and two spellings of it for two, where the
+/// row's object holds no runtime ([`builder`]).
+#[cfg(feature = "in-process")]
+pub(super) fn runtime(engine_kind: &str) -> &str {
+    match engine_kind.parse::<smg_worker::worker::RuntimeType>() {
+        Ok(read) if read.is_specified() => read.as_str(),
+        Ok(_) => "",
+        Err(_) => engine_kind,
+    }
+}
+
+/// Whether an object built from a row that states `overload` and
+/// `engine_kind` states a threshold of `defaults`:
 /// an engine's row that names none for a signal `defaults` state. The rows
 /// a host's overload switch changes
 /// ([`Objects::state_overload_switch`](super::Objects::state_overload_switch)).
-pub(super) fn takes_default(facts: &WorkerFacts, defaults: OverloadThresholds) -> bool {
+pub(super) fn takes_default(
+    overload: Overload,
+    engine_kind: &str,
+    defaults: OverloadThresholds,
+) -> bool {
     let Overload {
         kv_usage_permille,
         waiting_requests,
-    } = facts.overload;
+    } = overload;
     let waiting = waiting_requests.is_none() && defaults.waiting_requests.is_some();
     let usage = kv_usage_permille.is_none() && defaults.token_usage.is_some();
-    !external(facts) && (waiting || usage)
+    !external(engine_kind) && (waiting || usage)
 }
 
 /// The store's role for a worker object.

@@ -373,12 +373,7 @@ fn in_range(request: &DecideRequest) -> Result<(), Error> {
         wire::stated_items(request.encode.as_ref(), phase, decode_of)?;
         match &request.demands {
             None => Ok(()),
-            Some(stated) => {
-                // A decode call is read at the decode phase, whatever its
-                // facts say.
-                let phase = if decode_of == 0 { phase } else { Phase::Decode };
-                wire::stated_demands(stated, phase).map(|_| ())
-            }
+            Some(stated) => wire::stated_demands(stated).map(|_| ()),
         }
     });
     match checked {

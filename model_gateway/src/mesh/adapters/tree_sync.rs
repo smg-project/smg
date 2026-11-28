@@ -1203,4 +1203,5 @@ impl TreeSyncAdapter {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/mesh/adapters/tree_sync/tests.rs"]
 mod tests;

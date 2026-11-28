@@ -10,7 +10,7 @@
 //!
 //! | trait | who calls | how often |
 //! |---|---|---|
-//! | [`WorkersStore`] | the readers of a membership row: a host, and the holder of its worker objects for a row's status and its count. The trait holds no write: a row is written through that holder, or as a decided change ([`MemoryStore::follow`]) | per membership change or status tell, never per request |
+//! | [`WorkersStore`] | the readers of a membership row: a host, and the holder of its worker objects for a row's count. A row's told status the holder reads off the crate's own store (`MemoryStore::told_status`). The trait holds no write: a row is written through that holder, or as a decided change ([`MemoryStore::follow`]) | in this repository: the count per object laid and per row that stands at a cut laid whole; the epoch per membership call, per veto frame at a gateway's ceiling and per turn of a controller to ready. No decision calls it |
 //! | [`HealthSink`] | every gateway's vetoes. A worker's status is its worker object's word, told by the holder of the objects | per veto a gateway sets or lifts |
 //! | [`LeasesStore`] | every decision, dispatch and completion report, the dispatch-deadline sweep, `Hello` pages | two to three frames per request |
 //!
@@ -74,12 +74,16 @@ pub use leases::{
 #[cfg(feature = "controller")]
 pub(crate) use memory::DecodeIssue;
 pub use memory::{AtWork, Hand, LookOutcome, MemoryStore, StoreCheckpoint, StoreStats, Wake};
-pub use snapshot::{OutsideLists, StaleGeneration, StoreSnapshot, PUBLISH_WINDOW};
+pub use snapshot::{OutsideLists, StoreSnapshot, PUBLISH_WINDOW};
 pub use workers::{
     identity, identity_of, token, HealthPolicy, MembershipChange, Overload, ProviderKey,
     ProviderKeyError, Reachability, Registrant, Signals, WorkerFacts, WorkerPatch, WorkerRow,
     WorkerStatus, WorkersStore,
 };
+
+// What stands in this file itself: a record that several modules of the
+// store and their callers name by the store's path, and that has no method
+// of its own.
 
 /// The verified identity of a gateway: the fingerprint of the subject its
 /// session was authenticated as, never a message field. Leases, vetoes and
@@ -92,4 +96,16 @@ impl GatewayId {
     /// The gateway deciding in its own process: the embedded mode's one
     /// principal.
     pub const LOCAL: Self = Self(0);
+}
+
+/// Why a generation was not applied: its number is not above the standing
+/// one. The store's number only rises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("generation {offered} is not above the standing generation {standing}")]
+#[expect(clippy::exhaustive_structs, reason = "its two numbers are the record")]
+pub struct StaleGeneration {
+    /// The number of the generation the store holds.
+    pub standing: u64,
+    /// The number of the generation that was offered.
+    pub offered: u64,
 }

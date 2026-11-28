@@ -525,8 +525,8 @@ class RouterArgs:
     max_background_responses: int = 1024
     # Most bytes the router may buffer for a request it holds only to keep
     # it retryable; larger eligible requests stream and forfeit router retries.
-    # Also bounds transcription audio held for one pre-response resend; 0
-    # disables both kinds of buffering
+    # Also bounds transcription audio held for one pre-response resend and for
+    # the retries on another worker; 0 disables both kinds of buffering
     max_buffered_request_bytes: int = 1048576
     # Standing-concurrency cap (-1 to disable); permits span the full response
     max_concurrent_requests: int = -1
@@ -950,10 +950,11 @@ class RouterArgs:
                 "Idle timeout in seconds for pooled upstream connections. Must"
                 " stay below the backend HTTP server's keep-alive timeout (vLLM"
                 " and SGLang default to 5). 0 keeps idle connections forever."
-                " While a nonzero value is below the load monitor interval, an"
-                " idle HTTP worker is connected anew for every load poll; where"
-                " the server's keep-alive can be raised above that interval, a"
-                " value between the two keeps the connection."
+                " While a nonzero value is below the interval the load monitor"
+                " polls a worker at (the router's, unless a worker of its group"
+                " sets its own), an idle HTTP worker is connected anew for every"
+                " load poll; where the server's keep-alive can be raised above"
+                " that interval, a value between the two keeps the connection."
                 " Defaults to 3."
             ),
         )
@@ -1031,6 +1032,9 @@ class RouterArgs:
             help=(
                 "Choose off for the classic routing policies or on for Grand Central."
                 " With on, the routing options keep their meaning through a policy document."
+                f" Under a provider backend alone (such as --{prefix}backend openai, without"
+                f" --{prefix}enable-igw) the gateway places by no routing policy: on without a"
+                " policy document moves nothing there, and the start says so once."
             ),
         )
         routing_group.add_argument(
@@ -1039,10 +1043,13 @@ class RouterArgs:
             default=RouterArgs.policy_spec,
             help=(
                 "Run a policy document with Grand Central."
-                " The document replaces the routing options: one that is not at its"
-                " default is refused beside it by name. The two overload thresholds"
-                " stand beside it: the gateway builds its workers with them, unless"
-                " the document switches its overload block off."
+                " The document replaces the routing options. A policy name, a policy's"
+                " own setting, the overload switch and shed flag, the warm-up and"
+                f" pairing settings, --{prefix}routing-key-override,"
+                f" --{prefix}grouped-dp-sticky and --{prefix}dp-minimum-tokens-scheduler"
+                " are each refused beside it by name where not at the default. The two"
+                " overload thresholds stand beside it: the gateway builds its workers"
+                " with them, unless the document switches its overload block off."
             ),
         )
         routing_group.add_argument(
@@ -1473,12 +1480,13 @@ class RouterArgs:
             type=int,
             default=RouterArgs.max_tree_size,
             help="Maximum total size of each model's approximation tree for "
-            "cache-aware routing, shared across all workers: for requests "
-            "routed by text the chars of its texts plus 1024 for each node a "
-            "worker stands on, for requests routed by token ids (gRPC, and "
-            "HTTP requests that carry them) tokens; each eviction cycle trims "
-            "every tree back toward this bound, and writes take a tree past "
-            "it until the next cycle",
+            "cache-aware routing, summed over all workers: for requests "
+            "routed by text the chars of the nodes each worker stands on plus "
+            "1024 for each such node, for requests routed by token ids (gRPC, "
+            "and HTTP requests that carry them) the tokens each worker holds, "
+            "so a prefix that several workers hold counts once for each of "
+            "them; each eviction cycle trims every tree back toward this "
+            "bound, and writes take a tree past it until the next cycle",
         )
         routing_group.add_argument(
             f"--{prefix}block-size",
@@ -1559,8 +1567,9 @@ class RouterArgs:
                 " the worker as the client sent it: JSON validation defers to"
                 " the worker, and the provider profile's request normalization"
                 " is skipped. This also bounds the transcription audio held"
-                " for one resend after a pre-response connection failure; 0"
-                " disables both kinds of buffering"
+                " for one resend after a pre-response connection failure and"
+                " for the retries that take a failed transcription to another"
+                " worker; 0 disables both kinds of buffering"
             ),
         )
         routing_group.add_argument(
@@ -1802,7 +1811,8 @@ class RouterArgs:
             type=str,
             choices=["inline", "shm", "auto", "rdma"],
             default=RouterArgs.multimodal_tensor_transport,
-            help="Multimodal tensor transport: inline (default), shm, auto, or rdma (NIXL lane; needs mm-rdma build)",
+            help="Multimodal tensor transport: inline (default), shm, auto, or rdma "
+            f"(NIXL lane; needs mm-rdma build and --{prefix}rdma-listen-ip)",
         )
         parser.add_argument(
             f"--{prefix}multimodal-shm-min-bytes",
@@ -1865,7 +1875,7 @@ class RouterArgs:
             default=RouterArgs.mm_pixel_rdma,
             help=(
                 "Serve cached pixels over RDMA instead of inline bytes (the legacy"
-                " switch; --multimodal-tensor-transport rdma is the first-class one)."
+                f" switch; --{prefix}multimodal-tensor-transport rdma is the first-class one)."
                 " Falls back to SMG_MM_PIXEL_RDMA"
             ),
         )
@@ -2211,7 +2221,12 @@ class RouterArgs:
                 " Format: <alias>=<canonical>. Repeat for multiple aliases."
                 " Matching is case-sensitive. A vendor-named alias (kimi-*,"
                 " minimax-*, ...) also gives the served model that vendor's"
-                " contract profile under both names."
+                " contract profile under both names. An alias that is the name"
+                " of a checkpoint Symphony lists gives the served model that"
+                " checkpoint's table, where the served name is not listed, the"
+                " legacy parsers detect no parser by it and no parser name is"
+                " set for the model; of several such aliases the first in"
+                " sorted order gives its table."
             ),
         )
         # Prometheus configuration

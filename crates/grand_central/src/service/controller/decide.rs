@@ -238,12 +238,9 @@ pub(crate) fn serve<S>(
     let now = shared.deciders.now();
     // The table is asked where this replica leads. One that does not lead
     // has none to ask: the stream opens, and its requests are told.
-    let (placed, presence) = match shared.fence.leader_term(now) {
+    let (placed, presence) = match shared.leading(now) {
         Some(term) => {
-            let presence = shared
-                .gateways
-                .presence(gateway, now)
-                .ok_or_else(|| Status::failed_precondition(NO_SESSION))?;
+            let presence = shared.present(gateway, now)?;
             (Some(term), Some(presence))
         }
         None => (None, None),
@@ -328,7 +325,7 @@ impl<S> Answers<S> {
         let deciders = &self.shared.deciders;
         let now = deciders.now();
         let lease = lease.map(|leased| leased.sent_at(now));
-        let stopped = if self.shared.fence.leader_term(now) != Some(term) {
+        let stopped = if self.shared.leading(now) != Some(term) {
             Some((Reason::NotLeader, ReleaseReason::Abandoned))
         } else if lease.as_ref().is_some_and(wire::Leased::spent) {
             Some((Reason::BudgetGoneOnArrival, ReleaseReason::LateDecision))
@@ -358,20 +355,17 @@ impl<S> Answers<S> {
             return Ok(());
         }
         self.credit -= 1;
-        // The stream's place in the presence table is of one term: the
-        // first request this replica would decide under a term asks the
-        // table, as an open does.
-        let Some(term) = self.shared.fence.leader_term(received) else {
+        // The stream's place in the presence table is of one term: a
+        // request that spends a credit under a term the stream holds no
+        // place under asks the table, as an open does, whatever budget it
+        // states.
+        let Some(term) = self.shared.leading(received) else {
             let busy = deciders.busy(request.into_id(), Reason::NotLeader);
             self.own = Some((busy, true));
             return Ok(());
         };
         if self.placed != Some(term) {
-            let presence = self
-                .shared
-                .gateways
-                .presence(self.gateway, received)
-                .ok_or_else(|| Status::failed_precondition(NO_SESSION))?;
+            let presence = self.shared.present(self.gateway, received)?;
             // The place has no waker yet: the stream arms it before it
             // sleeps, in the poll that took it.
             self.gone = ended(presence.clone());

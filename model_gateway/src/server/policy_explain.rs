@@ -9,9 +9,9 @@
 //! the route reads the body and hands that id on. Where the route stated
 //! none, it stands under the gateway's own id of the request: the one its
 //! response's `x-request-id` header shows. The gateway restates that id on
-//! the request under a policy spec that keeps a sample, and the placement
-//! reads it off the headers its route hands it
-//! (`middleware::request_id`). Of a request that states no id of its own
+//! the request under a policy spec that keeps a sample
+//! (`middleware::request_id`), and the engine reads what stands there as
+//! that id. Of a request that states no id of its own
 //! and whose route hands its placement no headers, no decision is kept. An
 //! id that finds no record is answered 404 with the reason, in the control
 //! plane's error envelope.
@@ -107,25 +107,5 @@ pub(super) async fn get(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
-
-    /// A worker is found by the id the engine knows it by and written with
-    /// the address a request's success path shows. A registered URL that
-    /// carries a credential is written without it.
-    #[test]
-    fn a_worker_is_written_with_the_address_a_success_path_shows() {
-        let plain = "http://127.0.0.1:8001";
-        let keyed = "http://user:secret@127.0.0.1:8002";
-        let workers = [plain, keyed]
-            .map(|url| -> Arc<dyn Worker> { Arc::new(BasicWorkerBuilder::new(url).build()) });
-        let found = addresses(&workers);
-        assert_eq!(found.len(), 2);
-        assert_eq!(found[&worker_id(workers[0].as_ref())], plain);
-        let shown = found[&worker_id(workers[1].as_ref())];
-        assert_eq!(shown, workers[1].redacted_url());
-        assert!(!shown.contains("secret"), "{shown}");
-        assert!(shown.contains("127.0.0.1:8002"), "{shown}");
-    }
-}
+#[path = "../../tests/unit/server/policy_explain/tests.rs"]
+mod tests;

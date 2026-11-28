@@ -32,6 +32,7 @@
 //! turn is told to ask again.
 
 use std::{
+    future::Future,
     io,
     sync::Arc,
     task::{Context, Poll},
@@ -52,9 +53,9 @@ use super::{
     config::Scope,
     decide::{self, Streams},
     decision_slots::{self, DecisionSlots, Reads},
-    election::{self, split_identity, ElectionObservation, LeasePlace, Running},
+    election::{self, ElectionObservation, Leader, Leadership, LeasePlace, NotLed, Running},
     floor::Floors,
-    gateways::Gateways,
+    gateways::{Gateways, Presence, Refused, SessionPlace},
     generations::{
         Format, Generations, SpecRejected, Unanswered, DRY_RUNS_WAITING, WRITES_WAITING,
     },
@@ -75,7 +76,7 @@ use crate::{
     },
     engine::{explain::DecisionRecord, framework::Engine},
     service::{
-        elector::{Elector, Fence},
+        elector::Elector,
         proto::{
             self,
             grand_central_server::{GrandCentral, GrandCentralServer},
@@ -83,7 +84,7 @@ use crate::{
         replication::NotLeading,
     },
     stages::registry::StageRegistry,
-    store::MemoryStore,
+    store::{GatewayId, MemoryStore},
     worker_host::{Members, Objects},
 };
 
@@ -91,8 +92,9 @@ use crate::{
 /// store's entry into the term.
 const NOT_IN_TERM: &str = "this replica leads a term its store has not entered yet";
 
-/// A leader's refusal for its whole lead, where its take started no term in
-/// its store's log: the log followed a term at or above the one taken.
+/// A leader's refusal where its take started no term in its store's log:
+/// the log followed a term at or above the one taken. The election leaves
+/// that lease in the take's step, or keeps it where no term is left to take.
 const NO_TERM_LED: &str =
     "this replica holds the lease and its store leads no term: this call is not served until a later take";
 
@@ -151,15 +153,11 @@ impl<S: NamedService> NamedService for ByCall<S> {
 pub(crate) struct Shared {
     /// This controller's id.
     pub(crate) controller_id: String,
-    /// Its dialable address, `host:port`; empty when no client could be
-    /// told one.
-    pub(crate) address: String,
-    /// The holder identity it elects under.
-    pub(crate) identity: String,
-    /// The controller's one fence: the judge of "leader" at every answer.
-    pub(crate) fence: Arc<Fence>,
-    /// The election's last sight of the lease.
-    pub(crate) standing: watch::Receiver<ElectionObservation>,
+    /// Who leads: the controller's one fence, the identity it elects under,
+    /// the election's last sight of the lease and the store's log, behind
+    /// one reader. A call asks it through the methods of this state that
+    /// pass on, each at its own instant.
+    lead: Leadership,
     /// The controller's store: what the calls feed and read, and the run
     /// loop's tasks with them.
     pub(crate) store: Arc<MemoryStore>,
@@ -210,18 +208,6 @@ pub(crate) struct Shared {
     /// under, the first of the three counts of design 5.4: the bind makes
     /// it once, where the configuration is known.
     pub(crate) lag: Arc<Lag>,
-}
-
-/// Who leads, as this replica knows it at one read of its fence.
-pub(crate) struct Leader {
-    /// The leader's id; empty when nobody is named.
-    pub(crate) controller_id: String,
-    /// Its dialable address; empty when nobody is named or it has none.
-    pub(crate) address: String,
-    /// The highest term this replica knows.
-    pub(crate) term: u64,
-    /// Whether the leader is this replica.
-    pub(crate) is_leader: bool,
 }
 
 impl Shared {
@@ -303,11 +289,14 @@ impl Shared {
             place.is_shared().then(|| elector.fence()),
         ));
         Ok(Self {
+            lead: Leadership::new(
+                controller_id.clone(),
+                address,
+                elector,
+                standing,
+                Arc::clone(&feed.log),
+            ),
             controller_id,
-            address,
-            identity: elector.identity().to_owned(),
-            fence: elector.fence(),
-            standing,
             generations: Arc::clone(&generations),
             objects: Arc::clone(&objects),
             // The door decides a row's write over the worker objects its
@@ -373,40 +362,51 @@ impl Shared {
         Ok(election)
     }
 
-    /// Who leads, given `leading`, one read of the fence: the term this
-    /// replica leads under, or `None`. A replica whose fence is open names
-    /// itself under the fence's term. Any other names the holder its last
-    /// look at the lease saw, or nobody (an empty address: no leader known)
-    /// when the lease is free, when that look failed, when it read a term
-    /// under the highest this replica saw, when the record still names this
-    /// replica behind a closed fence, and when this replica's own take is
-    /// newer than that look: a holder is named under a term one write of
-    /// the lease stored for it. The term is the highest this replica knows
-    /// either way, so no answer of its falls in term.
-    pub(crate) fn leader(&self, leading: Option<u64>) -> Leader {
-        let (controller_id, address, term, is_leader) = match leading {
-            Some(term) => (self.controller_id.clone(), self.address.clone(), term, true),
-            None => {
-                let standing = self.standing.borrow();
-                let fenced = self.fence.term();
-                let term = standing.term.max(fenced);
-                if standing.holder.is_empty()
-                    || standing.holder == self.identity
-                    || fenced > standing.term
-                {
-                    (String::new(), String::new(), term, false)
-                } else {
-                    let (id, address) = split_identity(&standing.holder);
-                    (id.to_owned(), address.to_owned(), term, false)
-                }
-            }
-        };
-        Leader {
-            controller_id,
-            address,
-            term,
-            is_leader,
-        }
+    /// The term this replica leads under at `now`, or `None`: one read of
+    /// its fence ([`Leadership::leading`]). It asks no log: a call that
+    /// needs a led store asks [`Self::led`].
+    pub(crate) fn leading(&self, now: Instant) -> Option<u64> {
+        self.lead.leading(now)
+    }
+
+    /// The term of the last lease this replica held, `0` before any
+    /// ([`Leadership::held_term`]).
+    pub(crate) fn held_term(&self) -> u64 {
+        self.lead.held_term()
+    }
+
+    /// Who leads, by the fence's verdict at `now`
+    /// ([`Leadership::leader`]).
+    pub(crate) fn leader(&self, now: Instant) -> Leader {
+        self.lead.leader(now)
+    }
+
+    /// Who leads, for a replica whose fence read closed
+    /// ([`Leadership::leader_elsewhere`]).
+    pub(crate) fn leader_elsewhere(&self) -> Leader {
+        self.lead.leader_elsewhere()
+    }
+
+    /// The term this replica leads under at `now`, once its store leads it
+    /// ([`Leadership::led`]).
+    ///
+    /// # Errors
+    ///
+    /// The fence is closed at `now`, or the store's log does not lead the
+    /// term the fence shows.
+    pub(crate) fn led(&self, now: Instant) -> Result<u64, NotLed> {
+        self.lead.led(now)
+    }
+
+    /// A receiver of the election's sights of the lease
+    /// ([`Leadership::steps`]).
+    pub(crate) fn steps(&self) -> watch::Receiver<ElectionObservation> {
+        self.lead.steps()
+    }
+
+    /// The holder identity this replica elects under.
+    pub(crate) fn identity(&self) -> &str {
+        self.lead.identity()
     }
 
     /// Opens a watch of the worker rows for `by`, admitted under `term`,
@@ -432,7 +432,7 @@ impl Shared {
             store: Arc::clone(&self.store),
             objects: Arc::clone(&self.objects),
             feed: self.feed.clone(),
-            fence: Arc::clone(&self.fence),
+            fence: self.lead.fence(),
             role,
             term,
         };
@@ -468,6 +468,53 @@ impl Shared {
             )
         };
         snapshot::in_turn(&self.readers, take).await?
+    }
+
+    /// `gateway`'s presence at `now`, as a decide stream holds it
+    /// ([`Gateways::presence`]). A stream asks at its open where this
+    /// replica leads, and at the first request that spends a credit under a
+    /// term the stream is not placed under, each time behind its own read
+    /// of the fence. The table reads the fence again under its lock, at the
+    /// same `now`, and then the row: the term a stream is placed under is
+    /// its own read's, and a write of the elector can fall between the two
+    /// reads.
+    ///
+    /// # Errors
+    ///
+    /// `FAILED_PRECONDITION` with [`decide::NO_SESSION`]: the gateway is not
+    /// present.
+    pub(crate) fn present(&self, gateway: GatewayId, now: Instant) -> Result<Presence, Status> {
+        self.gateways
+            .presence(gateway, now)
+            .ok_or_else(|| Status::failed_precondition(decide::NO_SESSION))
+    }
+
+    /// The seat of `gateway`'s session at `now` under `term`, the session's
+    /// own read of the fence, with `subject` the name its key stands for
+    /// ([`Gateways::welcome`]).
+    ///
+    /// # Errors
+    ///
+    /// The presence table's refusal of the seat.
+    pub(crate) fn welcome(
+        &self,
+        gateway: GatewayId,
+        subject: &str,
+        term: u64,
+        now: Instant,
+    ) -> Result<SessionPlace, Refused> {
+        self.gateways.welcome(gateway, subject, term, now)
+    }
+
+    /// The presence table's task until `stop`: the sweep, and what rides
+    /// its clock ([`Gateways::run`]). Of the shared state, the task holds
+    /// the table alone.
+    pub(crate) fn sweep(
+        &self,
+        stop: watch::Receiver<bool>,
+    ) -> impl Future<Output = ()> + Send + use<> {
+        let gateways = Arc::clone(&self.gateways);
+        async move { gateways.run(stop).await }
     }
 }
 
@@ -669,8 +716,10 @@ impl Service {
     /// leader's control listener by the health service's word. The lease is
     /// taken before the store is told its term: in between the answer is
     /// `UNAVAILABLE`. A take at or below a term the log followed starts no
-    /// term: the answer is `UNAVAILABLE` for that whole lead. A call
-    /// admitted under a take the store has since passed is told to retry.
+    /// term. The answer is `UNAVAILABLE` while that lead lasts: the election
+    /// leaves it in the take's own step, or keeps it where no term is left
+    /// to take. A call admitted under a take the store has since passed is
+    /// told to retry.
     /// So a call that reads this guard is not served under a term the store
     /// does not lead: a membership write, a spec write, its dry run and a
     /// rollback, a standby's stream and its snapshot here, a watch's open
@@ -689,27 +738,24 @@ impl Service {
         self.led(now, Code::Unavailable, FOLLOWS_NO_LOG)
     }
 
-    /// The term this replica leads under at `now`, once its store leads it:
-    /// one read of the log ([`Log::leads`](crate::service::replication::Log::leads)),
-    /// whose refusal says whether it is a moment or the whole lead. A
-    /// replica that does not lead refuses under `code` with `message`: the
-    /// details are the `google.rpc.Status` that says both again and holds
-    /// the `NotLeader`.
+    /// The term this replica leads under at `now`, once its store leads it
+    /// ([`Shared::led`]): one read of the log
+    /// ([`Log::leads`](crate::service::replication::Log::leads)), whose
+    /// refusal says whether it is a moment or the whole lead. A replica
+    /// that does not lead refuses under `code` with `message`: the details
+    /// are the `google.rpc.Status` that says both again and holds the
+    /// `NotLeader`.
     fn led(&self, now: Instant, code: Code, message: &'static str) -> Result<u64, Status> {
-        if let Some(term) = self.shared.fence.leader_term(now) {
-            return match self.shared.feed.log.leads(term) {
-                Ok(()) => Ok(term),
-                Err(NotLeading::NotYet) => Err(Status::unavailable(NOT_IN_TERM)),
-                Err(NotLeading::Follows(_)) => Err(Status::unavailable(NO_TERM_LED)),
-                Err(NotLeading::Past(_)) => Err(Status::unavailable(TAKE_OVER)),
-            };
-        }
-        let holder = self.leader_info(now).address;
-        Err(not_leader(code, message, holder))
+        self.shared.led(now).map_err(|refused| match refused {
+            NotLed::Store(NotLeading::NotYet) => Status::unavailable(NOT_IN_TERM),
+            NotLed::Store(NotLeading::Follows(_)) => Status::unavailable(NO_TERM_LED),
+            NotLed::Store(NotLeading::Past(_)) => Status::unavailable(TAKE_OVER),
+            NotLed::Elsewhere { holder } => not_leader(code, message, holder),
+        })
     }
 
-    /// The `Leader` call's answer at `now`: [`Shared::leader`] at one read
-    /// of the fence.
+    /// The `Leader` call's answer at `now`: [`Shared::leader`] under the
+    /// fence's verdict at that instant.
     fn leader_info(&self, now: Instant) -> proto::LeaderInfo {
         let shared = &self.shared;
         let Leader {
@@ -717,7 +763,7 @@ impl Service {
             address,
             term,
             is_leader,
-        } = shared.leader(shared.fence.leader_term(now));
+        } = shared.leader(now);
         // A replica that follows says how far behind it is, by the age of
         // the last frame that left it at its leader's head; a leader follows
         // nobody.
@@ -1163,7 +1209,7 @@ impl GrandCentral for Service {
         let term = self.leading(Instant::now())?;
         self.shared
             .replication
-            .replicate(term, &standby, request.into_inner())
+            .replicate(&self.shared.floors, term, &standby, request.into_inner())
             .await
             .map(Response::new)
     }

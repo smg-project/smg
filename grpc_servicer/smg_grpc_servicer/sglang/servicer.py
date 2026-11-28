@@ -75,10 +75,13 @@ from smg_grpc_servicer.tensor_wire import tensor_from_parts
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 
 from ..constrained_decoding import (
+    SGLANG_SCHEMA_BACKENDS,
+    answer_schema_in_place_of_tag,
     grammar_backend_entry,
     grammar_start_labels,
     sglang_constrained_decoding_start,
     sglang_grammar_backend,
+    structural_tag_vocabulary_entry,
 )
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
@@ -295,6 +298,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Initialize the standalone gRPC service."""
         self.request_manager = request_manager
         self.server_args = server_args
+        # Read once: the grammar backend the scheduler was started with, which
+        # decides how an answer's structural tag is sent.
+        self._grammar_backend = sglang_grammar_backend(server_args)
         self.model_config = model_config
         self.model_info = model_info
         self.scheduler_info = scheduler_info
@@ -757,7 +763,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         )
         # The grammar backend the scheduler runs, resolved (the raw argument
         # is None unless set), under the same key the Rust servicer reads.
-        grammar_backend_entry(serializable_args, sglang_grammar_backend(self.server_args))
+        grammar_backend = sglang_grammar_backend(self.server_args)
+        grammar_backend_entry(serializable_args, grammar_backend)
+        # The vocabulary of structural-tag nodes that backend takes, as the
+        # Rust launcher reports it: the Router spells an older xgrammar's
+        # structural tags in the older vocabulary.
+        structural_tag_vocabulary_entry(serializable_args, grammar_backend)
         # The gateway reads this worker's running window (its PD admission
         # bound, its share of the fleet's capacity) from `max_running_requests`
         # here, which is None unless the operator set the flag: the scheduler
@@ -1312,6 +1323,18 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             ebnf_grammar = grpc_params.ebnf_grammar
         elif grpc_params.HasField("structural_tag"):
             structural_tag = grpc_params.structural_tag
+            # A tag that is a JSON answer's schema alone goes as that schema
+            # to a backend the tag is not spelled for (llguidance, outlines).
+            schema = answer_schema_in_place_of_tag(
+                structural_tag, self._grammar_backend, SGLANG_SCHEMA_BACKENDS
+            )
+            if schema is not None:
+                logger.debug(
+                    "a structural tag that is a JSON answer's schema alone goes to the "
+                    "%s grammar backend as that schema",
+                    self._grammar_backend,
+                )
+                json_schema, structural_tag = schema, None
 
         # Handle optional parameters conversion
         custom_params = (

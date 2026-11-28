@@ -540,6 +540,9 @@ impl<'a> SelectionInputs<'a> {
             cache_namespace: self.cache_namespace,
             needs_vision: self.needs_vision,
             decode_needs_vision: self.demand.decode,
+            language_model_reads_grids: self
+                .intermediate
+                .is_none_or(multimodal::MultimodalIntermediate::language_model_reads_grids),
         }
     }
 
@@ -1042,7 +1045,9 @@ impl WorkerSelectionStage {
         (moved, guard)
     }
 
-    /// Keep known grid-bearing decode identities on vision-capable workers.
+    /// Keep known grid-bearing decode identities on vision-capable workers:
+    /// those whose model's language model reads the grids
+    /// ([`multimodal::MultimodalIntermediate::decode_side_needs_grids`]).
     /// EPD references are unresolved: prefer vision when available, but let
     /// dispatch validate the resulting identity before using a stripped decode request.
     fn decode_side_needs_vision(
@@ -1055,9 +1060,8 @@ impl WorkerSelectionStage {
             WorkerSelectionMode::PrefillDecode => {
                 decode_needs_vision(request, intermediate, media_refs)
             }
-            WorkerSelectionMode::EncodePrefillDecode => {
-                intermediate.is_some_and(|mm| mm.has_mrope_grids())
-            }
+            WorkerSelectionMode::EncodePrefillDecode => intermediate
+                .is_some_and(multimodal::MultimodalIntermediate::decode_side_needs_grids),
             WorkerSelectionMode::Regular => false,
         }
     }
@@ -1339,18 +1343,19 @@ fn vision_capable(worker: &dyn Worker) -> bool {
 /// worker that accepts no vision input: the shapes dispatch refuses with a
 /// non-retryable 400 once such a worker is selected (media references, which
 /// each side expands itself; a multimodal request with `n > 1`, whose decode
-/// side recomputes the prompt locally; grid tensors, which the side derives
-/// its positions from). A text request of any `n` and a single-sample image
-/// request without grids take such a worker's stripped side, so they are not
-/// steered away from it.
+/// side recomputes the prompt locally; grid tensors the model's language
+/// model derives the side's positions from). A text request of any `n` and a
+/// single-sample image request without such grids take such a worker's
+/// stripped side, so they are not steered away from it.
 fn decode_needs_vision(
     request: &RequestType,
     intermediate: Option<&multimodal::MultimodalIntermediate>,
     media_refs: bool,
 ) -> bool {
     media_refs
-        || intermediate
-            .is_some_and(|intermediate| request.sampling_n() > 1 || intermediate.has_mrope_grids())
+        || intermediate.is_some_and(|intermediate| {
+            request.sampling_n() > 1 || intermediate.decode_side_needs_grids()
+        })
 }
 
 /// Context bounds for both token-processing sides, and which sides need a vision
@@ -4232,13 +4237,9 @@ mod tests {
         let model_id = "test-model-engine-rid";
         let (stage, policies) = stage_and_policies(model_id, 3);
         let mut document = PolicySpec::preset("consistent_hashing").expect("a stock preset");
-        document.bindings[0].routing_key = Some(RoutingKeySpec {
-            sources: vec![KeySourceSpec {
-                rid: true,
-                ..KeySourceSpec::default()
-            }],
-            strip_lineage: false,
-        });
+        let mut source = KeySourceSpec::default();
+        source.rid = true;
+        document.bindings[0].routing_key = Some(RoutingKeySpec::of(vec![source]));
         let spec = AppliedSpec::validate(&document);
         engine_on(&policies, spec.expect("a valid document"));
 
@@ -4501,6 +4502,7 @@ mod tests {
                 cache_namespace: None,
                 needs_vision: false,
                 decode_needs_vision: false,
+                language_model_reads_grids: true,
             },
             wire,
             constraint_decided_on: None,
@@ -8241,6 +8243,16 @@ mod tests {
             decode_needs_vision(&chat(None), Some(&gridded), false),
             "grid tensors are read by the decode side"
         );
+        let plain_rope =
+            image_intermediate(Some("image_grid_thw")).with_language_model_reads_grids(false);
+        assert!(
+            !decode_needs_vision(&chat(None), Some(&plain_rope), false),
+            "grid tensors the language model does not read leave the stripped side"
+        );
+        assert!(
+            decode_needs_vision(&chat(Some(2)), Some(&plain_rope), false),
+            "n > 1 still recomputes the prompt on the decode side"
+        );
     }
 
     /// Both disaggregated modes retain grid-dependent decode requirements;
@@ -8274,6 +8286,12 @@ mod tests {
         assert!(
             epd.decode_side_needs_vision(&request, Some(&gridded), false),
             "grid metadata still needs the vision model on decode"
+        );
+        let plain_rope =
+            image_intermediate(Some("image_grid_thw")).with_language_model_reads_grids(false);
+        assert!(
+            !epd.decode_side_needs_vision(&request, Some(&plain_rope), false),
+            "grids the language model does not read need no vision model on decode"
         );
         assert!(!epd.decode_side_needs_vision(&request, None, true));
         assert!(!epd.decode_side_needs_vision(&request, None, false));
@@ -8493,10 +8511,38 @@ mod tests {
             }
             let snapshot = ctx.state.routing_snapshot.as_ref().expect("snapshot");
             assert!(snapshot.decode_needs_vision);
+            assert!(snapshot.language_model_reads_grids);
         }
         assert_eq!(
             seen.into_keys().collect::<Vec<_>>(),
             ["grpc://127.0.0.1:8990"]
+        );
+
+        // The same grids of a model whose language model reads none of them
+        // (the spec's answer the intermediate carries): the whole decode
+        // pool, and the answer kept for the dispatch.
+        let mut seen = HashMap::new();
+        for _ in 0..4 {
+            let mut ctx = prepared_ctx(Arc::clone(&registry), None);
+            ctx.state.multimodal_intermediate = Some(
+                image_intermediate(Some("image_grid_thw")).with_language_model_reads_grids(false),
+            );
+            stage
+                .execute(&mut ctx)
+                .await
+                .expect("an image request with plain-RoPE grids selects");
+            if let Some(WorkerSelection::Disaggregated { decode, .. }) = ctx.state.workers.as_ref()
+            {
+                *seen.entry(decode.url().to_string()).or_insert(0) += 1;
+            }
+            let snapshot = ctx.state.routing_snapshot.as_ref().expect("snapshot");
+            assert!(!snapshot.decode_needs_vision);
+            assert!(!snapshot.language_model_reads_grids);
+        }
+        assert_eq!(
+            seen.len(),
+            2,
+            "plain-RoPE grids use the whole decode pool: {seen:?}"
         );
 
         let mut seen = HashMap::new();
@@ -9191,6 +9237,275 @@ mod tests {
             &stage,
         ));
         assert!(future <= 2048, "the dispatch future is {future} bytes");
+    }
+
+    /// A pair Grand Central placed, held as a pair route holds it ahead of
+    /// its prefill's send: one prefill and one decode on the KV transport
+    /// `connector`, what the hearing stage heard, the selection under the
+    /// runtime `runtime_type`, which the dispatch reads its shape from, and
+    /// the prefill's load not yet sent. `decode_vision` is the decode
+    /// worker's `supports_vision` label, none when `None`.
+    fn a_pair_ahead_of_its_send(
+        connector: &str,
+        runtime_type: RuntimeType,
+        decode_vision: Option<&str>,
+    ) -> (placement::tests::Heard, WorkerSelection, PrefillAhead) {
+        use crate::routers::common::{
+            placement::{
+                select_pair,
+                tests::{hearing_pairs_on, pairs_of, MODEL},
+                PlacedPair, PlacementInputs, Stated,
+            },
+            prefill_admission::hold_unbounded,
+        };
+
+        let registry = WorkerRegistry::new();
+        for (url, worker_type) in [
+            ("grpc://p:1", WorkerType::Prefill),
+            ("grpc://d:1", WorkerType::Decode),
+        ] {
+            let mut worker = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .health_config(no_health_check())
+                .kv_connector(connector);
+            if let (WorkerType::Decode, Some(vision)) = (worker_type, decode_vision) {
+                worker = worker.label(smg_worker::labels::SUPPORTS_VISION_LABEL, vision);
+            }
+            registry
+                .register(Arc::new(worker.build()))
+                .expect("worker registers");
+        }
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_pairs_on(&policies, false);
+        let pairs = pairs_of(&registry, &policies);
+        let inputs = PlacementInputs::default();
+        let pair = select_pair(
+            &registry,
+            &policies,
+            MODEL,
+            &pairs,
+            None,
+            None,
+            inputs,
+            Stated::nothing,
+        );
+        let Ok(pair) = pair else {
+            panic!("the engine places the pair");
+        };
+        let ((prefill, decode), ahead) = hold_unbounded(
+            pair,
+            Some("key"),
+            |pair: &PlacedPair| &pair.prefill,
+            |pair: PlacedPair| {
+                let (prefill, unsent) = pair.prefill.unsent();
+                ((prefill, pair.decode), unsent)
+            },
+        );
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill,
+            decode,
+            runtime_type,
+        };
+        (heard, workers, ahead)
+    }
+
+    /// The dispatch context of one attempt over `workers`, a pair held with
+    /// its prefill's load `ahead` of its send, with `client` for both sides.
+    fn an_attempt_over(
+        workers: WorkerSelection,
+        ahead: PrefillAhead,
+        client: &BackendClient,
+        runtime_type: RuntimeType,
+    ) -> DispatchContext {
+        use crate::routers::grpc::context::{ClientSelection, DispatchMetadata};
+
+        let mut ctx = dispatch_ctx("m", grpc_wire(runtime_type));
+        ctx.workers = Some(workers);
+        ctx.pd_prefill_guard = Some(ahead);
+        ctx.clients = Some(ClientSelection::Disaggregated {
+            prefill: client.clone(),
+            decode: client.clone(),
+        });
+        ctx.dispatch = Some(DispatchMetadata {
+            request_id: "r".to_string(),
+            model: "m".to_string(),
+            created: 0,
+            weight_version: None,
+        });
+        ctx
+    }
+
+    /// A pair's request that is refused ahead of any send is heard as a
+    /// release of both sides, with no dispatch and no end: the runtime's
+    /// refusal and the sequential plan's, for one request and for a batch.
+    /// Grand Central placed the pair, so the plan makes the decode's guards
+    /// ahead of its send, one for each sub-request, and the dispatch that
+    /// refuses the request has said neither side's send.
+    #[tokio::test]
+    async fn a_pair_refused_ahead_of_its_send_is_heard_as_a_release() {
+        use smg_worker::identity::basic::MORIIO_CONNECTOR;
+
+        use crate::routers::grpc::regular::stages::testing::mock_backend_client;
+
+        let (client, engine) = mock_backend_client("m").await;
+        let stage = regular_stage(Arc::new(WorkerRegistry::new()));
+        // Each refusal by a pair that meets it: a runtime with no pair
+        // protocol, and a decode whose connector the sequential plan refuses.
+        let refusals = [
+            (
+                RuntimeType::Mlx,
+                "NixlConnector",
+                "runtime_pd_not_supported",
+            ),
+            (
+                RuntimeType::Vllm,
+                MORIIO_CONNECTOR,
+                "moriio_grpc_pd_unsupported",
+            ),
+        ];
+        for (runtime_type, connector, code) in refusals {
+            for batched in [false, true] {
+                let (heard, workers, ahead) =
+                    a_pair_ahead_of_its_send(connector, runtime_type, None);
+                let said = || heard.lock().expect("the stage heard").clone();
+                assert_eq!(said(), ["issued", "issued"]);
+                let decode = Arc::clone(workers.decode_worker().expect("a pair's decode"));
+                let mut ctx = an_attempt_over(workers, ahead, &client, runtime_type);
+                let request = || ProtoGenerateRequest::Vllm(Box::default());
+                let plan = if batched {
+                    ExecutionPlan::Batch {
+                        kind: ExecutionPlanKind::PrefillDecode,
+                        shared_request_id: "r".to_string(),
+                        requests: vec![request(), request()],
+                    }
+                } else {
+                    ExecutionPlan::PrefillDecode(request())
+                };
+                let refused =
+                    execute_plan(&mut ctx, plan, true, None, GroupedDpSticky::Off, &stage).await;
+                let Err(refused) = refused else {
+                    panic!("{code}, batched {batched}: the plan is refused");
+                };
+                assert_eq!(
+                    refused
+                        .headers()
+                        .get(error::HEADER_X_SMG_ERROR_CODE)
+                        .unwrap(),
+                    code
+                );
+                assert_eq!(
+                    decode.load(),
+                    if batched { 2 } else { 1 },
+                    "{code}, batched {batched}: each sub-request counts on the decode"
+                );
+                drop(ctx);
+                assert_eq!(decode.load(), 0);
+                assert_eq!(
+                    said()[2..],
+                    ["released Abandoned", "released Abandoned"],
+                    "{code}, batched {batched}: both sides, with no dispatch and no end"
+                );
+            }
+        }
+        engine.abort();
+    }
+
+    /// The dispatch decides a pair's decode side by the answer the routing
+    /// snapshot keeps: a request with grid tensors for a language-model-only
+    /// decode is refused ahead of any send while the snapshot says the
+    /// model's language model reads the grids, and goes out, its prefill
+    /// sent, when the snapshot says it reads none of them.
+    #[tokio::test]
+    async fn the_dispatch_decides_the_decode_side_by_the_snapshots_grid_answer() {
+        use smg_grpc_client::vllm_proto as vllm;
+
+        use crate::routers::grpc::regular::stages::testing::mock_backend_client;
+
+        let (client, engine) = mock_backend_client("m").await;
+        let stage = regular_stage(Arc::new(WorkerRegistry::new()));
+        let gridded = || {
+            ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
+                mm_inputs: Some(vllm::MultimodalInputs {
+                    mm_hashes: vec!["h".to_string()],
+                    model_specific_tensors: HashMap::from([(
+                        "image_grid_thw".to_string(),
+                        vllm::TensorData::default(),
+                    )]),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }))
+        };
+        for reads in [true, false] {
+            let (heard, workers, ahead) =
+                a_pair_ahead_of_its_send("NixlConnector", RuntimeType::Vllm, Some("false"));
+            let mut ctx = an_attempt_over(workers, ahead, &client, RuntimeType::Vllm);
+            ctx.routing.language_model_reads_grids = reads;
+            let plan = ExecutionPlan::PrefillDecode(gridded());
+            let bound = Some(Duration::from_secs(5));
+            let answered =
+                execute_plan(&mut ctx, plan, true, bound, GroupedDpSticky::Off, &stage).await;
+            let code = answered.err().and_then(|refused| {
+                refused
+                    .headers()
+                    .get(error::HEADER_X_SMG_ERROR_CODE)
+                    .and_then(|code| code.to_str().ok())
+                    .map(str::to_owned)
+            });
+            let sent = heard
+                .lock()
+                .expect("the stage heard")
+                .iter()
+                .any(|word| word == "dispatched Prefill");
+            if reads {
+                assert_eq!(code.as_deref(), Some("pd_decode_language_model_only_mrope"));
+                assert!(!sent, "refused ahead of the prefill's send");
+            } else {
+                assert_ne!(code.as_deref(), Some("pd_decode_language_model_only_mrope"));
+                assert!(sent, "the stripped side's pair goes out");
+            }
+            drop(ctx);
+        }
+        engine.abort();
+    }
+
+    /// A batch of a pair Grand Central placed that goes out says each side's
+    /// send once, behind its refusals: the decode's first, on the first of
+    /// its guards, which the plan made ahead of that send, and then the
+    /// prefill's. What the mock engine answers the sub-requests is no part
+    /// of this: both words are said ahead of them.
+    #[tokio::test]
+    async fn a_pairs_batch_that_goes_out_says_each_send_once() {
+        use crate::routers::grpc::regular::stages::testing::mock_backend_client;
+
+        let (client, engine) = mock_backend_client("m").await;
+        let stage = regular_stage(Arc::new(WorkerRegistry::new()));
+        let (heard, workers, ahead) =
+            a_pair_ahead_of_its_send("NixlConnector", RuntimeType::Vllm, None);
+        let mut ctx = an_attempt_over(workers, ahead, &client, RuntimeType::Vllm);
+        let request = || ProtoGenerateRequest::Vllm(Box::default());
+        let plan = ExecutionPlan::Batch {
+            kind: ExecutionPlanKind::PrefillDecode,
+            shared_request_id: "r".to_string(),
+            requests: vec![request(), request()],
+        };
+        let bound = Some(Duration::from_secs(5));
+        let _answered =
+            execute_plan(&mut ctx, plan, true, bound, GroupedDpSticky::Off, &stage).await;
+        let sends: Vec<String> = heard
+            .lock()
+            .expect("the stage heard")
+            .iter()
+            .filter(|word| word.starts_with("dispatched"))
+            .cloned()
+            .collect();
+        assert_eq!(sends, ["dispatched Decode", "dispatched Prefill"]);
+        drop(ctx);
+        engine.abort();
     }
 
     /// A decode request is built for the decode the first decision named.

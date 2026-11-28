@@ -3,7 +3,7 @@
 //!
 //! A host that decides over worker lists decides by the engine's in-process
 //! front ([`InProcess`]), which owns the state of its documents' stages.
-//! A store tells those stages every word of a lease it files: its issue,
+//! A store tells those stages the words of a lease it files: its issue,
 //! its dispatch and its end. So a build that holds that front keeps one
 //! engine object for the store's life, and a store's applied document is
 //! that engine's value of it ([`Applied`]). The stages that hear of a lease

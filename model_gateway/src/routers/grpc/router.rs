@@ -140,7 +140,8 @@ impl GrpcRouter {
                 ctx.configured_reasoning_parser.clone(),
                 &tool_parser_factory,
                 &reasoning_parser_factory,
-            ),
+            )
+            .reading_by_alias(Arc::clone(&ctx.by_alias)),
             multimodal,
             tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
             tokenizer_load_failures: ctx.tokenizer_load_failures.clone(),
@@ -1394,4 +1395,5 @@ fn clear_unapplied_reasoning_keys(body: &mut ResponsesRequest) {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/routers/grpc/router/tests.rs"]
 mod tests;

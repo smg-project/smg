@@ -12,6 +12,7 @@ use std::{collections::BTreeMap, pin::Pin};
 
 use engine_zmq_client::protocol::sglang::multimodal::SglangWireTensor;
 use futures::{Stream, StreamExt};
+use prost::Message;
 use sg::{
     generate_response::Response as GenResp,
     sglang_scheduler_server::{SglangScheduler, SglangSchedulerServer},
@@ -20,10 +21,138 @@ use smg_grpc_client::{common_proto as common, sglang_proto as sg};
 use tonic::{Request, Response, Status};
 
 use super::{
-    media_identity, Frame, GenerateInput, LogProbs, MediaSpan, MockScheduler, Rendezvous,
-    TokenizerStream,
+    constraint, media_id, media_identity, Frame, GenerateInput, LogProbs, MediaSpan, MockScheduler,
+    Rendezvous, Shaping, TokenizerStream,
 };
-use crate::{engine::KvEventStream, script::MatchedStop};
+use crate::{
+    engine::KvEventStream,
+    replay::f32_json,
+    script::{self, MatchedStop},
+};
+
+/// The gRPC paths of this wire's two info calls, as a recorder writes them
+/// beside a record file ([`script::recorded_info`]).
+const MODEL_INFO_CALL: &str = "/sglang.grpc.scheduler.SglangScheduler/GetModelInfo";
+const SERVER_INFO_CALL: &str = "/sglang.grpc.scheduler.SglangScheduler/GetServerInfo";
+
+/// The model of a record file made on this wire ([`super::recorded_model`]).
+pub(super) fn recorded_model() -> Option<super::RecordedModel> {
+    let recorded = script::recorded_info(MODEL_INFO_CALL)?;
+    let info = sg::GetModelInfoResponse::decode(recorded.as_slice()).ok()?;
+    Some(super::RecordedModel {
+        max_context_length: info.max_context_length,
+        max_req_input_len: info.max_req_input_len,
+        vocab_size: info.vocab_size,
+        supports_vision: info.supports_vision,
+        model_type: info.model_type,
+        architectures: info.architectures,
+        eos_token_ids: info.eos_token_ids,
+        pad_token_id: info.pad_token_id,
+        bos_token_id: info.bos_token_id,
+        default_sampling_params_json: info.default_sampling_params_json,
+    })
+}
+
+/// The one identity of a media batch: the feature hash it states, else a
+/// fold of its pixel tensor, as the gateway's request states none. It keys
+/// all the spans of the batch, as this wire's engine pads a request's images
+/// as one item, and it joins the key of a recorded line ([`asked`]). The
+/// tensor is tens of megabytes an image, so the fold takes eight bytes a
+/// step.
+fn batch_identity(batch: &sg::MultimodalInputs) -> u64 {
+    batch.feature_hash.unwrap_or_else(|| {
+        let pixels = batch.pixel_values.as_ref();
+        let pixels = pixels.map_or(&[][..], |tensor| &tensor.data[..]);
+        let (words, rest) = pixels.as_chunks::<8>();
+        words.iter().fold(media_identity(rest), |digest, word| {
+            let word = u64::from_le_bytes(*word);
+            let digest = (digest ^ word).wrapping_mul(0x0100_0000_01b3);
+            digest ^ (digest >> 32)
+        })
+    })
+}
+
+/// What a `Generate` request asks beyond its prompt, under the names every
+/// wire's recorded lines use (`recorded.asked`): the recorder writes it and a
+/// replay keys on it ([`script::ask_fold`]). A media batch reads as the
+/// feature hash it states, else as the fold of its pixel values
+/// ([`batch_identity`]), and each
+/// reference in it as the fold of its modality and URL, in the batch's order
+/// ([`media_id`]): a reference can carry a credential, and a record file
+/// keeps what this returns. This wire carries no seed.
+pub(super) fn asked(request: &sg::GenerateRequest) -> serde_json::Value {
+    use sg::sampling_params::Constraint;
+    let media: Vec<String> = request
+        .mm_inputs
+        .as_deref()
+        .into_iter()
+        .chain(&request.extra_mm_inputs)
+        .flat_map(|batch| {
+            let content = match batch.feature_hash {
+                Some(hash) => format!("{hash:016x}"),
+                None => format!("fold:{:016x}", batch_identity(batch)),
+            };
+            // Pixels that state no hash key under their modality too: the
+            // same bytes read as a video ask another answer. A batch that
+            // names no modality is an image batch.
+            let content = match &batch.pixel_values {
+                Some(_) if batch.feature_hash.is_none() => {
+                    let named = &batch.modalities;
+                    let video = !named.is_empty() && named.iter().all(|name| name == "video");
+                    format!("{}:{content}", if video { "video" } else { "image" })
+                }
+                _ => content,
+            };
+            // A batch of references states no hash and carries no pixels:
+            // each URL joins the key under its modality, in its order.
+            let references = [
+                ("image", &batch.image_urls),
+                ("video", &batch.video_urls),
+                ("audio", &batch.audio_urls),
+            ];
+            let references = references.into_iter().flat_map(|(modality, urls)| {
+                urls.iter()
+                    .map(move |url| media_id("", format!("{modality}\n{url}").as_bytes()))
+            });
+            std::iter::once(content).chain(references)
+        })
+        .collect();
+    let unset = sg::SamplingParams::default();
+    let params = request.sampling_params.as_ref().unwrap_or(&unset);
+    let shaping = Shaping {
+        min_p: params.min_p,
+        frequency_penalty: params.frequency_penalty,
+        presence_penalty: params.presence_penalty,
+        repetition_penalty: params.repetition_penalty,
+        min_new_tokens: params.min_new_tokens,
+        ignore_eos: params.ignore_eos,
+        no_stop_trim: params.no_stop_trim,
+        logit_bias: (params.logit_bias.iter())
+            .map(|(token, bias)| (token.clone(), *bias))
+            .collect(),
+        score_ids: &request.token_ids_logprob,
+    };
+    shaping.join(serde_json::json!({
+        "stream": request.stream,
+        "max_new_tokens": params.max_new_tokens,
+        "n": params.n,
+        "temperature": f32_json(params.temperature),
+        "top_p": f32_json(params.top_p),
+        "top_k": params.top_k,
+        "seed": serde_json::Value::Null,
+        "stop": params.stop,
+        "stop_token_ids": params.stop_token_ids,
+        "logprobs": request.return_logprob.then_some(request.top_logprobs_num),
+        "media": media.len(),
+        "media_ids": media,
+        "constraint": params.constraint.as_ref().map(|c| match c {
+            Constraint::JsonSchema(v) => constraint("json_schema", v.as_str()),
+            Constraint::Regex(v) => constraint("regex", v.as_str()),
+            Constraint::EbnfGrammar(v) => constraint("ebnf_grammar", v.as_str()),
+            Constraint::StructuralTag(v) => constraint("structural_tag", v.as_str()),
+        }),
+    }))
+}
 
 pub(super) type Server = SglangSchedulerServer<MockScheduler>;
 type GenStream = Pin<Box<dyn Stream<Item = Result<sg::GenerateResponse, Status>> + Send>>;
@@ -172,29 +301,21 @@ impl SglangScheduler for MockScheduler {
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let req = request.into_inner();
         check_mm_inputs(&req)?;
-        // One identity keys all the spans of a batch, as this wire's engine
-        // pads a request's images as one item: the batch's feature hash, or
-        // a fold of its pixel tensor where the request carries none, as the
-        // gateway's carries none. The tensor is tens of megabytes an image,
-        // so the fold takes eight bytes a step and waits until the cache
-        // reads the spans: a prefill-role or scripted request, and the
-        // canned engine, never pay for it, but a gRPC prefill worker under
-        // `--prefill-engine true` does.
+        let ask = script::recorded().then(|| script::ask_fold(&asked(&req)));
+        // One identity keys all the spans of a batch ([`batch_identity`]).
+        // Where the request states no hash it is a fold of the pixel tensor,
+        // which waits until the cache reads the spans: a prefill-role
+        // request, a request a hand-written script answers and the canned
+        // engine never pay for it, but a gRPC prefill worker under
+        // `--prefill-engine true` does. A worker that holds recorded lines
+        // pays it once a request, above, for the key of the line; the
+        // recorder pays it once as a call ends.
         let (batch, extra) = (req.mm_inputs, req.extra_mm_inputs);
         let media = move || -> Vec<MediaSpan> {
             let batches = batch.as_deref().into_iter().chain(&extra);
             batches
                 .flat_map(|batch| {
-                    let identity = batch.feature_hash.unwrap_or_else(|| {
-                        let pixels = batch.pixel_values.as_ref();
-                        let pixels = pixels.map_or(&[][..], |tensor| &tensor.data[..]);
-                        let (words, rest) = pixels.as_chunks::<8>();
-                        words.iter().fold(media_identity(rest), |digest, word| {
-                            let word = u64::from_le_bytes(*word);
-                            let digest = (digest ^ word).wrapping_mul(0x0100_0000_01b3);
-                            digest ^ (digest >> 32)
-                        })
-                    });
+                    let identity = batch_identity(batch);
                     batch.mm_placeholders.iter().map(move |span| MediaSpan {
                         identity,
                         offset: span.offset,
@@ -229,6 +350,7 @@ impl SglangScheduler for MockScheduler {
                 pin: req.data_parallel_rank,
                 rendezvous,
                 media: Box::new(media),
+                ask,
             })
             .await?;
         let request_id = req.request_id;
@@ -284,8 +406,19 @@ impl SglangScheduler for MockScheduler {
         _request: Request<sg::GetModelInfoRequest>,
     ) -> Result<Response<sg::GetModelInfoResponse>, Status> {
         self.overrides.model_info().refusal("model info")?;
+        // A replay of a record file made on this wire answers what the
+        // recorded engine did; a tokenizer stated on the command line is the
+        // one of this host, so its path goes in place of the engine's own.
+        if let Some(recorded) = script::recorded_info(MODEL_INFO_CALL) {
+            let mut info = sg::GetModelInfoResponse::decode(recorded.as_slice())
+                .map_err(|e| Status::internal(format!("the recorded model info: {e}")))?;
+            if self.cfg.tokenizer_path != self.cfg.model_id {
+                info.tokenizer_path.clone_from(&self.cfg.tokenizer_path);
+            }
+            return Ok(Response::new(info));
+        }
         let context_length = self.cfg.context_length.min(i32::MAX as u32) as i32;
-        Ok(Response::new(sg::GetModelInfoResponse {
+        let mut info = sg::GetModelInfoResponse {
             model_path: self.cfg.model_id.clone(),
             tokenizer_path: self.cfg.tokenizer_path.clone(),
             is_generation: true,
@@ -304,7 +437,20 @@ impl SglangScheduler for MockScheduler {
             id2label_json: String::new(),
             num_labels: 0,
             default_sampling_params_json: self.cfg.default_sampling_params_json.clone(),
-        }))
+        };
+        if let Some(model) = super::recorded_model() {
+            info.max_context_length = model.max_context_length;
+            info.max_req_input_len = model.max_req_input_len;
+            info.vocab_size = model.vocab_size;
+            info.supports_vision = model.supports_vision;
+            info.model_type = model.model_type;
+            info.architectures = model.architectures;
+            info.eos_token_ids = model.eos_token_ids;
+            info.pad_token_id = model.pad_token_id;
+            info.bos_token_id = model.bos_token_id;
+            info.default_sampling_params_json = model.default_sampling_params_json;
+        }
+        Ok(Response::new(info))
     }
 
     async fn get_server_info(
@@ -312,6 +458,11 @@ impl SglangScheduler for MockScheduler {
         _request: Request<sg::GetServerInfoRequest>,
     ) -> Result<Response<sg::GetServerInfoResponse>, Status> {
         self.overrides.server_info().refusal("server info")?;
+        if let Some(recorded) = script::recorded_info(SERVER_INFO_CALL) {
+            return sg::GetServerInfoResponse::decode(recorded.as_slice())
+                .map(Response::new)
+                .map_err(|e| Status::internal(format!("the recorded server info: {e}")));
+        }
         Ok(Response::new(sg::GetServerInfoResponse {
             server_args: self.server_args(),
             scheduler_info: None,
@@ -856,6 +1007,40 @@ mod tests {
         );
     }
 
+    /// A list and an object an info patch sets reach a client of this wire
+    /// as a list and a struct in the server args, as an engine servicer's do.
+    #[tokio::test]
+    async fn a_patched_list_and_object_reach_the_server_args_in_their_kinds() {
+        use prost_types::value::Kind;
+
+        let (service, _stop) = MockScheduler::for_tests(Config::default(), 65_381);
+        let patch = json!({
+            "weight_version": ["a", "b"],
+            "kv_cache_dtype": {"bits": 8},
+        });
+        service.overrides.patch_info(patch.as_object().unwrap());
+        let info = service
+            .get_server_info(Request::new(sg::GetServerInfoRequest {}))
+            .await
+            .expect("info")
+            .into_inner();
+        let args = info.server_args.expect("server args").fields;
+        let kind = |key: &str| args.get(key).and_then(|value| value.kind.as_ref());
+        assert!(
+            matches!(kind("weight_version"), Some(Kind::ListValue(list)) if list.values.len() == 2),
+            "a list of two members: {:?}",
+            kind("weight_version")
+        );
+        assert!(
+            matches!(
+                kind("kv_cache_dtype"),
+                Some(Kind::StructValue(entry)) if entry.fields.contains_key("bits")
+            ),
+            "a struct with its member: {:?}",
+            kind("kv_cache_dtype")
+        );
+    }
+
     /// The admin fan-out's three RPCs on this wire call the core's answers:
     /// the flush succeeds, a profiling run starts and stops with one trace
     /// file in the requested directory, and a second stop is refused.
@@ -1372,5 +1557,54 @@ mod tests {
             );
         }
         assert_eq!(cached, [Some(0), Some(64), Some(16)]);
+    }
+
+    #[test]
+    fn a_batch_of_media_references_keys_on_each_url() {
+        let asked_with = |images: &[&str], videos: &[&str]| {
+            let mut req = request("r", &[1, 2, 3], false);
+            req.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+                image_urls: images.iter().map(|url| (*url).to_string()).collect(),
+                video_urls: videos.iter().map(|url| (*url).to_string()).collect(),
+                ..Default::default()
+            }));
+            asked(&req)
+        };
+        let pair = asked_with(&["http://a/1.png", "http://a/2.png"], &[]);
+        assert_eq!(pair, asked_with(&["http://a/1.png", "http://a/2.png"], &[]));
+        // Another picture, the same pictures in another order and the same
+        // URL under another modality each ask another answer.
+        assert_ne!(pair, asked_with(&["http://a/1.png", "http://a/3.png"], &[]));
+        assert_ne!(pair, asked_with(&["http://a/2.png", "http://a/1.png"], &[]));
+        assert_ne!(
+            asked_with(&["http://a/1"], &[]),
+            asked_with(&[], &["http://a/1"])
+        );
+        // A record file keeps the fold of a reference, never its URL.
+        assert!(!pair.to_string().contains("http://"), "{pair}");
+        // A batch of pixels that states no hash keys on its bytes, the zero
+        // bytes too: a payload under more leading zero bytes, and an
+        // all-zero payload of another length, each ask another answer.
+        let asked_pixels = |modalities: &[&str], bytes: &[u8]| {
+            let mut req = request("r", &[1, 2, 3], false);
+            req.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+                modalities: modalities.iter().map(|name| (*name).to_string()).collect(),
+                pixel_values: Some(sg::TensorData {
+                    data: bytes.to_vec().into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+            asked(&req)
+        };
+        let float = asked_pixels(&[], &[0, 0, 128, 63]);
+        assert_eq!(float, asked_pixels(&[], &[0, 0, 128, 63]));
+        assert_ne!(float, asked_pixels(&[], &[0, 0, 0, 0, 0, 0, 128, 63]));
+        assert_ne!(asked_pixels(&[], &[0; 4]), asked_pixels(&[], &[0; 8]));
+        // Such a batch keys under its modality too: one that names none is
+        // an image batch, and the same pixels read as a video ask another
+        // answer.
+        assert_eq!(float, asked_pixels(&["image"], &[0, 0, 128, 63]));
+        assert_ne!(float, asked_pixels(&["video"], &[0, 0, 128, 63]));
     }
 }

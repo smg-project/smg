@@ -198,7 +198,12 @@ pub(super) async fn execute_tool_loop(
         .clone()
         .unwrap_or_else(|| format!("resp_{}", uuid::Uuid::now_v7()));
 
-    let session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &session_request_id);
+    let mut session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &session_request_id);
+    // The loaded request's tools, the list the servers were connected from: it
+    // also holds an `mcp` entry that an input item declared.
+    if let Some(tools) = current_request.tools.as_deref() {
+        openai_bridge::configure_response_tools_approval(&mut session, tools);
+    }
     let user_function_names = collect_user_function_names(&current_request);
 
     // Get MCP tools and convert to chat format (do this once before loop)

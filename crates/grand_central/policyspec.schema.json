@@ -38,11 +38,13 @@
       }
     },
     "profiles": {
-      "description": "The profiles by name, each of at least one character.",
+      "description": "From 1 to 65535 profiles by name, each name of at least one character.",
       "type": "object",
       "additionalProperties": {
         "$ref": "#/$defs/ProfileSpec"
       },
+      "minProperties": 1,
+      "maxProperties": 65535,
       "propertyNames": {
         "minLength": 1
       }
@@ -93,12 +95,12 @@
           "minimum": 1
         },
         "boundaries": {
-          "description": "Ascending token positions the hash index and the prefix-hash ring\nkey on; empty for none. A hash index needs at least one.",
+          "description": "Ascending token positions, each above zero, that the hash index and\nthe prefix-hash ring key on; empty for none. A hash index needs at\nleast one.",
           "type": "array",
           "items": {
             "type": "integer",
             "format": "uint32",
-            "minimum": 0
+            "minimum": 1
           },
           "default": []
         },
@@ -156,14 +158,14 @@
           "default": "tree"
         },
         "ttl_s": {
-          "description": "How long a hash-index placement stays routable, in seconds.",
+          "description": "How long a placement of the classic hash index stays routable, in\nseconds. The crate's engine does not read it: no placement of its\nrecord expires.",
           "type": "integer",
           "format": "uint32",
           "minimum": 1,
           "default": 180
         },
         "max_size": {
-          "description": "The size bound of a tree index: on a text host its characters plus\n1024 for each node a worker stands on, tokens otherwise.\nThe crate's engine reads it for a pool whose profile reads sent\nprefixes: the model's record is bound to `max_size` over the block\nsize placements, never under one, one a block a worker was sent. A\nlowered bound is met by sweeps, at the record's next writes and at\nthe engine's upkeep.",
+          "description": "The size bound of a tree index, summed over the workers: on a text\nhost the characters of the nodes each worker stands on plus 1024 for\neach such node, otherwise the tokens each worker holds, so a prefix\nthat several workers hold counts once for each of them.\nThe crate's engine reads it for a pool whose profile reads sent\nprefixes: the model's record is bound to `max_size` over the block\nsize placements, never under one. A placement is a block a worker\nwas sent, and under a hash index a boundary a worker was sent. A\nlowered bound is met by sweeps, at the record's next writes and at\nthe engine's upkeep.",
           "type": "integer",
           "format": "uint64",
           "minimum": 1,
@@ -188,7 +190,7 @@
           "const": "tree"
         },
         {
-          "description": "A placement map keyed by the request's head at `view.boundaries`,\neach placement living `ttl_s`.",
+          "description": "The record of sent prefixes keyed by the request's head at\n`view.boundaries` alone, as the classic hash index keys it. The\ncrate's engine keys the record at the last whole block under each\nboundary that holds one, where the request carries a block hash\nfor each block under the boundary. A request that carries\nfewer block hashes than the first such boundary has whole\nblocks, or one hashed by its text, has no key: the record\nnames no worker for it and takes no placement for it. A\nboundary of more whole blocks than `view.max_block_hashes`\nkeys nothing either, for a request that carries no more\nhashes than that. A holder's depth is its boundary's, so a\n`prefix-affinity` stage counts it only where that share of the\nrequest clears the stage's `threshold`. The settings of the classic\nhash index translate to a threshold of zero, which counts a holder\nat any boundary; a document written by hand writes `threshold: 0`\nfor the same. No placement of the engine's record expires: the\nindex's `max_size` bounds the record instead.",
           "type": "string",
           "const": "hash"
         }
@@ -1578,7 +1580,7 @@
           "const": "pd-pair"
         },
         {
-          "description": "The pair, then the encode profile over the encoders of the chosen\nprefill's class, once per encode item or once for the items taken\nas one; all three sides named. A request with items that no encoder\nis open to is refused ahead of the pair.",
+          "description": "The pair, then the encode profile over the encoders of the chosen\nprefill's class, once per encode item or once for the items taken\nas one; all three sides named. A request with items that no encoder\nis open to is refused ahead of the pair. The pair of a request with\nitems is picked among the prefills whose class holds an open encoder\nthat takes its media. A decode without the vision a request asks of\nit is no candidate of the pair either.",
           "type": "string",
           "const": "epd"
         }
@@ -1723,6 +1725,23 @@
         "rule_placed": {
           "description": "Whether a request this rule placed alone is the profile's own\n(default `told`). Under `untold` no stage hears that request's\nissue or its dispatch, it is none of the profile's sends, and\nneither the engine's record of sent prefixes nor a lent tree\ntakes its prompt. The session table still hears its dispatch,\nand the stages its completion and its release. Under the `pd-pair`\nplan each side of a pair follows the word on its own: a side the\nrule placed alone is kept from that side's profile, beside a side\nthe stages placed, which is told. A controller keeps the word on\nthe lease it files for a single request, and tells such a request\noff its file by it all the same. Its file keeps no word of a pair's\nside: a controller takes `told` alone under the `pd-pair` plan.",
           "$ref": "#/$defs/RulePlaced"
+        },
+        "sides": {
+          "description": "The sides of a pair the rule covers: `prefill` or `decode`, or both,\neach named once. Left out, the rule covers both sides. Stated under\nthe `pd-pair` plan alone.\n\nA side the rule does not name is its profile's alone. The rule reads,\nclaims and writes no pin of that side's session. A side whose picker\nleaves the placement to the rule is not left out. A gateway leaves a\nrole out of its sticky override where the role's policy keeps a\nrouting key's handling to itself, as its `manual` and its\n`consistent_hashing` do.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "enum": [
+              "prefill",
+              "decode"
+            ]
+          },
+          "minItems": 1,
+          "maxItems": 2,
+          "uniqueItems": true
         }
       },
       "additionalProperties": false
@@ -1864,7 +1883,7 @@
       "type": "object",
       "properties": {
         "sample": {
-          "description": "Each decider of a controller, and each calling thread in a host's\nown process, keeps every Nth pick or shed it counts. The count\nstarts over under a new generation, and in a controller under a new\nlead. Zero keeps none. In a host's own process a request is counted\nonly where an id names it.",
+          "description": "Each decider of a controller, and each calling thread in a host's\nown process, keeps every Nth pick or shed it counts. The count\nstarts over under a new generation, and in a controller under a new\nlead. In a host's own process it also starts over under another\nengine, by the document's number. Zero keeps none. In a host's own\nprocess a request is counted only where an id names it.",
           "type": "integer",
           "format": "uint32",
           "minimum": 0,

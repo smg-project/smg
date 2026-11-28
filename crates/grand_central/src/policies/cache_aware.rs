@@ -1449,5 +1449,5 @@ impl ReadsLoad for WarmupSlice {
 }
 
 #[cfg(test)]
-#[path = "../../tests/unit/policies/cache_aware/tests.rs"]
+#[path = "../../tests/unit/policies/cache_aware/tests/mod.rs"]
 mod tests;

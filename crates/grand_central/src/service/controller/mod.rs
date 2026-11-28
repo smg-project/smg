@@ -129,8 +129,9 @@ pub const PROTOCOL_PACKAGE: &str = "smg.policy.v1";
 /// `Hello` offers and its `Leader` answers, and the newest its `Welcome`
 /// picks (design 5.2). A change a peer must know its controller reads
 /// raises it, and every other additive change within the package keeps
-/// it. Version 2 is the first whose frames state a request's hard demands
-/// (`DecideRequest.demands`).
+/// it. The rule binds from the first shipped release that carries the
+/// contract, as the contract's header says. Version 2 is the first whose
+/// frames state a request's hard demands (`DecideRequest.demands`).
 pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The oldest protocol version this build speaks, the bottom of the same
@@ -159,6 +160,9 @@ pub struct Controller {
     metrics: Arc<metrics::Metrics>,
     /// This replica's candidate: the election thread steps it once served.
     elector: Elector,
+    /// The candidate's fence, taken at the bind: [`Self::fence`] hands it
+    /// out.
+    fence: Arc<Fence>,
     /// The election's sight of the lease, written by its thread.
     standing: watch::Sender<ElectionObservation>,
     /// The listeners' close: one word, said once by the serve's drain.
@@ -543,7 +547,7 @@ impl Controller {
                     settings,
                     &workers.holder(),
                     Arc::new(door),
-                    Arc::clone(&shared.fence),
+                    elector.fence(),
                     config.worker_overload,
                 )
                 .map(Box::new)
@@ -555,6 +559,7 @@ impl Controller {
             phase,
             readiness,
             metrics: Arc::new(metrics::Metrics::new()),
+            fence: elector.fence(),
             elector,
             standing,
             stop,
@@ -657,6 +662,9 @@ impl Controller {
     /// The stages a policy document may name in this controller, fixed at
     /// the bind: a spec file's document is validated against them
     /// ([`Controller::spec_file`]).
+    ///
+    /// A stage the host registered under a name the engine refuses
+    /// requests under is among them, and no document may name it.
     pub fn stage_registry(&self) -> &StageRegistry {
         &self.catalog
     }
@@ -813,7 +821,8 @@ impl Controller {
     /// the holder's doc says what a write on a replica that follows comes
     /// to ("A host's write calls"). A row written through the entries of
     /// [`Self::store`] itself has no worker object, and no first copy holds
-    /// it, until a cut is laid whole.
+    /// it, until a cut is laid whole. A standby's applier also lays it at
+    /// the next event that tells the row and that the store takes.
     pub fn workers(&self) -> Arc<Objects<Members>> {
         self.workers.holder()
     }
@@ -828,7 +837,7 @@ impl Controller {
     /// renew deadline. A shard thread reads it before every decision it
     /// sends; readiness and the `Leader` call read the same one.
     pub fn fence(&self) -> Arc<Fence> {
-        Arc::clone(&self.shared.fence)
+        Arc::clone(&self.fence)
     }
 
     /// The load reports of this replica's workers as its decisions are
@@ -1019,7 +1028,7 @@ impl Controller {
         }
         #[cfg(feature = "discovery")]
         if let Some(discovery) = discovery {
-            let standing = shared.standing.clone();
+            let standing = shared.steps();
             let discovery_stop = stop.subscribe();
             tasks.spawn(async move {
                 discovery.run(standing, discovery_stop).await;
@@ -1027,11 +1036,12 @@ impl Controller {
             });
         }
         // The presence sweep: what a gateway held is let go once its grace
-        // period ended with no new `Hello`.
-        let gateways = Arc::clone(&shared.gateways);
-        let sweep_stop = stop.subscribe();
+        // period ended with no new `Hello`. The names that left, the leases
+        // past their dispatch deadline and the upkeep of the standing
+        // document's engine ride its task's clock (`Gateways::run`).
+        let sweep = shared.sweep(stop.subscribe());
         tasks.spawn(async move {
-            gateways.run(sweep_stop).await;
+            sweep.await;
             Ok(())
         });
         // The restores' clock: a leader lets go of a snapshot's cut whose
@@ -1084,7 +1094,7 @@ impl Controller {
                 .await
                 .map_err(Error::Admin)
         });
-        let mut looks = shared.standing.clone();
+        let mut looks = shared.steps();
         let mut election = shared
             .elect(elector, standing)
             .map_err(Error::ElectionThread)?;
@@ -1232,6 +1242,11 @@ impl Controller {
 /// word that nobody leads here. The word told again ends it, the drain's
 /// included; told at the change alone, the drain would leave that watch
 /// open to the end of the grace period.
+///
+/// The word is the fence's from the first take on ([`Readiness::led`]). A
+/// take lands ahead of the serve's turn to serving, and a move in between
+/// tells the term: told once more that nobody leads here, a watch the
+/// fence admitted in that moment would end under a lead that stands.
 ///
 /// The word names the term led, and a term is told once. A release and the
 /// take behind it can both fall between two reads of this loop: the replica

@@ -32,7 +32,9 @@
 //! status its log has not told yet between a driver's move and the tell,
 //! and a copy holds the log's word at the copy's place. A cut takes no
 //! object's mutation lock. A row a writer left with no turn of the holder
-//! is in no first copy until a cut laid whole lays it.
+//! is in no first copy until a cut laid whole lays it. A standby's applier
+//! and a watcher also lay it at the next event that tells the row and that
+//! the store takes.
 
 use parking_lot::MutexGuard;
 use smg_worker::registry::Generation;
@@ -56,22 +58,36 @@ fn told_row(laid: &Laid, told: &Told) -> Option<WorkerRow> {
     expect(dead_code, reason = "a controller's doors read through the holder")
 )]
 impl<G: Generation> Objects<G> {
-    /// The record under the row id `id`, as a door reads it: in the
-    /// holder's turn, off the object. `None` where no object stands for
-    /// the row.
-    pub(crate) fn record(&self, id: WorkerId) -> Option<WorkerRow> {
+    /// The row under the id `id`, read back off the worker object that
+    /// stands for it. It states the facts the object was laid from, with
+    /// the models the object serves now and the status it states now.
+    /// Models another writer of the registry set on the object since read
+    /// back under the revision the object was laid at. An empty list set
+    /// so reads back as the cards the object was built with. `None` where
+    /// no object stands for the row.
+    ///
+    /// It takes the holder's turn: a writer of a row waits for the read,
+    /// and no decision does. Each call builds the row again from the
+    /// object and the facts the holder keeps beside it: a read costs a
+    /// copy of the row's facts. Of a model its id is copied, and no card.
+    /// The turn is taken once: code the holder runs inside a turn must
+    /// not read here ([`Objects`], "A host's read calls").
+    pub fn read_row(&self, id: WorkerId) -> Option<WorkerRow> {
         let _turn = self.turn.lock();
         self.row(id)
     }
 
-    /// The record under the registration key `key`, as [`Self::record`]
-    /// reads one.
-    pub(crate) fn record_under(&self, key: &str) -> Option<WorkerRow> {
+    /// The row under the registration key `key`, whatever its
+    /// incarnation, as [`Self::read_row`] reads one: in the holder's turn,
+    /// built again for the call, with the status its object states. The
+    /// key is matched whole: a row registered under an address with its
+    /// scheme is not found under the bare address.
+    pub fn read_row_under(&self, key: &str) -> Option<WorkerRow> {
         let _turn = self.turn.lock();
         self.row_under(key)
     }
 
-    /// Every record whose facts name `engine`, as [`Self::record`] reads
+    /// Every row whose facts name `engine`, as [`Self::read_row`] reads
     /// one: its plain row, or each rank that stands. In no order. Asked
     /// once a registration at a door: no decision reads it.
     pub(crate) fn records_of(&self, engine: &str) -> Vec<WorkerRow> {
@@ -88,23 +104,41 @@ impl<G: Generation> Objects<G> {
             .collect()
     }
 
-    /// Every row at one place of the journal, cut from the worker objects:
+    /// The rows at one place of the journal, cut from the worker objects:
     /// what a watch starts from, what a standby is restored from and what
     /// an operator reads whole. The rows come by registration key.
+    ///
+    /// `store` is the store the holder's write calls tell: the place, the
+    /// epoch and each row's status are read from it. The cut holds the
+    /// rows that the holder and that store both hold. Nothing checks the
+    /// pair: a cut over another store states the rows that store tells
+    /// too, under its place and its statuses. A store that tells no
+    /// journal states the default place.
     ///
     /// In the holder's turn. Every
     /// writer of a row's facts holds that turn from its decision to the
     /// journal's telling, so the objects state each row the journal told
-    /// and none it did not. A row's status is the one the journal told,
+    /// and none it did not. A row's status is the one the store holds,
     /// read with the place and the epoch in one hold of the store's
-    /// membership lock ([`MemoryStore::told`]). A status tell takes no
-    /// turn of the holder: it changes no fact, and the copy holds its
-    /// status where the place holds its event.
+    /// membership lock. A status tell takes no turn of the holder: it
+    /// changes no fact, and the copy holds its status where the place
+    /// holds its event.
     ///
     /// The store's lock is held for the place and the statuses, and the
-    /// holder's turn for the rows: a door's write and a standby's applier
+    /// holder's turn for the rows. A door's write and a standby's applier
     /// wait for the copy there, and no decision does.
-    pub(crate) fn checkpoint(&self, store: &MemoryStore) -> StoreCheckpoint {
+    ///
+    /// A row's models are its object's, read as the cut visits the row
+    /// ([`Self::read_row`]): the place does not date them. Another writer
+    /// of the registry may set models on objects while a cut runs. The
+    /// cut may then hold one object's new list beside another's old one,
+    /// and a list the journal holds no word of yet.
+    ///
+    /// A row read alone ([`Self::read_row`]) carries the status its object
+    /// states. A row of this cut carries the status the store holds. The
+    /// cut builds every row again from its object and sorts them by key:
+    /// it costs a copy of every row's facts.
+    pub fn checkpoint(&self, store: &MemoryStore) -> StoreCheckpoint {
         let (turn, told) = self.told_turn(store);
         let mut rows: Vec<WorkerRow> = {
             let held = self.held.read();
@@ -173,7 +207,9 @@ impl<G: Generation> Objects<G> {
     /// the place in the hold that takes the statuses. A change handed to
     /// the store around the holder ([`MemoryStore::follow`]) takes none
     /// either: no product code hands one so. A row written so is in no
-    /// copy until a cut laid whole lays it.
+    /// copy until a cut laid whole lays it, or a standby's applier or a
+    /// watcher at the next event that carries the row and that the store
+    /// takes.
     fn told_turn(&self, store: &MemoryStore) -> (MutexGuard<'_, ()>, Told) {
         let turn = self.turn.lock();
         let told = store.told();

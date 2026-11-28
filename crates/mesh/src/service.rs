@@ -530,7 +530,7 @@ mod tests {
     };
 
     use rustls::crypto::ring;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpSocket};
     use tonic::{
         transport::{
             server::TcpIncoming, Certificate, ClientTlsConfig, Endpoint, Identity, Server,
@@ -718,23 +718,25 @@ mod tests {
     #[tokio::test]
     async fn a_member_keeps_dialing_its_join_peer_until_it_is_up() {
         init();
-        // A's address, reserved by a bind that is released at once: B's
-        // first dials are refused, as they are while the peer is not up yet.
-        let (listener_a, addr_a) = bind_node().await;
-        drop(listener_a);
+        // A's address, held by a socket that is bound and does not listen
+        // yet: B's first dials are refused, as they are while the peer is not
+        // up, and no other socket is handed the port before A listens on it.
+        let socket_a = TcpSocket::new_v4().unwrap();
+        socket_a
+            .bind(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)))
+            .unwrap();
+        let addr_a = socket_a.local_addr().unwrap();
         let (listener_b, addr_b) = bind_node().await;
         let handler_b = mesh_run!("B", listener_b, addr_b, vec![addr_a]);
 
-        // B's first round and its dial pass before A binds its address.
+        // B's first round and its dial pass before A listens on its address.
         tokio::time::sleep(Duration::from_millis(2500)).await;
         assert_eq!(
             handler_b.state.read().len(),
             1,
             "B found a member while nothing listened on A's address"
         );
-        let listener_a = TcpListener::bind(addr_a)
-            .await
-            .expect("A's address is free again");
+        let listener_a = socket_a.listen(1024).expect("A's socket listens");
         let handler_a = mesh_run!("A", listener_a, addr_a, Vec::new());
 
         wait_for(

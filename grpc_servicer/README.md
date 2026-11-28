@@ -773,7 +773,10 @@ the same way on every Rust servicer: a JSON-schema feature xgrammar drops
 (`multipleOf`, `uniqueItems`, a string `format` it lacks, ...) wherever
 xgrammar is the backend, whether the schema is a `response_format`'s or inside
 a forced tool call's structural tag; every kind of constraint on an engine with
-no grammar backend; a kind the backend does not compile. The vLLM servicer
+no grammar backend; a kind the backend does not compile. A structural tag that
+holds nothing but a JSON answer's schema goes to the engine as that schema
+where the backend is pinned to another name than `xgrammar`, or compiles a
+JSON schema and no structural tag. The vLLM servicer
 reads the backend off `--structured-outputs-config`, the SGLang and TokenSpeed
 servicers off their engine's `--grammar-backend` (see their sections); a
 backend the servicer does not know is left to the engine. The refusal is
@@ -1281,9 +1284,10 @@ its tokenizer. The Rust servicer refuses a constraint that backend cannot
 enforce before the scheduler, as the vLLM servicer does: every kind under
 `none` (the scheduler itself would admit the request and abort it with a 400),
 an EBNF grammar or a structural tag under `outlines`, which compiles JSON
-schemas and regular expressions only, and a JSON-schema feature xgrammar drops
-under `xgrammar`; a backend it does not know (a plugin of the scheduler's) is
-left to the engine.
+schemas and regular expressions only (a tag that holds nothing but a JSON
+answer's schema goes to it as that schema), and a JSON-schema feature xgrammar
+drops under `xgrammar`; a backend it does not know (a plugin of the
+scheduler's) is left to the engine.
 
 The Rust servicer's launcher also writes the `structural_tag_vocabulary` key
 (`older`) when the xgrammar installed beside the engine predates the

@@ -82,9 +82,10 @@
                              prompt (default off; decode picks keep the whole prompt)
     balance_rel_threshold:   Relative margin of the spill gate (multiple of the fleet mean)
     eviction_interval_secs:  Interval between LRU eviction / TTL sweep cycles
-    max_tree_size:           Max total size of each model's approximate tree (chars plus
-                             1024 for each node a worker stands on, or tokens), shared
-                             across all workers; enforced by eviction
+    max_tree_size:           Max total size of each model's approximate tree, summed over
+                             all workers (for each worker the chars of the nodes it stands
+                             on plus 1024 for each such node, or its tokens); enforced by
+                             eviction
     block_size:              Backend KV cache block size for event-driven routing
     cache_index:             Under-layer: tree (radix trees) or hash (placement map)
     cache_ttl_secs:          Seconds a hash-index placement stays routable
@@ -102,14 +103,14 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
+#[cfg(test)]
+use kv_index::PLACEMENT_HOLDER_CAP;
 use kv_index::{
     compute_request_content_hashes, request_prefix_hashes, salt::request_content_hashes_with_seed,
-    ContentHash, ModelTrees, OverlapScores, TenantId, TokenTree, Tree,
+    ContentHash, ModelPlacements, ModelTrees, OverlapScores, TenantId, TokenTree, Tree,
 };
 use parking_lot::RwLock;
 use rand::RngExt;
-use rustc_hash::FxBuildHasher;
 use serde::{Deserialize, Serialize};
 use smg_grand_central::engine::CacheIndex;
 use smg_worker::{
@@ -284,43 +285,24 @@ pub struct CacheAwarePolicy {
     /// `sync_local_insert` is a no-op.
     mesh_tree_sync: RwLock<Option<Arc<TreeSyncAdapter>>>,
     /// Hash-mode placement index (`cache_index = hash`): model →
-    /// (boundary, head hash) → live holders. Empty in tree mode.
-    /// Inner maps are Arc'd and model entries are never removed, so a
-    /// cloned inner handle stays canonical and walking it never holds
-    /// an outer-shard guard.
-    placement_index: Arc<DashMap<String, Arc<PlacementMap>, FxBuildHasher>>,
+    /// (boundary, head hash) → live holders, in the index crate's store
+    /// ([`ModelPlacements`]). Empty in tree mode. A holder is live while
+    /// its last touch is within `cache_ttl_secs`.
+    placement_index: Arc<ModelPlacements>,
 }
 
-/// Hash-mode per-model placement map: (boundary position, xxh3 of the token
-/// head up to that boundary) → workers recently routed that exact head.
-type PlacementMap = DashMap<(usize, u64), Vec<PlacementHolder>>;
-
-/// One worker's most recent dispatch of a head; live while `last_touch`
-/// is within `cache_ttl_secs`.
-#[derive(Debug, Clone)]
-struct PlacementHolder {
-    worker_url: String,
-    last_touch: Instant,
-}
-
-/// Max workers remembered per (boundary, head) key; recording a fourth
-/// evicts the stalest.
-const PLACEMENT_HOLDER_CAP: usize = 3;
-
-fn hash_token_head(namespace: Option<CacheNamespace>, head: &[u32]) -> u64 {
-    match namespace {
-        // An unpartitioned head hashes exactly as before.
-        None => xxhash_rust::xxh3::xxh3_64(bytemuck::cast_slice(head)),
-        // A partitioned head hashes as marker ‖ head (the placement index has
-        // no pages, so the bare marker suffices): a differing namespace is a
-        // different key, and a same-namespace head keys as before.
-        Some(namespace) => {
-            let mut hasher = xxhash_rust::xxh3::Xxh3::new();
-            hasher.update(bytemuck::cast_slice(&namespace.token_marker()));
-            hasher.update(bytemuck::cast_slice(head));
-            hasher.digest()
-        }
+/// What the placement index reads of a partition: its two marker ids.
+impl From<CacheNamespace> for [u32; 2] {
+    fn from(namespace: CacheNamespace) -> Self {
+        namespace.token_marker()
     }
+}
+
+/// The hash of a token head for the placement index: the index crate's
+/// ([`kv_index::hash_token_head`]), which reads the namespace's token
+/// marker for a partitioned head.
+fn hash_token_head(namespace: Option<CacheNamespace>, head: &[u32]) -> u64 {
+    kv_index::hash_token_head(namespace, head)
 }
 
 /// Total size across tenants (cached characters plus 1024 for each node)
@@ -402,11 +384,7 @@ impl CacheAwarePolicy {
         // Token trees sized to the backend's KV page (`block_size`): affinity
         // below one backend page is unusable by the engine.
         let trees = Arc::new(ModelTrees::new(config.block_size));
-        // Keyed by the operator's model ids and read on every request: the Fx
-        // hasher, as the model registry's maps.
-        let placement_index = Arc::new(
-            DashMap::<String, Arc<PlacementMap>, FxBuildHasher>::with_hasher(FxBuildHasher),
-        );
+        let placement_index = Arc::new(ModelPlacements::new());
 
         // Start background eviction thread if configured
         let eviction_task = if config.cache_index == CacheIndexKind::Hash {
@@ -728,17 +706,7 @@ impl CacheAwarePolicy {
         self.load_scorer.remove_worker(url);
         let tenant: TenantId = Arc::from(url);
         self.trees.remove_tenant(&tenant);
-        let placement_maps: Vec<Arc<PlacementMap>> = self
-            .placement_index
-            .iter()
-            .map(|model| Arc::clone(model.value()))
-            .collect();
-        for placements in placement_maps {
-            placements.retain(|_, holders| {
-                holders.retain(|h| h.worker_url != url);
-                !holders.is_empty()
-            });
-        }
+        self.placement_index.remove_worker(url);
     }
 
     /// `model_id`'s string tree, for tests that seed and read its tenants.
@@ -756,16 +724,8 @@ impl CacheAwarePolicy {
             .map(|worker_url| TenantId::from(worker_url.as_str()))
             .collect();
         self.trees.remove_tenants_from_model(model_id, &tenants);
-        let placements = self
-            .placement_index
-            .get(model_id)
-            .map(|entry| Arc::clone(entry.value()));
-        if let Some(placements) = placements {
-            placements.retain(|_, holders| {
-                holders.retain(|holder| !worker_urls.contains(&holder.worker_url));
-                !holders.is_empty()
-            });
-        }
+        self.placement_index
+            .remove_workers_from_model(model_id, worker_urls);
     }
 
     /// Test-only: one eviction pass over every tree at `max_size`, what the
@@ -3367,23 +3327,16 @@ impl CacheAwarePolicy {
         now: Instant,
     ) -> Vec<usize> {
         let ttl = Duration::from_secs(self.config.cache_ttl_secs);
-        let Some(model) = self
-            .placement_index
-            .get(model_id)
-            .map(|entry| Arc::clone(entry.value()))
-        else {
-            return Vec::new();
-        };
-        let Some(mut holders) = model.get_mut(&key) else {
-            return Vec::new();
-        };
-        holders.retain(|h| now.duration_since(h.last_touch) <= ttl);
-        holders
-            .iter()
-            .filter_map(|h| url_to_idx.get(h.worker_url.as_str()))
-            .flatten()
-            .copied()
-            .collect()
+        self.placement_index
+            .live_holders(model_id, key, now, ttl, |holders| {
+                holders
+                    .iter()
+                    .filter_map(|h| url_to_idx.get(h.worker_url.as_str()))
+                    .flatten()
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Record/touch `worker_url` at every applicable boundary of this
@@ -3398,63 +3351,15 @@ impl CacheAwarePolicy {
         now: Instant,
     ) {
         let ttl = Duration::from_secs(self.config.cache_ttl_secs);
-        let model = if let Some(entry) = self.placement_index.get(model_id) {
-            Arc::clone(entry.value())
-        } else {
-            Arc::clone(
-                self.placement_index
-                    .entry(model_id.to_string())
-                    .or_default()
-                    .value(),
-            )
-        };
-        for &boundary in boundaries {
-            let key = (boundary, hash_token_head(namespace, &tokens[..boundary]));
-            let mut holders = model.entry(key).or_default();
-            holders.retain(|h| now.duration_since(h.last_touch) <= ttl);
-            if let Some(holder) = holders.iter_mut().find(|h| h.worker_url == worker_url) {
-                holder.last_touch = now;
-                continue;
-            }
-            if holders.len() >= PLACEMENT_HOLDER_CAP {
-                if let Some(stalest) = holders
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, h)| h.last_touch)
-                    .map(|(i, _)| i)
-                {
-                    holders.swap_remove(stalest);
-                }
-            }
-            holders.push(PlacementHolder {
-                worker_url: worker_url.to_string(),
-                last_touch: now,
-            });
-        }
+        self.placement_index.record(
+            model_id, namespace, tokens, boundaries, worker_url, now, ttl,
+        );
     }
 
     /// Drop expired holders and empty keys; refresh the per-model entry
     /// gauge. Returns total live entries across models.
-    fn sweep_placement_index(
-        index: &DashMap<String, Arc<PlacementMap>, FxBuildHasher>,
-        ttl: Duration,
-        now: Instant,
-    ) -> usize {
-        let models: Vec<(String, Arc<PlacementMap>)> = index
-            .iter()
-            .map(|model| (model.key().clone(), Arc::clone(model.value())))
-            .collect();
-        let mut total = 0usize;
-        for (model_id, placements) in models {
-            placements.retain(|_, holders| {
-                holders.retain(|h| now.duration_since(h.last_touch) <= ttl);
-                !holders.is_empty()
-            });
-            let entries = placements.len();
-            total += entries;
-            Metrics::set_cache_placement_entries(&model_id, entries);
-        }
-        total
+    fn sweep_placement_index(index: &ModelPlacements, ttl: Duration, now: Instant) -> usize {
+        index.sweep(ttl, now, Metrics::set_cache_placement_entries)
     }
 
     /// Select worker using token-based tree (requests routed by token ids)

@@ -888,13 +888,20 @@ pub struct WorkerSpec {
 
     /// Per-worker load monitor interval override (seconds).
     /// When set, workers in the same group use this interval for load polling.
-    /// Falls back to the global `load_monitor_interval_secs` from router config.
+    /// Falls back to the router's interval: `load_monitor_interval_ms` of the
+    /// router config where it is set, else its `load_monitor_interval_secs`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub load_monitor_interval_secs: Option<u64>,
 
     /// Per-worker multimodal tensor transport override (`inline` | `shm` | `auto` | `rdma`).
     /// Overrides the router-level `multimodal_tensor_transport` for this worker
     /// (e.g. force `shm` for a co-located worker, `inline` for a remote one).
+    /// The RDMA lane is process-wide and only the router-level settings turn
+    /// it on or off (the router-level `multimodal_tensor_transport`, or the
+    /// legacy `mm_pixel_rdma`): `rdma` here alone does not turn it on. While
+    /// the lane is on, the gateway tries it first for each encoder input of
+    /// a gRPC worker whose runtime pulls from it, unless that input went to
+    /// shared memory: `inline` here does not keep a worker off the lane.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_tensor_transport: Option<TransportMode>,
 
@@ -1072,13 +1079,15 @@ impl WorkerSpec {
 
 /// Multimodal tensor transport mode for large payloads.
 ///
-/// - `Inline`: always carry tensor bytes in the gRPC message.
+/// - `Inline`: carry tensor bytes in the gRPC message; while the RDMA lane is
+///   on, a worker whose runtime pulls from it is still tried over the lane.
 /// - `Shm`: use same-host `/dev/shm` when SMG can write it.
 /// - `Auto`: use `/dev/shm` only when the receiving worker is verified to share
 ///   SMG's `/dev/shm`; otherwise fall back to inline.
-/// - `Rdma`: use the NIXL RDMA pixel lane for large tensors (requires the
-///   `mm-rdma` build feature + NIXL); falls back to inline when RDMA is
-///   unavailable.
+/// - `Rdma`: use the NIXL RDMA pixel lane (requires the `mm-rdma` build
+///   feature + NIXL); falls back to inline when RDMA is unavailable. Only the
+///   router-level settings turn the lane on: as a per-worker value, `rdma`
+///   carries the tensors as `inline` does.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -2168,12 +2177,33 @@ impl WorkerLoadResponse {
     /// Resident context tokens summed across all DP ranks; `None` unless
     /// every rank reports them. A report that lists fewer entries than the
     /// ranks it states answers `None` too, ahead of any sum: the ranks it
-    /// leaves out are in none.
+    /// leaves out are in none. The sum is exact in any order of the ranks,
+    /// in a count wider than a rank's: a sum past either end of what the
+    /// answer holds reads as that end, and nothing wraps.
     pub fn total_resident_tokens(&self) -> Option<i64> {
         if !self.lists_every_rank() {
             return None;
         }
-        self.loads.iter().map(|l| l.num_resident_tokens).sum()
+        // In the ranks' own width while the running sum fits: one add a rank.
+        let mut total = 0i64;
+        for load in &self.loads {
+            match total.checked_add(load.num_resident_tokens?) {
+                Some(sum) => total = sum,
+                None => return self.wide_total_resident_tokens(),
+            }
+        }
+        Some(total)
+    }
+
+    /// [`Self::total_resident_tokens`] for a report whose running sum left
+    /// the ranks' width: the whole sum in a wider count, held at the nearer
+    /// end of what the answer holds.
+    #[cold]
+    fn wide_total_resident_tokens(&self) -> Option<i64> {
+        let total = self.loads.iter().try_fold(0i128, |sum, load| {
+            Some(sum + i128::from(load.num_resident_tokens?))
+        })?;
+        Some(i64::try_from(total).unwrap_or(if total < 0 { i64::MIN } else { i64::MAX }))
     }
 
     /// Total running requests summed across all DP ranks.

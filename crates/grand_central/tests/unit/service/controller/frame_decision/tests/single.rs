@@ -1,0 +1,657 @@
+//! The cases of a single request's frame, and of a frame that stands alone.
+//! A single request's ask [`decide`] as a deciding thread asks it, in the
+//! world of one load of a store, over the worker objects the store's holder
+//! lays. One asks the engine's entry that [`decide`] asks, over the same
+//! objects, for a request whose host states what the workers hold of its
+//! prompt. One asks which documents are given the load snapshot. Two ask
+//! [`decide_alone`] for a prefill and for a decode frame that stands alone.
+
+use super::*;
+
+/// A decision whose stages refuse by no report reads no place, though its
+/// decider lent one: a frame left under another file's watch stays there
+/// for that file's thread, and the decision takes no turn at it.
+#[test]
+fn a_served_decision_whose_stages_refuse_by_no_report_applies_nothing_at_the_other_files() {
+    let store = Arc::new(MemoryStore::new().with_decision_slots(2));
+    let objects = holder(&store);
+    store
+        .apply(preset("random", 1))
+        .expect("above the unbound start");
+    let member = member(&store, &objects, 0);
+    LeasesStore::set_term(&*store, 1);
+    let mut watch = a_frame_under_the_second_files_watch(&store, member);
+    // The first file's decision, its place lent, under the preset's stages:
+    // each says it refuses by no report.
+    let _acting = DecisionSlot::new(0).enter();
+    let place = store.at_work();
+    let now = Instant::now();
+    let frame = frame_for(BOOKED, 1, 1);
+    let decision = served(&store, &objects, frame, GATEWAY, (now, now), Some(&place));
+    assert_eq!(first(&decision), Some(member), "its one worker is picked");
+    assert_eq!(
+        watch.look(),
+        LookOutcome::Fed,
+        "the frame waited for its file's look"
+    );
+}
+
+/// A key under a sessions rule with an in-flight cap keeps an owner over
+/// its thresholds in a decision this service makes, as under a host that
+/// counts its requests. The leases this service holds count the key's
+/// requests on each worker, and the request its maker makes says so: the
+/// cap can hand the key on, so the veto is lifted for the key. With the
+/// cap's two requests of the key on file on its owner, the key goes to
+/// another worker.
+#[test]
+fn a_served_key_under_a_capped_rule_keeps_an_owner_over_its_thresholds_below_its_cap() {
+    let mut document = PolicySpec::preset("consistent_hashing").expect("a preset of this build");
+    let manual = PolicySpec::preset("manual").expect("a preset of this build");
+    let rule = manual.bindings.first();
+    let rule = rule.and_then(|binding| binding.sessions.clone());
+    let mut rule = rule.expect("the manual preset's rule");
+    rule.assignment = Assignment::Delegate;
+    rule.inflight_cap = 2;
+    document.generation = 1;
+    document.view.headers = manual.view.headers.clone();
+    let binding = document.bindings.first_mut().expect("the preset's binding");
+    // The rule names the key's header, so the ring's own sources go: a
+    // binding names them once.
+    binding.routing_key = None;
+    binding.sessions = Some(rule);
+    let store = Arc::new(MemoryStore::with_publish_window(Duration::ZERO));
+    let objects = holder(&store);
+    let (singles, _) = fleet(&store, &objects);
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    store.apply(spec).expect("above the unbound start");
+    let now = Instant::now();
+    // The worker a request of the one key is sent to.
+    let decided = |id: u8| {
+        let frame = keyed(frame_for(MODEL, id, u64::from(id)), 17);
+        first(&served(&store, &objects, frame, GATEWAY, (now, now), None))
+    };
+    let owner = decided(1).expect("a pick over a free pool");
+    assert_eq!(decided(2), Some(owner), "the key has one owner");
+    let named = singles.iter().position(|&single| single == owner);
+    let named = named.expect("a worker of the fleet's singles");
+    // The owner's object reads over its thresholds, as a load monitor's
+    // verdict leaves it.
+    let url = format!("http://w{named}:8000");
+    let object = objects.registry().get_by_url(&url).expect("its object");
+    object.set_overloaded(true);
+    assert!(object.is_overloaded(), "the owner reads overloaded");
+    assert_eq!(
+        decided(3),
+        Some(owner),
+        "the cap's count stands, so the key keeps its owner"
+    );
+    // The cap's two requests of the key on file on its owner: the frame's
+    // session is the number its key hashes to.
+    LeasesStore::set_term(&*store, 1);
+    for id in 1..=2 {
+        file_of(&store, id, owner, Session::from_raw(17), now);
+    }
+    let next = decided(4).expect("a pick beside two workers under their thresholds");
+    assert_ne!(next, owner, "the key's owner is at its cap");
+}
+
+/// A decision reads one count a worker: the count its records took is
+/// kept, and a lease filed after it moves nothing the decision's stages
+/// read. Two leases are filed on the worker that held the fewest, after a
+/// stage's first reads and before the `count-first` picker's pick: the
+/// picker still names that worker. The next decision reads the two.
+#[test]
+fn a_served_lease_filed_after_a_records_first_read_moves_nothing_the_decision_reads() {
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    let late = Arc::new(Mutex::new(Vec::new()));
+    let read = Arc::new(Mutex::new(Vec::new()));
+    let mut catalog = StageRegistry::builtin();
+    let (kept, filed, own) = (Arc::clone(&read), Arc::clone(&late), Arc::downgrade(&store));
+    let stage = move || -> Box<dyn Filter> {
+        Box::new(Late {
+            store: Weak::clone(&own),
+            late: Arc::clone(&filed),
+            read: Arc::clone(&kept),
+        })
+    };
+    catalog.filter("late", stage).expect("a free name");
+    let mut document = PolicySpec::preset("random").expect("a preset of this build");
+    document.generation = 1;
+    let profile = document.profiles.get_mut("random");
+    let profile = profile.expect("the preset's profile");
+    profile.pick = "count-first".into();
+    profile.filter.push("late".into());
+    store
+        .apply(staged(&document, &catalog))
+        .expect("above the unbound start");
+    let members: Vec<WorkerId> = (0..3).map(|i| member(&store, &objects, i)).collect();
+    LeasesStore::set_term(&*store, 1);
+    let now = Instant::now();
+    for (target, id) in [members[0], members[2], members[2]].into_iter().zip(1..) {
+        file(&store, id, target, now);
+    }
+    let fewest = members[1];
+    *late.lock() = vec![fewest, fewest];
+    let frame = frame_for(BOOKED, 1, 1);
+    let decision = served(&store, &objects, frame, GATEWAY, (now, now), None);
+    let before = by_id(&members, &[1, 0, 2]);
+    assert_eq!(
+        read.lock()[0],
+        [before.clone(), before],
+        "a decision reads one count a worker"
+    );
+    assert_eq!(first(&decision), Some(fewest), "the picker read it too");
+    let frame = frame_for(BOOKED, 2, 2);
+    let next = served(&store, &objects, frame, GATEWAY, (now, now), None);
+    assert_eq!(read.lock()[1][0], by_id(&members, &[1, 2, 2]));
+    assert_eq!(first(&next), Some(members[0]), "the next reads the two");
+}
+
+/// The engine's own placement by the fewest requests reads the leases on
+/// file as a stage does, with nothing declared: a profile whose picker
+/// leaves the placement to its rule, under no rule and under a rule that
+/// delegates, and a sessions rule that assigns `min_load`. Each places a
+/// request on the worker that holds the fewest leases, whatever the
+/// request's seed.
+#[test]
+fn a_served_placement_by_the_fewest_requests_reads_the_leases_on_file() {
+    let ruled = |assignment: Assignment, pick: &str| {
+        let mut document = PolicySpec::preset("manual").expect("a preset of this build");
+        let rule = document.bindings[0].sessions.as_mut();
+        rule.expect("the preset's rule").assignment = assignment;
+        let profile = document.profiles.get_mut("manual");
+        profile.expect("the preset's profile").pick = pick.into();
+        document
+    };
+    let unruled = r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"manual"}}}"#;
+    let mut unruled: PolicySpec = serde_json::from_str(unruled).expect("a document");
+    unruled.generation = 1;
+    let (delegate, min_load) = (Assignment::Delegate, Assignment::MinLoad);
+    let cases = [
+        ("no rule", unruled, false),
+        ("a rule that delegates", ruled(delegate, "manual"), false),
+        (
+            "a rule that delegates, a key",
+            ruled(delegate, "manual"),
+            true,
+        ),
+        ("min_load", ruled(min_load, "random"), true),
+        (
+            "min_load, the placement its rule's",
+            ruled(min_load, "manual"),
+            true,
+        ),
+    ];
+    for (name, document, has_key) in cases {
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        let (store, objects, members, now) = booked(spec, &[2, 0, 3]);
+        for seed in 1..=16u8 {
+            let mut frame = frame_for(BOOKED, seed, u64::from(seed));
+            if has_key {
+                frame = keyed(frame, u64::from(seed));
+            }
+            let decision = served(&store, &objects, frame, GATEWAY, (now, now), None);
+            assert_eq!(first(&decision), Some(members[1]), "{name}, seed {seed}");
+        }
+    }
+}
+
+/// What the engine is handed for one request, as a stage reads it: the
+/// decision's instant and what is left of the budget, the candidates, and
+/// those of them its filters kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Handed {
+    now_micros: u64,
+    budget_micros: u32,
+    candidates: Vec<WorkerId>,
+    kept: Vec<WorkerId>,
+}
+
+/// The `random` picker, keeping what each decision is handed.
+#[derive(Debug)]
+struct Hands(Arc<Mutex<Vec<Handed>>>);
+
+impl Lifecycle for Hands {}
+
+impl Picker for Hands {
+    fn name(&self) -> &'static str {
+        "hands"
+    }
+
+    fn pick(
+        &self,
+        facts: &RequestFacts<'_>,
+        candidates: &[Candidate],
+        kept: &[u32],
+        scores: &[f32],
+        band: TieBand,
+        out: &mut Targets,
+    ) {
+        let mut all: Vec<WorkerId> = candidates.iter().map(|row| row.id).collect();
+        let passed = kept.iter().filter_map(|&at| candidates.get(at as usize));
+        let mut passed: Vec<WorkerId> = passed.map(|row| row.id).collect();
+        all.sort_unstable();
+        passed.sort_unstable();
+        self.0.lock().push(Handed {
+            now_micros: facts.now_micros,
+            budget_micros: facts.budget_micros,
+            candidates: all,
+            kept: passed,
+        });
+        Random.pick(facts, candidates, kept, scores, band, out);
+    }
+}
+
+/// The engine is handed the asking gateway's vetoes as they stand at the
+/// decider's instant, that instant on its own clock, and what is left of
+/// the request's budget. A veto is its gateway's alone, and it stands at
+/// the decision's instant or it holds no worker out. A model no member
+/// serves is decided over no worker: no stage is asked.
+#[test]
+fn a_served_decision_is_handed_its_gateways_vetoes_its_instant_and_the_budget_left() {
+    let heard = Arc::new(Mutex::new(Vec::new()));
+    let mut catalog = StageRegistry::builtin();
+    let kept = Arc::clone(&heard);
+    let stage = move || -> Box<dyn Picker> { Box::new(Hands(Arc::clone(&kept))) };
+    catalog.picker("hands", stage).expect("a free name");
+    let mut document = PolicySpec::preset("random").expect("a preset of this build");
+    document.generation = 1;
+    let profile = document.profiles.get_mut("random");
+    profile.expect("the preset's profile").pick = "hands".into();
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    let (mut singles, _) = fleet(&store, &objects);
+    singles.sort_unstable();
+    store
+        .apply(staged(&document, &catalog))
+        .expect("above the unbound start");
+    let taken = Instant::now();
+    let now = taken + Duration::from_secs(3);
+    // Received so long before its taking that 1,234 microseconds of the
+    // budget are left.
+    let waited = BUDGET - Duration::from_micros(1_234);
+    // One decision, and what its picker was handed where it was asked.
+    let handed = |model: &str, gateway: GatewayId, at: Instant| {
+        let frame = frame_for(model, 1, 1);
+        let decision = served(&store, &objects, frame, gateway, (at - waited, at), None);
+        let mut asked = mem::take(&mut *heard.lock());
+        assert!(asked.len() <= 1, "a decision asks its picker once");
+        (decision, asked.pop())
+    };
+    let micros = |at: Instant| store.deciding(|world| world.front().clock().micros(at));
+    let whole = Handed {
+        now_micros: micros(now),
+        budget_micros: 1_234,
+        candidates: singles.clone(),
+        kept: singles.clone(),
+    };
+    assert_eq!(handed(MODEL, GATEWAY, now).1, Some(whole.clone()));
+
+    let vetoed = singles[1];
+    store.gateway_veto(GATEWAY, vetoed, Some(taken + Duration::from_secs(60)));
+    let held_out = Handed {
+        kept: vec![singles[0], singles[2]],
+        ..whole.clone()
+    };
+    let standing = handed(MODEL, GATEWAY, now).1;
+    assert_eq!(standing, Some(held_out), "a standing veto");
+    let theirs = handed(MODEL, OTHER, now).1;
+    assert_eq!(theirs, Some(whole.clone()), "the veto is its gateway's");
+    let ended = taken + Duration::from_secs(61);
+    let after = Handed {
+        now_micros: micros(ended),
+        ..whole
+    };
+    let past = handed(MODEL, GATEWAY, ended).1;
+    assert_eq!(past, Some(after), "a veto that ended");
+
+    let (nobody, asked) = handed("model-nobody-serves", GATEWAY, now);
+    assert_eq!(first(&nobody), None, "no worker to name");
+    assert_eq!(asked, None, "decided over no worker");
+}
+
+/// A decision runs under the generation of the world it read, whatever
+/// generation the store applies meanwhile. The store keeps one engine, and
+/// that engine holds the later generation by the time this decision asks:
+/// the decision is made by its world's stage all the same, its lease is
+/// filed under its world's generation, and the stage that made the pick
+/// hears the issue. The later generation's stage is asked nothing.
+#[test]
+fn a_decision_whose_world_a_generation_replaced_is_decided_and_filed_under_its_worlds() {
+    let did = Arc::new(Mutex::new(Vec::new()));
+    let mut catalog = StageRegistry::builtin();
+    let (built, kept) = (AtomicU32::new(0), Arc::clone(&did));
+    let stage = move || -> Box<dyn Picker> {
+        let made = built.fetch_add(1, Ordering::Relaxed);
+        let did = Arc::clone(&kept);
+        Box::new(Which { made, did })
+    };
+    catalog.picker("which", stage).expect("a free name");
+    // The second generation states the profile another way, so its picker
+    // is an object of its own.
+    let spec = |generation: u64, filters: &str| {
+        let text = format!(
+            r#"{{
+              "apiVersion": "smg.policy/v1",
+              "profiles": {{ "only": {{ "filter": [{filters}], "pick": "which" }} }},
+              "bindings": [ {{ "match": {{ "model": "*" }}, "profile": "only" }} ]
+            }}"#
+        );
+        let mut document: PolicySpec = serde_json::from_str(&text).expect("a document");
+        document.generation = generation;
+        staged(&document, &catalog)
+    };
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    fleet(&store, &objects);
+    store.apply(spec(1, "")).expect("above the unbound start");
+    LeasesStore::set_term(&*store, 1);
+    let now = Instant::now();
+    let request = Checked::new(frame_for(MODEL, 1, 1)).expect("a frame the record holds");
+    let taken = taken_at(&request, GATEWAY, (now, now), None);
+    let (mut frames, own) = (FrameBuffers::default(), Part::default());
+    let loads = Arc::new(LoadSnapshot::default());
+    let next = spec(2, r#""healthy""#);
+    let (decision, lease) = store.deciding(|world| {
+        // A generation starts while the decision holds its world.
+        store.apply(next).expect("a later generation");
+        let decided = decide(world, &objects, &taken, &mut frames, &loads, &own);
+        let (decision, booked) = decided.expect("the engine decides");
+        let filed = issue(&store, world, &taken, 1, &decision, booked);
+        let lease = filed.expect("the store files it");
+        (decision, lease.expect("a pick's lease"))
+    });
+    let pick = decision.pick().expect("a pick");
+    assert_eq!(pick.trace.generation, 1, "decided under its world's");
+    assert_eq!(lease.generation, 1, "and filed under it");
+    let did = did.lock();
+    let [(picker, "picked", _), (hearer, "issued", 1)] = did[..] else {
+        panic!("one pick and the issue of its lease: {did:?}");
+    };
+    assert_eq!(picker, hearer, "the stage that picked heard the issue");
+    let standing = store.deciding(|world| world.spec().generation());
+    assert_eq!(standing, 2, "the later generation stands");
+}
+
+/// A frame's request with its host's own word of what the workers hold of
+/// the prompt: the rows it names, or the column it fills.
+struct Fed<'a> {
+    frame: FrameRequest<'a>,
+    named: Option<AffinityRows<'a>>,
+    column: &'a [AffinityFacts],
+}
+
+impl RequestMaker for Fed<'_> {
+    fn model(&self) -> &str {
+        self.frame.model()
+    }
+
+    fn make<'w>(&'w self, spec: &'w AppliedSpec) -> Request<'w> {
+        let mut request = self.frame.make(spec);
+        request.facts.named = self.named;
+        request.facts.affinity = self.column;
+        request
+    }
+
+    fn workers(&self) -> WorkerLists<'_> {
+        self.frame.workers()
+    }
+}
+
+/// One document, one list, one answer on both feeds. The entry a frame's
+/// decision asks takes a host's own word of what the workers hold of a
+/// prompt, as rows it names or as a column filled from them, and decides
+/// alike by either. The profile takes no sample, so its rows are named
+/// under no cap. Twenty of the list's twenty-eight workers hold the
+/// request's first block and eight of those its second, and all twenty are
+/// named. Each seed's pick is one of the deepest holders on either feed,
+/// the same one, and the deepest tie.
+#[test]
+fn a_served_request_decides_by_the_rows_named_under_no_cap_as_by_the_column_filled_from_them() {
+    let document: PolicySpec = serde_json::from_str(
+        r#"{
+          "apiVersion": "smg.policy/v1",
+          "generation": 1,
+          "profiles": { "p": { "score": ["prefix-affinity"], "pick": "best" } },
+          "bindings": [{ "profile": "p" }]
+        }"#,
+    )
+    .expect("a document of this build");
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    let spec = AppliedSpec::validate(&document).expect("the document validates");
+    let cap = spec.engine().affinity_rows_cap(BOOKED, Phase::Single);
+    assert_eq!(cap, u32::MAX, "a profile that takes no sample");
+    store.apply(spec).expect("above the unbound start");
+    for i in 0..28 {
+        member(&store, &objects, i);
+    }
+    // The rows by their place in the list: the first eight hold both of
+    // the request's blocks, the next twelve its first.
+    let depth = |row: u32| if row < 8 { 2 } else { 1 };
+    let holder = |row: u32| AffinityHolder {
+        row,
+        overlap_blocks: depth(row),
+        predicted_blocks: 0,
+    };
+    let holders: Vec<AffinityHolder> = (0..20).map(holder).collect();
+    let named = AffinityRows {
+        holders: &holders,
+        ..AffinityRows::default()
+    };
+    // The column a host fills from the same holders.
+    let mut column = vec![AffinityFacts::default(); 28];
+    for holder in &holders {
+        column[holder.row as usize].overlap_blocks = holder.overlap_blocks;
+    }
+    let now = Instant::now();
+    let mut picked = BTreeSet::new();
+    for seed in 1..=64 {
+        let mut frame = frame_for(BOOKED, 1, seed);
+        let facts = frame.facts.as_mut().expect("the case's frame has facts");
+        facts.block_hashes = vec![1, 2];
+        facts.hash_kind = proto::HashKind::Token.into();
+        let request = Checked::new(frame).expect("a frame the record holds");
+        let mut lists = Lists::default();
+        let read = lists.of(&request);
+        // The place of the first target in the list.
+        let first = |named: Option<AffinityRows<'_>>, column: &[AffinityFacts]| -> u32 {
+            store.deciding(|world| {
+                let generation = objects.registry().model_generation(BOOKED);
+                let generation = generation.as_deref().expect("the model's list");
+                let lent = objects.lent(generation, Role::Single);
+                let frame = FrameRequest::new(&request, &read, BUDGET, WorkerLists::Single(lent));
+                let fed = Fed {
+                    frame,
+                    named,
+                    column,
+                };
+                let decided = world.front().decide_without_lease(&fed, now);
+                let (decision, _) = decided.expect("the engine decides");
+                let pick = decision.pick().expect("a pick over a ready list");
+                let first = pick.targets.first().expect("a pick names a target");
+                first.position
+            })
+        };
+        let to = first(Some(named), &[]);
+        assert_eq!(to, first(None, &column), "seed {seed}");
+        assert!(to < 8, "seed {seed} went to the worker at {to}");
+        picked.insert(to);
+    }
+    assert!(picked.len() > 1, "the deepest holders tie: {picked:?}");
+}
+
+/// A frame's request is given the snapshot where its document reads load
+/// reports and no stage of it keeps them: the three load-led presets, and
+/// a document that holds the resident-work stage, which keeps none. A
+/// document that reads no report is given none, and neither is one that
+/// holds a stage that keeps the reports it is told: a stage of the cases'
+/// own, since no stage of this build keeps them.
+#[test]
+fn a_request_is_given_the_snapshot_where_its_document_reads_reports_and_keeps_none() {
+    let applied = |document: &str| {
+        let document: PolicySpec =
+            serde_json::from_str(document).expect("a document of this build");
+        AppliedSpec::validate(&document).expect("the document validates")
+    };
+    for name in ["least_load", "power_of_two", "cache_aware"] {
+        assert!(hands_reports(&preset(name, 1)), "{name} reads load reports");
+    }
+    let unread = applied(
+        r#"{
+          "apiVersion": "smg.policy/v1",
+          "generation": 1,
+          "profiles": { "p": { "pick": "random" } },
+          "bindings": [{ "profile": "p" }]
+        }"#,
+    );
+    assert!(!hands_reports(&unread), "the document reads no report");
+    let resident = applied(
+        r#"{
+          "apiVersion": "smg.policy/v1",
+          "generation": 1,
+          "profiles": { "p": {
+            "score": ["least-load", { "resident-work": { "request_tokens": 512 } }],
+            "pick": "best"
+          } },
+          "bindings": [{ "profile": "p" }]
+        }"#,
+    );
+    assert!(
+        hands_reports(&resident),
+        "the resident-work stage keeps no report"
+    );
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .scorer("keeps-reports", || Box::new(KeepsReports))
+        .expect("a free name");
+    let keeping: PolicySpec = serde_json::from_str(
+        r#"{
+          "apiVersion": "smg.policy/v1",
+          "generation": 1,
+          "profiles": { "p": { "score": ["least-load", "keeps-reports"], "pick": "best" } },
+          "bindings": [{ "profile": "p" }]
+        }"#,
+    )
+    .expect("a document of this build");
+    assert!(
+        !hands_reports(&staged(&keeping, &catalog)),
+        "a stage of the document keeps reports"
+    );
+}
+
+/// A prefill frame, and a decode frame that names no lease, stand alone
+/// under a plan of one profile. Each is decided over the list of its own
+/// phase's role, and that list is the asking gateway's to take by that
+/// role's reach and standing vetoes. On each side another gateway alone
+/// dials one worker and the asking gateway vetoes another, at places that
+/// differ between the sides. Every frame is answered a pick whose every
+/// target is the one worker left of its own side, with no decode beside
+/// it: no worker of the other side and none of the single role is named.
+/// The other gateway dials every worker and vetoes none: its picks name
+/// the three of the frame's side.
+#[test]
+fn a_frame_that_stands_alone_takes_its_own_phases_list_by_that_roles_places_and_vetoes() {
+    let store = Arc::new(MemoryStore::new());
+    let objects = holder(&store);
+    store
+        .apply(preset("random", 1))
+        .expect("above the unbound start");
+    let member = |name: &str, role, only| side_member(&store, &objects, name, role, only);
+    let (prefill, decode) = (Role::Prefill, Role::Decode);
+    let prefills = [
+        member("p0", prefill, None),
+        member("p1", prefill, Some(OTHER)),
+        member("p2", prefill, None),
+    ];
+    let decodes = [
+        member("d0", decode, None),
+        member("d1", decode, None),
+        member("d2", decode, Some(OTHER)),
+    ];
+    member("s0", Role::Single, None);
+    let now = Instant::now();
+    let until = Some(now + Duration::from_secs(60));
+    store.gateway_veto(GATEWAY, prefills[2], until);
+    store.gateway_veto(GATEWAY, decodes[0], until);
+    let named = |gateway: GatewayId, phase: proto::Phase| -> BTreeSet<WorkerId> {
+        let mut named = BTreeSet::new();
+        for n in 1..=64 {
+            let asking = (gateway, now);
+            let answer = served_alone(&store, &objects, alone_at(n, phase), asking, None);
+            let Decision::Pick(pick) = &answer else {
+                panic!("frame {n} at {phase:?} is answered no pick: {answer:?}");
+            };
+            let alone = pick.targets.iter().all(|target| target.pair.is_none());
+            assert!(alone, "no decode beside a target: {answer:?}");
+            named.extend(pick.targets.iter().map(|target| target.id));
+        }
+        named
+    };
+    let (ahead, behind) = (proto::Phase::Prefill, proto::Phase::Decode);
+    assert_eq!(named(GATEWAY, ahead), BTreeSet::from([prefills[0]]));
+    assert_eq!(named(GATEWAY, behind), BTreeSet::from([decodes[1]]));
+    assert_eq!(named(OTHER, ahead), BTreeSet::from(prefills));
+    assert_eq!(named(OTHER, behind), BTreeSet::from(decodes));
+}
+
+/// A frame that stands alone is decided behind an apply of what waits at
+/// the other files where a stage of its OWN phase's binding may refuse by
+/// a report of leases: a frame left under another file's watch is applied
+/// by the decision, where its decider lent its place. Another phase's
+/// binding says nothing for it: where the single requests' picker alone
+/// may so refuse, the frame takes no turn there, and what waits is left
+/// for its own file's look. A prefill frame and a decode frame alike.
+#[test]
+fn a_frame_that_stands_alone_applies_what_waits_where_its_own_phases_binding_reads_reports() {
+    let mut catalog = StageRegistry::builtin();
+    catalog
+        .picker("by-reports", || Box::new(ByReports))
+        .expect("a free name");
+    // The picker of the two sides' phases, then of every other request.
+    let cases = [
+        (["by-reports", "random"], LookOutcome::Quiet),
+        (["random", "by-reports"], LookOutcome::Fed),
+    ];
+    let sides = [
+        (proto::Phase::Prefill, Role::Prefill),
+        (proto::Phase::Decode, Role::Decode),
+    ];
+    for (picks, waited) in cases {
+        for (phase, role) in sides {
+            let [sided, rest] = picks;
+            let document = format!(
+                r#"{{
+                  "apiVersion": "smg.policy/v1",
+                  "generation": 1,
+                  "profiles": {{
+                    "sides": {{ "filter": [], "pick": "{sided}" }},
+                    "rest": {{ "filter": [], "pick": "{rest}" }}
+                  }},
+                  "bindings": [
+                    {{ "match": {{ "phase": ["prefill", "decode"] }}, "profile": "sides" }},
+                    {{ "profile": "rest" }}
+                  ]
+                }}"#
+            );
+            let document: PolicySpec =
+                serde_json::from_str(&document).expect("a document of this build");
+            let store = Arc::new(MemoryStore::new().with_decision_slots(2));
+            let objects = holder(&store);
+            store
+                .apply(staged(&document, &catalog))
+                .expect("above the unbound start");
+            let member = side_member(&store, &objects, "w0", role, None);
+            LeasesStore::set_term(&*store, 1);
+            let mut watch = a_frame_under_the_second_files_watch(&store, member);
+            // The first file's decision, its place lent.
+            let _acting = DecisionSlot::new(0).enter();
+            let place = store.at_work();
+            let asking = (GATEWAY, Instant::now());
+            let decision = served_alone(&store, &objects, alone_at(1, phase), asking, Some(&place));
+            assert_eq!(first(&decision), Some(member), "{phase:?}: {decision:?}");
+            assert_eq!(watch.look(), waited, "{phase:?} under {picks:?}");
+        }
+    }
+}

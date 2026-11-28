@@ -49,6 +49,7 @@ use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
 };
+use smg_worker::metrics::series as worker_series;
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
@@ -1519,7 +1520,9 @@ pub fn build_apps(
     // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject
     // to the WASM manager's `max_body_size` (10MB default). Audio uploads
     // routinely exceed that, so WASM middleware would reject them with 400
-    // before reaching the handler.
+    // before reaching the handler. No request-body deadline either: the
+    // innermost layer only measures how long the read of the upload waited
+    // for the client, for the dispatch wait counted without the upload.
     let multipart_upload_routes = Router::new()
         .route("/v1/audio/transcriptions", post(v1_audio_transcriptions))
         .route_layer(
@@ -1527,7 +1530,10 @@ pub fn build_apps(
                 .layer(InertLayer(serving_auth_layer.clone()))
                 .layer(tenant_resolution_state.layer())
                 .layer(InertLayer(priority_admission))
-                .layer(InertLayer(legacy_limit)),
+                .layer(InertLayer(legacy_limit))
+                .layer(tower::util::MapRequestLayer::new(|request: Request| {
+                    request.map(middleware::body_timeout::upload_measured)
+                })),
         );
 
     let public_routes = Router::new()
@@ -2008,8 +2014,9 @@ async fn start_workflow_engines(
         info!("Startup tokenizer job submitted (will complete in background)");
     }
 
-    // A worker that no workflow registers here (a mesh peer's) gets its
-    // model's tokenizer job from the registry's events.
+    // A worker that no workflow registers or removes here (a mesh peer's)
+    // gets its model's tokenizer job and the close of its pooled encode
+    // connections from the registry's events.
     spawn_worker_event_reactions(app_context);
 
     info!(
@@ -2510,7 +2517,7 @@ pub async fn startup_with(
     // resolved router config; per-worker specs still override at request time.
     use crate::routers::grpc::multimodal::{
         enforce_jpeg_decoder_policy, init_mm_settings, init_mm_transport_defaults,
-        report_jpeg_decoder, MultimodalSettings,
+        report_jpeg_decoder, spawn_buffer_pool_trim, MultimodalSettings,
     };
     init_mm_transport_defaults(
         config.router_config.multimodal_tensor_transport,
@@ -2531,6 +2538,15 @@ pub async fn startup_with(
     // before a fatal configuration error.
     let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
         let handle = metrics::start_prometheus(prometheus_config.clone());
+        // This start hands the handle to its own metrics listener and to
+        // nothing else, and that listener's scrape appends the per-worker
+        // store's text to the exporter's: the histogram families record in
+        // the store's fixed cells, from the first series on.
+        if worker_series::keep_histograms() {
+            debug!("Histogram families record in the per-worker series store's cells");
+        } else {
+            warn!("Histogram families stay with the exporter: one registered there first");
+        }
         metrics::init_startup_series();
         // Under Symphony the series of a request no table reads exist at zero
         // from the start; a table's own follow its model's first registration.
@@ -2580,6 +2596,8 @@ pub async fn startup_with(
     if config.prometheus_config.is_some() {
         history_metrics::spawn_sampler(Arc::clone(&app_context));
     }
+    // The media crate's buffer pool gives its idle buffers back at rest.
+    spawn_buffer_pool_trim();
 
     // Register the CRDT namespaces and start the inbound sync adapters now;
     // gossip starts further down, after the metrics and probe listeners are

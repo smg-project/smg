@@ -238,13 +238,15 @@ impl HarmonyResponseProcessor {
         // answer shows no first token. Its dispatch wait needs none: it is
         // read here, inside the request's future, against the dispatch the
         // generation clock starts at.
+        let waited = context::dispatch_wait(started);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: metrics_labels::BACKEND_HARMONY,
             model_id: &chat_request.model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: None,
-            dispatch_wait: context::dispatch_wait(started),
+            dispatch_wait: waited.map(|waited| waited.since_entry),
+            dispatch_wait_after_body: waited.map(|waited| waited.since_body),
             generation_duration: started.elapsed(),
             input_tokens: Some(u64::from(counts.prompt)),
             cached_tokens: Some(u64::from(counts.cached)),
@@ -477,8 +479,11 @@ mod tests {
             );
         }
         // The engine counted reasoning itself: its count stands on both paths.
-        assert_eq!(reasoning_of(&chat_usage(counts(7), 3)), Some(7));
-        assert_eq!(reasoning_of(&iteration_usage(counts(7), 3)), Some(7));
-        assert_eq!(reasoning_of(&iteration_usage(counts(7), 0)), Some(7));
+        assert_eq!(reasoning_of(&chat_usage(counts(4), 3)), Some(4));
+        assert_eq!(reasoning_of(&iteration_usage(counts(4), 3)), Some(4));
+        assert_eq!(reasoning_of(&iteration_usage(counts(4), 0)), Some(4));
+        // A count above the five completion tokens is reported as five on both.
+        assert_eq!(reasoning_of(&chat_usage(counts(7), 3)), Some(5));
+        assert_eq!(reasoning_of(&iteration_usage(counts(7), 3)), Some(5));
     }
 }

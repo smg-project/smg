@@ -103,7 +103,9 @@ use super::{
         AlonePick, DecideOutcome, Decided, DecisionEngine, DecisionRefused, HeldDecision, Request,
         RequestMaker, WorkerLists,
     },
-    framework::{release, AloneProfile, Engine, NotAlone, Picker, Place, PoolWord, ShadowRows},
+    framework::{
+        release, AloneProfile, Engine, Issuing, NotAlone, Picker, Place, PoolWord, ShadowRows,
+    },
     lease_events,
     list_cell::{HandedLists, LentList},
     prompt_hashes::{HashSeeds, PromptHashes},
@@ -542,6 +544,42 @@ impl InProcess {
                 None
             }
         }
+    }
+
+    /// One word of a lease, `said` of the decision `held`, told to those
+    /// who hear it under a catch of its own ([`Self::word_caught`]).
+    /// `issuing` is what hears at the engine that issued the lease: the
+    /// engine in force for a lease of its own generation, and for an older
+    /// one what the document kept of the stages that stood by then
+    /// ([`InForce::stood_at`]). `sends` is the engine in force, whose
+    /// counts of sends take a dispatch.
+    #[inline(always)]
+    fn told_of<I: Issuing>(&self, issuing: I, sends: &Engine, held: &HeldDecision<'_>, said: Said) {
+        let micros = |at| self.clock.micros(at);
+        let tell = || match held.lease.side {
+            Side::Single => {
+                lease_events::single(&lease_events::of_host(issuing, sends), held, said);
+            }
+            // A pair's guard holds its prefill side's lease.
+            Side::Prefill => {
+                lease_events::pair(&lease_events::of_host(issuing, sends), held, said, micros);
+            }
+            // No lease is issued for a side on its own.
+            Side::Decode | Side::Encode => {}
+        };
+        self.word_caught(tell);
+    }
+
+    /// [`Self::told_of`] for a lease an earlier document than `document`
+    /// issued: the stages that stood by the lease's generation hear its
+    /// word ([`InForce::stood_at`]). Out of line: such a word is told for
+    /// the requests an apply finds in flight, and a word of the document
+    /// in force keeps one telling in its caller.
+    #[cold]
+    #[inline(never)]
+    fn told_older(&self, document: &InForce, held: &HeldDecision<'_>, said: Said) {
+        let stood = document.stood_at(held.lease.generation);
+        self.told_of(stood, document.spec.engine(), held, said);
     }
 
     /// One word of a store's membership, said under the store's lock of its
@@ -1045,6 +1083,11 @@ impl Loaded<'_, '_> {
     /// ([`pair::date_decode_claim`]): the host tells each word of the side
     /// under that lease's date.
     ///
+    /// `claimed` is the claim the lease's first decision made for its
+    /// decode side, as the host's record states it: the key, and the
+    /// worker, `WorkerId(0)` where it claimed none. A call that claims
+    /// another worker under that key hands it on with its date.
+    ///
     /// A call that hands no pair's lists is decided over no worker.
     ///
     /// # Errors
@@ -1058,6 +1101,7 @@ impl Loaded<'_, '_> {
         self,
         maker: &impl RequestMaker,
         held: &super::decision::Target,
+        claimed: (super::view::Session, WorkerId),
         issued_micros: u64,
         now: Instant,
     ) -> Result<super::decision::Decision, DecisionRefused> {
@@ -1087,8 +1131,12 @@ impl Loaded<'_, '_> {
             // A claim the call made takes the date of the pair's lease. The
             // decision is read where the answer stands, as a guard's call
             // reads it ([`pair::issued`]).
+            // No side is issued here, so the key is made from the request.
             if let Ok(decision) = &decided {
-                pair::date_decode_claim(own, &request.facts, decision, issued_micros);
+                let facts = &request.facts;
+                let key = || pair::decode_session(facts);
+                let at = facts.now_micros;
+                pair::date_decode_claim(own, decision, key, at, || claimed, issued_micros);
             }
             decided
         })
@@ -1337,9 +1385,10 @@ impl Loaded<'_, '_> {
 /// and is counted with them. A panic in a stage that hears a word is held
 /// here too and counted ([`InProcess::unheard`]): the request goes on.
 ///
-/// A word of a lease is told to the stages of the document in force, where
-/// that document issued the lease. A lease issued under a document that a
-/// new one replaced since is told to nobody ([`InProcess::apply`]). The
+/// The engine tells a word of a lease to stages that take it and to no
+/// other. Such a stage is the document in force's where that document
+/// issued the lease. For a lease an earlier document issued it is one the
+/// document in force kept that stood then ([`InProcess::apply`]). The
 /// shadow counts are those of the document in force.
 impl DecisionEngine for InProcess {
     fn decide_under(
@@ -1395,7 +1444,8 @@ impl DecisionEngine for InProcess {
 
     fn say(&self, _: GatewayId, held: &HeldDecision<'_>, said: Said, _: Instant) {
         // A single's word no stage takes is told to nobody. A pair's
-        // dispatch may carry its decode's issue: every word of one is told.
+        // dispatch may carry its decode's issue: every word of one goes to
+        // the rule of a lease's words, which says what its stages hear.
         let kind = match said {
             Said::Dispatched(..) => EventKind::Dispatched,
             Said::Completed(_) => EventKind::Completed,
@@ -1407,24 +1457,12 @@ impl DecisionEngine for InProcess {
         // force: a send is a fact of its worker, whatever document decided
         // it.
         let document = self.in_force();
-        let sends = document.spec.engine();
-        let mut engine = sends;
         if held.lease.generation != document.spec.generation() {
-            engine = document.stood_at(held.lease.generation);
-        } else if held.lease.side == Side::Single && !document.hears.contains(kind) {
-            return;
+            self.told_older(&document, held, said);
+        } else if held.lease.side != Side::Single || document.hears.contains(kind) {
+            let sends = document.spec.engine();
+            self.told_of(sends, sends, held, said);
         }
-        let micros = |at| self.clock.micros(at);
-        let tell = || match held.lease.side {
-            Side::Single => lease_events::single(&lease_events::of_host(engine, sends), held, said),
-            // A pair's guard holds its prefill side's lease.
-            Side::Prefill => {
-                lease_events::pair(&lease_events::of_host(engine, sends), held, said, micros);
-            }
-            // No lease is issued for a side on its own.
-            Side::Decode | Side::Encode => {}
-        };
-        self.word_caught(tell);
     }
 
     // No lease is filed, so no pass ends one: a lease ends at its guard's

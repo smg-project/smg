@@ -134,12 +134,6 @@
 //! from a stranger's by the record the elector attempted, and is adopted as
 //! its own.
 
-#![expect(
-    clippy::exhaustive_enums,
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 mod file;
 #[cfg(feature = "kubernetes")]
 mod kubernetes;
@@ -157,8 +151,14 @@ pub use kubernetes::{KubernetesLease, TERM_ANNOTATION};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-/// The election's timing, shared by every backend (design 10).
+/// The election's timing, shared by every backend (design 10). The default
+/// is the design's: a duration of 3 s, a renew period of 1 s and a renew
+/// deadline of 2 s.
+///
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it states otherwise, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ElectionSettings {
     /// How long the record may stand unchanged before a candidate takes it,
     /// timed by each candidate from its own first sight of the record.
@@ -205,8 +205,13 @@ impl ElectionSettings {
 }
 
 /// The lease as its backend stores it: the file's one JSON line, the
-/// `Lease` object's spec.
+/// `Lease` object's spec. The default is a record with no holder, under
+/// term zero.
+///
+/// The record gains fields: code outside this crate starts from the default
+/// and assigns what it knows, and a pattern of it ends with `..`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct LeaseRecord {
     /// The holder's identity; empty once released.
     pub holder: String,
@@ -307,7 +312,15 @@ pub enum ElectError {
 }
 
 /// What one [`Elector::tick`] did.
+///
+/// The enum is closed: the program that drives an elector acts on each
+/// form, it leads, follows or stops, so a form that joins stops its build
+/// until it says what it does there.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_enums,
+    reason = "closed by its doc: a host acts on each form, and a new one must stop its build"
+)]
 pub enum TickOutcome {
     /// This candidate took the lease under `term`. It leads from now, or
     /// from one renew deadline after this take's write where the record had

@@ -463,9 +463,9 @@ async fn a_session_that_ends_and_one_that_follows_inside_the_grace_period_change
     let bed = bed().await;
     let seat = bed.welcomed(NAME, 1);
     let mut early = bed.opened(NAME).await;
-    // The session ends; a millisecond of its gateway's period is left.
+    // The session ends; a nanosecond of its gateway's period is left.
     seat.end(bed.now());
-    bed.at(GRACE_PERIOD - MS);
+    bed.at(GRACE_PERIOD - Duration::from_nanos(1));
     let mut late = bed.opened(NAME).await;
     bed.decides(&mut early, 1, 1).await;
     bed.decides(&mut late, 2, 1).await;
@@ -708,6 +708,36 @@ async fn a_place_taken_at_a_request_ends_its_stream_while_the_request_is_decided
     let no_session = (Code::FailedPrecondition, NO_SESSION.to_owned());
     assert_eq!(stream.status().await, no_session);
     release.send(()).expect("the decider waits for the case");
+}
+
+/// A stream that holds no place in the table asks it at the receipt of
+/// the first request that spends a credit under a term, whatever budget
+/// the request states. A nanosecond inside its gateway's period the
+/// request is decided. At the period's end a request that states no
+/// budget ends its stream in an open's words.
+#[tokio::test]
+async fn an_unplaced_streams_first_request_under_a_term_asks_the_table_at_its_receipt() {
+    let mut bed = bed().await;
+    assert!(bed.elector.release().expect("the release"));
+    // Opened under no lead, neither stream holds a place in the table.
+    let mut inside = bed.opened(NAME).await;
+    let mut past = bed.opened(NAME).await;
+    bed.takes(2);
+    let seat = bed.welcomed(NAME, 2);
+    seat.end(bed.now());
+    bed.at(GRACE_PERIOD - Duration::from_nanos(1));
+    bed.decides(&mut inside, 1, 2).await;
+    bed.at(GRACE_PERIOD);
+    // A request that brings no budget asks the table ahead of the check
+    // of its budget.
+    let mut none = frame(1, 1);
+    none.facts
+        .as_mut()
+        .expect("the case's frame has facts")
+        .budget_micros = 0;
+    past.send(none).await;
+    let no_session = (Code::FailedPrecondition, NO_SESSION.to_owned());
+    assert_eq!(past.status().await, no_session);
 }
 
 /// A stream of the gateway `NAME` that a case polls by hand, beside its

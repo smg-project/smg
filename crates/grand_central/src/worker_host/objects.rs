@@ -34,9 +34,12 @@ use super::found::pairing_descriptor;
 #[cfg(feature = "in-process")]
 use super::members::{EncodeColumns, Members, Stated};
 #[cfg(feature = "in-process")]
+use super::object::runtime;
+#[cfg(feature = "in-process")]
 use super::reach::{ListReach, Reach};
 use super::{
     credentials::{Credentials, RegistrationInFlight},
+    found::engine_of,
     kv_tables::KvTables,
     membership_writer::{MembershipWriteOutcome, MembershipWriteRefused},
     object::{builder, dial_address, external, status, takes_default, thresholds, unchecked},
@@ -74,7 +77,9 @@ pub struct RowRevision {
     pub revision: u64,
 }
 
-/// A row and the object that stands for it.
+/// A row and the object that stands for it: two pointers, so a copy
+/// names the same remainder and the same object.
+#[derive(Clone)]
 struct Laid {
     /// What of the row the object does not hold as stated, with the row's
     /// id and the revision the object was built from.
@@ -85,13 +90,17 @@ struct Laid {
 /// What stands, both ways.
 #[derive(Default)]
 struct Held {
-    /// A row's object, by the row's id.
-    objects: HashMap<WorkerId, ObjectId>,
+    /// A row's object, by the row's id: the object's id in the registry,
+    /// and what that object's entry holds. The two entries name one
+    /// remainder and one object ([`Self::replace`] writes both). So a
+    /// reader that asks this entry for the remainder or the object takes
+    /// one lookup: the ranks' readers, a cut's compare, the lists' reader
+    /// and the host count. A read of a whole row (`Objects::row`), a
+    /// status copy and a standby's kept instant still go by the object's
+    /// id, in two lookups.
+    objects: HashMap<WorkerId, (ObjectId, Laid)>,
     /// An object's row, by the object's id in the registry.
     rows: HashMap<ObjectId, Laid>,
-    /// The facts a row's object was built from, by the row's id: what a
-    /// snapshot read holds the row against.
-    facts: HashMap<WorkerId, WorkerFacts>,
     /// The rows of each engine's ranks, by the address they dial: what
     /// routes a rank's batch on the engine's one events stream.
     ranks: HashMap<String, Vec<(u16, WorkerId)>>,
@@ -105,15 +114,14 @@ struct Held {
 }
 
 impl Held {
-    /// State `row`'s facts in the entry, where every lay states them: at a
+    /// State `row`'s place in the entry, where every lay states it: at a
     /// build, and where a row another maker made again is stated anew. The
-    /// row's place among its engine's ranks moves with them: a row laid
-    /// again leaves the rank its old facts stated. Its lane in the KV
+    /// row's place among its engine's ranks moves with its facts: a row laid
+    /// again leaves the rank its standing object dials. Its lane in the KV
     /// tables is made, kept or made again as the facts ask, in this turn.
     fn state(&mut self, row: &WorkerRow) {
         self.unrank(row.id);
         self.rank(row.id, &row.facts);
-        self.facts.insert(row.id, row.facts.clone());
         if let Some(tables) = &self.tables {
             tables.member(row);
         }
@@ -127,9 +135,11 @@ impl Held {
             .push((facts.dp_rank, row));
     }
 
-    /// Take `row` out of its engine's ranks, by the facts it was laid from.
+    /// Take `row` out of its engine's ranks, by the address its standing
+    /// object dials.
     fn unrank(&mut self, row: WorkerId) {
-        let Some(address) = self.facts.get(&row).map(dial_address) else {
+        let standing = self.objects.get(&row);
+        let Some(address) = standing.map(|(_, laid)| engine_of(laid.object.as_ref())) else {
             return;
         };
         let Some(rows) = self.ranks.get_mut(address) else {
@@ -142,20 +152,32 @@ impl Held {
     }
 
     /// Take the row `id` out of every table of the entry: its place among
-    /// its engine's ranks, its facts, its object's id, and that object's
+    /// its engine's ranks, its object's id, and that object's
     /// own entry. Its lane in the KV tables goes with it, with the blocks
     /// it wrote. A row that leaves goes through here, at its object's end
     /// and where its next life takes its object's place.
     fn leave(&mut self, id: WorkerId) {
-        // The rank first: it is found by the row's facts.
+        // The rank first: it is found by the row's object.
         self.unrank(id);
-        self.facts.remove(&id);
-        if let Some(object) = self.objects.remove(&id) {
-            self.rows.remove(&object);
-        }
+        self.replace(id, None);
         if let Some(tables) = &self.tables {
             tables.forget(id);
         }
+    }
+
+    /// Replace what stands for `row`, both ways: `laid` under its object's
+    /// id, or nothing where the row leaves. The one writer of the two
+    /// maps. The row's own entry takes the two pointers its object's
+    /// entry holds. So a read by the row's id and a read by the object's
+    /// id find one remainder and one object. Answers the entry the write
+    /// took out.
+    fn replace(&mut self, row: WorkerId, laid: Option<(ObjectId, Laid)>) -> Option<Laid> {
+        let Some((id, laid)) = laid else {
+            let (id, _) = self.objects.remove(&row)?;
+            return self.rows.remove(&id);
+        };
+        self.objects.insert(row, (id.clone(), laid.clone()));
+        self.rows.insert(id, laid)
     }
 }
 
@@ -178,7 +200,9 @@ impl Held {
 /// row may stand there under the id and the revision an object was built
 /// from and state other facts. The holder trusts no revision it held
 /// alone there. It holds each
-/// row against the facts its object was built from, beside the revision.
+/// row against the facts read back off its object, beside the revision.
+/// Models another writer of the registry set on the object read back as
+/// set: a row that states others is laid again.
 /// A row whose facts and revision both stand keeps its object: one built
 /// again from them would state the same row, and its replacement would
 /// start every read of its worker again. A credential the host kept since
@@ -215,7 +239,9 @@ impl Held {
 /// A change handed to the store around the holder
 /// ([`MemoryStore::follow`]) takes no turn either: no product code hands
 /// one so. A row written so has no object,
-/// and no copy holds it, until a cut is laid whole.
+/// and no copy holds it, until a cut is laid whole. A standby's applier
+/// and a watcher also lay it at the next event that tells the row and
+/// that the store takes.
 ///
 /// A row takes the place of its own object alone: an object another row
 /// holds under its URL is dropped first.
@@ -224,7 +250,9 @@ impl Held {
 ///
 /// [`Self::upsert`], [`Self::patch`], [`Self::remove`], [`Self::connect_row`]
 /// and [`Self::drain_row`] are the write side of a host that keeps worker
-/// objects: a controller's registration calls write a row through them. Each
+/// objects, and each names no term. A controller's registration calls write
+/// through the entries the five stand on, which are private to the crate
+/// and take the call's term. Each
 /// call decides over the object that stands and tells `store` what it
 /// decided. The object the call leaves stands when it returns, and a
 /// removed row's object is gone by then. The three calls that write a row
@@ -256,6 +284,28 @@ impl Held {
 /// registration call's. A host that does not lead must not write: such a
 /// write lands in its own store alone, its leader's next event no longer
 /// fits that store, and the leader's snapshot takes the write back.
+///
+/// # A host's read calls
+///
+/// [`Self::read_row`], [`Self::read_row_under`] and [`Self::checkpoint`]
+/// are what a host with a holder reads of its rows. Each takes the
+/// holder's turn: a writer of a row waits for the read, and no decision
+/// does. A row read alone carries the status its object states, and a
+/// cut's row the status the store holds. Either carries the models its
+/// object serves now. Each builds the rows it hands back again from
+/// their objects: a copy of their facts a call.
+///
+/// The turn is taken once at a time, and the thread that holds it does
+/// not take it again. So code that the holder runs inside a turn must
+/// call nothing of the holder that takes the turn: these reads,
+/// [`Self::upsert`], [`Self::patch`] and [`Self::remove`] among them.
+/// Such a call never returns: it waits for the turn its own thread holds.
+///
+/// A host's own code runs there too. The store tells its journal of a
+/// row's write inside that write's turn. The journal's last call of a
+/// write, [`crate::store::Journal::released`], arrives under no lock of
+/// the store, and still inside that turn. The overload switch asks the
+/// host's `leads` inside its turn ([`Self::state_overload_switch`]).
 ///
 /// The registry numbers its own objects, so an object's id is not its row's.
 /// The holder keeps the two together ([`Self::standing`], [`Self::object`]).
@@ -459,9 +509,7 @@ impl<G: Generation> Objects<G> {
             held.rows
                 .values()
                 .filter(|laid| {
-                    held.facts
-                        .get(&laid.remainder.standing.row)
-                        .is_some_and(|dialing| dial_address(dialing) == address)
+                    engine_of(laid.object.as_ref()) == address
                         && credentials
                             .of(address, laid.remainder.standing.row)
                             .as_ref()
@@ -515,8 +563,11 @@ impl<G: Generation> Objects<G> {
     /// does behind a put that replaces ([`Self::upsert`]): a move a health
     /// driver made on the standing object ahead of its telling finds that
     /// object replaced, and tells nothing. `leads` is the host's own word
-    /// of its lead, asked under the object's lock and again under the
-    /// store's. Where it holds, the table is told the object's status.
+    /// of its lead, asked inside the holder's turn, under the object's
+    /// lock and again under the store's. It must call nothing that takes
+    /// the turn, that object's lock or the store's lock: none of the
+    /// holder's read, write or status calls. Where it holds, the table is
+    /// told the object's status.
     /// Where it does not, the table is not written, and the object takes
     /// the status its row holds.
     /// Return how many objects were laid again.
@@ -535,9 +586,9 @@ impl<G: Generation> Objects<G> {
         };
         let changed: Vec<WorkerId> = {
             let held = self.held.read();
-            let rows = held.facts.iter();
-            rows.filter(|(_, facts)| takes_default(facts, defaults))
-                .map(|(&row, _)| row)
+            let rows = held.rows.values().map(|laid| &laid.remainder);
+            rows.filter(|row| takes_default(row.overload, &row.engine_kind, defaults))
+                .map(|row| row.standing.row)
                 .collect()
         };
         let mut laid = 0;
@@ -715,7 +766,8 @@ impl<G: Generation> Objects<G> {
 
     /// The registry's id of the object that stands for `row`.
     pub fn object(&self, row: WorkerId) -> Option<ObjectId> {
-        self.held.read().objects.get(&row).cloned()
+        let held = self.held.read();
+        held.objects.get(&row).map(|(id, _)| id.clone())
     }
 
     /// The row of rank `rank` of the engine whose rank 0 row is `row`:
@@ -724,38 +776,56 @@ impl<G: Generation> Objects<G> {
     /// object for `row`, or `row` stands above rank 0 by the facts it is
     /// laid from. Only an engine's rank 0 row holds the engine's one events
     /// stream, and the stream's writer routes a rank's batch by this
-    /// answer: a row laid again above rank 0 routes none.
+    /// answer: a row laid again above rank 0 routes none. The row's
+    /// entry is found by one lookup, by the row's id; a rank above 0
+    /// reads the engine's ranks too, by the address the row's object
+    /// dials.
     pub fn rank_row(&self, row: WorkerId, rank: u16) -> Option<WorkerId> {
         let held = self.held.read();
-        let facts = held.facts.get(&row)?;
-        if facts.dp_rank != 0 {
+        let (_, laid) = held.objects.get(&row)?;
+        if laid.remainder.dp_rank != 0 {
             return None;
         }
         if rank == 0 {
             return Some(row);
         }
         held.ranks
-            .get(dial_address(facts))?
+            .get(engine_of(laid.object.as_ref()))?
             .iter()
             .find(|&&(ranked, _)| ranked == rank)
             .map(|&(_, row)| row)
+    }
+
+    /// The rows of every rank of the engine whose rank 0 row is `row`,
+    /// its own among them: the rows that dial the address `row`'s object
+    /// dials. None where the holder holds no object for `row`, or `row`
+    /// stands above rank 0 by the facts it is laid from: such a row's
+    /// stream is routed no rank ([`Self::rank_row`]). One read of the
+    /// entry under its read lock.
+    pub(crate) fn rank_rows(&self, row: WorkerId) -> Vec<WorkerId> {
+        let held = self.held.read();
+        let lowest = held.objects.get(&row);
+        let lowest = lowest.filter(|(_, laid)| laid.remainder.dp_rank == 0);
+        let ranks = lowest.and_then(|(_, laid)| held.ranks.get(engine_of(laid.object.as_ref())));
+        let ranks = ranks.into_iter().flatten();
+        ranks.map(|&(_, ranked)| ranked).collect()
     }
 
     /// Whether the row `row` stands at rank `rank`, by the facts its
     /// object was laid from. `false` for a row the holder holds no object
     /// for. Asked of the worker a dispatch report names, which may have
     /// left or changed its rank since its decision. One read of the
-    /// entry under its read lock, a leaf: the caller may hold a turn of
-    /// the leases' files.
+    /// entry under its read lock, one lookup by the row's id, a leaf: the
+    /// caller may hold a turn of the leases' files.
     #[cfg_attr(
         not(any(test, feature = "controller")),
         expect(dead_code, reason = "a controller's word to its engine asks it")
     )]
     pub(crate) fn lists_rank(&self, row: WorkerId, rank: u16) -> bool {
         let held = self.held.read();
-        held.facts
+        held.objects
             .get(&row)
-            .is_some_and(|facts| facts.dp_rank == rank)
+            .is_some_and(|(_, laid)| laid.remainder.dp_rank == rank)
     }
 
     /// How many objects stand.
@@ -785,7 +855,7 @@ impl<G: Generation> Objects<G> {
             return;
         };
         let held = self.held.read();
-        credentials.forget_left(read, |row| held.facts.contains_key(&row));
+        credentials.forget_left(read, |row| held.objects.contains_key(&row));
     }
 
     /// Have the keeper forget the one row `left`, where no object stands
@@ -797,15 +867,15 @@ impl<G: Generation> Objects<G> {
             return;
         };
         let held = self.held.read();
-        credentials.forget_left(read, |row| row != left || held.facts.contains_key(&row));
+        credentials.forget_left(read, |row| row != left || held.objects.contains_key(&row));
     }
 
     /// A cut's rows, whole: the objects of rows that went are dropped
     /// first, each leaving its URL to a later incarnation's, then every row
-    /// that does not stand as its object was built is laid again. No
+    /// its object does not state as it stands is laid again. No
     /// revision held is trusted alone here: in another history, a row
     /// under a held id and revision may be another life with other
-    /// facts. The facts are compared beside it. A row that
+    /// facts. The facts are compared beside it, read back off the object. A row that
     /// stands so may still be another life, made by another or admitted at
     /// another time: its object stays, and its entry is stated again.
     fn reconcile<S: WorkersStore + ?Sized>(&self, store: &S, rows: &[WorkerRow]) {
@@ -835,50 +905,46 @@ impl<G: Generation> Objects<G> {
         }
     }
 
-    /// Whether `row`'s object was built from the row as it stands now: the
-    /// facts the row states and the revision it stands at. One that was
-    /// keeps its object and its place.
+    /// Whether `row`'s object states the row as it stands now: the
+    /// revision it stands at, and the facts the row states, read back off
+    /// the object. One that does keeps its object and its place. Models
+    /// set on the object since its build read back as set: a row that
+    /// states others does not stand.
     fn stands(&self, row: &WorkerRow) -> bool {
         let held = self.held.read();
-        held.facts.get(&row.id) == Some(&row.facts)
-            && held
-                .objects
-                .get(&row.id)
-                .and_then(|object| held.rows.get(object))
-                .is_some_and(|laid| laid.remainder.standing.revision == row.revision)
+        held.objects.get(&row.id).is_some_and(|(_, laid)| {
+            laid.remainder.standing.revision == row.revision
+                && laid.remainder.row(laid.object.as_ref()).facts == row.facts
+        })
     }
 
     /// Whether the entry kept for `row` names another maker of the row, or
     /// another time it was admitted at, than the row states.
     fn remade(&self, row: &WorkerRow) -> bool {
         let held = self.held.read();
-        held.objects
-            .get(&row.id)
-            .and_then(|object| held.rows.get(object))
-            .is_some_and(|laid| {
-                laid.remainder.maker != row.maker || laid.remainder.admitted_at != row.admitted_at
-            })
+        held.objects.get(&row.id).is_some_and(|(_, laid)| {
+            laid.remainder.maker != row.maker || laid.remainder.admitted_at != row.admitted_at
+        })
     }
 
     /// The status the table holds for the row an object was built from,
     /// where the row stands at that revision still: what an object takes
-    /// from the table. Read under the object's mutation lock, so of two
-    /// such reads the later one's status stands on the object.
-    fn table_status<S: WorkersStore + ?Sized>(
-        store: &S,
-        standing: RowRevision,
-    ) -> Option<ObjectStatus> {
+    /// from the table. It is the store's read of one told status
+    /// ([`MemoryStore::told_status`]): no row is copied. Read under the
+    /// object's mutation lock, so of two such reads the later one's
+    /// status stands on the object.
+    fn table_status(store: &MemoryStore, standing: RowRevision) -> Option<ObjectStatus> {
         store
-            .get(standing.row)
-            .filter(|row| row.revision == standing.revision)
-            .map(|row| status(row.status))
+            .told_status(standing.row, standing.revision)
+            .map(status)
     }
 
-    /// Read the row under the lock the health adapter writes under. The
-    /// object's entry must still name that row and its current revision.
-    /// The registry writes the status it is handed and tells it.
+    /// Read the row's told status under the lock the health adapter
+    /// writes under. The object's entry must still name that row and its
+    /// current revision. The registry writes the status it is handed and
+    /// tells it.
     #[inline(never)]
-    fn copy_status<S: WorkersStore + ?Sized>(&self, store: &S, row: WorkerId) {
+    fn copy_status(&self, store: &MemoryStore, row: WorkerId) {
         let Some(id) = self.object(row) else {
             return;
         };
@@ -915,17 +981,19 @@ impl<G: Generation> Objects<G> {
 
     /// State the entry of the object that stands for `row` again, from the
     /// row: its maker and the time it was admitted at. The caller found the
-    /// row's facts and revision to be the ones the object was built from
+    /// row's facts and revision to be the ones its object states
     /// ([`Self::stands`]), so nothing a generation's lists, pair classes or
     /// encode columns are derived from moves here, and the registry is not
     /// written.
     fn restate(&self, row: &WorkerRow) {
         let held = &mut *self.held.write();
-        let entry = held.objects.get(&row.id);
-        let Some(laid) = entry.and_then(|id| held.rows.get_mut(id)) else {
+        let standing = held.objects.get(&row.id);
+        let standing = standing.map(|(id, laid)| (id.clone(), Arc::clone(&laid.object)));
+        let Some((id, object)) = standing else {
             return;
         };
-        laid.remainder = Arc::new(RowRemainder::of(row));
+        let remainder = Arc::new(RowRemainder::of(row));
+        held.replace(row.id, Some((id, Laid { remainder, object })));
         held.state(row);
     }
 
@@ -947,7 +1015,7 @@ impl<G: Generation> Objects<G> {
         // switches the default off.
         if let Some(defaults) = self.overload_defaults {
             worker = worker.overload(thresholds(&row.facts.overload));
-            if !external(&row.facts) && self.defaults_on.load(Relaxed) {
+            if !external(&row.facts.engine_kind) && self.defaults_on.load(Relaxed) {
                 worker = worker.overload_defaults(defaults);
             }
         }
@@ -973,6 +1041,12 @@ impl<G: Generation> Objects<G> {
     /// object another row holds under the URL is dropped first: a row takes
     /// the place of its own object alone. Where the registry holds nothing
     /// under the URL by then, the object is registered under a new id.
+    ///
+    /// A row holds one object. Where the row's own object stands under
+    /// another URL, that one is dropped first too. A cut that names an id
+    /// again under another address lays its rows in order: the first's
+    /// object ends, and the last stands until a later row of the cut takes
+    /// its address.
     fn put<S: WorkersStore + ?Sized>(&self, store: &S, row: &WorkerRow, object: Arc<dyn Worker>) {
         // The id first, then the entry, then the registry's write: its
         // event finds the entry.
@@ -984,18 +1058,21 @@ impl<G: Generation> Objects<G> {
             self.end(other.row);
             id = self.registry.reserve_id_for_url(&row.facts.key);
         }
+        // The row's own object under another URL leaves first too.
+        if self.object(row.id).is_some_and(|own| own != id) {
+            self.end(row.id);
+        }
         let standing = {
             let mut entries = self.held.write();
-            entries.objects.insert(row.id, id.clone());
+            // The ranks first: a row laid again leaves the rank its
+            // standing object dials.
             entries.state(row);
             let laid = Laid {
                 remainder: Arc::new(RowRemainder::of(row)),
                 object: Arc::clone(&object),
             };
-            entries
-                .rows
-                .insert(id, laid)
-                .map(|standing| standing.object)
+            let standing = entries.replace(row.id, Some((id, laid)));
+            standing.map(|standing| standing.object)
         };
         self.registry.register_or_replace(Arc::clone(&object));
         if let Some(standing) = standing {
@@ -1174,6 +1251,10 @@ impl Objects<Members> {
     /// that goes later. The generation is the registry's old one by then,
     /// and its classes stand as its lists do.
     ///
+    /// The rule is handed a row's engine kind as the worker crate reads
+    /// the name, and as the row wrote it where that crate does not know
+    /// the name.
+    ///
     /// A generation keeps one set of classes a pairing mode, derived at
     /// the first ask under the mode. What a set is derived from does not
     /// move under a generation: a write that moves a row's wires, its
@@ -1201,7 +1282,8 @@ impl Objects<Members> {
     /// every worker of both lists takes class `0`.
     fn derive_pairs(&self, generation: &Members, mode: Pairing) -> PartnerClasses {
         /// A row as the rule reads it: by the descriptor it states, else by
-        /// `own`, what its worker object offers a partner.
+        /// `own`, what its worker object offers a partner, and by its engine
+        /// kind as [`runtime`] hands it.
         fn member<'a>(
             row: &'a Arc<RowRemainder>,
             own: Option<&'a PairingDescriptor>,
@@ -1210,7 +1292,7 @@ impl Objects<Members> {
             Member::new(
                 row.standing.row,
                 row.wire_modes,
-                &row.engine_kind,
+                runtime(&row.engine_kind),
                 descriptor,
             )
         }
@@ -1266,6 +1348,9 @@ impl Objects<Members> {
     /// there: an encoder of class `0`, which takes no item, and a prefill
     /// no encoder hands to.
     ///
+    /// The rule is handed a row's engine kind as the pair rule is
+    /// ([`Self::pair_classes`]).
+    ///
     /// The rule runs over whatever is lent. Where no prefill is lent, an
     /// encoder keeps the class of its end, and the pair's own decision
     /// answers for the side that is missing.
@@ -1285,23 +1370,22 @@ impl Objects<Members> {
 
     /// The encode columns of `generation`'s two lists as lent, derived now.
     fn derive_encode(&self, generation: &Members) -> EncodeColumns {
-        /// A lent worker as the rule reads it: its row's engine kind and
-        /// offer, and for a worker no row stands for an unknown runtime
-        /// with `none`, the offer that states nothing.
+        /// The offer the rule reads of a lent worker: its row's, and for a
+        /// worker no row stands for `none`, the offer that states nothing.
+        fn offer<'a>(row: Option<&'a Arc<RowRemainder>>, none: &'a EncodeOffer) -> &'a EncodeOffer {
+            row.map_or(none, |row| &row.encode)
+        }
+        /// A lent worker as the rule reads it: its row's engine kind as
+        /// [`runtime`] hands it, and its offer. A worker no row stands for
+        /// is of an unknown runtime.
         fn member<'a>(
             row: Option<&'a Arc<RowRemainder>>,
             none: &'a EncodeOffer,
         ) -> EncodeMember<'a> {
-            row.map_or(
-                EncodeMember {
-                    runtime: "",
-                    offer: none,
-                },
-                |row| EncodeMember {
-                    runtime: &row.engine_kind,
-                    offer: &row.encode,
-                },
-            )
+            EncodeMember {
+                runtime: row.map_or("", |row| runtime(&row.engine_kind)),
+                offer: offer(row, none),
+            }
         }
         let lists = [Role::Encode, Role::Prefill].map(|role| self.lent(generation, role));
         let [encoders, prefills] = self.remainders(lists);
@@ -1310,7 +1394,7 @@ impl Objects<Members> {
             encoders.iter().map(|row| member(row.as_ref(), &none)),
             prefills.iter().map(|row| member(row.as_ref(), &none)),
         );
-        let offers = encoders.iter().map(|row| member(row.as_ref(), &none).offer);
+        let offers = encoders.iter().map(|row| offer(row.as_ref(), &none));
         let prefill_classes = (0..prefills.len()).map(|at| classes.prefill_class(at));
         EncodeColumns::new(classes.encoder_facts(offers), prefill_classes.collect())
     }
@@ -1327,7 +1411,7 @@ impl Objects<Members> {
         lists.map(|list| {
             let facts = list.facts.unwrap_or_default();
             let row = |(worker, fact): (&Arc<dyn Worker>, &FixedFacts)| {
-                let laid = held.rows.get(held.objects.get(&fact.id?)?)?;
+                let (_, laid) = held.objects.get(&fact.id?)?;
                 Arc::ptr_eq(&laid.object, worker).then(|| Arc::clone(&laid.remainder))
             };
             list.workers.iter().zip(facts).map(row).collect()

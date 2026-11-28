@@ -5,6 +5,7 @@ use serde_json::Value;
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
+    minimax_resize::SGLANG_RESIZE_KEY,
     registry::{
         layouts::grid_patch_layouts_for, MediaItemInfo, ModelMetadata, ModelProcessorSpec,
         ModelRegistryError, RegistryResult,
@@ -338,6 +339,15 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         true
     }
 
+    /// M3's language model runs plain partial RoPE over token positions
+    /// (`text_config` sets `rope_theta`, `rotary_dim` and
+    /// `partial_rotary_factor`, and no M-RoPE section); the 3-D rotary
+    /// embedding is the vision tower's (`vision_config.rope_mode: 3d`). The
+    /// grid tensors therefore feed only the vision tower.
+    fn language_model_reads_grids(&self) -> bool {
+        false
+    }
+
     fn placeholder_token_for(
         &self,
         metadata: &ModelMetadata,
@@ -439,6 +449,14 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         }
     }
 
+    /// A clip is stamped only where its preprocessor config carries
+    /// [`SGLANG_RESIZE_KEY`]: the worker that sets it follows a processor that
+    /// stamps every clip it decodes. Everywhere else the frame blocks stand
+    /// bare, as an engine that runs the reference processor lays them out when
+    /// started with its defaults: the reference stamps only a clip whose frame
+    /// rate and sampled frame indices it is handed, and with that engine's
+    /// processor cache on, its default, neither reaches the reference. With
+    /// the cache off both do, and the stamps are written.
     fn prompt_replacements_with_media(
         &self,
         metadata: &ModelMetadata,
@@ -448,7 +466,11 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         preprocessor_config: &PreProcessorConfig,
     ) -> RegistryResult<Vec<PromptReplacement>> {
         match modality {
-            Modality::Video => {
+            Modality::Video
+                if preprocessor_config
+                    .get_extra::<bool>(SGLANG_RESIZE_KEY)
+                    .unwrap_or(false) =>
+            {
                 let placeholder_token = self.placeholder_token_for(metadata, Modality::Video)?;
                 let temporal_patch_size =
                     MiniMaxM3VisionProcessor::temporal_patch_size_from(preprocessor_config)
@@ -476,9 +498,10 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         // sizes key (or the other way round), or a request carrying both is
         // sliced by a tensor the batch does not have. The frame spacing the
         // shared video processor emits is batched here, so clips sampled at
-        // different rates join one batch (M3 reads the timing off its text
-        // stamps). The entry declares no legacy field map: the trait's
-        // default reads one, and this override replaces that default.
+        // different rates join one batch (where a clip is stamped, M3 reads
+        // the timing off its text stamps). The entry declares no legacy field
+        // map: the trait's default reads one, and this override replaces that
+        // default.
         grid_patch_layouts_for(modality)
     }
 
@@ -585,6 +608,13 @@ mod tests {
     fn matches_by_model_type_and_id() {
         let spec = MiniMaxM3VisionSpec;
         assert!(spec.matches(&metadata()));
+    }
+
+    /// The grids M3's processor emits feed the vision tower alone: the
+    /// language model's positions do not read them.
+    #[test]
+    fn the_language_model_reads_no_grids() {
+        assert!(!MiniMaxM3VisionSpec.language_model_reads_grids());
     }
 
     #[test]
@@ -785,7 +815,15 @@ mod tests {
         PlaceholderRange { offset, length }
     }
 
-    /// The video replacements for `counts` clips, given their media info and the preprocessor config.
+    /// `config` as the worker whose clips are stamped hands it to the spec.
+    fn stamping(mut config: PreProcessorConfig) -> PreProcessorConfig {
+        config
+            .extra
+            .insert(SGLANG_RESIZE_KEY.to_string(), true.into());
+        config
+    }
+
+    /// The video replacements for `counts` clips where clips are stamped, given their media info and the preprocessor config.
     fn video_replacements_with(
         meta: &ModelMetadata,
         counts: Vec<usize>,
@@ -799,12 +837,12 @@ mod tests {
                 &preprocessed_video(counts, grid_t),
                 Modality::Video,
                 media,
-                config,
+                &stamping(config.clone()),
             )
             .unwrap()
     }
 
-    /// The video replacement for the request's one clip under the default preprocessor config.
+    /// The stamped video replacement for the request's one clip under the default preprocessor config.
     fn video_replacement(
         meta: &ModelMetadata,
         counts: Vec<usize>,
@@ -838,8 +876,41 @@ mod tests {
     }
 
     #[test]
-    fn sampled_video_stamps_each_frame_with_its_source_time() {
-        // Five frames at 30 fps pair into three temporal frames, each stamped with its first frame's time.
+    fn sampled_video_without_the_mark_carries_no_time_stamp() {
+        // The road without the mark, every worker but the one that sets
+        // `SGLANG_RESIZE_KEY`: the default preprocessor config is handed as it
+        // stands. An engine that runs the reference processor with its
+        // defaults hands it neither a clip's frame rate nor its sampled frame
+        // indices, so the prompt it builds holds the frame blocks alone. The
+        // test tokenizer encodes any text, so a stamp laid between the blocks
+        // would show in the sequence.
+        //
+        // Five sampled frames pair into three temporal frames; a lone frame stays one block.
+        for (frame_indices, frames, grid_t) in [(vec![0, 15, 30, 45, 60], 3, 3), (vec![7], 1, 1)] {
+            let replacements = MiniMaxM3VisionSpec
+                .prompt_replacements_with_media(
+                    &metadata(),
+                    &preprocessed_video(vec![4 * frames], grid_t),
+                    Modality::Video,
+                    &[sampled(&frame_indices, 30.0)],
+                    &PreProcessorConfig::default(),
+                )
+                .unwrap();
+
+            assert_eq!(
+                replacements[0].tokens,
+                frame_block(4).repeat(frames),
+                "{frames} temporal frames"
+            );
+        }
+    }
+
+    #[test]
+    fn sampled_video_under_the_mark_stamps_each_frame_with_its_source_time() {
+        // The road under the mark, the worker whose processor stamps every
+        // clip (`video_replacement` lays the mark on the config by `stamping`):
+        // five frames at 30 fps pair into three temporal frames, each stamped
+        // with its first frame's time.
         let replacement = video_replacement(
             &metadata(),
             vec![12],
@@ -1050,7 +1121,7 @@ mod tests {
                 &preprocessed_video(vec![12], 3),
                 Modality::Video,
                 &[sampled(&[0, 15, 30, 45, 60], 30.0)],
-                &PreProcessorConfig::default(),
+                &stamping(PreProcessorConfig::default()),
             )
             .unwrap_err();
 
@@ -1069,7 +1140,7 @@ mod tests {
         // the stamp path reports the same configuration error instead of
         // pairing the frames by the default.
         let meta = metadata();
-        let mut config = PreProcessorConfig::default();
+        let mut config = stamping(PreProcessorConfig::default());
         config.extra.insert(
             "img_token_compression_config".to_string(),
             json!({ "temporal_patch_size": "two" }),

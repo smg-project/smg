@@ -33,11 +33,11 @@ use tonic::{
 use tracing::{info, warn};
 
 use super::{
-    election::ElectionObservation,
+    election::{ElectionObservation, Leader},
     generations::Generations,
     principal::ENTRY,
     replication::BEAT,
-    service::{Leader, Shared},
+    service::Shared,
     worker_wire::{self, Refused},
 };
 use crate::{
@@ -633,17 +633,16 @@ impl Standby {
     /// names another leader, or the same one under another term: the sync
     /// is with one leader's term ([`Lag::forget`]).
     pub(crate) async fn run(self, mut stop: watch::Receiver<bool>) {
-        let mut steps = self.shared.standing.clone();
+        let mut steps = self.shared.steps();
         let mut streak = Streak::default();
-        let mut led = self.shared.fence.term();
+        let mut led = self.shared.held_term();
         // The term of the leader the last stream was opened against.
         let mut followed = None;
         loop {
-            let leading = self.shared.fence.leader_term(Instant::now());
-            let leader = self.shared.leader(leading);
+            let leader = self.shared.leader(Instant::now());
             // The fence's term moves at a take alone: this replica has
             // held the lease since the loop's last look.
-            let term = self.shared.fence.term();
+            let term = self.shared.held_term();
             if term != led {
                 self.shared.lag.forget();
                 led = term;
@@ -681,7 +680,7 @@ impl Standby {
             let wait = match next {
                 Next::Join | Next::Turn => continue,
                 Next::Lease => MOST,
-                Next::Wait => streak.wait(&self.shared.identity),
+                Next::Wait => streak.wait(self.shared.identity()),
             };
             tokio::select! {
                 () = pause(&mut steps, next == Next::Lease, wait) => {}
@@ -703,8 +702,7 @@ impl Standby {
             if steps.changed().await.is_err() {
                 return Next::Lease;
             }
-            let leading = self.shared.fence.leader_term(Instant::now());
-            let named = self.shared.leader(leading);
+            let named = self.shared.leader(Instant::now());
             if named.controller_id != leader.controller_id
                 || named.address != leader.address
                 || named.term != leader.term
@@ -810,7 +808,7 @@ impl Standby {
         let asks = self.asks.load(Ordering::Relaxed);
         if asks {
             self.pace.wait().await;
-            if self.shared.fence.leader_term(Instant::now()).is_some() {
+            if self.shared.leading(Instant::now()).is_some() {
                 return Ended::leads(false);
             }
         }
@@ -985,5 +983,5 @@ fn unread(refused: Refused) -> String {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/unit/service/controller/standby/tests.rs"]
+#[path = "../../../tests/unit/service/controller/standby/tests/mod.rs"]
 mod tests;

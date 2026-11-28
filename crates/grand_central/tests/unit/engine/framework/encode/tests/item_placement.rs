@@ -139,6 +139,8 @@ fn the_admitted_rows_answer_by_their_place_in_the_hosts_pools() {
         },
         row(1, Role::Decode, 1, 9),
     ];
+    // Each of the three lists is handed its column, by the pool's places.
+    bed.decode_affinity = vec![AffinityFacts::default(); 2];
     bed.encoders = vec![
         unready(row(0, Role::Encode, 0, 0)),
         row(1, Role::Encode, 0, 3),
@@ -147,6 +149,46 @@ fn the_admitted_rows_answer_by_their_place_in_the_hosts_pools() {
     bed.encode_affinity = vec![AffinityFacts::default(); 2];
     bed.decode_images = true;
     assert_eq!(bed.placed(), ((1, 1), vec![1], false));
+}
+
+/// A side that was cut reads each of its rows' own entry of the column its
+/// host handed beside the pool. The decode that takes images and the
+/// encoder of the prefill's class each stand second in their pool and first
+/// among the rows admitted. A stage reads there the blocks the host stated
+/// for that row: not the first entry of the pool's column, and not a
+/// column of no entry.
+#[test]
+fn a_side_that_was_cut_reads_each_rows_own_affinity() {
+    let mut engine = engine();
+    let notes = noting(&mut engine);
+    let holding = |overlap_blocks| AffinityFacts {
+        overlap_blocks,
+        ..AffinityFacts::default()
+    };
+    let mut bed = Bed::new();
+    // The first decode takes no image and the request asks one of its
+    // decode; the first encoder is of another class than the prefill's.
+    bed.decodes = vec![
+        Candidate {
+            vision: false,
+            ..row(0, Role::Decode, 1, 0)
+        },
+        row(1, Role::Decode, 1, 0),
+    ];
+    bed.decode_affinity = vec![holding(3), holding(7)];
+    bed.encoders = vec![row(0, Role::Encode, 0, 0), row(1, Role::Encode, 0, 0)];
+    bed.facts = vec![pushing(2), pushing(1)];
+    bed.encode_affinity = vec![holding(4), holding(9)];
+    bed.decode_images = true;
+    let (decision, placed) = bed.decide_with(&engine);
+    assert_eq!(pair_of(&decision), (0, 1));
+    assert_eq!(placed.encoders().first().map(|t| t.position), Some(1));
+    for (phase, blocks) in [(Phase::Decode, 7), (Phase::Encode, 9)] {
+        let read = noted_under(&notes, phase);
+        assert!(!read.is_empty(), "{phase:?}: no stage was asked");
+        let own = |note: &Noted| (note.at, note.blocks) == (0, Some(blocks));
+        assert!(read.iter().all(own), "{phase:?}: {read:?}");
+    }
 }
 
 #[test]

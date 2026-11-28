@@ -61,6 +61,7 @@ from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 from ..constrained_decoding import (
     grammar_backend_entry,
     grammar_start_labels,
+    structural_tag_vocabulary_entry,
     tokenspeed_constrained_decoding_start,
     tokenspeed_grammar_backend,
 )
@@ -684,7 +685,12 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         )
         # The grammar backend the scheduler runs, resolved, under the same key
         # the Rust servicer reads.
-        grammar_backend_entry(server_args_dict, tokenspeed_grammar_backend(self.server_args))
+        grammar_backend = tokenspeed_grammar_backend(self.server_args)
+        grammar_backend_entry(server_args_dict, grammar_backend)
+        # The vocabulary of structural-tag nodes that backend takes, as the
+        # Rust launcher reports it: the Router spells an older xgrammar's
+        # structural tags in the older vocabulary.
+        structural_tag_vocabulary_entry(server_args_dict, grammar_backend)
 
         # Control endpoint and capabilities for a fronting gateway (SMG reads
         # the `rl.*` keys straight into worker labels). Older engines have no

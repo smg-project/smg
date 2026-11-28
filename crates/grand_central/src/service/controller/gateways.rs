@@ -175,9 +175,6 @@ struct Table {
     /// The next instant each row needs a sweep visit, ordered by instant.
     /// A row has at most one entry, kept in step with [`Row::deadline`].
     deadlines: BTreeSet<(Instant, GatewayId)>,
-    /// A case reads the sweep's visits, and the sweep itself counts them here.
-    #[cfg(test)]
-    sweep_visits: usize,
     /// The highest term the table was read under since this replica last
     /// led; `None` when the last read found the fence closed, and before
     /// the first.
@@ -237,15 +234,6 @@ pub(crate) struct SessionPlace {
     gateway: GatewayId,
     session: u64,
     superseded: Arc<Replaced>,
-    /// A case arms this pause, and the place's own drop waits on it.
-    #[cfg(test)]
-    drop_pause: Option<Arc<DropPause>>,
-}
-
-#[cfg(test)]
-struct DropPause {
-    gone: std::sync::Barrier,
-    swept: std::sync::Barrier,
 }
 
 impl Row {
@@ -298,6 +286,12 @@ impl SessionPlace {
         self.superseded.told.load(Ordering::Acquire)
     }
 
+    /// The grace period of the table this seat stands in: the session's
+    /// `Welcome` tells it in whole milliseconds.
+    pub(crate) fn grace(&self) -> Duration {
+        self.gateways.grace()
+    }
+
     /// One kind's veto on `worker` set until `until`, or lifted, at `now`:
     /// the other kinds' ends stand, and the store shows the latest of them
     /// with the hold among them ([`hold_of`]).
@@ -322,14 +316,10 @@ impl SessionPlace {
 
 impl Drop for SessionPlace {
     fn drop(&mut self) {
-        // A no-op after `end`: the row's period started there.
+        // The session's end. It starts no period where a newer session
+        // stands, the period runs already, or the row was let go.
         self.gateways
             .gone(self.gateway, self.session, &self.superseded, Instant::now());
-        #[cfg(test)]
-        if let Some(pause) = &self.drop_pause {
-            pause.gone.wait();
-            pause.swept.wait();
-        }
     }
 }
 
@@ -513,18 +503,32 @@ impl Gateways {
             gateway,
             session,
             superseded,
-            #[cfg(test)]
-            drop_pause: None,
         })
     }
 
-    /// The gateway's presence at `now` for a decide stream's open: `None`
-    /// when it is not present. No decision asks: a stream's open and end do.
+    /// The gateway's presence at `now` for a decide stream: `None` when it
+    /// is not present. No decision asks: a stream does where it is placed
+    /// under a term, at its open or at a request's receipt.
     pub(crate) fn presence(&self, gateway: GatewayId, now: Instant) -> Option<Presence> {
         let mut table = self.table.lock();
         self.observe(&mut table, self.fence.leader_term(now), now);
         let row = table.rows.get(&gateway)?;
         (!self.over(row, now)).then(|| Presence(row.ended.subscribe()))
+    }
+
+    /// The earliest of `deadlines`, taken out of the set, where it is due
+    /// at `now`. `None`, and the set as it stood, where the earliest is
+    /// later or the set holds none.
+    fn pop_due(
+        deadlines: &mut BTreeSet<(Instant, GatewayId)>,
+        now: Instant,
+    ) -> Option<(Instant, GatewayId)> {
+        let (earliest, _) = *deadlines.first()?;
+        if earliest <= now {
+            deadlines.pop_first()
+        } else {
+            None
+        }
     }
 
     /// One pass of the sweep at `now`: every gateway whose period is over
@@ -536,18 +540,7 @@ impl Gateways {
             return 0;
         }
         let mut gone = Vec::new();
-        while table
-            .deadlines
-            .first()
-            .is_some_and(|(deadline, _)| *deadline <= now)
-        {
-            let Some((deadline, gateway)) = table.deadlines.pop_first() else {
-                break;
-            };
-            #[cfg(test)]
-            {
-                table.sweep_visits += 1;
-            }
+        while let Some((deadline, gateway)) = Self::pop_due(&mut table.deadlines, now) {
             let Some(row) = table.rows.get_mut(&gateway) else {
                 continue;
             };

@@ -31,7 +31,9 @@
 //! A watch of some models is told a write when a row it names serves one of
 //! them: the row the write left in the table, or the row it took out. A
 //! row's models change with its incarnation at the door, so a row leaves a
-//! watcher's models by a replacement, which names both rows.
+//! watcher's models by a replacement, which names both rows. A status
+//! entry names no row. It holds the models its row served at the write,
+//! and the same rule reads them.
 //!
 //! A membership entry the wire has no form for is told to no watch. The
 //! store writes none; one that lands is logged once a replica.
@@ -44,8 +46,6 @@
 //! with it, so the ceiling of watches bounds what a principal leaves
 //! unread.
 
-#[cfg(test)]
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
     pin::Pin,
     sync::Arc,
@@ -67,7 +67,10 @@ use tracing::{info, warn};
 use super::{principal::Principal, worker_wire};
 pub(super) use crate::document::operator::snapshot::PAGE_BYTES;
 use crate::{
-    document::operator::{snapshot::serves, SerialTurn},
+    document::operator::{
+        snapshot::{serves, serves_models},
+        SerialTurn,
+    },
     service::{
         elector::Fence,
         proto,
@@ -116,9 +119,6 @@ pub(crate) struct Feed {
     /// watch leaves, and by the last snapshot call out with no watch open:
     /// a copy of every row is held only while a reader can share it.
     rows: Arc<Mutex<Option<Arc<StoreCheckpoint>>>>,
-    /// The cuts of every row this feed took, for a case.
-    #[cfg(test)]
-    cuts: Arc<AtomicUsize>,
 }
 
 impl Feed {
@@ -136,8 +136,6 @@ impl Feed {
             teller: Arc::default(),
             unwired: Arc::default(),
             rows: Arc::default(),
-            #[cfg(test)]
-            cuts: Arc::default(),
         }
     }
 
@@ -239,8 +237,6 @@ impl Feed {
             return Arc::clone(cut);
         }
         let cut = Arc::new(objects.checkpoint(store));
-        #[cfg(test)]
-        self.cuts.fetch_add(1, Ordering::Relaxed);
         *kept = Some(Arc::clone(&cut));
         cut
     }
@@ -687,7 +683,9 @@ impl Asked {
 
     /// Whether a watch comes to the write: a row it names serves an asked
     /// model. A membership entry that names no row has no wire form, and
-    /// every watch comes to it: the first logs it ([`Feed::untold`]).
+    /// every watch comes to it: the first logs it ([`Feed::untold`]). A
+    /// status entry is read by its kind: it holds the models its row
+    /// serves, which is all the rule reads of a row.
     fn tells(&self, entry: &Entry) -> bool {
         match &entry.event {
             Event::Member { row, left, .. } => {
@@ -697,6 +695,7 @@ impl Asked {
                         .flatten()
                         .any(|row| self.serves(row))
             }
+            Event::Status { models, .. } => serves_models(&self.models, models),
             Event::Term | Event::Generation { .. } => false,
         }
     }

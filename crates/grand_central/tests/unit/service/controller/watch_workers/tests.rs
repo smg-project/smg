@@ -45,11 +45,6 @@ use crate::{
 };
 
 impl Feed {
-    /// The cuts of every row this feed took, for a case.
-    pub(in crate::service::controller) fn cuts(&self) -> usize {
-        self.cuts.load(Ordering::Relaxed)
-    }
-
     /// The kept cut, for a case.
     pub(in crate::service::controller) fn kept(&self) -> Option<Arc<StoreCheckpoint>> {
         self.rows.lock().clone()
@@ -773,6 +768,30 @@ async fn a_watch_of_one_model_is_told_the_rows_that_serve_it() {
         panic!("the next write of the watcher's model: {registered:?}");
     };
     assert_eq!(row.id, again.0);
+}
+
+/// A status entry names every model its row serves: a watch that asked
+/// for the second of a row's two models is told the row's status.
+#[tokio::test]
+async fn a_watch_of_a_rows_second_model_is_told_its_status() {
+    let leader = leader();
+    let both = leader.lays(WorkerFacts {
+        key: key(0),
+        engine: key(0),
+        incarnation: 1,
+        models: vec!["model-a".to_owned(), "model-b".to_owned()],
+        dp_size: 1,
+        ..WorkerFacts::default()
+    });
+    let mut stream = leader.watch(Start::Snapshot, &["model-b"]);
+    let page = next(&mut stream).await;
+    assert!(matches!(page.event, Some(Event::Snapshot(_))), "{page:?}");
+    stand(&leader.objects, &leader.store, both, WorkerStatus::Ready);
+    let status = next(&mut stream).await;
+    let Some(Event::Status(status)) = status.event else {
+        panic!("a status: {status:?}");
+    };
+    assert_eq!(status.worker_id, both.0);
 }
 
 /// A watched write wakes no watch itself. Once its store has let its

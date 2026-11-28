@@ -516,16 +516,21 @@ pub(crate) fn accepted_by(
 ///
 /// A route asks it of the guard ([`Self::of`]) and tests nothing of who
 /// placed the request. The handle is empty for a guard that keeps no side
-/// of Grand Central's: a classic guard, a guard made ahead of its send
-/// until that send hands it the side ([`Placed::ahead`] until
-/// [`Placed::sent`], the load of a pair's prefill until [`Unsent::sent`]),
-/// and a guard made of another ([`WorkerLoadGuard::replicate`]). It is
-/// empty too where no stage of the engine's document takes an outcome. An
-/// empty handle holds nothing, and a report through it says nothing.
+/// of Grand Central's. A classic guard keeps none. A guard made ahead of
+/// its send keeps none until that send hands it the side: [`Placed::ahead`]
+/// until [`Placed::sent`], the load of a pair's prefill until
+/// [`Unsent::sent`]. A guard made of another keeps none
+/// ([`WorkerLoadGuard::replicate`]). A replica of a pair's prefill load is
+/// the exception: it keeps the first load's handle
+/// ([`Self::kept_by_replica_of`]). The handle is empty too where no stage
+/// of the engine's document takes an outcome. An empty handle holds
+/// nothing, and a report through it says nothing.
 ///
 /// Where the handle is not empty, the engine hears the request's end once
-/// the guard and every handle are gone: with the status last reported, or
-/// as it heard it before where nobody reported (a client that left).
+/// the guard and every handle are gone. It hears the status last reported,
+/// or the end as it heard it before where nobody reported (a client that
+/// left). A failure reported stands against a good answer reported behind
+/// it: a side several readers tell failed once one of them met a failure.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RequestEnd(SideEnd);
 
@@ -576,6 +581,24 @@ impl RequestEnd {
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    /// A replica of `guard` that keeps the handle on `guard`'s end: asked
+    /// for its own handle, the replica then answers the same side
+    /// ([`Self::of`]). A fan-out's and a batch's prefill loads are such
+    /// replicas, and each child tells the one prefill side through its own.
+    /// A guard whose kept value is no side of Grand Central's leaves its
+    /// replica with nothing kept. Out of line: a guard that keeps nothing
+    /// is replicated where its load stands, and never comes here.
+    #[inline(never)]
+    pub(crate) fn kept_by_replica_of(guard: &WorkerLoadGuard) -> WorkerLoadGuard {
+        let end = Self::of(guard);
+        let replica = guard.replicate();
+        if end.0.is_empty() {
+            replica
+        } else {
+            replica.keeping(Box::new(end))
+        }
+    }
 }
 
 /// One request's end as several readers of its answers tell it: the streams
@@ -622,16 +645,23 @@ impl SharedEnd {
 /// value itself, so the caller's test loads nothing.
 #[inline(never)]
 fn kept_side_end(guard: &WorkerLoadGuard) -> SideEnd {
-    guard
-        .kept()
-        .and_then(|kept| kept.downcast_ref::<PlacementSide>())
-        .map_or_else(SideEnd::default, PlacementSide::side_end)
+    let Some(kept) = guard.kept() else {
+        return SideEnd::default();
+    };
+    if let Some(side) = kept.downcast_ref::<PlacementSide>() {
+        return side.side_end();
+    }
+    // A replica keeps the handle of the guard it was made of
+    // ([`RequestEnd::kept_by_replica_of`]): the same side.
+    kept.downcast_ref::<RequestEnd>()
+        .map_or_else(SideEnd::default, |end| end.0.clone())
 }
 
-/// [`RequestEnd::report`] through a handle a stage hears, out of line.
+/// [`RequestEnd::report`] through a handle a stage hears, out of line. No
+/// good answer is written over a failure told on the same side.
 #[inline(never)]
 fn reported(end: &SideEnd, status: u16, answered: bool) {
-    end.reported(Outcome::reported(status, transport_class(status, answered)));
+    end.reported_unless_failed(Outcome::reported(status, transport_class(status, answered)));
 }
 
 /// The class of an end of `status`, the one mapping of the gateway: a
@@ -8037,13 +8067,9 @@ pub(crate) mod tests {
         let registry = http_registry(&["http://h:1", "http://h:2", "http://h:3"]);
         let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let mut document = PolicySpec::preset("consistent_hashing").expect("a stock preset");
-        document.bindings[0].routing_key = Some(RoutingKeySpec {
-            sources: vec![KeySourceSpec {
-                rid: true,
-                ..KeySourceSpec::default()
-            }],
-            strip_lineage: false,
-        });
+        let mut source = KeySourceSpec::default();
+        source.rid = true;
+        document.bindings[0].routing_key = Some(RoutingKeySpec::of(vec![source]));
         let spec = AppliedSpec::validate(&document);
         engine_on(&policies, spec.expect("a valid document"));
         let keyed = PlacementInputs {
@@ -8773,10 +8799,9 @@ pub(crate) mod tests {
     /// stock pair of two rotations under that word, on `policies`.
     fn shedding_pair_engine_on(policies: &PolicyRegistry) {
         let mut sheds = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
-        sheds.bindings[0].overload = Some(OverloadSpec {
-            shed_when_all_vetoed: true,
-            ..OverloadSpec::default()
-        });
+        let mut overload = OverloadSpec::default();
+        overload.shed_when_all_vetoed = true;
+        sheds.bindings[0].overload = Some(overload);
         engine_on(
             policies,
             AppliedSpec::validate(&sheds).expect("a valid document"),
@@ -10556,6 +10581,23 @@ pub(crate) mod tests {
         hearing_pairs(policies, false, true)
     }
 
+    /// [`hearing_pair_sides_on`] where the document picks a pair's decode
+    /// behind its prefill: a decode asked again there may move.
+    pub(crate) fn hearing_later_pair_sides_on(policies: &PolicyRegistry) -> Heard {
+        hearing_pairs(policies, true, true)
+    }
+
+    /// One pair a hearing engine placed, for a case of another module. Its
+    /// stage names the side at each end. Answers what the stage hears and the
+    /// pair's two answers, neither sent yet.
+    pub(crate) fn heard_pair() -> (Heard, PlacedPair) {
+        let registry = one_pair();
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let heard = hearing_pair_sides_on(&policies);
+        let pair = pair_from(&registry, &policies).expect("the engine places the pair");
+        (heard, pair)
+    }
+
     fn hearing_pairs(policies: &PolicyRegistry, later: bool, sides: bool) -> Heard {
         let heard = Heard::default();
         let kept = Arc::clone(&heard);
@@ -10589,13 +10631,9 @@ pub(crate) mod tests {
         let document = PolicySpec::pair_presets("round_robin", "round_robin");
         let mut document = document.expect("the pair presets");
         document.generation = 1;
-        document.bindings[0].routing_key = Some(RoutingKeySpec {
-            sources: vec![KeySourceSpec {
-                rid: true,
-                ..KeySourceSpec::default()
-            }],
-            strip_lineage: false,
-        });
+        let mut source = KeySourceSpec::default();
+        source.rid = true;
+        document.bindings[0].routing_key = Some(RoutingKeySpec::of(vec![source]));
         let spec = AppliedSpec::validate(&document);
         engine_on(policies, spec.expect("a valid document"));
     }
@@ -10922,10 +10960,9 @@ pub(crate) mod tests {
         // and its engine decides under that word.
         let shedding = PolicyRegistry::new(PolicyConfig::RoundRobin);
         let mut sheds = PolicySpec::pair_presets("round_robin", "round_robin").expect("presets");
-        sheds.bindings[0].overload = Some(OverloadSpec {
-            shed_when_all_vetoed: true,
-            ..OverloadSpec::default()
-        });
+        let mut overload = OverloadSpec::default();
+        overload.shed_when_all_vetoed = true;
+        sheds.bindings[0].overload = Some(overload);
         engine_on(
             &shedding,
             AppliedSpec::validate(&sheds).expect("a valid document"),

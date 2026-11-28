@@ -8,11 +8,6 @@
 //! A page writes itself as JSON ([`WorkerRowsPage`]): a host in process serves
 //! the rows an operator reads with no mapping of its own.
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 use std::{borrow::Cow, collections::BTreeMap, sync::Arc, time::Instant};
 
 use serde::{Serialize, Serializer};
@@ -35,22 +30,29 @@ pub(crate) const PAGE_BYTES: usize = 2 * 1024 * 1024;
 /// The most model ids a snapshot or a watch names.
 pub(crate) const MODELS: usize = 128;
 
-/// The bytes a row's `demand_facts` takes in a page's JSON where its worker
-/// states none: the key, `null` and the comma.
-const NO_DEMAND_FACTS_BYTES: usize = 20;
-
-/// The bytes it takes at most where the worker states a fact: the key, the
-/// comma and the block with each value at its longest.
-const DEMAND_FACTS_BYTES: usize = 114;
-
 /// What a snapshot caller asks of the worker rows.
+///
+/// The default asks for every model's rows under the byte bound alone. The
+/// record gains fields: code outside this crate starts from the default and
+/// assigns what it asks otherwise, and a pattern of it ends with `..`.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct WorkerRowsQuery {
     /// The model ids to include. An empty list includes every model.
     pub models: Vec<String>,
     /// The maximum number of rows to return. `usize::MAX` uses only the
     /// byte bound.
     pub limit: usize,
+}
+
+impl Default for WorkerRowsQuery {
+    /// Every model's rows, under the byte bound alone.
+    fn default() -> Self {
+        Self {
+            models: Vec::new(),
+            limit: usize::MAX,
+        }
+    }
 }
 
 impl WorkerRowsQuery {
@@ -92,7 +94,14 @@ pub(crate) fn unnamed(models: &[String]) -> Option<&'static str> {
 /// searched in a sorted list (the `rows_serving` of its worker objects'
 /// holder): the two change together.
 pub(crate) fn serves(models: &[String], row: &WorkerRow) -> bool {
-    models.is_empty() || row.facts.models.iter().any(|model| models.contains(model))
+    serves_models(models, &row.facts.models)
+}
+
+/// The rule of [`serves`] over the models a row serves, `served`: the one
+/// fact of a row the rule reads. A status entry of the membership log holds
+/// that list in its row's place, and a watch reads it by this rule.
+pub(crate) fn serves_models(models: &[String], served: &[String]) -> bool {
+    models.is_empty() || served.iter().any(|model| models.contains(model))
 }
 
 /// The store rows read for a snapshot.
@@ -129,18 +138,21 @@ pub struct WorkerRowsPage {
 /// tells it.
 impl Serialize for WorkerRowsPage {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        #[derive(Serialize)]
-        struct Page<'a> {
-            rows: Vec<RowJson<'a>>,
-            truncated: bool,
-        }
         let rows = self.rows.iter().map(|row| RowJson::of(row, self.taken));
-        Page {
+        PageJson {
             rows: rows.collect(),
             truncated: self.truncated,
         }
         .serialize(serializer)
     }
+}
+
+/// A page's JSON ([`WorkerRowsPage`]): its rows, and whether a matching
+/// row was left out.
+#[derive(Serialize)]
+struct PageJson<'a> {
+    rows: Vec<RowJson<'a>>,
+    truncated: bool,
 }
 
 /// One row of a page's JSON ([`WorkerRowsPage`]).
@@ -182,8 +194,11 @@ enum ReachableJson {
     GatewayId(String),
 }
 
-/// What a row states of a pair and of an encode handoff, under the names
-/// of the contract's pairing descriptor.
+/// What a row states of a pair and of an encode handoff, in one object. A
+/// pair's fields stand under the names of the contract's pairing
+/// descriptor. `vision` and the encode offer's five fields keep the names
+/// the descriptor reserves: the contract states them on the registration
+/// and on the row themselves.
 #[derive(Serialize)]
 struct PairingJson<'a> {
     protocol: Option<&'a str>,
@@ -380,23 +395,42 @@ impl<'a> PairingJson<'a> {
     }
 }
 
-/// Takes a redacted page at `now`, limited by row count and a conservative
-/// measure of the rows' facts. A row admitted after `now` reads as new at
-/// that instant. The first row must fit the byte bound too.
+/// Takes a redacted page at `now`, limited by row count and by the bytes
+/// its JSON takes ([`WorkerRowsPage`]), written compact. A host that writes
+/// the page another way, as with indentation, can write more. A row
+/// admitted after `now` reads as new at that instant. The first row must
+/// fit the byte bound too.
 pub fn worker_rows_page(asked: &WorkerRowsQuery, read: Rows, now: Instant) -> WorkerRowsPage {
-    let (rows, truncated) = worker_rows_page_with(asked, read, now, false, |row| {
-        let bytes = measure(&row);
+    counted_page(asked, read, now).0
+}
+
+/// [`worker_rows_page`], with the bytes its paging counted for the page's
+/// JSON. The count is the JSON's own length with `truncated` at its longer
+/// word: a page that left a row out writes one byte fewer.
+fn counted_page(asked: &WorkerRowsQuery, read: Rows, now: Instant) -> (WorkerRowsPage, usize) {
+    let framing = Framing {
+        around: written(&PageJson {
+            rows: Vec::new(),
+            truncated: false,
+        }),
+        between: 1,
+    };
+    let (rows, truncated, bytes) = paged(asked, read, now, false, framing, |row| {
+        // The row as the page writes it: redacted, at the take's instant.
+        let bytes = written(&RowJson::of(&row, now));
         (row.into_owned(), bytes)
     });
-    WorkerRowsPage {
+    let page = WorkerRowsPage {
         rows,
         truncated,
         taken: now,
-    }
+    };
+    (page, bytes)
 }
 
 /// Pages the redacted rows using the host's measure of the answer. A host
 /// that sends an oversized first row alone can keep that rule here.
+#[cfg(feature = "controller")]
 pub(crate) fn worker_rows_page_with<T>(
     asked: &WorkerRowsQuery,
     read: Rows,
@@ -404,6 +438,30 @@ pub(crate) fn worker_rows_page_with<T>(
     allow_oversized_first: bool,
     map: impl Fn(Cow<'_, WorkerRow>) -> (T, usize),
 ) -> (Vec<T>, bool) {
+    let framing = Framing::default();
+    let (rows, truncated, _) = paged(asked, read, now, allow_oversized_first, framing, map);
+    (rows, truncated)
+}
+
+/// What a page's bytes hold beside its rows' own: the bytes around the
+/// rows, and the bytes between two of them. A host whose measure frames
+/// each row states neither.
+#[derive(Clone, Copy, Default)]
+struct Framing {
+    around: usize,
+    between: usize,
+}
+
+/// The redacted rows `asked` serves out of `read`, paged by `map`'s measure
+/// of each under `framing`, with the bytes counted for the page.
+fn paged<T>(
+    asked: &WorkerRowsQuery,
+    read: Rows,
+    now: Instant,
+    allow_oversized_first: bool,
+    framing: Framing,
+    map: impl Fn(Cow<'_, WorkerRow>) -> (T, usize),
+) -> (Vec<T>, bool, usize) {
     let told = |row| map(redacted(row, now));
     match read {
         Rows::Shared(cut) => page(
@@ -414,6 +472,7 @@ pub(crate) fn worker_rows_page_with<T>(
                 .map(Cow::Borrowed),
             None,
             allow_oversized_first,
+            framing,
             told,
         ),
         Rows::Told(rows, serving) => page(
@@ -421,6 +480,7 @@ pub(crate) fn worker_rows_page_with<T>(
             rows.into_iter().map(Cow::Owned),
             Some(serving),
             allow_oversized_first,
+            framing,
             told,
         ),
     }
@@ -429,25 +489,29 @@ pub(crate) fn worker_rows_page_with<T>(
 /// A single pass over the serving rows, stopping at the first bound.
 /// The store supplies the serving count when it has already selected a
 /// prefix. A shared cut needs just one more matching row to say it was cut.
+/// The bytes counted are the page's: a row that did not fit adds none.
 fn page<'a, T>(
     limit: usize,
     mut rows: impl Iterator<Item = Cow<'a, WorkerRow>>,
     serving: Option<usize>,
     allow_oversized_first: bool,
+    framing: Framing,
     told: impl Fn(Cow<'a, WorkerRow>) -> (T, usize),
-) -> (Vec<T>, bool) {
+) -> (Vec<T>, bool, usize) {
     let mut page = Vec::new();
-    let mut bytes: usize = 0;
+    let mut bytes = framing.around;
     for row in rows.by_ref().take(limit) {
         let (row, size) = told(row);
-        bytes = bytes.saturating_add(size);
-        if bytes > PAGE_BYTES && !(allow_oversized_first && page.is_empty()) {
-            return (page, true);
+        let between = if page.is_empty() { 0 } else { framing.between };
+        let with = bytes.saturating_add(between).saturating_add(size);
+        if with > PAGE_BYTES && !(allow_oversized_first && page.is_empty()) {
+            return (page, true, bytes);
         }
+        bytes = with;
         page.push(row);
     }
     let truncated = serving.map_or_else(|| rows.next().is_some(), |count| page.len() < count);
-    (page, truncated)
+    (page, truncated, bytes)
 }
 
 /// Only copy a shared row here if an address or timestamp needs changing.
@@ -529,58 +593,32 @@ pub(crate) fn without_userinfo(address: &str) -> Option<String> {
     userinfo.then(|| format!("{scheme}{host}{tail}"))
 }
 
-/// Count each text with room for its framing and allow 512 bytes for
-/// fixed fields and the row envelope. Count the addresses and facts that
-/// can be told twice and include the pairing and encode descriptors. Count
-/// the block of demand facts at its longest for a worker that states one,
-/// and as `null` for a worker that states none.
-fn measure(row: &WorkerRow) -> usize {
-    let facts = &row.facts;
-    let text = |text: &str| text.len().saturating_add(16);
-    let demand_facts = if DemandFactsJson::of(facts.demand_facts).is_some() {
-        DEMAND_FACTS_BYTES
-    } else {
-        NO_DEMAND_FACTS_BYTES
-    };
-    let mut bytes = 512usize
-        .saturating_add(demand_facts)
-        .saturating_add(text(&facts.key).saturating_mul(2))
-        .saturating_add(text(&facts.engine))
-        .saturating_add(text(&facts.engine_kind).saturating_mul(2));
-    for field in [
-        facts.zone.as_deref(),
-        facts.labels.get("policy").map(String::as_str),
-        facts.encode.connector.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        bytes = bytes.saturating_add(text(field));
+/// The bytes the JSON writer writes for `value`, written compact. The
+/// count goes through the writer itself, so it holds no second copy of the
+/// JSON's layout. No value a page counts fails to write: its maps are
+/// keyed by texts, and the writer that counts takes every byte. A count
+/// that failed all the same reads as the largest number, past the page's
+/// bound.
+fn written<T: Serialize>(value: &T) -> usize {
+    let mut counted = Counted(0);
+    match serde_json::to_writer(&mut counted, value) {
+        Ok(()) => counted.0,
+        Err(_) => usize::MAX,
     }
-    if let Registrant::Provider(maker) = &row.maker {
-        bytes = bytes
-            .saturating_add(text(maker.provider()))
-            .saturating_add(text(maker.key()));
+}
+
+/// A writer that counts the bytes it is given and keeps none.
+struct Counted(usize);
+
+impl std::io::Write for Counted {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
     }
-    if let Some(pairing) = &facts.pairing {
-        for field in [&pairing.protocol, &pairing.transport, &pairing.version]
-            .into_iter()
-            .chain(&pairing.kv_layout)
-            .flatten()
-        {
-            bytes = bytes.saturating_add(text(field));
-        }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
-    for model in &facts.models {
-        bytes = bytes.saturating_add(text(model));
-    }
-    for (name, value) in &facts.labels {
-        bytes = bytes
-            .saturating_add(text(name))
-            .saturating_add(text(value))
-            .saturating_add(16);
-    }
-    bytes
 }
 
 #[cfg(test)]

@@ -23,7 +23,7 @@ use crate::{
     engine::{
         decision::{Decision, Target, Targets},
         decision_engine::{DecisionEngine, DecisionRefused, Request, RequestMaker, WorkerLists},
-        framework::{EncodeItems, EncodePlaced, Picker, TieBand},
+        framework::{EncodeItems, EncodePlaced, Issuing, Picker, Scorer, TieBand},
         in_process::{
             membership::tests::{handed, id, registry, remove},
             single::tests::{
@@ -40,7 +40,10 @@ use crate::{
     policies::random::Random,
     stages::{registry::StageRegistry, Lifecycle},
     store::{GatewayId, StaleGeneration},
-    tracking::{lease::Membership, DecisionGuard, Placement, PlacementSide},
+    tracking::{
+        lease::{EventKind, EventSet, Membership},
+        DecisionGuard, Lease, Placement, PlacementSide, ReleaseReason, Side,
+    },
 };
 
 impl InProcess {
@@ -79,7 +82,7 @@ impl InProcess {
     ) -> Result<Decision, DecisionRefused> {
         let document = self.in_force();
         self.under(&document)
-            .decide_decode_without_lease(maker, held, 0, now)
+            .decide_decode_without_lease(maker, held, Default::default(), 0, now)
     }
 
     /// [`Loaded::decide_encode_without_lease`] under the document in
@@ -477,6 +480,37 @@ fn a_document_put_in_force_inside_a_decision_decides_the_next_one() {
     assert_eq!(after.trace().generation, 2, "the next decision");
 }
 
+/// A decision kept as a sample is kept by the document it began under. A
+/// document put in force while the decision makes its request takes no
+/// record of it. The record stands in the first document's ring, where a
+/// handle of that document reads it. The engine reads the ring of the
+/// document in force, and finds none there.
+#[test]
+fn a_decision_is_kept_by_the_document_it_began_under() {
+    let keeping_each = |number: u64| {
+        let mut document = PolicySpec::preset("least_load").expect("a built-in preset");
+        document.generation = number;
+        document.explain.sample = 1;
+        AppliedSpec::validate(&document).expect("the document validates")
+    };
+    let engine = InProcess::new(keeping_each(1));
+    let first = engine.spec();
+    let members = PublishedList::new(pool(4));
+    let maker = AppliesInside {
+        asks: Asks::of(request(), Some(&members)),
+        engine: &engine,
+        next: Cell::new(Some(keeping_each(2))),
+    };
+    let answer = engine.decide_under(GatewayId::LOCAL, &maker, Instant::now());
+    let (began, _) = answer.expect("an answer").whole().expect("no place");
+    assert_eq!(engine.spec().generation(), 2, "the next is in force");
+    let kept = first.0.kept_sample(b"request");
+    let record = kept.expect("kept by the document the decision began under");
+    assert_eq!(record.decision, began.decision);
+    assert_eq!(record.decision.trace().generation, 1);
+    assert_eq!(engine.explained(b"request"), None, "the ring in force");
+}
+
 /// The record of sent prompts is the engine's and stands across a new
 /// document: a prompt sent under one document goes back to its worker
 /// under the next, at every seed. The next document's stages are built
@@ -673,21 +707,428 @@ fn a_stage_built_since_a_leases_generation_and_kept_later_did_not_stand_at_it() 
         applied.expect("a number above the standing one");
     }
     for generation in [1, 2] {
-        let lease = crate::tracking::Lease {
+        let lease = Lease {
             generation,
             ..Default::default()
         };
         let held = engine.spec();
         let stood = held.under(&engine).hearing(generation);
         let stood = stood.expect("a generation under the standing one");
-        let side = crate::tracking::Side::Single;
-        stood.on_dispatched(&lease, &Target::default(), side, 0);
+        let side = Side::Single;
+        stood.dispatched_stages(&lease, &Target::default(), side, 0);
     }
     // The pickers by the place the table built them at: `random` of the
     // first document, kept by both later ones, and the second document's
     // `second`, kept by the third.
     assert_eq!(words(&built, 0), ["dispatched", "dispatched"]);
     assert_eq!(words(&built, 3), ["dispatched"], "born under the second");
+    // A lease of the document's own generation is heard by the document's
+    // whole engine, and one of a generation above it by nobody.
+    let held = engine.spec();
+    let own = held.under(&engine).hearing(3);
+    let own = own.expect("the standing generation");
+    let lease = Lease {
+        generation: 3,
+        ..Default::default()
+    };
+    own.dispatched_stages(&lease, &Target::default(), Side::Single, 0);
+    assert_eq!(words(&built, 0).len(), 3, "kept since the first");
+    assert_eq!(words(&built, 3).len(), 2, "kept since the second");
+    assert!(
+        held.under(&engine).hearing(4).is_none(),
+        "no stage booked it"
+    );
+    // A fourth document builds `second` anew. A lease of its generation
+    // reaches the picker it built, which stood by no earlier generation:
+    // the engine whole hears it, and not what the engine kept alone.
+    let applied = engine.apply(hearing_over(&stages, 4, second_profile));
+    applied.expect("a number above the standing one");
+    let held = engine.spec();
+    let own = held.under(&engine).hearing(4);
+    let own = own.expect("the standing generation");
+    let lease = Lease {
+        generation: 4,
+        ..Default::default()
+    };
+    own.dispatched_stages(&lease, &Target::default(), Side::Single, 0);
+    assert_eq!(words(&built, 0).len(), 4, "kept since the first");
+    assert_eq!(words(&built, 7), ["dispatched"], "built under the fourth");
+    assert_eq!(words(&built, 3).len(), 2, "replaced: it hears no more");
+}
+
+/// The last generation a document can bear is one as any other. On a host
+/// with a file of leases, a lease of the document's own generation reaches
+/// every profile of the document, the one it built under `u64::MAX` among
+/// them. A lease of the first document reaches the profile kept since
+/// then alone.
+#[cfg(feature = "controller")]
+#[test]
+fn a_lease_of_the_last_generation_reaches_the_profile_its_document_built() {
+    let (stages, built) = hearing_stages();
+    let engine = InProcess::new(hearing_over(&stages, 1, |_| {}));
+    let applied = engine.apply(hearing_over(&stages, u64::MAX, second_profile));
+    applied.expect("a number above the standing one");
+    let held = engine.spec();
+    let side = Side::Single;
+    let lease = |generation| Lease {
+        generation,
+        ..Default::default()
+    };
+    let own = held.under(&engine).hearing(u64::MAX);
+    let own = own.expect("the standing generation");
+    own.dispatched_stages(&lease(u64::MAX), &Target::default(), side, 0);
+    // The pickers by the place the table built them at: `random` of the
+    // first document, kept, the one let go for it, and the `second` the
+    // last document built.
+    assert_eq!(words(&built, 0), ["dispatched"]);
+    assert_eq!(words(&built, 2), ["dispatched"], "built under the last");
+    let older = held.under(&engine).hearing(1);
+    let older = older.expect("a generation under the standing one");
+    older.dispatched_stages(&lease(1), &Target::default(), side, 0);
+    assert_eq!(words(&built, 0).len(), 2, "kept since the first");
+    assert_eq!(words(&built, 2).len(), 1, "it did not stand by the first");
+    assert!(words(&built, 1).is_empty(), "let go untold");
+}
+
+/// A document holds each of its profiles once, whatever the number of
+/// generations they were made under, and nothing for an earlier
+/// generation: a word of an older lease is told by the generations the
+/// document's own profiles were made under ([`InForce::stood_at`]). Twelve
+/// documents each add one profile and keep the ones that stand, as a
+/// supplied spec may. Under the last, a dispatch of a lease of each
+/// earlier generation reaches the pickers made by then and no other: the
+/// ones the lease before reached, and one that its own generation's
+/// document built. Asked the document's own generation, one above it or
+/// the last a document can bear, `stood_at` answers the eleven the
+/// document kept. Each profile's object is held by the document in force
+/// alone.
+#[test]
+fn a_document_holds_each_profile_once_whatever_generations_made_them() {
+    const DOCUMENTS: u64 = 12;
+    let (stages, built) = hearing_stages();
+    // `random` and a profile `more-<n>` for each generation from the
+    // second to `count`, each bound to a model no case asks for.
+    let grown = |count: u64| {
+        move |document: &mut PolicySpec| {
+            for at in 2..=count {
+                let name = format!("more-{at:02}");
+                let profile = document.profiles["random"].clone();
+                document.profiles.insert(name.clone(), profile);
+                let elsewhere = BindingSpec {
+                    matcher: Match {
+                        model: name.clone(),
+                        ..Match::default()
+                    },
+                    profile: Some(name),
+                    ..BindingSpec::default()
+                };
+                document.bindings.insert(0, elsewhere);
+            }
+        }
+    };
+    let engine = InProcess::new(hearing_over(&stages, 1, grown(1)));
+    for number in 2..=DOCUMENTS {
+        let applied = engine.apply(hearing_over(&stages, number, grown(number)));
+        applied.expect("a number above the standing one");
+    }
+    // The dispatches each picker the table built has heard so far, by the
+    // place the table built it at.
+    let dispatches = || -> Vec<usize> {
+        let heard = |picker: &Heard| {
+            let words = picker.lock();
+            words.iter().filter(|word| word.0 == "dispatched").count()
+        };
+        built.lock().iter().map(heard).collect()
+    };
+    let held = engine.spec();
+    let document = &held.0;
+    let side = Side::Single;
+    // The pickers the lease before reached, by their places, and the count
+    // of pickers the documents before this lease's built: a document
+    // builds one for each profile it holds.
+    let mut reached_before: Vec<usize> = Vec::new();
+    let mut built_before = 0;
+    let above = [DOCUMENTS, DOCUMENTS + 5, u64::MAX];
+    for (holds, generation) in (1_usize..).zip((1..DOCUMENTS).chain(above)) {
+        let lease = Lease {
+            generation,
+            ..Default::default()
+        };
+        let before = dispatches();
+        let hears = document.stood_at(generation);
+        hears.dispatched_stages(&lease, &Target::default(), side, 0);
+        let after = dispatches();
+        let places = 0..after.len();
+        let reached: Vec<usize> = places.filter(|&at| after[at] != before[at]).collect();
+        for &at in &reached {
+            assert_eq!(after[at], before[at] + 1, "a lease of {generation}");
+        }
+        if generation < DOCUMENTS {
+            // The ones the lease before reached, and one more: a picker
+            // that this generation's document built.
+            let own = built_before..built_before + holds;
+            let joined = |at: &&usize| !reached_before.contains(at);
+            let joined: Vec<usize> = reached.iter().filter(joined).copied().collect();
+            assert_eq!(reached.len(), reached_before.len() + 1, "{generation}");
+            assert_eq!(joined.len(), 1, "a lease of {generation}: {reached:?}");
+            assert!(own.contains(&joined[0]), "a lease of {generation}");
+            built_before += holds;
+        } else {
+            assert_eq!(reached, reached_before, "a lease of {generation}");
+        }
+        reached_before = reached;
+    }
+    let profiles = document.spec.engine().profiles();
+    assert_eq!(profiles.len() as u64, DOCUMENTS);
+    assert_eq!(reached_before.len() + 1, profiles.len(), "the eleven kept");
+    for profile in profiles {
+        let holders = Arc::strong_count(profile);
+        assert_eq!(holders, 1, "{} is held {holders} times", profile.name);
+    }
+}
+
+/// A scorer that keeps the words it hears and names the dispatch alone.
+/// It implements a release too: an engine that told it one would show
+/// here.
+#[derive(Debug)]
+struct Sends(Heard);
+
+impl Lifecycle for Sends {
+    fn hears(&self) -> EventSet {
+        EventSet::NONE.with(EventKind::Dispatched)
+    }
+
+    fn on_dispatched(&self, lease: &Lease, target: &Target, _: Side, _: u32) {
+        let heard = ("dispatched", target.id, lease.target_index);
+        self.0.lock().push(heard);
+    }
+
+    fn on_released(&self, lease: &Lease, _: ReleaseReason) {
+        let heard = ("released", lease.booked, lease.target_index);
+        self.0.lock().push(heard);
+    }
+}
+
+impl Scorer for Sends {
+    fn name(&self) -> &'static str {
+        "sends"
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        out.fill(0.0);
+        TieBand::NORMALIZED
+    }
+}
+
+/// A word of an older lease that is told to the stages goes to the ones
+/// that name it among those that stood under its generation
+/// ([`InForce::stood_at`]). The profile `second` scores by a stage that
+/// takes the dispatch alone, and picks by one that takes every word, as
+/// the case's `random` does. The second document keeps both profiles and
+/// adds a copy of `second`. A dispatch of a lease of the first document
+/// reaches the three stages that stood. Its release reaches the two
+/// pickers, and not the scorer, which does not name it. Neither word
+/// reaches a stage of the profile made since.
+#[test]
+fn an_older_leases_word_is_told_to_the_stages_that_stood_and_name_it() {
+    let (mut stages, built) = hearing_stages();
+    // The scorers' lists, in the order the table built the scorers.
+    let scored = Arc::new(Mutex::new(Vec::new()));
+    let lists = Arc::clone(&scored);
+    let added = stages.scorer("sends", move || {
+        let heard = Heard::default();
+        lists.lock().push(Arc::clone(&heard));
+        Box::new(Sends(heard))
+    });
+    added.expect("a free name");
+    // The registration built one scorer, to ask its name.
+    scored.lock().clear();
+    let scoring = |document: &mut PolicySpec| {
+        second_profile(document);
+        let second = document.profiles.get_mut("second");
+        second
+            .expect("the profile added")
+            .score
+            .push("sends".into());
+    };
+    let grown = |document: &mut PolicySpec| {
+        scoring(document);
+        let third = document.profiles["second"].clone();
+        document.profiles.insert("third".into(), third);
+        let mut bound = document.bindings[0].clone();
+        "a third model".clone_into(&mut bound.matcher.model);
+        bound.profile = Some("third".into());
+        document.bindings.insert(0, bound);
+    };
+    let engine = InProcess::new(hearing_over(&stages, 1, scoring));
+    let applied = engine.apply(hearing_over(&stages, 2, grown));
+    applied.expect("a number above the standing one");
+
+    let held = engine.spec();
+    let stood = held.0.stood_at(1);
+    let lease = Lease {
+        generation: 1,
+        ..Lease::default()
+    };
+    stood.dispatched_stages(&lease, &Target::default(), Side::Single, 0);
+    stood.released(&lease, ReleaseReason::ClientGone);
+    // The pickers by the place the table built them at: the first
+    // document's `random` and `second`, kept by the second, then the
+    // second's own two, let go, and its `third`, made since. The scorers
+    // likewise: of `second`, the one let go for it, and of `third`.
+    for kept in [0, 1] {
+        assert_eq!(words(&built, kept), ["dispatched", "released"]);
+    }
+    assert_eq!(words(&scored, 0), ["dispatched"], "it names no release");
+    for untold in [2, 3, 4] {
+        assert!(words(&built, untold).is_empty(), "the picker at {untold}");
+    }
+    for untold in [1, 2] {
+        assert!(words(&scored, untold).is_empty(), "the scorer at {untold}");
+    }
+}
+
+/// What the two [`Switched`] scorers of a profile say of themselves while
+/// their case's switch stands so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Says {
+    /// The first names the release and the second the dispatch, and
+    /// neither keeps a report.
+    First,
+    /// The first names the dispatch and the second the release: each
+    /// word's list holds one of the two, as under [`Self::First`], and
+    /// the other one.
+    Second,
+    /// As [`Self::First`], and the first keeps reports.
+    Reports,
+}
+
+/// A scorer that answers of itself by a switch its case turns and by its
+/// place in its profile, the first or the second, and keeps the words it
+/// hears. It implements the dispatch and the release.
+#[derive(Debug)]
+struct Switched {
+    heard: Heard,
+    says: Arc<Mutex<Says>>,
+    second: bool,
+}
+
+impl Lifecycle for Switched {
+    fn hears(&self) -> EventSet {
+        let crossed = *self.says.lock() == Says::Second;
+        let kind = if self.second == crossed {
+            EventKind::Released
+        } else {
+            EventKind::Dispatched
+        };
+        EventSet::NONE.with(kind)
+    }
+
+    fn keeps_loads(&self) -> bool {
+        !self.second && *self.says.lock() == Says::Reports
+    }
+
+    fn on_dispatched(&self, lease: &Lease, target: &Target, _: Side, _: u32) {
+        let heard = ("dispatched", target.id, lease.target_index);
+        self.heard.lock().push(heard);
+    }
+
+    fn on_released(&self, lease: &Lease, _: ReleaseReason) {
+        let heard = ("released", lease.booked, lease.target_index);
+        self.heard.lock().push(heard);
+    }
+}
+
+impl Scorer for Switched {
+    fn name(&self) -> &'static str {
+        "switched"
+    }
+
+    fn score(&self, _: &RequestFacts<'_>, _: &[Candidate], _: &[u32], out: &mut [f32]) -> TieBand {
+        out.fill(0.0);
+        TieBand::NORMALIZED
+    }
+}
+
+/// A later document keeps a profile only where its build listed the
+/// profile's scorers and its picker as the standing engine's did: each
+/// under the same words of a lease, and each among the stages that keep
+/// reports or not. The profile scores by two scorers that answer by a
+/// switch. The standing ones answered under [`Says::First`] at their
+/// build, and by the apply the later document's two say the same of
+/// themselves. Where they said so at their own build too, the profile is
+/// kept. Where the two named each other's word there, each word's list
+/// holds one scorer in both engines and another one: the profile is built
+/// new. Where the first said it keeps reports there, the profile is built
+/// new too.
+///
+/// A dispatch under the later document then reaches the one scorer that
+/// named it at the build that made it, and no other. Where the two named
+/// each other's word, a standing scorer kept would be told a dispatch it
+/// never named.
+#[test]
+fn a_later_document_keeps_a_profile_its_build_listed_as_the_standing_one() {
+    for later in [Says::First, Says::Second, Says::Reports] {
+        let (mut stages, _) = hearing_stages();
+        // The scorers' lists, in the order the table built the scorers:
+        // a document's first and its second, by turns.
+        let scored = Arc::new(Mutex::new(Vec::new()));
+        let says = Arc::new(Mutex::new(Says::First));
+        let (lists, switch) = (Arc::clone(&scored), Arc::clone(&says));
+        let added = stages.scorer("switched", move || {
+            let heard = Heard::default();
+            let mut lists = lists.lock();
+            let second = lists.len() % 2 == 1;
+            lists.push(Arc::clone(&heard));
+            let says = Arc::clone(&switch);
+            Box::new(Switched {
+                heard,
+                says,
+                second,
+            })
+        });
+        added.expect("a free name");
+        // The registration built one scorer, to ask its name.
+        scored.lock().clear();
+        let scoring = |document: &mut PolicySpec| {
+            let profile = document.profiles.get_mut("random");
+            let profile = profile.expect("the preset's profile");
+            profile.score.extend(["switched".into(), "switched".into()]);
+        };
+        let engine = InProcess::new(hearing_over(&stages, 1, scoring));
+        let stood = engine.spec();
+        // The later document's build asks its scorers under `later`. The
+        // apply asks all four under the first answer.
+        *says.lock() = later;
+        let next = hearing_over(&stages, 2, scoring);
+        *says.lock() = Says::First;
+        engine.apply(next).expect("a number above the standing one");
+        let in_force = engine.spec();
+        let profile = |of: &SpecHandle| Arc::clone(&of.0.spec.engine().profiles()[0]);
+        let kept = Arc::ptr_eq(&profile(&in_force), &profile(&stood));
+        assert_eq!(kept, later == Says::First, "{later:?}");
+
+        let members = PublishedList::new(pool(2));
+        let asks = Asks::of(request(), Some(&members));
+        let now = Instant::now();
+        let decided = DecisionGuard::decide_under(&engine, GatewayId::LOCAL, &asks, now);
+        let mut held = decided.expect("a decision");
+        assert!(held.take(0).is_some(), "the first target");
+        held.dispatched(now);
+        // The scorer that named the dispatch at the build that made it,
+        // by the place the table built it at: the standing second where
+        // the profile is kept, and of the later document's two the first
+        // under `Second` and the second under `Reports`.
+        let named = match later {
+            Says::First => 1,
+            Says::Second => 2,
+            Says::Reports => 3,
+        };
+        for at in 0..4 {
+            let told: &[&str] = if at == named { &["dispatched"] } else { &[] };
+            assert_eq!(words(&scored, at), told, "{later:?}: the scorer at {at}");
+        }
+    }
 }
 
 /// A send said behind a later document, for a decision the document before

@@ -1,5 +1,5 @@
 use std::{
-    borrow::Cow,
+    borrow::{Borrow, Cow},
     convert::Infallible,
     error::Error as _,
     future::Future,
@@ -42,7 +42,7 @@ use openai_protocol::{
 use reqwest::multipart::{Form, Part};
 use smg_worker::{
     identity::{
-        basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
+        basic::{BasicWorker, ConnectionMode, RuntimeType, Worker, WorkerLoadGuard, WorkerType},
         endpoint::Endpoint,
     },
     metrics::writers::Metrics as WorkerMetrics,
@@ -61,6 +61,7 @@ use crate::{
             request_body_stalled_response, REQUEST_BODY_STALLED, REQUEST_BODY_TOO_LARGE,
         },
         scheduler::PreemptionGuard,
+        sse_keepalive::names_event_stream,
         TenantRequestMeta,
     },
     observability::{
@@ -75,7 +76,7 @@ use crate::{
             attach_sized_body,
             attempt_ledger::{
                 closes_retry_window, is_upstream_answer, mark_upstream_answer, AttemptLedger,
-                WORKER_BODY_TOO_LARGE,
+                Charges, WORKER_BODY_TOO_LARGE,
             },
             body_policy::{
                 decide_body_path, BodyPath, BodyPathInputs, BODY_PATH_BUFFERED, BODY_PATH_STREAMED,
@@ -92,9 +93,10 @@ use crate::{
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
             responses_compat::lower_responses_request_for_local_backend,
             retry::{
-                is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
+                is_request_timeout, is_retryable_response, is_retryable_status, mark_non_retryable,
+                request_timeout_response, RetryExecutor,
             },
-            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+            snapshot::{BodyFacts, RoutingPool, WorkerRegistry, WorkerRegistryExt},
             sse_rechunk::{NoopObserver, RechunkPolicy, SseRechunker},
             stream::GuardedStream,
             worker_selection::{SelectWorkerRequest, WorkerSelector},
@@ -166,6 +168,28 @@ struct TypedAttempt<'a, T> {
     tried: &'a parking_lot::Mutex<Vec<String>>,
 }
 
+/// One transcription across its attempts: the inputs every attempt of
+/// `Router::route_multipart_transcription` reads, and the ledger and the
+/// tried list the attempts share.
+struct TranscriptionAttempt<'a> {
+    headers: Option<&'a HeaderMap>,
+    body: &'a TranscriptionRequest,
+    route: &'static str,
+    /// The canonical model id, as in [`TypedAttempt`].
+    model_id: &'a str,
+    canonical_model: Option<&'a str>,
+    routing: &'a RoutingDerivatives,
+    is_stream: bool,
+    /// The finalizers of the request's router metrics.
+    outcome: &'a RouteOutcome<'a>,
+    start: Instant,
+    /// The request's bookkeeping across attempts, as in [`TypedAttempt`].
+    ledger: &'a AttemptLedger,
+    /// The engines a failed attempt was sent to; the next attempt selects
+    /// away from them while another available worker is left.
+    tried: &'a parking_lot::Mutex<Vec<String>>,
+}
+
 /// Regular router that uses injected load balancing policies
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
@@ -179,7 +203,8 @@ pub struct Router {
     /// Cap on buffering a request only to keep it retryable; larger eligible
     /// requests stream and forfeit router retries. It also bounds the
     /// transcription audio held for one resend after a pre-response connection
-    /// failure. `0` disables both kinds of buffering.
+    /// failure and for the retries that take a failed transcription to another
+    /// worker. `0` disables both kinds of buffering.
     max_buffered_request_bytes: u64,
     realtime_registry: Arc<RealtimeRegistry>,
     webrtc_bind_addr: Option<std::net::IpAddr>,
@@ -1022,10 +1047,7 @@ impl Router {
         // A replayable failure: the retry re-selects away from this engine
         // while another available worker is left to take the request.
         if is_retryable_response(&response) {
-            let mut tried = attempt.tried.lock();
-            if !tried.iter().any(|engine| engine == worker.base_url()) {
-                tried.push(worker.base_url().to_string());
-            }
+            note_tried(&mut attempt.tried.lock(), worker.base_url());
         }
 
         // Record worker errors for server errors (5xx)
@@ -1200,9 +1222,89 @@ impl Router {
         // The finalizers of the request's router metrics: one runs at every
         // exit below.
         let outcome = self.begin_route(route, model_id, is_stream);
+        let endpoint = outcome.endpoint;
+        let tried = parking_lot::Mutex::new(Vec::new());
+        let ledger = AttemptLedger::default();
+        let attempt = TranscriptionAttempt {
+            headers,
+            body,
+            route,
+            model_id,
+            canonical_model: canonical_model.as_deref(),
+            routing: &routing,
+            is_stream,
+            outcome: &outcome,
+            start,
+            ledger: &ledger,
+            tried: &tried,
+        };
 
-        let placed = match self.select_transcription_worker(headers, model_id, &routing, body.rid())
-        {
+        // Endpoint input has nonempty audio: the multipart extractor rejects
+        // an empty file, so a zero limit cannot make a resend eligible.
+        if audio.bytes.len() as u64 > self.max_buffered_request_bytes {
+            // Audio outside the bound is given to its one form, which cannot
+            // be built again: one attempt, and its answer stands.
+            return self
+                .transcription_attempt(&attempt, audio, false, false)
+                .await;
+        }
+        // Held audio builds the form again, so a failed attempt goes to
+        // another worker under the retry config the typed route reads: the
+        // model's where a worker set one, else the router's.
+        let per_model_retry_config = self.worker_registry.get_retry_config(model_id);
+        let retry_config = per_model_retry_config
+            .as_ref()
+            .unwrap_or(&self.retry_config);
+        let last = retry_config.max_retries.max(1) - 1;
+        RetryExecutor::execute_response_with_retry(
+            retry_config,
+            |index: u32| self.transcription_attempt(&attempt, &audio, true, index < last),
+            |res, _| is_retryable_response(res),
+            |delay, index| {
+                Metrics::record_worker_retry(metrics_labels::WORKER_REGULAR, endpoint);
+                Metrics::record_worker_retry_backoff(index, delay);
+            },
+            || {
+                Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_REGULAR, endpoint);
+            },
+        )
+        .await
+    }
+
+    /// One attempt of a transcription: the worker and its dispatch-time
+    /// overload re-check, the form's send and the relay of the worker's
+    /// answer. Where `moves` holds (held audio and an attempt left), a send
+    /// that fails before any answer and a worker's head under a retryable
+    /// status end the attempt with the worker's breaker sample alone, as a
+    /// retryable answer the retry layer takes to another worker; every other
+    /// end is the request's answer, finalized as a lone attempt's. The
+    /// request's ledger keeps the typed route's two rules: a worker is
+    /// charged one breaker failure a request, and a worker's own 500 is
+    /// definitive, so it moves to another available worker alone and is
+    /// relayed with its body where none is left.
+    async fn transcription_attempt<A: Borrow<AudioFile>>(
+        &self,
+        attempt: &TranscriptionAttempt<'_>,
+        audio: A,
+        resend: bool,
+        moves: bool,
+    ) -> Response {
+        let outcome = attempt.outcome;
+        let selected = {
+            let tried = attempt.tried.lock();
+            // No attempt goes back to a worker whose answer was definitive.
+            attempt.ledger.with_candidate_filter(|candidate_filter| {
+                self.select_transcription_worker(
+                    attempt.headers,
+                    attempt.model_id,
+                    attempt.routing,
+                    attempt.body.rid(),
+                    candidate_filter,
+                    &tried,
+                )
+            })
+        };
+        let placed = match selected {
             Ok(placed) => placed,
             Err(refusal) => {
                 outcome.pre_send_error(&refusal);
@@ -1217,7 +1319,7 @@ impl Router {
         // dispatching anyway is measurably worse.
         if let Some(resp) = overload::shed_if_worker_overloaded(
             worker.as_ref(),
-            model_id,
+            attempt.model_id,
             self.worker_registry.overload_shed_enabled(),
         ) {
             outcome.pre_send_error(&resp);
@@ -1225,25 +1327,29 @@ impl Router {
         }
 
         // Streamed requests have no rid; the header is the whole sticky key.
-        let load_guard = placed.guard(self.policy_registry.sticky_header_key(headers));
+        let load_guard = placed.guard(self.policy_registry.sticky_header_key(attempt.headers));
 
-        // Endpoint input has nonempty audio: the multipart extractor rejects
-        // an empty file, so a zero limit cannot make a resend eligible.
-        let resend = audio.bytes.len() as u64 <= self.max_buffered_request_bytes;
         let res = match Self::send_transcription(
-            headers,
-            body,
+            attempt.headers,
+            attempt.body,
             audio,
             resend,
             worker.as_ref(),
-            route,
-            canonical_model.as_deref(),
-            &outcome,
+            attempt.route,
+            attempt.canonical_model,
+            outcome,
+            attempt.ledger,
+            moves,
         )
         .await
         {
             Ok(res) => res,
-            Err(response) => return response,
+            Err(response) => {
+                if moves && is_retryable_response(&response) {
+                    note_tried(&mut attempt.tried.lock(), worker.base_url());
+                }
+                return response;
+            }
         };
 
         let status = res.status();
@@ -1252,19 +1358,67 @@ impl Router {
 
         events::RequestReceivedEvent {}.emit();
 
-        if is_stream {
-            relay_transcription_stream(res, status, worker, load_guard, outcome, start)
+        // A definitive answer no other worker is left to take: it stands.
+        let mut stands = false;
+        if resend && is_retryable_status(status) {
+            // The worker's own word, before a byte of its answer is relayed.
+            // Its 500 is its answer for this payload and settles on the
+            // request's ledger as a typed answer does: the worker takes no
+            // later attempt, and the window closes where no other is left.
+            let mut moved = Response::new(Body::empty());
+            *moved.status_mut() = status;
+            mark_upstream_answer(&mut moved);
+            if closes_retry_window(&moved) {
+                attempt.ledger.settle(
+                    &mut moved,
+                    [worker],
+                    self.worker_registry
+                        .get_routing_pool(attempt.model_id, RoutingPool::HttpRegular)
+                        .iter(),
+                );
+            }
+            if moves && is_retryable_response(&moved) {
+                // Another worker may serve the request: the breaker takes
+                // its sample and the answer is left unread for the next
+                // attempt's.
+                worker_outcome(attempt.ledger, worker.as_ref(), status);
+                note_tried(&mut attempt.tried.lock(), worker.base_url());
+                return moved;
+            }
+            stands = !is_retryable_response(&moved);
+        }
+
+        let mut response = if attempt.is_stream {
+            relay_transcription_stream(
+                res,
+                status,
+                worker,
+                load_guard,
+                outcome.clone(),
+                attempt.ledger.charges().clone(),
+                attempt.start,
+            )
         } else {
             buffer_transcription_response(
                 res,
                 status,
                 worker.as_ref(),
                 self.max_payload_size,
-                &outcome,
-                start,
+                outcome,
+                attempt.ledger,
+                attempt.start,
             )
             .await
+        };
+        // A definitive answer that stands is the request's answer, and an
+        // answer whose read began does not move: the gateway's own failure
+        // of that read is the request's answer too.
+        if stands
+            || (resend && !is_retryable_status(status) && is_retryable_status(response.status()))
+        {
+            mark_non_retryable(&mut response);
         }
+        response
     }
 
     /// The worker of a transcription, or the refusal this router answers.
@@ -1284,6 +1438,8 @@ impl Router {
         model_id: &str,
         routing: &RoutingDerivatives,
         rid: Option<&str>,
+        candidate_filter: Option<CandidateFilter<'_>>,
+        tried: &[String],
     ) -> Result<placement::Placed, Response> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         let all_workers = snapshot.pool(RoutingPool::HttpRegular);
@@ -1308,8 +1464,8 @@ impl Router {
                 rid_key: routing.rid_key.as_deref(),
                 rid,
                 cache_namespace: routing.cache_namespace,
-                candidate_filter: None,
-                tried: &[],
+                candidate_filter,
+                tried,
             },
             placement::Stated::nothing,
         ) else {
@@ -1353,20 +1509,23 @@ impl Router {
     /// pre-response transport failure builds the request again from held
     /// audio. Audio outside the configured bound is given to its one form and
     /// sent once. A form the request cannot build or a send that fails is the
-    /// finalized error answer.
+    /// finalized error answer; where `moves` holds, a send failure the retry
+    /// layer replays is left for it with the worker's breaker sample alone.
     #[expect(
         clippy::too_many_arguments,
         reason = "the form inputs and the dispatch accounting are passed separately"
     )]
-    async fn send_transcription(
+    async fn send_transcription<A: Borrow<AudioFile>>(
         headers: Option<&HeaderMap>,
         body: &TranscriptionRequest,
-        audio: AudioFile,
+        audio: A,
         resend: bool,
         worker: &dyn Worker,
         route: &'static str,
         canonical_model: Option<&str>,
         outcome: &RouteOutcome<'_>,
+        ledger: &AttemptLedger,
+        moves: bool,
     ) -> Result<reqwest::Response, Response> {
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -1388,7 +1547,7 @@ impl Router {
                 worker.api_key(),
             ))
         };
-        let first = match request(&audio) {
+        let first = match request(audio.borrow()) {
             Ok(first) => first,
             Err(e) => {
                 let resp = error::bad_request("multipart_build_failed", e);
@@ -1406,7 +1565,7 @@ impl Router {
             // resend never fires for it: build the request again (the inputs
             // that built the first form build the second).
             Err(e) if is_pre_response_transport_error(&e) => {
-                match held.as_ref().and_then(|audio| request(audio).ok()) {
+                match held.as_ref().and_then(|audio| request(audio.borrow()).ok()) {
                     Some(again) => {
                         Metrics::record_upstream_send_retry(metrics_labels::ROUTER_HTTP);
                         untraced(again.send()).await
@@ -1426,7 +1585,20 @@ impl Router {
                     cause(&e)
                 );
                 let err_resp = convert_reqwest_error(e);
-                outcome.send_failure(worker, &err_resp);
+                if moves && is_retryable_response(&err_resp) {
+                    // The retry layer takes it to another worker: the
+                    // breaker's sample and the upstream-response counter of
+                    // a send failure; the router's terminal metric waits for
+                    // the answer the request ends on.
+                    worker_outcome(ledger, worker, err_resp.status());
+                    Metrics::record_router_upstream_response(
+                        metrics_labels::ROUTER_HTTP,
+                        err_resp.status().as_u16(),
+                        extract_error_code_from_response(&err_resp),
+                    );
+                } else {
+                    outcome.send_failure(ledger, worker, &err_resp);
+                }
                 Err(err_resp)
             }
         }
@@ -1546,7 +1718,7 @@ impl Router {
                 .get(CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
             {
-                Some(ct) => ct.starts_with("text/event-stream"),
+                Some(ct) => names_event_stream(ct),
                 None => status.is_success(),
             };
             let rechunker = rechunk
@@ -1692,7 +1864,7 @@ impl Router {
             .headers()
             .get(CONTENT_TYPE)
             .and_then(|ct| ct.to_str().ok())
-            .is_some_and(|ct| ct.starts_with("text/event-stream"));
+            .is_some_and(names_event_stream);
         self.forward_worker_response(
             res,
             StreamRelayMode {
@@ -1944,6 +2116,7 @@ fn build_transcription_form(
 /// request ends. `Router::begin_route` builds it for the typed route,
 /// which ends through `answered_typed`, and for the multipart
 /// transcription route, which ends through `answered` and `answered_as`.
+#[derive(Clone)]
 struct RouteOutcome<'a> {
     model_label: Cow<'a, str>,
     endpoint: &'static str,
@@ -1977,14 +2150,14 @@ impl RouteOutcome<'_> {
     }
 
     /// A request the worker never answered. Its synthetic status feeds the
-    /// worker circuit breaker and worker-error metric (transport failures,
-    /// timeouts and connect errors must be visible to health tracking so the
-    /// same bad worker isn't picked repeatedly), then the upstream-response
-    /// counter and, as on `route_typed_request`, the terminal router_error
-    /// counter.
-    fn send_failure(&self, worker: &dyn Worker, err_resp: &Response) {
+    /// worker circuit breaker, by the request's `ledger`, and the
+    /// worker-error metric (transport failures, timeouts and connect errors
+    /// must be visible to health tracking so the same bad worker isn't picked
+    /// repeatedly), then the upstream-response counter and, as on
+    /// `route_typed_request`, the terminal router_error counter.
+    fn send_failure(&self, ledger: &AttemptLedger, worker: &dyn Worker, err_resp: &Response) {
         let err_status = err_resp.status();
-        worker_outcome(worker, err_status);
+        worker_outcome(ledger, worker, err_status);
         Metrics::record_router_upstream_response(
             metrics_labels::ROUTER_HTTP,
             err_status.as_u16(),
@@ -2072,10 +2245,26 @@ impl RouteOutcome<'_> {
     }
 }
 
+/// Notes `engine` on a request's tried list, once however many of its
+/// attempts failed there: the list's length is the retry number a placement
+/// is handed, the count of engines the request tried.
+fn note_tried(tried: &mut Vec<String>, engine: &str) {
+    if !tried.iter().any(|noted| noted == engine) {
+        tried.push(engine.to_string());
+    }
+}
+
 /// The worker's side of a request's outcome: the status feeds its circuit
-/// breaker, and a server error the worker-error metric.
-fn worker_outcome(worker: &dyn Worker, status: StatusCode) {
-    worker.record_outcome(status.as_u16());
+/// breaker by the request's `ledger`, one failure a request however many
+/// of its attempts met the worker, and a server error the worker-error
+/// metric.
+fn worker_outcome(ledger: &AttemptLedger, worker: &dyn Worker, status: StatusCode) {
+    ledger.record_outcome(worker, status.as_u16());
+    worker_error(status);
+}
+
+/// The worker-error metric of a server error.
+fn worker_error(status: StatusCode) {
     if status.is_server_error() {
         Metrics::record_worker_error(
             metrics_labels::WORKER_REGULAR,
@@ -2086,13 +2275,15 @@ fn worker_outcome(worker: &dyn Worker, status: StatusCode) {
 }
 
 /// Relays a streamed transcription body to the client; the worker's and the
-/// router's outcome is attributed when the stream ends, by the relay task.
+/// router's outcome is attributed when the stream ends, by the relay task,
+/// which holds the request's `charges` for the breaker's sample.
 fn relay_transcription_stream(
     res: reqwest::Response,
     status: StatusCode,
     worker: &Arc<dyn Worker>,
     load_guard: WorkerLoadGuard,
     outcome: RouteOutcome<'_>,
+    charges: Charges,
     start: Instant,
 ) -> Response {
     // Preserve the upstream content-type verbatim. A `stream=true`
@@ -2174,7 +2365,8 @@ fn relay_transcription_stream(
         } else {
             stream_header_status
         };
-        worker_outcome(worker_for_stream.as_ref(), effective_status);
+        charges.record_outcome(worker_for_stream.as_ref(), effective_status.as_u16());
+        worker_error(effective_status);
         // A client disconnect gets no terminal router metric: it is
         // neither a completed request (duration) nor a router or
         // worker failure (error). Worker-level attribution above
@@ -2202,6 +2394,7 @@ async fn buffer_transcription_response(
     worker: &dyn Worker,
     max_payload_size: usize,
     outcome: &RouteOutcome<'_>,
+    ledger: &AttemptLedger,
     start: Instant,
 ) -> Response {
     let response_headers = header_utils::preserve_response_headers(res.headers());
@@ -2237,7 +2430,7 @@ async fn buffer_transcription_response(
     // into a local 5xx, and we want the circuit breaker + metrics to see
     // that. Streaming outcomes are owned by `relay_transcription_stream`.
     let final_status = response.status();
-    worker_outcome(worker, final_status);
+    worker_outcome(ledger, worker, final_status);
     outcome.answered_as(final_status, reason, start);
 
     response
@@ -2364,13 +2557,47 @@ pub(super) fn convert_reqwest_error(e: reqwest::Error) -> Response {
 
 use async_trait::async_trait;
 
+/// Whether a card of `worker` names an alias.
+fn names_an_alias(worker: &Arc<dyn Worker>) -> bool {
+    let models = &worker.metadata().spec.models;
+    models.iter().any(|card| !card.aliases.is_empty())
+}
+
+/// What `workers` say together to the decision of a request's body path,
+/// for their generation to keep; `None` at the first one that is not the
+/// built-in type, as nothing a worker of another type says is kept.
+fn kept_body_facts(workers: &[Arc<dyn Worker>]) -> Option<BodyFacts> {
+    let mut facts = BodyFacts {
+        aliased: false,
+        mutates: false,
+    };
+    for worker in workers {
+        // The type of the object itself: `Worker::as_any` is a worker's own
+        // answer, and one that wraps a built-in worker may give that one.
+        let object: &dyn std::any::Any = &**worker;
+        if !object.is::<BasicWorker>() {
+            return None;
+        }
+        facts.aliased |= names_an_alias(worker);
+        facts.mutates |= worker.mutates_request();
+    }
+    Some(facts)
+}
+
 impl Router {
     /// Gather this router's per-request state for the shared decision matrix
     /// in [`crate::routers::common::body_policy`].
     fn request_body_path(&self, headers: &HeaderMap, wasm_request_hooks: bool) -> BodyPath {
-        let candidates = self
-            .worker_registry
-            .get_routing_pool(UNKNOWN_MODEL_ID, RoutingPool::HttpRegular);
+        // What built-in workers say together is kept by their membership
+        // generation: the first decision behind a membership change reads
+        // them, every later one reads the kept answers and walks no worker.
+        // A worker of another type may change an answer on the handle the
+        // generation holds, so with one among them nothing is kept, and
+        // each question below walks the generation's pool to its first yes
+        // at every decision.
+        let generation = self.worker_registry.global_generation();
+        let kept = generation.body_facts(kept_body_facts);
+        let live = || generation.pool(RoutingPool::HttpRegular);
         decide_body_path(&BodyPathInputs {
             routing_key_override: self.policy_registry.routing_key_override_enabled(),
             // The body question: a document keyed by a request's own id
@@ -2381,11 +2608,14 @@ impl Router {
             // A worker knows a model's canonical id alone, and only a body
             // read here has an alias in it rewritten to that id.
             model_ambiguous: self.worker_registry.model_count() > 1
-                || candidates.iter().any(|w| {
-                    let models = &w.metadata().spec.models;
-                    models.iter().any(|card| !card.aliases.is_empty())
-                }),
-            worker_mutates_body: candidates.iter().any(|w| w.mutates_request()),
+                || match kept {
+                    Some(facts) => facts.aliased,
+                    None => live().iter().any(names_an_alias),
+                },
+            worker_mutates_body: match kept {
+                Some(facts) => facts.mutates,
+                None => live().iter().any(|worker| worker.mutates_request()),
+            },
             wasm_request_hooks,
             content_length: header_utils::content_length(Some(headers)).map(|len| len as u64),
             // The model sits inside the unread body, so any per-model retry
@@ -3089,15 +3319,19 @@ impl RouterTrait for Router {
 mod tests {
     use std::{
         net::SocketAddr,
-        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering},
     };
 
     use axum::http::header::{CONTENT_LENGTH, RETRY_AFTER};
     use openai_protocol::{model_card::ModelCard, profile::ProviderProfile, rerank::RerankResult};
     use serde_json::{json, Value};
     use smg_worker::{
-        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        identity::basic::BasicWorker,
+        connection::engine::EngineConnection,
+        health::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            resilience::ResolvedResilience,
+        },
+        identity::{basic::WorkerMetadata, error::WorkerResult},
         test_support::{no_health_check, RefusedAddress},
     };
 
@@ -3237,6 +3471,330 @@ mod tests {
             "one send and one resend reach the worker"
         );
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// A held clip sent to the transcription route of `router`.
+    async fn transcribe_clip(router: &Router) -> Response {
+        transcribe_clip_as(router, false).await
+    }
+
+    /// [`transcribe_clip`], asked as a stream where `stream` holds.
+    async fn transcribe_clip_as(router: &Router, stream: bool) -> Response {
+        let body = TranscriptionRequest {
+            model: "m".to_string(),
+            stream: stream.then_some(true),
+            ..Default::default()
+        };
+        let audio = AudioFile {
+            bytes: Bytes::from_static(b"RIFF-clip"),
+            file_name: "clip.wav".to_string(),
+            content_type: Some("audio/wav".to_string()),
+        };
+        router
+            .route_multipart_transcription(
+                None,
+                &body,
+                audio,
+                "/v1/audio/transcriptions",
+                UNKNOWN_MODEL_ID,
+            )
+            .await
+    }
+
+    /// A transcription whose worker answers a retryable status at its head
+    /// goes to another worker of the model, as a typed request does: the
+    /// caller reads the answer of the worker that serves it.
+    #[tokio::test]
+    async fn a_transcription_moves_to_another_worker_behind_a_retryable_answer() {
+        let route = ["/v1/audio/transcriptions"];
+        let (failing, failed) =
+            fixed_status_upstream(&route, StatusCode::SERVICE_UNAVAILABLE).await;
+        let (serving, served) = fixed_status_upstream(&route, StatusCode::OK).await;
+        let mut router = breaker_router(&[&failing, &serving], fast_retry_config(3), 5);
+        router.max_buffered_request_bytes = b"RIFF-clip".len() as u64;
+
+        // Two requests: the rotation names each worker first once.
+        for _ in 0..2 {
+            assert_eq!(transcribe_clip(&router).await.status(), StatusCode::OK);
+        }
+
+        assert_eq!(served.load(AtomicOrdering::SeqCst), 2);
+        assert!(
+            failed.load(AtomicOrdering::SeqCst) >= 1,
+            "the failing worker was asked first at least once"
+        );
+    }
+
+    /// A transcription whose worker closes every connection unanswered goes
+    /// to another worker of the model once its one resend failed too.
+    #[tokio::test]
+    async fn a_transcription_moves_to_another_worker_behind_a_failed_send() {
+        let (dead, refused) = flaky_upstream(usize::MAX).await;
+        let (live, _) = flaky_upstream(0).await;
+        let mut router = breaker_router(
+            &[&format!("http://{dead}"), &format!("http://{live}")],
+            fast_retry_config(3),
+            5,
+        );
+        router.max_buffered_request_bytes = b"RIFF-clip".len() as u64;
+
+        for _ in 0..2 {
+            assert_eq!(transcribe_clip(&router).await.status(), StatusCode::OK);
+        }
+
+        assert!(
+            refused.load(AtomicOrdering::SeqCst) >= 2,
+            "the dead worker took a send and its resend at least once"
+        );
+    }
+
+    /// When every worker answers a retryable status the caller reads the
+    /// last worker's answer whole, behind as many attempts as the retry
+    /// config allows, each to a worker not yet tried.
+    #[tokio::test]
+    async fn a_transcription_out_of_attempts_is_answered_by_its_last_worker() {
+        let route = ["/v1/audio/transcriptions"];
+        let (first, first_hits) =
+            fixed_status_upstream(&route, StatusCode::SERVICE_UNAVAILABLE).await;
+        let (second, second_hits) =
+            fixed_status_upstream(&route, StatusCode::SERVICE_UNAVAILABLE).await;
+        let mut router = breaker_router(&[&first, &second], fast_retry_config(2), 5);
+        router.max_buffered_request_bytes = b"RIFF-clip".len() as u64;
+
+        let response = transcribe_clip(&router).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("upstream failed"));
+        assert_eq!(first_hits.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(second_hits.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    /// Audio over the retry buffer cannot be built again: the answer of its
+    /// one attempt stands although another worker serves the model.
+    #[tokio::test]
+    async fn a_transcription_larger_than_the_retry_buffer_stays_with_its_worker() {
+        let route = ["/v1/audio/transcriptions"];
+        let (failing, failed) =
+            fixed_status_upstream(&route, StatusCode::SERVICE_UNAVAILABLE).await;
+        let (serving, served) = fixed_status_upstream(&route, StatusCode::OK).await;
+        let mut router = breaker_router(&[&failing, &serving], fast_retry_config(3), 5);
+        router.max_buffered_request_bytes = b"RIFF-clip".len() as u64 - 1;
+
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            statuses.push(transcribe_clip(&router).await.status());
+        }
+        statuses.sort();
+
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE],
+            "the rotation names each worker once and each answer stands"
+        );
+        assert_eq!(failed.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(served.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    /// Three attempts of one transcription on a worker that cannot serve it
+    /// now are one failure for its breaker, the moved attempts and the relay
+    /// of the last answer together: the threshold counts failed requests.
+    #[tokio::test]
+    async fn a_transcription_charges_its_worker_one_failure_a_request() {
+        let route = ["/v1/audio/transcriptions"];
+        let (url, hits) = fixed_status_upstream(&route, StatusCode::SERVICE_UNAVAILABLE).await;
+        let mut router = breaker_router(&[&url], fast_retry_config(3), 2);
+        router.max_buffered_request_bytes = b"RIFF-clip".len() as u64;
+        let worker = router.worker_registry.get_all().remove(0);
+
+        let response = transcribe_clip(&router).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&body).contains("upstream failed"),
+            "the third attempt reaches the worker and its answer is relayed"
+        );
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Closed,
+            "one failed request is one failure, under the threshold of two"
+        );
+
+        transcribe_clip(&router).await;
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Open,
+            "the second failed request reaches the threshold"
+        );
+    }
+
+    /// The last answer of a streamed transcription is relayed by a task that
+    /// outlives its attempt: its breaker sample is the request's too.
+    #[tokio::test]
+    async fn a_streamed_transcription_charges_its_worker_one_failure_a_request() {
+        let route = ["/v1/audio/transcriptions"];
+        let (url, hits) = fixed_status_upstream(&route, StatusCode::SERVICE_UNAVAILABLE).await;
+        let mut router = breaker_router(&[&url], fast_retry_config(3), 2);
+        router.max_buffered_request_bytes = b"RIFF-clip".len() as u64;
+        let worker = router.worker_registry.get_all().remove(0);
+
+        let response = transcribe_clip_as(&router, true).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // The relay's task samples the breaker before it ends the body.
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("upstream failed"));
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 3);
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// A transcription whose every send fails is one failure for its worker
+    /// as well: the sends of the moved attempts and of the last one.
+    #[tokio::test]
+    async fn a_transcription_whose_sends_fail_charges_its_worker_one_failure() {
+        let (dead, accepted) = flaky_upstream(usize::MAX).await;
+        let mut router = breaker_router(&[&format!("http://{dead}")], fast_retry_config(3), 2);
+        router.max_buffered_request_bytes = b"RIFF-clip".len() as u64;
+        let worker = router.worker_registry.get_all().remove(0);
+
+        let response = transcribe_clip(&router).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            accepted.load(AtomicOrdering::SeqCst),
+            6,
+            "three attempts reach the worker, each a send and its resend"
+        );
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// The tried list behind two attempts of one transcription that each
+    /// move on from `url`, the lone worker of its router. The attempts share
+    /// the list as `route_multipart_transcription` hands it to them.
+    async fn tried_behind_two_attempts(url: &str) -> Vec<String> {
+        let mut router = breaker_router(&[url], fast_retry_config(3), 5);
+        router.max_buffered_request_bytes = b"RIFF-clip".len() as u64;
+        let body = TranscriptionRequest {
+            model: "m".to_string(),
+            ..Default::default()
+        };
+        let audio = AudioFile {
+            bytes: Bytes::from_static(b"RIFF-clip"),
+            file_name: "clip.wav".to_string(),
+            content_type: Some("audio/wav".to_string()),
+        };
+        let route = "/v1/audio/transcriptions";
+        let routing = router.routing_derivatives(None, &body);
+        let outcome = router.begin_route(route, UNKNOWN_MODEL_ID, false);
+        let tried = parking_lot::Mutex::new(Vec::new());
+        let ledger = AttemptLedger::default();
+        let attempt = TranscriptionAttempt {
+            headers: None,
+            body: &body,
+            route,
+            model_id: UNKNOWN_MODEL_ID,
+            canonical_model: None,
+            routing: &routing,
+            is_stream: false,
+            outcome: &outcome,
+            start: Instant::now(),
+            ledger: &ledger,
+            tried: &tried,
+        };
+        for _ in 0..2 {
+            let moved = router
+                .transcription_attempt(&attempt, &audio, true, true)
+                .await;
+            assert!(is_retryable_response(&moved), "the attempt moves on");
+        }
+        let engines = tried.lock().clone();
+        engines
+    }
+
+    /// A worker that answers a retryable status to two attempts of one
+    /// transcription is one engine on the tried list, as on the typed route:
+    /// the list's length is the retry number a placement reads.
+    #[tokio::test]
+    async fn a_transcription_answered_twice_by_a_worker_tried_it_once() {
+        let (url, hits) = fixed_status_upstream(
+            &["/v1/audio/transcriptions"],
+            StatusCode::SERVICE_UNAVAILABLE,
+        )
+        .await;
+
+        let tried = tried_behind_two_attempts(&url).await;
+
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            2,
+            "both attempts reach it"
+        );
+        assert_eq!(tried, [url]);
+    }
+
+    /// A worker whose sends fail in two attempts of one transcription is one
+    /// engine on the tried list as well.
+    #[tokio::test]
+    async fn a_transcription_whose_sends_failed_twice_tried_its_worker_once() {
+        let (dead, accepted) = flaky_upstream(usize::MAX).await;
+        let url = format!("http://{dead}");
+
+        let tried = tried_behind_two_attempts(&url).await;
+
+        assert_eq!(
+            accepted.load(AtomicOrdering::SeqCst),
+            4,
+            "both attempts reach it, each a send and its resend"
+        );
+        assert_eq!(tried, [url]);
+    }
+
+    /// A 500 the worker itself answered is its verdict on the audio: a lone
+    /// worker is sent the transcription once and its answer is returned with
+    /// its body, as a typed request's is.
+    #[tokio::test]
+    async fn a_workers_own_500_is_not_replayed_on_a_transcription() {
+        let route = ["/v1/audio/transcriptions"];
+        let (url, hits) = fixed_status_upstream(&route, StatusCode::INTERNAL_SERVER_ERROR).await;
+        let mut router = breaker_router(&[&url], fast_retry_config(5), 2);
+        router.max_buffered_request_bytes = b"RIFF-clip".len() as u64;
+        let worker = router.worker_registry.get_all().remove(0);
+
+        let response = transcribe_clip(&router).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            hits.load(AtomicOrdering::SeqCst),
+            1,
+            "the worker's answer is definitive for this audio"
+        );
+        assert!(!is_retryable_response(&response));
+        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("upstream failed"));
+    }
+
+    /// With two workers the transcription moves to the other one once; the
+    /// second definitive answer stands, and neither worker is asked again.
+    #[tokio::test]
+    async fn a_workers_own_500_moves_a_transcription_to_another_worker_once() {
+        let route = ["/v1/audio/transcriptions"];
+        let (url_a, hits_a) =
+            fixed_status_upstream(&route, StatusCode::INTERNAL_SERVER_ERROR).await;
+        let (url_b, hits_b) =
+            fixed_status_upstream(&route, StatusCode::INTERNAL_SERVER_ERROR).await;
+        let mut router = breaker_router(&[&url_a, &url_b], fast_retry_config(5), 5);
+        router.max_buffered_request_bytes = b"RIFF-clip".len() as u64;
+
+        let response = transcribe_clip(&router).await;
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("upstream failed"));
+        assert_eq!(hits_a.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(hits_b.load(AtomicOrdering::SeqCst), 1);
     }
 
     /// Audio over the retry buffer is sent once, and its failure stands.
@@ -4380,9 +4938,16 @@ mod tests {
         let cut = spawn_cut_stub("/body", "application/json", &["abc"], true).await;
         let res = client.post(format!("{cut}/body")).send().await.unwrap();
         let status = res.status();
-        let answer =
-            buffer_transcription_response(res, status, &worker, 1 << 20, &outcome, Instant::now())
-                .await;
+        let answer = buffer_transcription_response(
+            res,
+            status,
+            &worker,
+            1 << 20,
+            &outcome,
+            &AttemptLedger::default(),
+            Instant::now(),
+        )
+        .await;
         assert_eq!(answer.status(), StatusCode::BAD_GATEWAY);
         assert_eq!(
             extract_error_code_from_response(&answer),
@@ -4406,9 +4971,16 @@ mod tests {
         let whole = spawn_cut_stub("/body", "application/json", &["abc"], false).await;
         let res = client.post(format!("{whole}/body")).send().await.unwrap();
         let status = res.status();
-        let answer =
-            buffer_transcription_response(res, status, &worker, 1 << 20, &outcome, Instant::now())
-                .await;
+        let answer = buffer_transcription_response(
+            res,
+            status,
+            &worker,
+            1 << 20,
+            &outcome,
+            &AttemptLedger::default(),
+            Instant::now(),
+        )
+        .await;
         assert_eq!(answer.status(), StatusCode::OK);
         let rendered = handle.render();
         assert!(
@@ -4818,6 +5390,218 @@ mod tests {
             BodyPath::Buffer(REASON_MODEL_AMBIGUOUS),
             "a body that may name an alias is read first"
         );
+    }
+
+    /// The body decision reads the regular workers once in a membership
+    /// generation: the first decision keeps their answers, a later one
+    /// reads the kept answers, and the decision behind a membership change
+    /// reads the members of its own generation.
+    #[test]
+    fn the_body_decision_asks_the_workers_once_a_generation() {
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
+        router
+            .worker_registry
+            .register_or_replace(Arc::new(plain_worker("http://worker1:8080")));
+        let headers = headers_with_content_length(Some("64"));
+        let streamed = BodyPath::Stream(REASON_RETRY_FORFEITED);
+        // The answers the generation of the moment holds; one that holds
+        // none would read its workers here.
+        let kept = || {
+            let generation = router.worker_registry.global_generation();
+            generation.body_facts(|_| panic!("no decision kept the answers"))
+        };
+        let plain = BodyFacts {
+            aliased: false,
+            mutates: false,
+        };
+
+        assert_eq!(router.request_body_path(&headers, false), streamed);
+        assert_eq!(kept(), Some(plain), "the first decision keeps the answers");
+        assert_eq!(router.request_body_path(&headers, false), streamed);
+
+        // A worker that rewrites its body joins, then leaves: each change
+        // publishes a generation, and the request behind it decides by the
+        // members of that generation.
+        let mutating = BasicWorkerBuilder::new("http://worker2:8080")
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .dp_config(3, 8)
+            .build();
+        let joined = router
+            .worker_registry
+            .register_or_replace(Arc::new(mutating));
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Buffer(REASON_WORKER_MUTATES_BODY)
+        );
+        assert_eq!(
+            kept(),
+            Some(BodyFacts {
+                mutates: true,
+                ..plain
+            })
+        );
+        router.worker_registry.remove(&joined).unwrap();
+        assert_eq!(router.request_body_path(&headers, false), streamed);
+        assert_eq!(kept(), Some(plain));
+    }
+
+    /// A regular worker of another type around a built-in one. It answers
+    /// [`Worker::as_any`] with the worker it wraps, says whether it
+    /// rewrites its body from a flag that changes on the handle, and counts
+    /// how often it is asked.
+    #[derive(Debug)]
+    struct Wrapper {
+        inner: BasicWorker,
+        mutates: AtomicBool,
+        asked: AtomicUsize,
+    }
+
+    impl Wrapper {
+        fn around(url: &str) -> Self {
+            Self {
+                inner: plain_worker(url),
+                mutates: AtomicBool::new(false),
+                asked: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Worker for Wrapper {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self.inner.as_any()
+        }
+        fn url(&self) -> &str {
+            self.inner.url()
+        }
+        fn api_key(&self) -> Option<&String> {
+            self.inner.api_key()
+        }
+        fn worker_type(&self) -> &WorkerType {
+            self.inner.worker_type()
+        }
+        fn connection_mode(&self) -> &ConnectionMode {
+            self.inner.connection_mode()
+        }
+        fn status(&self) -> openai_protocol::worker::WorkerStatus {
+            self.inner.status()
+        }
+        fn set_status(&self, status: openai_protocol::worker::WorkerStatus) {
+            self.inner.set_status(status);
+        }
+        fn load(&self) -> usize {
+            self.inner.load()
+        }
+        fn increment_load(&self) {
+            self.inner.increment_load();
+        }
+        fn decrement_load(&self) {
+            self.inner.decrement_load();
+        }
+        fn routing_key_load(&self) -> usize {
+            self.inner.routing_key_load()
+        }
+        fn routing_key_inflight(&self, routing_key: &str) -> usize {
+            self.inner.routing_key_inflight(routing_key)
+        }
+        fn increment_routing_key_load(&self, routing_key: &str) {
+            self.inner.increment_routing_key_load(routing_key);
+        }
+        fn decrement_routing_key_load(&self, routing_key: &str) {
+            self.inner.decrement_routing_key_load(routing_key);
+        }
+        fn processed_requests(&self) -> usize {
+            self.inner.processed_requests()
+        }
+        fn increment_processed(&self) {
+            self.inner.increment_processed();
+        }
+        fn metadata(&self) -> &WorkerMetadata {
+            self.inner.metadata()
+        }
+        fn circuit_breaker_state(&self) -> CircuitState {
+            self.inner.circuit_breaker_state()
+        }
+        fn circuit_breaker_can_execute(&self) -> bool {
+            self.inner.circuit_breaker_can_execute()
+        }
+        fn record_circuit_breaker_outcome(&self, success: bool) {
+            self.inner.record_circuit_breaker_outcome(success);
+        }
+        fn resilience(&self) -> &ResolvedResilience {
+            self.inner.resilience()
+        }
+        fn http_client(&self) -> &reqwest::Client {
+            self.inner.http_client()
+        }
+        fn http_client_handle_if_initialized(&self) -> Option<Arc<reqwest::Client>> {
+            self.inner.http_client_handle_if_initialized()
+        }
+        async fn check_health_async(&self) -> WorkerResult<()> {
+            self.inner.check_health_async().await
+        }
+        async fn engine_connection(&self) -> WorkerResult<Option<Arc<dyn EngineConnection>>> {
+            self.inner.engine_connection().await
+        }
+        fn mutates_request(&self) -> bool {
+            self.asked.fetch_add(1, AtomicOrdering::SeqCst);
+            self.mutates.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    /// A worker of another type is asked at every decision, also one that
+    /// answers [`Worker::as_any`] with the built-in worker it wraps: what
+    /// it says changes on the handle a generation holds, behind no
+    /// membership change.
+    #[test]
+    fn the_body_decision_asks_a_worker_of_another_type_every_time() {
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
+        let wrapper = Arc::new(Wrapper::around("http://worker1:8080"));
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&wrapper) as Arc<dyn Worker>);
+        let headers = headers_with_content_length(Some("64"));
+
+        wrapper.mutates.store(true, AtomicOrdering::SeqCst);
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Buffer(REASON_WORKER_MUTATES_BODY)
+        );
+        wrapper.mutates.store(false, AtomicOrdering::SeqCst);
+        assert_eq!(
+            router.request_body_path(&headers, false),
+            BodyPath::Stream(REASON_RETRY_FORFEITED)
+        );
+        assert_eq!(wrapper.asked.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    /// A decision that finds answers kept reads those and asks no worker.
+    /// The worker here counts how often it is asked; the test keeps the
+    /// answers itself, as the first decision does for built-in workers,
+    /// and keeps one this worker does not give.
+    #[test]
+    fn the_body_decision_asks_no_worker_behind_kept_answers() {
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![]);
+        let counted = Arc::new(Wrapper::around("http://worker1:8080"));
+        router
+            .worker_registry
+            .register_or_replace(Arc::clone(&counted) as Arc<dyn Worker>);
+        let headers = headers_with_content_length(Some("64"));
+        let kept = BodyFacts {
+            aliased: false,
+            mutates: true,
+        };
+        let generation = router.worker_registry.global_generation();
+        assert_eq!(generation.body_facts(|_| Some(kept)), Some(kept));
+
+        for _ in 0..2 {
+            assert_eq!(
+                router.request_body_path(&headers, false),
+                BodyPath::Buffer(REASON_WORKER_MUTATES_BODY)
+            );
+        }
+        assert_eq!(counted.asked.load(AtomicOrdering::SeqCst), 0);
     }
 
     #[test]
@@ -7568,6 +8352,71 @@ mod tests {
                             \"finish_reason\":null}]}\n\n\
                             data: [DONE]\n\n";
 
+    /// A media type's name is case-insensitive (RFC 9110, section 8.3.1):
+    /// a typed route relays a worker's event stream as one however the
+    /// worker spells the type. Matched by its lowercase spelling alone, a
+    /// `Text/Event-Stream` answer kept the upstream's `Content-Length`, as
+    /// a body that is no event stream does.
+    #[tokio::test]
+    async fn a_typed_routes_event_stream_is_one_however_the_worker_spells_its_type() {
+        use openai_protocol::validated::Normalizable;
+
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let mut answers = Vec::new();
+        for content_type in ["text/event-stream", "Text/Event-Stream"] {
+            let url = spawn_sized_worker(SIZED_DELTA_BODY, content_type).await;
+            let router =
+                streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+            let mut request: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "served-plain-relay-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 16,
+                "stream": true,
+            }))
+            .unwrap();
+            request.normalize();
+            let response = router
+                .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            let sized = response.headers().contains_key(CONTENT_LENGTH);
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            answers.push((sized, bytes));
+        }
+        assert!(!answers[0].0, "an event stream carries no upstream length");
+        assert_eq!(
+            answers[1], answers[0],
+            "the answer under `Text/Event-Stream` is the one under `text/event-stream`"
+        );
+    }
+
+    /// The pass-through reads the type the same way: a worker's event
+    /// stream under another spelling is relayed, where it was buffered
+    /// whole and refused above the payload limit.
+    #[tokio::test]
+    async fn a_passed_through_event_stream_is_relayed_however_the_worker_spells_its_type() {
+        for content_type in ["text/event-stream", "Text/Event-Stream"] {
+            let (url, _captured) = spawn_capture_stub(content_type, SIZED_DELTA_BODY).await;
+            // A payload limit under the answer's length: a relayed stream
+            // passes it, a buffered answer does not.
+            let router = streaming_router(PolicyConfig::RoundRobin, 64, vec![plain_worker(&url)]);
+
+            let response = router
+                .route_streaming_request(streamed_request(&[b"{}"]), "/generate", false)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            let bytes = http_body_util::BodyExt::collect(response.into_body())
+                .await
+                .unwrap()
+                .to_bytes();
+            assert_eq!(bytes, SIZED_DELTA_BODY.as_bytes(), "{content_type}");
+        }
+    }
+
     /// A streamed SSE relay may change the body's length, by re-slicing it
     /// or by ending a cut stream with its error event, so a sized upstream
     /// answer reaches the client without the upstream's `Content-Length` on
@@ -8341,13 +9190,9 @@ mod tests {
         );
         let router = streaming_router_with_registry(Arc::new(policies), 1024 * 1024, workers);
         let mut document = PolicySpec::preset("consistent_hashing").expect("a stock preset");
-        document.bindings[0].routing_key = Some(RoutingKeySpec {
-            sources: vec![KeySourceSpec {
-                rid: true,
-                ..KeySourceSpec::default()
-            }],
-            strip_lineage: false,
-        });
+        let mut source = KeySourceSpec::default();
+        source.rid = true;
+        document.bindings[0].routing_key = Some(RoutingKeySpec::of(vec![source]));
         let spec = AppliedSpec::validate(&document).expect("a valid document");
         engine_on(&router.policy_registry, spec);
 

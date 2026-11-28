@@ -431,8 +431,8 @@ pub trait CacheIndexes: Send + Sync {
 #[derive(Default)]
 pub struct Affinity {
     indexes: OnceLock<Arc<dyn CacheIndexes>>,
-    /// The record of sent prefixes of each model, by the model id its
-    /// workers registered under. Locked where a list's table is read, at a
+    /// The record of sent prefixes of each model, by the id a list's first
+    /// worker lists the model under. Locked where a list's table is read, at a
     /// change of membership and at the timer's sweep: never by a decision's naming
     /// or its write, which hold their record by the list's table. A write
     /// a thread keeps holds its record itself ([`Waiting`]).
@@ -513,9 +513,10 @@ impl Affinity {
     /// registry: each one the map alone holds that holds a worker's place,
     /// under a model `stated` says none of the follow's workers states as
     /// its own, with the number of its last taking. A list keeps its
-    /// record under the model its first worker states, so no list reads a
-    /// record whose model no worker that stands states. The follow asks
-    /// its registry of each ahead of [`Self::let_go`].
+    /// record under a model its first worker lists (the id of the card
+    /// that answers to the request's name, else its first model), so no
+    /// list reads a record whose model no worker that stands lists. The
+    /// follow asks its registry of each ahead of [`Self::let_go`].
     pub(super) fn unstated(&self, stated: impl Fn(&str) -> bool) -> Vec<(Box<str>, u64)> {
         let mut records = self.records.lock();
         let unstated = records.iter_mut().filter_map(|(model, record)| {
@@ -627,28 +628,55 @@ impl Affinity {
             .collect()
     }
 
-    /// The record of `model`, made at its first asking and held to `bound`
-    /// placements.
-    fn record_of(&self, model: &str, bound: usize) -> Arc<PrefixRecord> {
-        let record = {
+    /// The record of `model`, made at its first asking with its keys at
+    /// `boundaries` ([`PrefixRecord::boundaries`]) and held to the
+    /// placements `max_size` tokens make at `size` tokens a block, the size
+    /// the list's first worker is hashed by. A record a list reads from
+    /// `behind` its first worker's first model is read by lists of other
+    /// first models and other sizes: it is held by the smallest size asked
+    /// ([`PrefixRecord::hold`]). A record of the model that is keyed
+    /// another way leaves the map as one let go ([`Self::let_go`]): keys
+    /// at boundaries are no run of blocks, so neither kind reads what the
+    /// other wrote. The tables and the writes that hold it keep it.
+    fn record_of(
+        &self,
+        model: &str,
+        max_size: u64,
+        size: u32,
+        behind: bool,
+        boundaries: Option<&[u32]>,
+    ) -> Arc<PrefixRecord> {
+        let bound = |size: u32| {
+            let bound = (max_size / u64::from(size.max(1))).max(1);
+            usize::try_from(bound).unwrap_or(usize::MAX)
+        };
+        let (record, gone) = {
             let mut records = self.records.lock();
-            let record = if let Some(record) = records.get(model) {
-                Arc::clone(record)
+            let kept = records
+                .get(model)
+                .filter(|record| record.boundaries.as_deref() == boundaries)
+                .map(Arc::clone);
+            let (record, gone) = if let Some(record) = kept {
+                (record, None)
             } else {
+                let gone = records.remove(model);
+                self.count_gone(gone.iter());
                 let left = self.left_past.load(Ordering::Relaxed);
-                let record = Arc::new(PrefixRecord::new(bound, left));
+                let record = Arc::new(PrefixRecord::new(bound(size), left, boundaries));
                 records.insert(model.into(), Arc::clone(&record));
-                record
+                (record, gone)
             };
             // The number of this taking, which no other taking of the map
             // has: a record made anew under its model never reads as the
             // one that left.
             let taken = self.taken.fetch_add(1, Ordering::Relaxed) + 1;
             record.taken.store(taken, Ordering::Relaxed);
-            record
+            (record, gone)
         };
-        // Outside the map's mutex: a bound that moved takes the record.
-        record.bound_to(bound);
+        // Outside the map's mutex: a record that left is freed, as at a
+        // sweep, and a bound that moved takes the record.
+        drop(gone);
+        record.hold(size, behind, bound);
         record
     }
 }
@@ -659,9 +687,21 @@ impl Affinity {
 /// ([`Table::recorded`]), shared by every deciding thread.
 struct PrefixRecord {
     predictor: RwLock<PrefixPredictor>,
+    /// The boundaries the record's keys lie at, a hash index's
+    /// ([`Table::fold_keys`]); none where they are one a block. A table
+    /// keyed another way takes a record of its own
+    /// ([`Affinity::record_of`]).
+    boundaries: Option<Box<[u32]>>,
     /// The record's bound as the last table set it: a table's read takes
     /// the record, which the deciders hold, only where the bound moved.
     bound: AtomicUsize,
+    /// The block sizes the record's lists asked it with, which hold its
+    /// bound once a list read it from behind its first model. Such a
+    /// record is read by lists hashed at different sizes: held by the
+    /// size of each, its bound would follow which worker heads a list.
+    /// One table's read at a time takes them, to size the record
+    /// ([`Self::hold`]).
+    sizes: Mutex<Sizes>,
     /// Work waits for a sweep: a worker left, or the bound came down.
     sweeping: AtomicBool,
     /// How many leaves were told, counted on from where the map's records
@@ -687,10 +727,16 @@ struct PrefixRecord {
 #[derive(Clone, Copy, Debug)]
 struct RecordRead {
     tick: u16,
-    /// The leading blocks of the request the record holds for a worker of
-    /// the list: the depth its deepest holders were sent.
+    /// The leading keys of the request the record holds for a worker of
+    /// the list: the depth its deepest holders were sent. A key is a block
+    /// of the request, and under a hash index a boundary of the view the
+    /// request reaches ([`Table::fold_keys`]).
     blocks: u32,
-    /// The record holds the whole request for a worker of the list.
+    /// Those keys in blocks of the request, as a stage counts a sent
+    /// prefix: their count, and under a hash index the depth of the
+    /// deepest boundary among them ([`Table::depth_of`]).
+    depth: u32,
+    /// The record holds every key of the request for a worker of the list.
     whole: bool,
     /// The request's last block was used at this tick.
     fresh: bool,
@@ -718,7 +764,7 @@ impl PrefixRead {
     /// it wrote, among those sent the request's deepest block: it wrote
     /// that depth into the entry of each of them, however many they are.
     fn found(self, entry: &AffinityFacts) -> bool {
-        self.read.blocks != 0 && entry.predicted_blocks == self.read.blocks
+        self.read.depth != 0 && entry.predicted_blocks == self.read.depth
     }
 }
 
@@ -727,16 +773,29 @@ const fn tick_of(now_micros: u64) -> u16 {
     (now_micros >> 20) as u16
 }
 
+/// The block sizes a record's lists asked it with ([`PrefixRecord::hold`]).
+struct Sizes {
+    /// The smallest size a list asked with since the record was made.
+    smallest: u32,
+    /// A list read the record from behind its first model.
+    shared: bool,
+}
+
 impl PrefixRecord {
     /// A write gives the lock back after this many blocks.
     const SLICE: usize = 16;
     /// A sweep's step.
     const SWEEP: usize = 64;
 
-    fn new(bound: usize, left: u64) -> Self {
+    fn new(bound: usize, left: u64, boundaries: Option<&[u32]>) -> Self {
         Self {
             predictor: RwLock::new(PrefixPredictor::new(bound)),
+            boundaries: boundaries.map(Into::into),
             bound: AtomicUsize::new(bound),
+            sizes: Mutex::new(Sizes {
+                smallest: u32::MAX,
+                shared: false,
+            }),
             sweeping: AtomicBool::new(false),
             left: AtomicU64::new(left),
             left_out: AtomicU64::new(0),
@@ -751,6 +810,21 @@ impl PrefixRecord {
             self.predictor.write().set_bound(bound);
             self.sweeping.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Holds the record to the placements `bound` makes of the block size
+    /// a list asks with: `size` while every list reads the record under
+    /// its first model, as its bound always was; the smallest size asked
+    /// since the record was made, by the lists ahead too, once a list read
+    /// it from `behind` its first model. That size does not rise while the
+    /// record lives. The size is picked and the bound set under one lock:
+    /// a list that picked ahead of a smaller size sets no bound behind it.
+    fn hold(&self, size: u32, behind: bool, bound: impl Fn(u32) -> usize) {
+        let mut sizes = self.sizes.lock();
+        sizes.smallest = sizes.smallest.min(size);
+        sizes.shared |= behind;
+        let size = if sizes.shared { sizes.smallest } else { size };
+        self.bound_to(bound(size));
     }
 
     /// Counts the leave also where the record holds no place for `worker`:
@@ -991,6 +1065,13 @@ struct Table {
     ///
     /// [`Engine::side_reads_sent_alone`]: crate::engine::Engine::side_reads_sent_alone
     side_alone: bool,
+    /// The view's boundaries, in tokens and ascending, where the model's
+    /// index is of the kind hash: the record of sent prefixes then holds a
+    /// request of token ids by one key a boundary it reaches and a request
+    /// hashed by its text by none ([`Self::fold_keys`]), as the classic
+    /// policy keys its placement map. `None` under a tree index, whose
+    /// record holds a request by every block.
+    boundaries: Option<Box<[u32]>>,
     /// The host's token tree for the place, where it lends one, the
     /// profile reads a record and the model has no index of cache events
     /// that holds a block ([`Self::holds`]): a request whose host names its
@@ -1090,6 +1171,7 @@ impl Table {
             record: None,
             alone: false,
             side_alone: false,
+            boundaries: None,
             sent: None,
             sent_text: None,
             block: spec.block_size(),
@@ -1191,24 +1273,53 @@ impl Table {
             table.warming = warming.into();
         }
         let record = engine.pool_record_for(model, phase);
-        // The record is the registered model's, and so are its settings.
-        let settings = spec.index_for(registered);
-        if let Some(alone) = record.filter(|_| settings.kind == IndexKind::Tree) {
+        // The record is the model's the request names, and so are its
+        // settings and the trees lent for it, by the id of the first
+        // worker's card that answers to the name, an id ahead of an alias
+        // as the registry reads a name: a list of a model holds workers of
+        // different first models. A name no card answers to is the
+        // caller's own word, and reads the first model's record.
+        let mut named = None;
+        first.any_model(&mut |card| {
+            let id = card.id == model;
+            if id || (named.is_none() && card.matches(model)) {
+                named = Some(card.id.clone());
+            }
+            id
+        });
+        let named = named.as_deref().unwrap_or(registered);
+        let settings = spec.index_for(named);
+        // A hash index keeps what it placed and reads no tree: the record
+        // is keyed by the request's head at the view's boundaries alone,
+        // and its host is asked for no tree. Whom the record speaks for is
+        // the reader's own word, as under a tree: where the model's index
+        // of cache events holds a block it decides a single request of a
+        // reader that reads cache events alone (`Table::index_alone`).
+        let hash = settings.kind == IndexKind::Hash;
+        if let Some(alone) = record {
             let size = affinity.block_size(registered);
             let size = size.unwrap_or_else(|| spec.block_size()).max(1);
-            let bound = (settings.max_size / u64::from(size)).max(1);
-            let bound = usize::try_from(bound).unwrap_or(usize::MAX);
-            table.record = Some(affinity.record_of(registered, bound));
+            let behind = named != registered;
+            let boundaries: Option<Box<[u32]>> = hash.then(|| spec.boundaries().into());
+            let record = affinity.record_of(
+                named,
+                settings.max_size,
+                size,
+                behind,
+                boundaries.as_deref(),
+            );
+            table.record = Some(record);
             table.alone = alone;
             table.side_alone = engine.side_reads_sent_alone(model, phase);
-            if cap != 0 {
+            table.boundaries = boundaries;
+            if cap != 0 && !hash {
                 let lent = affinity.indexes.get();
                 if !table.holds {
-                    table.sent = lent.and_then(|indexes| indexes.token_tree(registered, phase));
+                    table.sent = lent.and_then(|indexes| indexes.token_tree(named, phase));
                 }
                 // A request of text reads no index: its tree is asked for
                 // beside one too.
-                table.sent_text = lent.and_then(|indexes| indexes.string_tree(registered, phase));
+                table.sent_text = lent.and_then(|indexes| indexes.string_tree(named, phase));
             }
             if table.sent.is_some() || table.sent_text.is_some() {
                 let print = |worker: &Arc<dyn Worker>| fingerprint(worker.url().as_bytes());
@@ -1528,13 +1639,80 @@ impl Table {
         read
     }
 
-    /// Reads the record of sent prefixes for the request: the deepest block
+    /// The depths, in blocks of the request, that a hash index keys it at:
+    /// the whole blocks under each of `boundaries`, the view's
+    /// ([`Self::blocks_of`]), ascending. Two boundaries that end in one
+    /// block are one depth, and a boundary under one block is none.
+    fn depths<'a>(
+        &'a self,
+        boundaries: &'a [u32],
+        facts: &'a RequestFacts<'_>,
+    ) -> impl Iterator<Item = usize> + 'a {
+        let mut last = 0;
+        boundaries.iter().filter_map(move |&boundary| {
+            let depth = self.blocks_of(boundary as usize, facts) as usize;
+            (depth != last).then(|| {
+                last = depth;
+                depth
+            })
+        })
+    }
+
+    /// The request's keys of the record of sent prefixes into `keys`: one
+    /// a block ([`PrefixPredictor::fold_into`]). Under a hash index they
+    /// are one a boundary of the view the request reaches, the fold through
+    /// the boundary's last whole block ([`Self::depths`]), as a
+    /// consistent-hash stage keys a prefix: the heads the classic policy
+    /// keys its placement map by. A boundary counts in whole blocks, where
+    /// the classic policy asks for its every token. A request of token ids
+    /// reaches a boundary that holds a whole block where it carries a hash
+    /// for each block under it. A request that carries fewer hashes than
+    /// the first depth counts has no key, and neither has one hashed by
+    /// windows of its text, since such an index keys token ids: the record
+    /// names it nobody and takes no placement for it.
+    fn fold_keys(&self, keys: &mut Vec<u64>, facts: &RequestFacts<'_>) {
+        let hashes = facts.block_hashes;
+        let Some(boundaries) = self.boundaries.as_deref() else {
+            return PrefixPredictor::fold_into(keys, facts.namespace_seed, hashes);
+        };
+        // No key lies past the deepest boundary.
+        let deepest = match facts.hash_kind {
+            HashKind::Token => self.depths(boundaries, facts).last().unwrap_or(0),
+            HashKind::Text => 0,
+        };
+        let within = hashes.len().min(deepest);
+        PrefixPredictor::fold_into(keys, facts.namespace_seed, &hashes[..within]);
+        let mut kept = 0;
+        for depth in self.depths(boundaries, facts) {
+            if depth > keys.len() {
+                break;
+            }
+            keys[kept] = keys[depth - 1];
+            kept += 1;
+        }
+        keys.truncate(kept);
+    }
+
+    /// The request's first `held` keys ([`Self::fold_keys`]) in blocks of
+    /// it: their count, and under a hash index the depth the last of them
+    /// was folded at ([`Self::depths`]).
+    fn depth_of(&self, held: u32, facts: &RequestFacts<'_>) -> u32 {
+        let Some(boundaries) = self.boundaries.as_deref() else {
+            return held;
+        };
+        let last = (held as usize).checked_sub(1);
+        let depth = last.and_then(|last| self.depths(boundaries, facts).nth(last));
+        depth.map_or(0, count)
+    }
+
+    /// Reads the record of sent prefixes for the request: the deepest key
     /// of it that a worker the record speaks for was sent, as a count of
-    /// blocks, and the workers sent it, into `deepest`. `alone` is the
+    /// keys, and the workers sent it, into `deepest`. `alone` is the
     /// reader's word the record speaks by ([`Self::recorded`]), which the
     /// read keeps for its pick's write. The request's keys
-    /// are folded into `keys`. The record's lock is held as a reader for
-    /// the one read and given back before a row is chosen.
+    /// are folded into `keys` ([`Self::fold_keys`]). The record's lock is
+    /// held as a reader for the one read and given back before a row is
+    /// chosen. A request with no key reads no block: no lock is taken.
     fn read_record(
         &self,
         record: &PrefixRecord,
@@ -1543,16 +1721,30 @@ impl Table {
         keys: &mut Vec<u64>,
         deepest: &mut Vec<WorkerId>,
     ) -> (u32, RecordRead) {
-        PrefixPredictor::fold_into(keys, facts.namespace_seed, facts.block_hashes);
+        self.fold_keys(keys, facts);
         let tick = tick_of(facts.now_micros);
+        deepest.clear();
+        if keys.is_empty() {
+            let read = RecordRead {
+                tick,
+                blocks: 0,
+                depth: 0,
+                whole: true,
+                fresh: false,
+                left: record.left.load(Ordering::Acquire),
+                waits: false,
+                alone,
+            };
+            return (0, read);
+        }
         let usable = |id: WorkerId| self.spoken_row(id, facts.hash_kind, alone).is_some();
         let predictor = record.predictor.read();
         let found = predictor.deepest_among(keys, &usable);
-        deepest.clear();
         deepest.extend(found.holders());
         let read = RecordRead {
             tick,
             blocks: found.blocks(),
+            depth: self.depth_of(found.blocks(), facts),
             whole: found.blocks() as usize == keys.len(),
             fresh: found.fresh(tick),
             // Acquire against the leaves' Release: a raise read here was
@@ -1598,6 +1790,7 @@ impl Table {
                 deepest.clear();
                 read = RecordRead {
                     blocks,
+                    depth: self.depth_of(blocks, facts),
                     whole: blocks as usize == keys.len(),
                     fresh: false,
                     waits: true,
@@ -1608,7 +1801,7 @@ impl Table {
                 deepest.push(write.target);
             }
         }
-        (read.blocks, read)
+        (read.depth, read)
     }
 
     /// The record's holders of the request, behind the holders already
@@ -2333,8 +2526,8 @@ pub(super) fn column(
             table.fill(facts, table.side_alone, buffers, column)
         })
     });
-    // A place whose stages read no affinity keeps no table: every worker
-    // reads as holding nothing, just admitted.
+    // The table of a place whose stages read no affinity holds an empty
+    // column: every worker reads as holding nothing, just admitted.
     column.resize(workers.len(), AffinityFacts::default());
     read
 }
@@ -2461,7 +2654,7 @@ pub(super) fn record_by_column(
     }
     with_buffers(|buffers| {
         // The keys are the request's own, whichever list was filled last.
-        PrefixPredictor::fold_into(&mut buffers.keys, facts.namespace_seed, facts.block_hashes);
+        table.fold_keys(&mut buffers.keys, facts);
         write_behind(record, buffers, read.read, held, id);
     });
 }

@@ -146,6 +146,19 @@ async fn the_bind_draws_its_logs_first_place() {
     assert!(starts.iter().all(|start| start.seq != 0 && start.term == 0));
 }
 
+/// A controller hands out the fence its bind took from its candidate: a
+/// candidate a case puts in behind the bind has another, and the
+/// controller's stays the bind's.
+#[tokio::test]
+async fn a_controller_hands_out_the_fence_its_bind_took() {
+    let mut controller = Controller::bind(valid()).await.expect("the listeners bind");
+    let bound = controller.fence();
+    controller.elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
+        .expect("the settings are in order");
+    assert!(Arc::ptr_eq(&controller.fence(), &bound));
+    assert!(!Arc::ptr_eq(&controller.elector.fence(), &bound));
+}
+
 /// The thread gone at its take, before the serve read ready, and at its
 /// first renewal, after: the serve ends with the error either way, so
 /// the process exits and its supervisor starts it again.
@@ -191,7 +204,7 @@ async fn a_served_controller_decides_under_its_next_term_past_a_terms_mark() {
     });
     let case = async {
         let (wait, begun) = (Duration::from_secs(20), Instant::now());
-        while shared.fence.leader_term(Instant::now()).is_none() {
+        while shared.leading(Instant::now()).is_none() {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -234,7 +247,7 @@ async fn a_served_controller_keeps_no_sent_prefixes_of_a_model_whose_workers_lef
     });
     let case = async {
         let (wait, begun) = (Duration::from_secs(20), Instant::now());
-        while shared.fence.leader_term(Instant::now()).is_none() {
+        while shared.leading(Instant::now()).is_none() {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -282,7 +295,7 @@ async fn a_served_controller_lays_a_worker_written_through_its_holder() {
     });
     let case = async {
         let (wait, begun) = (Duration::from_secs(20), Instant::now());
-        while shared.fence.leader_term(Instant::now()).is_none() {
+        while shared.leading(Instant::now()).is_none() {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -334,7 +347,7 @@ async fn a_served_controller_probes_its_rows_while_it_leads() {
     });
     let case = async {
         let (wait, begun) = (Duration::from_secs(20), Instant::now());
-        while shared.fence.leader_term(Instant::now()).is_none() {
+        while shared.leading(Instant::now()).is_none() {
             assert!(begun.elapsed() < wait, "no first take");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -961,6 +974,77 @@ async fn a_take_under_another_term_between_two_reads_is_another_word() {
     assert_ne!(second, first, "a take is another term");
     steps.send_replace(ElectionObservation::default());
     names(&mut role, second).await;
+}
+
+/// A take lands ahead of the serve's turn to serving: the election's
+/// thread stamps the fence, and the serve sets its phase at its next
+/// move. The fence admits a watch from the take, so the step under a
+/// serve still starting tells the term: a watch admitted in that moment
+/// hears its own term, and no second word that nobody leads here. The
+/// serve's turn to serving then tells nothing more.
+#[tokio::test]
+async fn a_take_under_a_serve_still_starting_is_told_as_its_term() {
+    let mut elector = Elector::alone("controller-0@127.0.0.1:1", ElectionSettings::default())
+        .expect("the default settings are in order");
+    let (steps, stepped) = watch::channel(ElectionObservation::default());
+    let (phase, readiness) = detached(elector.fence(), stepped, Arc::new(Lag::new(Duration::ZERO)));
+    let (_stop, stopped) = watch::channel(false);
+    let (told, mut role) = watch::channel(None);
+    let mut teller = JoinSet::new();
+    teller.spawn(tell_role(readiness, stopped, Vec::new(), told));
+    // The teller's first word, ahead of any take: nobody leads here.
+    let first = timeout(Duration::from_secs(5), role.changed()).await;
+    assert!(matches!(first, Ok(Ok(()))), "the teller told no first word");
+    assert_eq!(*role.borrow_and_update(), None);
+
+    // The take, with the phase as a serve's start leaves it. A watch
+    // admitted here sees the word as it stands, as an open does. The
+    // renewals stand ahead of the clock, each just short of the deadline
+    // the one before it stamped: the fence stays open seconds past the
+    // take, so a thread held on a loaded host reads the term.
+    let mut renewed = Instant::now();
+    assert!(matches!(
+        elector.tick(renewed),
+        Ok(TickOutcome::Acquired { .. })
+    ));
+    for _ in 0..10 {
+        renewed += ElectionSettings::default().renew_deadline - Duration::from_millis(10);
+        assert!(matches!(
+            elector.tick(renewed),
+            Ok(TickOutcome::Renewed { .. })
+        ));
+    }
+    let term = elector.fence().term();
+    let mut opened = role.clone();
+    opened.mark_unchanged();
+    steps.send_replace(ElectionObservation::default());
+    let heard = timeout(Duration::from_secs(5), opened.changed()).await;
+    assert!(
+        matches!(heard, Ok(Ok(()))),
+        "the step told the watch nothing"
+    );
+    assert_eq!(
+        *opened.borrow_and_update(),
+        Some(term),
+        "the step under a serve still starting tells the term its fence holds"
+    );
+
+    // The serve's turn to serving, taken by the teller: turns of the
+    // runtime and no clock. The term is told once.
+    phase.send_replace(Phase::Serving);
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !opened.has_changed().expect("the teller holds the word"),
+        "the turn to serving told the term again"
+    );
+    // The teller took that turn: the word behind the lead's loss is told.
+    assert!(elector.release().expect("a release"));
+    steps.send_replace(ElectionObservation::default());
+    let lost = timeout(Duration::from_secs(5), opened.changed()).await;
+    assert!(matches!(lost, Ok(Ok(()))), "the loss was not told");
+    assert_eq!(*opened.borrow_and_update(), None);
 }
 
 /// A serve whose lead opened with no step of the election since: the

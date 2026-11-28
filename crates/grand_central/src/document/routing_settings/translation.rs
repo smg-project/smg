@@ -161,10 +161,10 @@ pub(super) fn presets(config: &RoutingSettings) -> Result<Planned<'_>, RoutingSe
 pub(super) fn both_families(
     config: &RoutingSettings,
 ) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
-    let mode = &config.mode;
+    let (mode, main) = (&config.mode, &config.policy);
     let (both, encode) = match mode {
         ModeSettings::Regular | ModeSettings::Provider(_) => {
-            (config.enable_igw && !manual_alone(config), None)
+            (config.enable_igw && !manual_alone(mode, main), None)
         }
         ModeSettings::PrefillDecode {
             prefill_policy: _,
@@ -182,7 +182,7 @@ pub(super) fn both_families(
     if !both {
         return Ok(None);
     }
-    families(config, encode).map(Some)
+    families(mode, main, encode).map(Some)
 }
 
 /// The document of a gateway of many routers outside the encode mode, with
@@ -200,40 +200,44 @@ pub(super) fn both_families(
 /// A setting with no document under three sides leaves the plan where it
 /// is written, as one manual side of the pair's two does.
 ///
-/// The manual policy on both sides of the pair is planned: its rule places
+/// The manual policy on both sides of the pair is planned. Its rule places
 /// the pair's two sides, each by its own session, and the encode side
-/// places an item by its content.
-pub(super) fn three_sided(
-    config: &RoutingSettings,
-) -> Result<Option<Planned<'_>>, RoutingSettingsError> {
-    let encode_mode = matches!(config.mode, ModeSettings::EncodePrefillDecode { .. });
-    if !config.enable_igw || encode_mode || manual_alone(config) {
+/// places an item by its own policy.
+///
+/// The plan reads three of the settings and takes them as they are: the
+/// mode, the main policy, and whether the gateway is one of many routers.
+pub(super) fn three_sided<'a>(
+    mode: &'a ModeSettings,
+    main: &'a PolicySettings,
+    many_routers: bool,
+) -> Result<Option<Planned<'a>>, RoutingSettingsError> {
+    let encode_mode = matches!(mode, ModeSettings::EncodePrefillDecode { .. });
+    if !many_routers || encode_mode || manual_alone(mode, main) {
         return Ok(None);
     }
-    families(config, Some(&ENCODE_DEFAULT)).map(Some)
+    families(mode, main, Some(&ENCODE_DEFAULT)).map(Some)
 }
 
 /// Whether the settings are a regular configuration under the manual
-/// policy. Its picker leaves the placement to the binding's session rule,
-/// and this module does not plan its pairs beside its single requests yet:
-/// such a gateway of many routers plans its single requests alone, under
-/// the plan of two families as under the plan of three sides.
-fn manual_alone(config: &RoutingSettings) -> bool {
-    let regular = matches!(
-        config.mode,
-        ModeSettings::Regular | ModeSettings::Provider(_)
-    );
-    regular && matches!(config.policy, PolicySettings::Manual { .. })
+/// policy, by their mode and their main policy. Its picker leaves the
+/// placement to the binding's session rule, and this module does not plan
+/// its pairs beside its single requests yet: such a gateway of many
+/// routers plans its single requests alone, under the plan of two families
+/// as under the plan of three sides.
+fn manual_alone(mode: &ModeSettings, main: &PolicySettings) -> bool {
+    let regular = matches!(mode, ModeSettings::Regular | ModeSettings::Provider(_));
+    regular && matches!(main, PolicySettings::Manual { .. })
 }
 
 /// The plan of two families: the pair's sides under one binding over their
 /// phases, with `encode` as a third side ahead of them where one is named,
-/// and the main policy's single binding behind it.
+/// and the main policy's single binding behind it. The sides' policies are
+/// the mode's own, or `main` where the mode names none.
 fn families<'a>(
-    config: &'a RoutingSettings,
+    mode: &'a ModeSettings,
+    main: &'a PolicySettings,
     encode: Option<&'a PolicySettings>,
 ) -> Result<Planned<'a>, RoutingSettingsError> {
-    let (mode, main) = (&config.mode, &config.policy);
     let (prefill, decode) = (mode.prefill_policy(main), mode.decode_policy(main));
     let mut sides = vec![("prefill", prefill), ("decode", decode)];
     let mut phases = vec![Phase::Prefill, Phase::Decode];
@@ -350,7 +354,9 @@ fn label_side<'a>(
     if let Some(sources) = key_sources(policy, config)? {
         shared.bound.keys.push((name, sources));
     }
-    shared.bound.overridden += usize::from(override_places(policy, config));
+    if override_places(policy, config) {
+        shared.bound.overridden.push("single");
+    }
     Ok((std::mem::take(&mut shared.bound), own))
 }
 
@@ -433,17 +439,17 @@ pub(super) fn written_with<'a>(
                         policy: policy.name(),
                         part: "profile",
                     })?;
-            // The encode side places an item by the item's content: it reads
-            // no key, the override never places it and no session rule does.
-            // So the manual policy is no encode side's, as the gateway's own
-            // check holds (`validate_encode_policy`,
-            // `model_gateway/src/config/validation.rs:319-328`).
+            // The encode side places an item by its own policy: it reads no
+            // key of the request's, the override never places it and no
+            // session rule does. So the manual policy is no encode side's, as
+            // the gateway's own check holds: `validate_encode_policy`
+            // (`model_gateway/src/config/validation.rs`).
             if side == ENCODE_SIDE {
                 if matches!(policy, PolicySettings::Manual { .. }) {
                     return Err(unsupported(
                         "encode_policy",
                         policy.name(),
-                        "a session rule places no item: an item goes to its encoder by its content",
+                        "a session rule places no item: an item goes to its encoder by its side's policy",
                     ));
                 }
                 shared.bound.encode_side = true;
@@ -454,9 +460,7 @@ pub(super) fn written_with<'a>(
                     shared.bound.keys.push((policy.name(), sources));
                 }
                 if override_places(policy, config) {
-                    shared.bound.overridden += 1;
-                } else {
-                    shared.bound.keyed_itself = Some(side);
+                    shared.bound.overridden.push(side);
                 }
             }
         }
@@ -733,8 +737,16 @@ fn write_policy<'a>(
                 ),
                 uncached_credit: unless(*balance_uncached_credit, false),
             };
+            // The classic hash index reads no match threshold: a holder at
+            // any boundary is its hit, however small its share of the
+            // request. The record of the kind hash states a holder at its
+            // boundary, so its stage counts a holder at every share.
+            let match_threshold = match cache_index {
+                IndexKind::Hash => 0.0,
+                IndexKind::Tree => *cache_threshold,
+            };
             let affinity = PrefixAffinityParams {
-                threshold: unless(*cache_threshold, DEFAULT_THRESHOLD),
+                threshold: unless(match_threshold, DEFAULT_THRESHOLD),
                 decay: unless(*overlap_decay, 0.0),
                 accounting_ttl_ms: unless(*selection_accounting_ttl_ms, 0),
                 spill: unless(spill, SpillParams::default()),
@@ -761,20 +773,29 @@ fn write_policy<'a>(
                     ScoreStage::KvPressure(KvPressureParams { weight, ..pressure })
                 })?;
             }
+            // The classic hash index calls no warm-up slice: a worker
+            // admitted beside older ones takes no share of the requests,
+            // so a turn of a conversation stays with its holder. A window
+            // and a thin ratio of zero keep nobody young and nobody thin.
+            let (warmup_secs, warmup_thin_ratio) = match cache_index {
+                IndexKind::Hash => (0, 0.0),
+                IndexKind::Tree => (config.worker_warmup_secs, config.worker_warmup_thin_ratio),
+            };
             let warmup = WarmupSliceParams {
-                secs: unless(config.worker_warmup_secs, DEFAULT_WARMUP_SECS),
+                secs: unless(warmup_secs, DEFAULT_WARMUP_SECS),
                 share: unless(config.worker_warmup_share, DEFAULT_WARMUP_SHARE),
                 blocks: unless(
                     narrow("worker_warmup_blocks", config.worker_warmup_blocks)?,
                     DEFAULT_WARMUP_BLOCKS,
                 ),
-                thin_ratio: unless(config.worker_warmup_thin_ratio, DEFAULT_WARMUP_THIN_RATIO),
+                thin_ratio: unless(warmup_thin_ratio, DEFAULT_WARMUP_THIN_RATIO),
                 divert_every: unless(
                     config.worker_warmup_divert_every,
                     DEFAULT_WARMUP_DIVERT_EVERY,
                 ),
-                // The slice counts a hit as a miss by the affinity's own
-                // threshold: the one setting is written in both stages.
+                // The slice counts a hit as a miss by the settings' match
+                // threshold under an index of either kind: it judges what
+                // the cache events hold, which no boundary keys.
                 miss_share: unless(*cache_threshold, DEFAULT_THRESHOLD),
                 ..WarmupSliceParams::default()
             };
@@ -914,11 +935,10 @@ struct Bound {
     /// the manual policy's rule places the plan's other sides alone.
     encode_side: bool,
     /// The sides whose keyed requests the sticky override places
-    /// ([`override_places`]).
-    overridden: usize,
-    /// A side the override does not place. With the override on, that
-    /// side's policy reads the routing key itself.
-    keyed_itself: Option<&'static str>,
+    /// ([`override_places`]), by name. With the override on, a side that
+    /// is not among them reads the routing key itself, or is the encode
+    /// side, which reads none.
+    overridden: Vec<&'static str>,
     /// The sources each keyed side reads a request's key from, under the
     /// side's policy.
     keys: Vec<(&'static str, RoutingKeySpec)>,
@@ -982,10 +1002,13 @@ fn index_spec((kind, ttl_s, max_size, sweep_s): IndexNumbers) -> IndexSpec {
     // The document's cadence and size both start at one, so its longest
     // cadence and its largest size say it. No sweep falls inside a
     // process's life, and no write meets the bound.
-    let (max_size, sweep_s) = if sweep_s == 0 {
-        (u64::MAX, u32::MAX)
-    } else {
-        (max_size, sweep_s)
+    // An index of kind hash keeps its named size at that interval too: its
+    // record of sent prefixes is trimmed at its own write, the least used
+    // end first, and waits for no sweep.
+    let (max_size, sweep_s) = match (sweep_s, kind) {
+        (0, IndexKind::Hash) => (max_size, u32::MAX),
+        (0, _) => (u64::MAX, u32::MAX),
+        _ => (max_size, sweep_s),
     };
     IndexSpec {
         kind,
@@ -1018,17 +1041,47 @@ impl Bound {
             if let Some(key) = &key {
                 within_a_block(key, config)?;
             }
-            if self.overridden > 0 {
-                if let Some(reason) = override_refused(sides, self.keyed_itself) {
-                    return Err(unsupported("routing_key_override.enabled", true, reason));
+            if !self.overridden.is_empty() {
+                // The settings write the override's rule for a single
+                // request and for a pair. Under a plan with an encode side
+                // they write none yet.
+                if sides > 2 {
+                    return Err(unsupported(
+                        "routing_key_override.enabled",
+                        true,
+                        "the sticky sessions' rule places a single request or the two sides of a pair, and this plan has an encode side",
+                    ));
                 }
-                binding.sessions = Some(override_rule(config)?);
+                // The gateway's sticky map places a role at a time. It
+                // asks the role's policy, and leaves the role to one
+                // that keeps the key's handling to itself: `manual` and
+                // `consistent_hashing`
+                // (`model_gateway/src/policies/registry.rs`,
+                // `sticky_for`). No side is `manual` here, and a pair
+                // with one such side is refused below. Beside a side
+                // under `consistent_hashing` the rule names the side
+                // the override places, and covers it alone.
+                let named = (self.overridden.len() < sides).then(|| {
+                    self.overridden
+                        .iter()
+                        .map(|&side| side.to_owned())
+                        .collect()
+                });
+                binding.sessions = Some(SessionsSpec {
+                    sides: named,
+                    ..override_rule(config)?
+                });
                 // The rule's cap counts a key's requests on a worker by
                 // the key's text, which a header hands where the view
-                // lists it.
+                // lists it. The view lists the session's sources alone.
+                // Beside a side left to its own policy the binding's
+                // list holds that side's client sources and its target
+                // source too ([`one_list`]). The rule reads none of
+                // them, and the check refuses `cookie` in the view.
                 *view_headers = key
                     .iter()
                     .flat_map(|key| &key.sources)
+                    .filter(|source| !source.client && !source.target)
                     .filter_map(|source| source.header.clone())
                     .collect();
             }
@@ -1039,7 +1092,7 @@ impl Bound {
             return Err(unsupported(
                 "policy",
                 "manual",
-                "the manual policy places by the binding's one session rule, so every side of a plan is manual or none is",
+                "the settings write the manual policy's session rule over both sides of a pair, so both sides are manual or neither is",
             ));
         }
         let key = one_list(self.keys)?.ok_or(RoutingSettingsError::NoPart {
@@ -1356,34 +1409,6 @@ fn override_places(policy: &PolicySettings, config: &RoutingSettings) -> bool {
     config.routing_key_override.enabled && placed
 }
 
-/// Why a plan of `sides` sides takes no rule of the sticky override, where
-/// the override places a side of it. `keyed_itself` is a side the override
-/// does not place: its policy reads the routing key itself. `None` for a
-/// single request's plan, and for a pair's whose two sides the override
-/// places.
-///
-/// A binding's rule places every side of its plan, each side by its own
-/// session, as the gateway's sticky map pins each role under its own key
-/// (`model_gateway/src/policies/registry.rs`, `select_sticky`). The map
-/// places a role at a time, so beside a side whose policy reads the key
-/// itself it places the other side alone (`sticky_for`), and no document
-/// holds the rule to one side yet. The check takes no sessions rule under a
-/// plan with an encode side.
-fn override_refused(sides: usize, keyed_itself: Option<&'static str>) -> Option<&'static str> {
-    match (sides, keyed_itself) {
-        (1, _) | (2, None) => None,
-        (2, Some("prefill")) => Some(
-            "the sticky sessions' rule places both sides of a pair, and the prefill side's policy reads the routing key itself",
-        ),
-        (2, Some(_)) => Some(
-            "the sticky sessions' rule places both sides of a pair, and the decode side's policy reads the routing key itself",
-        ),
-        _ => Some(
-            "the sticky sessions' rule places a single request or the two sides of a pair, and this plan has an encode side",
-        ),
-    }
-}
-
 /// The requests of one key a worker carries under the sticky override
 /// before the key's next request is placed again: the number of the
 /// gateway's own sticky map.
@@ -1410,9 +1435,12 @@ const OVERRIDE_INFLIGHT_CAP: u16 = 2;
 ///   these settings write says so.
 ///
 /// The rule names no header: the binding's `routing_key` block lists the
-/// key's sources ([`key_sources`]). It stands on a single request's binding,
-/// and on a pair's where the override places both sides
-/// ([`override_refused`]).
+/// key's sources ([`key_sources`]). It stands on a single request's binding
+/// and on a pair's. A pair may hold one side under `consistent_hashing`,
+/// which keeps the key's handling to itself. The binding's rule then names
+/// the other side and covers it alone (`sessions.sides`, written where the
+/// binding is). A pair with that policy on both sides gets no rule, and
+/// one with one `manual` side is refused.
 fn override_rule(config: &RoutingSettings) -> Result<SessionsSpec, RoutingSettingsError> {
     let sticky = &config.routing_key_override;
     let (ttl_s, sweep_s) = pin_times(
@@ -1435,6 +1463,7 @@ fn override_rule(config: &RoutingSettings) -> Result<SessionsSpec, RoutingSettin
             Assignment::Random | Assignment::MinLoad | Assignment::MinGroup => Recovery::Original,
         },
         rule_placed: RulePlaced::Untold,
+        sides: None,
     })
 }
 

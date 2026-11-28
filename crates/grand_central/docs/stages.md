@@ -35,6 +35,10 @@ No filter takes a parameter under its bare name. `has-room` alone can be written
 - The room `has-room` asks about is a free one, or the room the request holds there already.
 - A row the store builds reads both bits open.
 - For capacity, the host that asks gates it at its own commit.
+- On a pair's prefill side, a shed under `has-capacity` says a wait for room. Where the side's own run sheds, a picker's decline aside, it is named for a prefill with an open partner that stands but for its limit.
+- It is named too where the pair's default takes a prefill at its limit, under a profile that lists it as a hard filter.
+- Behind the pair's default and its question of saturation, where no prefill at the request's places stands but for the limit, the side's stage is read with it set aside.
+- The limit's place on that side changes no answer there, under filters whose word on a row does not turn on how often they are asked.
 
 ### `has-room` with a rule
 
@@ -268,6 +272,7 @@ Over the wire these rules hold:
 
 - Cache events are token blocks, so the index of cache events is never asked for a text request.
 - The record of sent prefixes speaks for every worker of a text request's list, whatever the index holds for the worker.
+- Under an index of the kind `hash` the record keys no text request: [Index](policy-spec.md#index) has the rule.
 - A text request under a cache partition is hashed under the partition's whole identity, the extra key included. So it shares no window with a request of another partition.
 
 ## Pickers

@@ -1,3 +1,5 @@
+use sha2::{Digest as _, Sha256};
+
 use super::*;
 use crate::{
     engine::{
@@ -335,7 +337,7 @@ fn a_profile_weighs_by_a_scorers_own_word_and_by_no_need() {
     }
 }
 
-fn doc(text: &str) -> PolicySpec {
+pub(super) fn doc(text: &str) -> PolicySpec {
     serde_json::from_str(text).expect("a well-formed document")
 }
 
@@ -3010,6 +3012,7 @@ fn the_manual_preset_states_its_whole_rule() {
             issue_session_id: false,
             recovery: Recovery::Original,
             rule_placed: RulePlaced::Told,
+            sides: None,
         }
     );
     assert_eq!(spec.view.headers, ["x-smg-routing-key"]);
@@ -3036,6 +3039,22 @@ fn the_manual_picker_on_the_encode_side_of_epd_is_not_in_this_build() {
             "{prefill} and {decode}"
         );
     }
+    // Each profile whose picker leaves the placement to the rule is
+    // refused there, the second of two by name as the first, beside the
+    // other on the prefill side.
+    for (encode, prefill) in [("held", "sticky"), ("sticky", "held")] {
+        let epd = doc(&format!(
+            r#"{{"apiVersion":"smg.policy/v1","profiles":{{"held":{{"pick":"manual"}},"q":{{"pick":"random"}},"sticky":{{"pick":"manual"}}}},"bindings":[{{"plan":"epd","profiles":{{"encode":"{encode}","prefill":"{prefill}","decode":"q"}}}}]}}"#
+        ));
+        assert_eq!(
+            not_in_build(&epd),
+            (
+                "bindings[0].profiles.encode".to_string(),
+                "a picker that places by the sessions rule on the encode side"
+            ),
+            "{encode} on the encode side"
+        );
+    }
     // On a side of a pair the same profile validates, and so it does
     // under the single plan, here with no rule; the preset is the
     // profile with one.
@@ -3049,18 +3068,16 @@ fn the_manual_picker_on_the_encode_side_of_epd_is_not_in_this_build() {
     assert!(single.validate().is_ok());
 }
 
-/// The manual picker runs on the prefill and the decode side of `epd`,
-/// as on the two sides of a pair: on both, and on either one beside a
-/// picker of its own. With no rule on its binding such a side is placed
-/// by its assignment, in the build of a host that makes the
-/// lifecycle's calls and in the build of one that makes some only.
-/// Under a rule it follows its key in the first build. The second
-/// refuses a rule under `epd` by the plan's name, whatever its sides'
-/// pickers.
+/// The manual picker runs on the prefill and the decode side of `epd`, as
+/// on the two sides of a pair. It runs on both, and on either one beside a
+/// picker of its own. With no rule on its binding such a side is placed by
+/// its assignment. Under a rule that tells its stages it follows its key.
+/// Both hold in the build of a host that makes the lifecycle's calls and
+/// in the build of one that makes some only.
 ///
-/// A gateway's own check takes any policy on the prefill and the
-/// decode side of its encode mode, `manual` among them
-/// (`model_gateway/src/config/validation.rs:1005-1010`).
+/// A gateway's own check takes any policy on the prefill and the decode
+/// side of its encode mode, the manual one among them: `validate_mode` in
+/// `model_gateway/src/config/validation.rs`.
 #[test]
 fn the_manual_picker_runs_on_the_pairs_two_sides_of_epd() {
     let rule = r#","sessions":{"sticky_header":"x-session-id","inflight_cap":65535}"#;
@@ -3077,18 +3094,7 @@ fn the_manual_picker_runs_on_the_pairs_two_sides_of_epd() {
         assert!(bare.validate_in(&some, &[]).is_ok(), "{sides}");
         let ruled = epd(prefill, decode, rule);
         assert!(ruled.validate().is_ok(), "{sides}");
-        let refused = ruled.validate_in(&some, &[]).err();
-        assert!(
-            matches!(
-                refused,
-                Some(SpecError::BadSessions {
-                    index: 0,
-                    name: "plan",
-                    ..
-                })
-            ),
-            "{sides}: {refused:?}"
-        );
+        assert!(ruled.validate_in(&some, &[]).is_ok(), "{sides}");
     }
 }
 
@@ -3119,11 +3125,12 @@ fn a_pairs_sessions_rule_is_in_the_build_of_a_host_that_makes_some_lifecycle_cal
 /// tells a lease's words off a file, which keeps no word of a pair's
 /// side.
 ///
-/// Under `epd` the rule runs on the pair's two sides in the build of a
-/// host that makes the lifecycle's calls, under either word, and a cap
-/// makes the document's engine read a key's count as under a pair. The
-/// build of a host that makes some only refuses the rule by the plan's
-/// name, whatever its word.
+/// Under `epd` the rule runs on the pair's two sides, under either word,
+/// in the build of a host that makes the lifecycle's calls. A cap makes
+/// the document's engine read a key's count as under a pair. The build of
+/// a host that makes some only takes the rule that tells its stages, with
+/// a cap or with none. It refuses the one that keeps what it places from
+/// the profile, by that field's name, and its reason names the `epd` plan.
 ///
 /// A gateway's sticky map places each role of a pair under that role's
 /// own key, and hands its policy no request it placed
@@ -3187,26 +3194,47 @@ fn a_sessions_rule_runs_under_a_pair_and_under_epd_by_its_hosts_calls() {
     let capped = r#"{"sticky_header":"x-session-id"}"#;
     for rule in [uncapped, untold, capped] {
         assert_eq!(under("epd", epd, rule), None, "{rule}");
-        let refused = spec_with_binding(&format!(
-            r#"{{"plan":"epd","profiles":{epd},"sessions":{rule}}}"#
+    }
+    // The build of a host that tells a lease's words off a file: whether
+    // its engine reads the count of a key's requests under `epd`.
+    let epd_on_file = |sessions: &str| {
+        spec_with_binding(&format!(
+            r#"{{"plan":"epd","profiles":{epd},"sessions":{sessions}}}"#
         ))
         .validate_in(&some, &[])
-        .err();
-        assert_eq!(
-            refused,
-            Some(SpecError::BadSessions {
-                index: 0,
-                name: "plan",
-                reason: "`single` or `pd-pair`",
-            }),
-            "{rule}"
-        );
-        assert_eq!(
-            refused.map(|err| err.to_string()),
-            Some("binding 0: sessions plan is not `single` or `pd-pair`".to_string()),
-            "{rule}"
-        );
-    }
+        .map(|built| built.needs().session_in_flight)
+    };
+    assert_eq!(
+        epd_on_file(uncapped),
+        Ok(false),
+        "a rule that tells its stages"
+    );
+    assert_eq!(epd_on_file(capped), Ok(true), "a cap reads the count");
+    let refused = epd_on_file(untold).err();
+    assert_eq!(
+        refused,
+        Some(SpecError::BadSessions {
+            index: 0,
+            name: "rule_placed",
+            reason: UNTOLD_ON_FILE_EPD,
+        })
+    );
+    let path = refused.as_ref().map(SpecError::field_path);
+    assert_eq!(path.as_deref(), Some("bindings[0].sessions.rule_placed"));
+    // Each plan's refusal as an operator reads it: the pair's words stand
+    // as they stood, and the other names its own plan.
+    assert_eq!(
+        refused.map(|err| err.to_string()),
+        Some(
+            "binding 0: sessions rule_placed is not `told` under the epd plan in this build: \
+             a file of leases keeps no side's word"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        UNTOLD_ON_FILE,
+        "`told` under the pd-pair plan in this build: a file of leases keeps no side's word"
+    );
     let counts =
         |sessions: &str| built("epd", epd, sessions).map(|built| built.needs().session_in_flight);
     assert_eq!((counts(uncapped), counts(capped)), (Ok(false), Ok(true)));
@@ -3234,6 +3262,164 @@ fn a_sessions_rule_runs_under_a_pair_and_under_epd_by_its_hosts_calls() {
         )
     };
     assert_eq!(of_encode(&ruled), of_encode(&bare));
+}
+
+/// A sessions rule under a pair names the sides it covers (`sides`):
+/// `prefill`, `decode` or both, each once and in either order. Left
+/// out, the rule covers both sides, and a document that names none
+/// writes no `sides` key.
+///
+/// The check refuses, each by the field's path: a list under the single
+/// plan or under `epd`, an empty list and a side named twice. It refuses
+/// the encode side and every other name too. A list that leaves out a
+/// side whose picker leaves the placement to the rule is not in this
+/// build, by the path of that side's profile.
+///
+/// A gateway's sticky map places a role at a time. It asks the role's
+/// policy, and leaves the role to one that keeps a routing key's
+/// handling to itself: `manual` and `consistent_hashing` (`sticky_for`
+/// in `model_gateway/src/policies/registry.rs`).
+#[test]
+fn a_sessions_rule_names_the_sides_of_a_pair_it_covers() {
+    // One binding under a rule, beside the profile `q` and the profile
+    // `sticky`, whose picker leaves the placement to the rule.
+    let bound = |binding: &str, sides: &str| {
+        doc(&format!(
+            r#"{{"apiVersion":"smg.policy/v1","view":{{"headers":["x-session-id"]}},"profiles":{{"q":{{"pick":"random"}},"sticky":{{"pick":"manual"}}}},"bindings":[{{{binding},"sessions":{{"sticky_header":"x-session-id"{sides}}}}}]}}"#
+        ))
+    };
+    let pair = |prefill: &str, decode: &str| {
+        format!(r#""plan":"pd-pair","profiles":{{"prefill":"{prefill}","decode":"{decode}"}}"#)
+    };
+    let named = |sides: &str| format!(r#","sides":{sides}"#);
+    let plain = pair("q", "q");
+    let covered = |sides: &str| {
+        let built = bound(&plain, sides).validate();
+        let built = built.expect("the document validates");
+        let binding = built.binding("m", Phase::Prefill).expect("the binding");
+        binding.sessions.as_ref().expect("the rule").sides
+    };
+    assert_eq!(covered(""), SessionSides::Any);
+    // The type's own default is that rule: one built in code that names
+    // no side covers both.
+    assert_eq!(SessionSides::default(), SessionSides::Any);
+    for (sides, rule) in [
+        (r#"["prefill"]"#, SessionSides::Prefill),
+        (r#"["decode"]"#, SessionSides::Decode),
+        (r#"["prefill","decode"]"#, SessionSides::Any),
+        (r#"["decode","prefill"]"#, SessionSides::Any),
+    ] {
+        assert_eq!(covered(&named(sides)), rule, "{sides}");
+    }
+    // The rule as a document writes it.
+    let written = |sides: &str| {
+        let document = serde_json::to_value(bound(&plain, sides)).expect("a document");
+        document["bindings"][0]["sessions"].clone()
+    };
+    assert_eq!(written("").get("sides"), None);
+    let decode = written(&named(r#"["decode"]"#));
+    assert_eq!(decode["sides"], serde_json::json!(["decode"]));
+    // A `null` is the field left out, under the single plan too.
+    let single = bound(r#""profile":"q""#, &named("null")).validate();
+    assert!(single.is_ok(), "{:?}", single.err());
+
+    // Under `epd` a rule covers the pair's two sides, and takes no list.
+    let epd = r#""plan":"epd","profiles":{"encode":"q","prefill":"q","decode":"q"}"#;
+    assert_eq!(bound(epd, "").validate().err(), None);
+    let (by_prefill, by_decode) = (pair("sticky", "q"), pair("q", "sticky"));
+    let other = "`prefill`, `decode` or both: a rule covers no other side";
+    for (binding, sides, reason) in [
+        (
+            r#""profile":"q""#,
+            r#"["prefill"]"#,
+            "left out under the single plan: a single request has one side",
+        ),
+        (
+            epd,
+            r#"["decode"]"#,
+            "left out under the epd plan in this build: a rule covers the pair's two sides there",
+        ),
+        (
+            plain.as_str(),
+            "[]",
+            "a list of one side at least: leave it out for both",
+        ),
+        (
+            plain.as_str(),
+            r#"["decode","decode"]"#,
+            "a list that names each side once",
+        ),
+        (
+            plain.as_str(),
+            r#"["prefill","prefill"]"#,
+            "a list that names each side once",
+        ),
+        // A third item is read as the first two are.
+        (
+            plain.as_str(),
+            r#"["prefill","decode","decode"]"#,
+            "a list that names each side once",
+        ),
+        (plain.as_str(), r#"["encode"]"#, other),
+        (plain.as_str(), r#"["prefill","both"]"#, other),
+        // A name is read as written, with a space before it, behind it
+        // or both.
+        (plain.as_str(), r#"[" decode"]"#, other),
+        (plain.as_str(), r#"["decode "]"#, other),
+        (plain.as_str(), r#"[" decode "]"#, other),
+    ] {
+        let refused = bound(binding, &named(sides)).validate().err();
+        let by_name = SpecError::BadSessions {
+            index: 0,
+            name: "sides",
+            reason,
+        };
+        assert_eq!(refused.as_ref(), Some(&by_name), "{sides}");
+        assert_eq!(by_name.field_path(), "bindings[0].sessions.sides");
+        assert_eq!(
+            by_name.to_string(),
+            format!("binding 0: sessions sides is not {reason}")
+        );
+    }
+    // A refusal names its own binding: the second of two here.
+    let second = doc(&format!(
+        r#"{{"apiVersion":"smg.policy/v1","view":{{"headers":["x-session-id"]}},"profiles":{{"q":{{"pick":"random"}}}},"bindings":[{{"match":{{"model":"other"}},"profile":"q"}},{{{plain},"sessions":{{"sticky_header":"x-session-id","sides":[]}}}}]}}"#
+    ));
+    let by_name = SpecError::BadSessions {
+        index: 1,
+        name: "sides",
+        reason: "a list of one side at least: leave it out for both",
+    };
+    assert_eq!(second.validate().err().as_ref(), Some(&by_name));
+    assert_eq!(by_name.field_path(), "bindings[1].sessions.sides");
+    // A side whose picker leaves the placement to the rule is not left
+    // out: the binding's one rule would not place it, and it holds no
+    // second.
+    for (binding, sides, side) in [
+        (&by_prefill, r#"["decode"]"#, "prefill"),
+        (&by_decode, r#"["prefill"]"#, "decode"),
+    ] {
+        let lacking = SpecError::NotInBuild {
+            path: format!("bindings[0].profiles.{side}"),
+            what: BY_RULE_ON_A_SIDE_LEFT_OUT,
+        };
+        let refused = bound(binding, &named(sides)).validate().err();
+        assert_eq!(refused, Some(lacking), "{sides}");
+    }
+    assert_eq!(
+        BY_RULE_ON_A_SIDE_LEFT_OUT,
+        "a picker that places by the sessions rule on a side the rule's `sessions.sides` leaves out",
+    );
+    // Such a side stands under a rule that names it, alone or beside
+    // the other side, and under one that names none.
+    for (binding, sides) in [
+        (&by_prefill, named(r#"["prefill"]"#)),
+        (&by_decode, named(r#"["decode"]"#)),
+        (&by_decode, named(r#"["decode","prefill"]"#)),
+        (&by_decode, String::new()),
+    ] {
+        assert_eq!(bound(binding, &sides).validate().err(), None, "{sides}");
+    }
 }
 
 #[test]
@@ -4453,14 +4639,6 @@ fn every_refusal_names_its_field() {
         (
             SpecError::BadSessions {
                 index: 2,
-                name: "plan",
-                reason: "so",
-            },
-            "bindings[2].plan",
-        ),
-        (
-            SpecError::BadSessions {
-                index: 2,
                 name: "sweep_s",
                 reason: "so",
             },
@@ -4939,70 +5117,6 @@ fn a_digest_moves_with_every_field_the_schema_names_but_the_line() {
         assert_ne!(document, &base, "{field} is changed");
         let moved = document.digest().expect("a digest") != digest;
         assert_eq!(moved, *field != "generation", "{field}");
-    }
-}
-
-/// The digest copies none of the document: what it hashes is, byte for
-/// byte, the JSON the document itself writes under a zeroed line. Held
-/// for every preset, under a line and under none, for a document that
-/// writes every field the schema names and for one that writes the
-/// least: a field left out where it is the default is left out of both.
-#[test]
-fn a_digest_hashes_what_the_document_itself_writes_under_a_zeroed_line() {
-    let base = PolicySpec::preset("least_load").expect("a preset");
-    let every_field = PolicySpec {
-        explain: ExplainSpec { sample: 2 },
-        view: ViewSpec {
-            headers: vec!["x-team".to_owned()],
-            ..base.view.clone()
-        },
-        index: BTreeMap::from([("another*".to_owned(), IndexSpec::default())]),
-        signals: BTreeMap::from([(
-            "held".to_owned(),
-            SignalSpec {
-                unit: "tokens".to_owned(),
-                max_age_ms: Some(4_000),
-                across_ranks: AcrossRanks::Max,
-            },
-        )]),
-        plans: PlansSpec {
-            pd_pair: PdPairPlanSpec {
-                pairing: Pairing::Off,
-                ..PdPairPlanSpec::default()
-            },
-        },
-        bindings: vec![BindingSpec::default()],
-        ..base
-    };
-    let written = serde_json::to_value(&every_field).expect("the document is JSON");
-    let schema = serde_json::to_value(PolicySpec::schema()).expect("the schema is JSON");
-    let fields = |of: &serde_json::Value| -> BTreeSet<String> {
-        let fields = of.as_object().expect("a map of fields");
-        fields.keys().cloned().collect()
-    };
-    assert_eq!(
-        fields(&written),
-        fields(&schema["properties"]),
-        "the document writes every field the schema names"
-    );
-    let least = doc(r#"{"apiVersion":"smg.policy/v1","profiles":{"p":{"pick":"best"}}}"#);
-    let mut documents = vec![every_field, least];
-    for name in PRESETS {
-        let preset = PolicySpec::preset(name).expect(name);
-        documents.push(PolicySpec {
-            generation: 7,
-            ..preset.clone()
-        });
-        documents.push(preset);
-    }
-    for document in documents {
-        let borrowed = serde_json::to_string(&document.lineless()).expect("serializes");
-        let owned = serde_json::to_string(&PolicySpec {
-            generation: 0,
-            ..document
-        })
-        .expect("serializes");
-        assert_eq!(borrowed, owned);
     }
 }
 

@@ -97,6 +97,7 @@ struct Bed {
     facts: Vec<EncoderFacts>,
     prefill_classes: Vec<u32>,
     prefill_affinity: Vec<AffinityFacts>,
+    decode_affinity: Vec<AffinityFacts>,
     encode_affinity: Vec<AffinityFacts>,
     /// Each pool's signal cells, one a row under one signal; empty for a
     /// pool that is handed none.
@@ -134,6 +135,7 @@ impl Bed {
             facts: vec![pushing(1)],
             prefill_classes: vec![1],
             prefill_affinity: Vec::new(),
+            decode_affinity: Vec::new(),
             encode_affinity: Vec::new(),
             prefill_cells: Vec::new(),
             decode_cells: Vec::new(),
@@ -174,6 +176,7 @@ impl Bed {
     fn pools(&self) -> PairPools<'_> {
         PairPools {
             prefill_affinity: &self.prefill_affinity,
+            decode_affinity: &self.decode_affinity,
             ..PairPools::of(&self.prefills, &self.decodes)
         }
     }
@@ -403,4 +406,81 @@ fn pair_of(decision: &Decision) -> (u32, u32) {
         target.position,
         target.pair.expect("a pair").decode_position,
     )
+}
+
+/// What a stage was handed with one row it was asked: the request's phase,
+/// the row's place, the blocks of the row's entry of the affinity column
+/// (`None` where the column holds no entry for it), whether the request
+/// carries signal cells, and the mask.
+#[derive(Clone, Debug, PartialEq)]
+struct Noted {
+    phase: Phase,
+    at: u32,
+    blocks: Option<u32>,
+    cells: bool,
+    mask: Vec<u32>,
+}
+
+/// What [`NotesItsRows`] noted, in the order it was asked.
+type Notes = Arc<parking_lot::Mutex<Vec<Noted>>>;
+
+/// A filter that keeps every row and notes what it was handed with it.
+#[derive(Debug)]
+struct NotesItsRows {
+    notes: Notes,
+    soft: bool,
+}
+
+impl framework::Filter for NotesItsRows {
+    fn name(&self) -> &'static str {
+        "notes-its-rows"
+    }
+
+    fn keep(&self, facts: &RequestFacts<'_>, row: &Candidate, cx: &Constraints<'_>) -> bool {
+        let entry = facts.affinity.get(row.position as usize);
+        self.notes.lock().push(Noted {
+            phase: facts.phase,
+            at: row.position,
+            blocks: entry.map(|of| of.overlap_blocks),
+            cells: facts.signal_cells.is_some(),
+            mask: cx.stalled.to_vec(),
+        });
+        true
+    }
+
+    fn soft(&self) -> bool {
+        self.soft
+    }
+}
+
+/// Puts [`NotesItsRows`] on `engine`'s decode profile and on its encode
+/// profile, and answers what it notes. On the encode profile it is soft:
+/// the pass that opens the encoders asks the hard filters alone, so a key's
+/// run alone asks it there, over the encoders offered.
+fn noting(engine: &mut Engine) -> Notes {
+    let notes = Notes::default();
+    let binding = engine.binding("m", Phase::Prefill).expect("the binding");
+    let Plan::Epd { encode } = binding.plan else {
+        panic!("the epd plan");
+    };
+    let decode = binding.decode_profile.unwrap_or(binding.profile);
+    for (profile, soft) in [(decode, false), (encode, true)] {
+        let profile = usize::from(profile);
+        let filter = NotesItsRows {
+            notes: Arc::clone(&notes),
+            soft,
+        };
+        let filters = &mut own(&mut engine.profiles[profile]).filters;
+        filters.push(Box::new(filter));
+        engine.marks[profile] =
+            framework::Marks::of(&engine.profiles[profile], engine.orders[profile]);
+    }
+    notes
+}
+
+/// What the stages of `phase` noted of each row they were asked.
+fn noted_under(notes: &Notes, phase: Phase) -> Vec<Noted> {
+    let notes = notes.lock();
+    let of_phase = notes.iter().filter(|note| note.phase == phase);
+    of_phase.cloned().collect()
 }

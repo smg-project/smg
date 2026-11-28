@@ -56,7 +56,7 @@ clock, a lease's issue instant), and each file's comments name them.
   names the module's version and the accepted range.
 - Both are pre-release until the first shipped release that carries them; the
   rules above bind from then on.
-- `tests/contracts.rs` pins the names: the RPC list of each service with its
+- `tests/plugin/contracts.rs` pins the names: the RPC list of each service with its
   streaming shape, the cases of every `oneof`, the worlds, the interfaces and
   their functions, and the package names and versions. An additive change
   extends a list there on purpose; a removal or a rename fails the test.

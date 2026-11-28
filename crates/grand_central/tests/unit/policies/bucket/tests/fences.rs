@@ -1,5 +1,5 @@
-//! The fence on a worker that left. A view older than the leave lists
-//! it nowhere, until the feed names it again or the fence lapses.
+//! The fence on a leaver. A view older than the leave lists a fenced
+//! worker nowhere, until the feed names it again or the fence lapses.
 
 use super::*;
 

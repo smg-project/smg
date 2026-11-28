@@ -230,6 +230,19 @@ fn a_shed_is_written_with_its_reason_and_no_unset_option() {
     assert_eq!(json["decision"]["queue"], wanted);
 }
 
+/// A shed's record that holds the worker its binding's shadow picked
+/// writes that worker in the trace, as a pick's record does.
+#[test]
+fn a_sheds_record_writes_the_worker_its_shadow_picked() {
+    let spec = standing();
+    let before = SystemTime::now();
+    let mut kept = record(shed(), None);
+    kept.shadow_target = Some(WorkerId(11));
+    let json = written(&kept, &spec, before);
+    assert!(json["decision"]["shed"].is_object(), "{json}");
+    assert_eq!(json["decision"]["trace"]["shadow_pick"], "11", "{json}");
+}
+
 /// A score that is no number has no JSON form: its row is written without
 /// the name, beside a row whose score is one.
 #[test]

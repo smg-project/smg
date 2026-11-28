@@ -1,6 +1,6 @@
 //! The typed decision (design 4.2): an ordered list of targets the host walks
-//! at dispatch, a shed with its reason and the stage that emptied the pool, or
-//! a queue ticket. A busy answer is not a decision: a remote decider gives it
+//! at dispatch, a shed with its reason and the stage it is named by, or a
+//! queue ticket. A busy answer is not a decision: a remote decider gives it
 //! on its stream and the host's fallback takes over at once, so the enum
 //! never carries one.
 
@@ -392,7 +392,10 @@ pub enum ShedReason {
 /// decision that drew first ([`Trace::drew_first`]) asked the filters about
 /// the rows it drew alone and holds no count of the pool: [`Survivors::get`]
 /// answers `None` there, never a zero, and a reader prints the word, not a
-/// number. The default is a count of zero.
+/// number. A pair decided by each side's draw is no such decision: its draw
+/// is asked only where the whole pass keeps every row, and it writes the
+/// count that pass writes, the size of its prefill list. The default is a
+/// count of zero.
 ///
 /// The count and its absence are one word of the record, written by one
 /// store as the bare count was: a trace that says whether it counted is the
@@ -549,7 +552,10 @@ impl Trace {
     /// is of the rows drawn. A decision by the rows its key names carries
     /// the mark with no draw, a pin followed or a ring walked
     /// ([`Engine::decide_keyed`](crate::engine::Engine::decide_keyed)): no
-    /// pass ran for it either, and `top` is of the rows it hands out.
+    /// pass ran for it either, and `top` is of the rows it hands out. A
+    /// pair decided by each side's draw does not carry it: that draw stands
+    /// for a pass that keeps every row, and the trace holds the count that
+    /// pass writes.
     pub const fn drew_first(&self) -> bool {
         self.survivors.get().is_none()
     }
@@ -898,32 +904,72 @@ impl Pick {
 #[non_exhaustive]
 pub struct Shed {
     pub reason: ShedReason,
-    /// The name of the filter or picker that left nothing.
+    /// The name of the filter or picker that left nothing. A pair's shed
+    /// as saturated over whole lists names the overload veto, whichever
+    /// stage ended its pass: the list judged is wholly over its
+    /// thresholds. A pair's shed
+    /// with no endpoint behind a pass that the overload veto ended names
+    /// the stage that refused a worker with room of the list judged: the
+    /// first such worker in the list's order, and where none has room the
+    /// first ready one, or the list's first where none is ready. A list
+    /// that holds no worker names `partnered`
+    /// ([`Engine::decide_pair`](crate::engine::framework::Engine::decide_pair)).
     pub emptied_by: &'static str,
     pub retry_after_secs: u16,
     /// The binding's scale-from-zero budget lets the host hold the request.
     pub wait_allowed: bool,
-    /// The side of a pair this refusal is for: a host answers for that
-    /// role, as the gateway's own pair selection names a role in every
-    /// refusal. A decision fills it by its own list, the one its stages
-    /// left with nobody. The prefill side where no prefill passed its own
-    /// stages, where the prefill's own run declined, and where the
-    /// prefills stand at their admission limit. The decode side where the
-    /// prefills that passed had no decode to pair with, and where the
-    /// decode's run refused. A decode decided again names the decode
-    /// side, and the prefill side where the held prefill left its list.
-    /// Two refusals name the side of the list that selection judges
-    /// instead. A pair whose named worker's number reaches nobody
-    /// (`target-worker`) names the side it reaches nobody on, the
-    /// prefills' first. A call's shed that stands behind a route's rule
-    /// names the prefill side where none of the rule's prefills can take
-    /// the request, whichever list the decision said. An encode request
-    /// names the side of its pair that a hard demand left nobody, as its
-    /// pair alone does. `None` for a single decision, for a pair refused
+    /// The side of a pair this refusal is for: the role the gateway's own
+    /// pair selection names in the same refusal, for which a host
+    /// answers. The prefill side where the prefill's own run declined,
+    /// and where the prefills stand at their admission limit. Where the
+    /// prefill side places nobody else, the side is read in that
+    /// selection's order: the prefill side for a prefill pool that holds
+    /// no worker; the decode side where no prefill of the pool pairs with
+    /// any decode, a decode pool that holds no worker among them; the
+    /// decode side where a prefill that pairs with a decode stands as it
+    /// is, its admission limit aside; and else the prefill side
+    /// ([`Engine::decide_pair`](crate::engine::framework::Engine::decide_pair)).
+    /// That order is read over the pools the decision is handed. Two
+    /// cuts are made ahead of it: over lists that both hold a worker, a
+    /// request whose hard demand no worker of a list meets is refused
+    /// for that list's side, the prefills' first, and an encode
+    /// request's pass hands the decision the prefills an open encoder
+    /// serves, so a pool it leaves nobody reads as one that holds no
+    /// worker. Where both lists hold a worker and no prefill pairs with
+    /// any decode, both part from that selection, which asks the
+    /// pairing first: the design names the two open. A demand's cut
+    /// parts from it too where a pair stands only among the workers the
+    /// demand left out.
+    /// The decode side too where the prefill was picked and the decode's
+    /// run refused. A decode decided again names the decode side where
+    /// its own run refused, and the prefill side where the held prefill
+    /// left its list. A pair whose
+    /// named worker's number reaches nobody (`target-worker`) names the
+    /// side it reaches nobody on, the prefills' first. A pair whose named
+    /// workers cannot be sent to after all names the decode side where a
+    /// pair of the call's last decision lost its decode alone, and the
+    /// prefill side otherwise: that selection asks the prefill first. It
+    /// names none where the route's rule is asked then and takes no worker
+    /// of a list: the call ends on the rule's refusal. A call's shed as
+    /// saturated that stands behind a route's rule names the side of the
+    /// list that selection judges among the rule's workers: the prefill
+    /// side where none of the rule's prefills can take the request,
+    /// whichever list the decision said. An encode request's refusal for
+    /// a hard demand names a side as its pair's alone does: over lists
+    /// that both hold a worker the side the demand left nobody, and where
+    /// a list of its pair holds no worker that list's side instead. A
+    /// refusal of its pair's own decision keeps that decision's side.
+    /// `None` for a single decision, for a pair refused
     /// before either side was read, for an encode request's other
-    /// refusals of its own pass (for its encoders, for the pairs they
-    /// serve, for a list's places), and for a refusal that came over a
-    /// link: the protocol's message has no field for it.
+    /// refusals of its own pass (ahead of either side's read, for its
+    /// encoders or an item, for the pairs they serve, for the decodes
+    /// that take its images, for a list's places), for a call's shed
+    /// with no endpoint that stands
+    /// behind a route's rule, whose lists the rule narrowed, and for a
+    /// refusal that came over a link: the protocol's message has no field
+    /// for it. A shed made where no prefill of the lists pairs with any
+    /// decode keeps its side under a route's rule: the rule is not asked
+    /// behind it.
     pub side: Option<PairSide>,
     pub trace: Trace,
 }
@@ -967,9 +1013,8 @@ impl Decision {
         }
     }
 
-    /// This decision, its refusal naming the side of a pair that was left
-    /// with nobody ([`Shed::side`]). A pick and a queue ticket pass as they
-    /// are.
+    /// This decision, its refusal naming the side of a pair it is for
+    /// ([`Shed::side`]). A pick and a queue ticket pass as they are.
     #[must_use]
     pub(crate) fn of_side(mut self, side: PairSide) -> Self {
         if let Self::Shed(shed) = &mut self {
@@ -1056,13 +1101,6 @@ pub(crate) const WIRES: &str = "wires";
 
 /// The stage a decision is shed under when its gateway hints a subset of 0
 /// of a pool that has rows: a decision over no candidates, as it asked.
-#[cfg_attr(
-    not(feature = "in-process"),
-    expect(
-        dead_code,
-        reason = "the deciders that shed under it are built under `in-process`"
-    )
-)]
 pub(crate) const SUBSET_HINT: &str = "subset-hint";
 
 /// The stage a request is answered under for the places it is held to
@@ -1082,8 +1120,171 @@ pub(crate) const PLACES: &str = "places";
 /// a controller's served decision. A pair's decision is shed under it
 /// where the number its decode side states reaches no row
 /// ([`Constraints::target_worker`](crate::engine::view::Constraints::target_worker)),
-/// and declined under it where the number stands beside no places.
-pub(crate) const TARGET_WORKER: &str = "target-worker";
+/// and declined under it where the number stands beside no places. A
+/// caller that reads the name answers a shed under it as a decline,
+/// whatever its reason.
+pub const TARGET_WORKER: &str = "target-worker";
+
+/// The name a request is declined under ([`ShedReason::PolicyDeclined`])
+/// where the spec in force binds no plan of the request's kind for its
+/// model. A caller that reads the name may answer that no retry changes
+/// it.
+pub const BINDING: &str = "binding";
+
+/// The stage a pool is shed under when none of its rows takes the pixels
+/// its request holds, an image or a video: the `epd` plan's vision rule
+/// sheds under it, and so does a request's vision demand
+/// ([`UnmetDemand::Vision`](crate::engine::demands::UnmetDemand::Vision)).
+pub(crate) const VISION: &str = "vision";
+
+/// The stage a pool is shed under when none of its rows processes media by
+/// reference
+/// ([`UnmetDemand::References`](crate::engine::demands::UnmetDemand::References)).
+pub(crate) const REFERENCES: &str = "references";
+
+/// The stage a pool is shed under when its rows that process media by
+/// reference all run the other pipeline than the request names
+/// ([`UnmetDemand::Pipeline`](crate::engine::demands::UnmetDemand::Pipeline)).
+pub(crate) const PIPELINE: &str = "pipeline";
+
+/// The stage a pool is shed under when each of its rows states a context
+/// window that holds less than the request needs
+/// ([`UnmetDemand::Window`](crate::engine::demands::UnmetDemand::Window)).
+pub(crate) const CONTEXT_WINDOW: &str = "context-window";
+
+/// The stage a pool is shed under when none of its rows decides a
+/// constraint as the request's was decided
+/// ([`UnmetDemand::Decoding`](crate::engine::demands::UnmetDemand::Decoding)).
+pub(crate) const DECODING: &str = "decoding";
+
+/// The stage a decision names when it is refused for its affinity column:
+/// what a host counts its sheds under.
+pub(crate) const AFFINITY_COLUMN: &str = "affinity-column";
+
+/// The stage a decision names when a profile that shows its rows to a
+/// plugin was handed rows that carry a mask beside them.
+pub(crate) const WRITTEN_ROWS: &str = "written-rows";
+
+/// The crate's word, in a shed's `emptied_by`, for a pool no stage emptied.
+pub(crate) const NO_STAGE: &str = "none";
+
+/// The stage a pair is shed under where no row of a side is of a class
+/// that pairs with the other side's: a picked prefill no decode pairs with.
+pub(crate) const PARTNERS: &str = "partners";
+
+/// The stage a pair's decision names where the workers left pair with
+/// nobody that stands: a prefill side narrowed to the classes with an open
+/// partner that keeps no row (the framework's `filter`), prefills that
+/// stand and pair with no decode, and a shed with no endpoint whose worker
+/// with room pairs with nobody (the framework's `Half::refused_room`).
+pub(crate) const PARTNERED: &str = "partnered";
+
+/// The stage a decode asked again is shed under where the prefill its call
+/// holds left the lists.
+pub(crate) const PREFILL_GONE: &str = "prefill-gone";
+
+/// The stage named when no encoder is open for the request though one that
+/// takes it is registered, or when none is registered at all: a retry may
+/// find one. Where the overload veto left none open under a binding that
+/// sheds, the veto's own stage, `not-overloaded`, is named in its stead.
+pub(crate) const ENCODERS: &str = "encoders";
+
+/// The stage named when the request holds pixels, an image or a video, and
+/// none of the registered encoders that would take it otherwise takes
+/// images. A demand for vision the request states is the same test.
+pub(crate) const ENCODE_VISION: &str = "encode-vision";
+
+/// The stage named when no registered encoder hands to a prefill of a pair:
+/// a pushing encoder states no role, or no prefill states its end.
+pub(crate) const EC_COMPATIBLE: &str = "ec-compatible";
+
+/// The stage named when no registered encoder takes the request's media,
+/// by the request's own facts or by the media a demand of it names.
+pub(crate) const ENCODE_MEDIA: &str = "encode-media";
+
+/// The stage named when the decode must take images and no decode of a pair
+/// an encoder serves does.
+pub(crate) const DECODE_VISION: &str = "decode-vision";
+
+/// The stage named when a column of the encode pool is not one entry a row.
+pub(crate) const ENCODE_COLUMN: &str = "encode-column";
+
+/// The stage named when a request with items meets an encode profile that
+/// shows its rows to a plugin: no scope is opened over the encoders offered
+/// to a key.
+pub(crate) const ENCODE_SCOPE: &str = "encode-scope";
+
+/// What a request that states the later decode is declined under where its
+/// decode is held to the ones that take images, by its demand or by
+/// references beside an image or a video: a decode asked again takes no
+/// items, so nothing there holds it to a decode that takes images. So is
+/// one that leaves a part of its hard demand to its encoders: a decode
+/// asked again would hold the decode to the whole.
+pub(crate) const DECODE_LATER: &str = "decode-later";
+
+/// What a request that carries encode items over other lists than an
+/// encode request's three is declined under: no list of it holds an encoder.
+pub(crate) const ENCODE_ITEMS: &str = "encode-items";
+
+/// What a request is shed under where its route's rule takes no worker of
+/// its list: the rule's own name on a request (`PlaceRequest::admits`). A
+/// pair's first decision's shed as saturated is the answer in its place
+/// where that shed stands.
+pub(crate) const ADMITS: &str = "admits";
+
+/// What a request is shed under where its call's earlier decisions left
+/// none of its budget (`PlaceRequest::budget_micros`).
+pub(crate) const BUDGET: &str = "budget";
+
+/// What a shed reads under at a gateway that asks a controller, where the
+/// name the controller answered under is no stage of a demand: the
+/// client's door keeps a demand's stage by its name and reads every other
+/// name as this one.
+pub(crate) const CONTROLLER: &str = "controller";
+
+/// Every name the engine refuses under by itself: its own words in a
+/// shed's `emptied_by`, beside the names of the stages. Each place that
+/// refuses under one reads its constant here. The registry takes a host's
+/// stage of such a name, and the validator refuses a document that names
+/// it, and at the name it answers
+/// [`SpecError::BadStage`](crate::document::SpecError::BadStage): no
+/// document runs a stage registered under one. A stage can still bear
+/// such a name in ways the validator does not see. Three are known: a
+/// profile a host builds in code, a plain factory whose later build
+/// answers another name than it registered under, and a stage that
+/// answers one name where the registry or the validator asks it and
+/// another at a decision. Under [`CONTROLLER`] the client's door also
+/// reads a stage of the controller's own document.
+pub(crate) const KEPT: [&str; 28] = [
+    WIRES,
+    SUBSET_HINT,
+    PLACES,
+    TARGET_WORKER,
+    BINDING,
+    VISION,
+    REFERENCES,
+    PIPELINE,
+    CONTEXT_WINDOW,
+    DECODING,
+    AFFINITY_COLUMN,
+    WRITTEN_ROWS,
+    NO_STAGE,
+    PARTNERS,
+    PARTNERED,
+    PREFILL_GONE,
+    ENCODERS,
+    ENCODE_VISION,
+    EC_COMPATIBLE,
+    ENCODE_MEDIA,
+    DECODE_VISION,
+    ENCODE_COLUMN,
+    ENCODE_SCOPE,
+    DECODE_LATER,
+    ENCODE_ITEMS,
+    ADMITS,
+    BUDGET,
+    CONTROLLER,
+];
 
 /// A shed the deciders say in the engine's place, in the shape of the
 /// engine's own.

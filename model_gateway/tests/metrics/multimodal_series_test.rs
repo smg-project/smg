@@ -2,7 +2,9 @@
 //! buckets (not summaries), carrying what the record calls say.
 //!
 //! The recorder is this binary's, installed once for all its tests (see
-//! `recorder()` in the group's `mod.rs`).
+//! `recorder()` in the group's `mod.rs`). A case reads a sample, and the
+//! absence of one, under its own model: another case's request writes
+//! series of the same families.
 
 use std::time::Duration;
 
@@ -129,7 +131,7 @@ fn the_media_pipeline_families_render_as_histograms_with_their_values() {
     assert!(
         !items
             .iter()
-            .any(|line| line.contains("source=\"data_url\"")),
+            .any(|line| line.contains(image[0]) && line.contains("source=\"data_url\"")),
         "a zero count makes no series:\n{}",
         items.join("\n")
     );
@@ -170,7 +172,7 @@ fn the_media_pipeline_families_render_as_histograms_with_their_values() {
     assert!(
         !bytes
             .iter()
-            .any(|line| line.contains("source=\"data_url\"")),
+            .any(|line| line.contains(image[0]) && line.contains("source=\"data_url\"")),
         "a failed fetch brought no bytes:\n{}",
         bytes.join("\n")
     );

@@ -70,7 +70,7 @@ use crate::{
     store::{
         applied::Applied,
         workers::{WorkerFacts, WorkerRow},
-        GatewayId,
+        GatewayId, StaleGeneration,
     },
     tracking::in_flight::{InFlightCounts, WorkerSlot},
 };
@@ -457,17 +457,6 @@ impl Vetoes {
     }
 }
 
-/// Why a generation was not applied: its number is not above the standing
-/// one. The store's number only rises.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("generation {offered} is not above the standing generation {standing}")]
-pub struct StaleGeneration {
-    /// The number of the generation the store holds.
-    pub standing: u64,
-    /// The number of the generation that was offered.
-    pub offered: u64,
-}
-
 /// How many members of the standing membership name an engine family or a
 /// zone that the standing generation's list, which holds entries, does not
 /// hold: each reads position 0 in that field. Counted wherever the members
@@ -848,13 +837,6 @@ impl Writer {
     /// can give the same id and revision different facts.
     pub(super) fn clear_listed(&mut self) {
         self.listed.clear();
-    }
-
-    /// How many members' reads under the standing generation's lists are
-    /// kept ([`Self::list`], [`Self::relist`]).
-    #[cfg(all(test, feature = "operator"))]
-    pub(super) fn listed(&self) -> usize {
-        self.listed.len()
     }
 
     /// What the members of a membership build read under the standing

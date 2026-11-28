@@ -53,9 +53,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # The default build: with `tokenizers-v1` the opt-in pipeline serves
+          # this bench's encodes, and the encoder a default build ships is not
+          # measured.
           - bench: tokenizer_benchmark
             package: smg
-            features: tokenizers-v1
+            features: ''
             gates: tokenizer.toml
             cwd: model_gateway
             artifact: tokenizer-results

@@ -577,6 +577,7 @@ fn a_pin_outside_the_places_stands_and_the_worker_picked_is_claimed_beside_it() 
             sweep_micros: 10_000_000,
             recovery,
             rule_placed: RulePlaced::Told,
+            sides: Default::default(),
         };
         let profile = bare("random", vec![], Box::new(Random));
         let binding = Binding {

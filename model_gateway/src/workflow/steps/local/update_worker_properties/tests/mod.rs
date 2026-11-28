@@ -807,6 +807,208 @@ async fn an_update_is_dropped_for_a_worker_replaced_or_removed_since_it_was_foun
     );
 }
 
+/// A removal's `Draining` mark stands until the removal takes the worker:
+/// a connect signal queued before the mark, an update of a worker whose
+/// health checks are off, and the late activation of a registration whose
+/// worker was replaced since each made the worker `Ready` inside its drain.
+/// A registration of the URL alone starts its worker without the mark,
+/// `Pending`.
+#[tokio::test]
+async fn a_draining_worker_is_put_back_into_service_by_no_other_writer() {
+    use smg_worker::health::port::HealthSink;
+
+    use crate::workflow::{
+        data::WorkerRegistrationMode,
+        steps::{create_worker_workflow_data, ActivateWorkersStep},
+    };
+
+    let url = "http://w:8000";
+    let found: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .status(WorkerStatus::Ready)
+            .build(),
+    );
+    let app_ctx = make_app_context(std::slice::from_ref(&found));
+    let registry = &app_ctx.worker_registry;
+    let id = registry.get_id_by_url(url).unwrap();
+    let queued = found.revision();
+    registry.transition_status(&id, WorkerStatus::Draining);
+    let status = || registry.get(&id).unwrap().status();
+
+    // A status change moves no revision: a signal queued before the mark
+    // still matches.
+    assert_eq!(registry.connected(&id, queued), None);
+    assert_eq!(status(), WorkerStatus::Draining, "after the connect signal");
+
+    let mut update = make_context(Arc::clone(&app_ctx), Arc::clone(&found), HashMap::new());
+    UpdateWorkerPropertiesStep
+        .execute(&mut update)
+        .await
+        .unwrap();
+    assert_eq!(status(), WorkerStatus::Draining, "after the update");
+
+    // The registration still holds the worker the update rebuilt under it.
+    let mut data = create_worker_workflow_data(
+        WorkerSpec::new(url),
+        WorkerRegistrationMode::CreateOnly,
+        Arc::clone(&app_ctx),
+        WorkerJobAsker::Api,
+    );
+    data.actual_workers = Some(vec![Arc::clone(&found)]);
+    let mut registration = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    ActivateWorkersStep
+        .execute(&mut registration)
+        .await
+        .unwrap();
+    assert_eq!(status(), WorkerStatus::Draining, "after the activation");
+
+    registry.register_or_replace_clearing_drain(Arc::new(BasicWorkerBuilder::new(url).build()));
+    assert_eq!(status(), WorkerStatus::Pending, "after a registration");
+}
+
+/// The last step of a registration reaches the worker an update rebuilt
+/// under its id since the registry write: the activation goes through the
+/// registry, by the id that stands under the URL, and is published as a
+/// `StatusChanged` event for that id.
+#[tokio::test]
+async fn an_activation_reaches_the_worker_an_update_rebuilt_since() {
+    use smg_worker::registry::event::WorkerEvent;
+
+    use crate::workflow::{
+        data::WorkerRegistrationMode,
+        steps::{create_worker_workflow_data, ActivateWorkersStep},
+    };
+
+    let url = "http://w:8000";
+    let found: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .status(WorkerStatus::Pending)
+            .build(),
+    );
+    let app_ctx = make_app_context(std::slice::from_ref(&found));
+    let registry = &app_ctx.worker_registry;
+    let id = registry.get_id_by_url(url).unwrap();
+
+    let mut update = make_context(Arc::clone(&app_ctx), Arc::clone(&found), HashMap::new());
+    UpdateWorkerPropertiesStep
+        .execute(&mut update)
+        .await
+        .unwrap();
+    let rebuilt = registry.get(&id).unwrap();
+    assert!(
+        !Arc::ptr_eq(&rebuilt, &found),
+        "the update rebuilt the worker"
+    );
+    assert_eq!(rebuilt.status(), WorkerStatus::Pending, "after the update");
+
+    let mut data = create_worker_workflow_data(
+        WorkerSpec::new(url),
+        WorkerRegistrationMode::CreateOnly,
+        Arc::clone(&app_ctx),
+        WorkerJobAsker::Api,
+    );
+    data.actual_workers = Some(vec![Arc::clone(&found)]);
+    let mut registration = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    let mut events = registry.subscribe_events();
+    ActivateWorkersStep
+        .execute(&mut registration)
+        .await
+        .unwrap();
+    assert_eq!(
+        rebuilt.status(),
+        WorkerStatus::Ready,
+        "after the activation"
+    );
+    let published = std::iter::from_fn(|| events.try_recv().ok()).find_map(|event| match event {
+        WorkerEvent::StatusChanged {
+            worker_id,
+            old_status,
+            new_status,
+            ..
+        } => Some((worker_id, old_status, new_status)),
+        _ => None,
+    });
+    assert_eq!(
+        published,
+        Some((id, WorkerStatus::Pending, WorkerStatus::Ready)),
+        "the activation is published"
+    );
+}
+
+/// A registration of the URL over a worker its removal drains: the new
+/// worker starts without the mark, its activation puts it in service, and
+/// the removal, pinned to the worker it drained, leaves it.
+#[tokio::test]
+async fn a_registration_over_a_draining_worker_serves_again_and_outlives_the_removal() {
+    use smg_worker::workflow::RemoveFromWorkerRegistryStep;
+
+    use crate::workflow::{
+        data::WorkerRegistrationMode,
+        steps::{
+            create_worker_removal_workflow_data, create_worker_workflow_data, ActivateWorkersStep,
+            RegisterWorkersStep,
+        },
+    };
+
+    let url = "http://w:8000";
+    let found: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .status(WorkerStatus::Ready)
+            .build(),
+    );
+    let app_ctx = make_app_context(std::slice::from_ref(&found));
+    let registry = &app_ctx.worker_registry;
+    let id = registry.get_id_by_url(url).unwrap();
+    // The removal's selection, then its drain step.
+    let pinned = found.revision();
+    registry.transition_status(&id, WorkerStatus::Draining);
+    let status = || registry.get(&id).unwrap().status();
+
+    let listed: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new(url).build());
+    let mut data = create_worker_workflow_data(
+        WorkerSpec::new(url),
+        WorkerRegistrationMode::Upsert,
+        Arc::clone(&app_ctx),
+        WorkerJobAsker::Discovery,
+    );
+    data.actual_workers = Some(vec![Arc::clone(&listed)]);
+    let mut registration = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    RegisterWorkersStep
+        .execute(&mut registration)
+        .await
+        .unwrap();
+    assert_eq!(status(), WorkerStatus::Pending, "after the registration");
+    ActivateWorkersStep
+        .execute(&mut registration)
+        .await
+        .unwrap();
+    assert_eq!(status(), WorkerStatus::Ready, "after its activation");
+
+    let mut data = create_worker_removal_workflow_data(
+        url.to_string(),
+        Some(HashMap::from([(id.as_str().to_string(), Some(pinned))])),
+        Arc::clone(&app_ctx),
+        WorkerJobAsker::Discovery,
+    );
+    data.worker_urls = vec![url.to_string()];
+    data.actual_workers_to_remove = Some(vec![Arc::clone(&found)]);
+    let mut removal = WorkflowContext::new(WorkflowInstanceId::new(), data);
+    RemoveFromWorkerRegistryStep
+        .execute(&mut removal)
+        .await
+        .unwrap();
+    let standing = registry.get(&id).expect("the removal leaves the worker");
+    assert!(
+        Arc::ptr_eq(&standing, &listed),
+        "the worker under the id is the registration's"
+    );
+    assert_eq!(standing.status(), WorkerStatus::Ready, "after the removal");
+}
+
 #[tokio::test]
 async fn pd_update_preserves_connector_and_pair_descriptor() {
     for (connector, mode, protocol, transport, pair_key, expected_mode) in [
@@ -1809,4 +2011,171 @@ async fn a_refresh_fills_the_fields_an_empty_registration_label_left_unset() {
         Some("MooncakeConnector")
     );
     assert!(!rebuilt.metadata().spec.labels.contains_key("kv_role"));
+}
+
+/// A gRPC worker a gateway-shaped grammar reaches (its role generates tokens
+/// and its runtime's request carries a constraint), over `labels` with
+/// `discovered` on record as the engine's read.
+fn grpc_worker_a_grammar_reaches(
+    url: &str,
+    labels: HashMap<String, String>,
+    discovered: HashMap<String, String>,
+) -> Arc<dyn Worker> {
+    Arc::new(
+        BasicWorkerBuilder::new(url)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Vllm)
+            .labels(labels)
+            .discovered_labels(discovered)
+            .status(WorkerStatus::Ready)
+            .build(),
+    )
+}
+
+/// One label refresh of the worker registered at `url` with the report
+/// `fresh`; the worker the registry holds behind it.
+async fn refreshed_with(
+    app_ctx: &Arc<AppContext>,
+    url: &str,
+    fresh: &HashMap<String, String>,
+) -> Arc<dyn Worker> {
+    let worker = app_ctx
+        .worker_registry
+        .get_by_url(url)
+        .expect("the worker is registered");
+    let mut refresh = make_refresh_context(Arc::clone(app_ctx), worker, fresh.clone());
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
+    app_ctx
+        .worker_registry
+        .get_by_url(url)
+        .expect("the worker stays registered")
+}
+
+/// The count of grammar start warnings among the captured log `lines`.
+fn grammar_start_warnings(lines: &[&str]) -> usize {
+    lines
+        .iter()
+        .filter(|line| line.contains("names no constrained_decoding_start label"))
+        .count()
+}
+
+/// A label refresh that takes a worker's grammar start away says so once, in
+/// the words of a registration: the engine named a start and names none now.
+/// The same report again says nothing more, and neither does a report that
+/// names a start.
+#[tokio::test]
+#[traced_test]
+async fn a_label_refresh_warns_once_of_a_grammar_start_the_engine_stops_naming() {
+    const URL: &str = "grpc://start-lost:9000";
+    const START: &str = "constrained_decoding_start";
+    let named = labels_of(&[("page_size", "128"), (START, "after_reasoning")]);
+    let worker = grpc_worker_a_grammar_reaches(URL, named.clone(), named);
+    let app_ctx = make_app_context(std::slice::from_ref(&worker));
+    let silent = labels_of(&[("page_size", "128")]);
+
+    let rebuilt = refreshed_with(&app_ctx, URL, &silent).await;
+    assert!(!rebuilt.metadata().spec.labels.contains_key(START));
+    logs_assert(|lines: &[&str]| match grammar_start_warnings(lines) {
+        1 => Ok(()),
+        n => Err(format!(
+            "one warning at the refresh that takes the start, not {n}"
+        )),
+    });
+
+    refreshed_with(&app_ctx, URL, &silent).await;
+    logs_assert(|lines: &[&str]| match grammar_start_warnings(lines) {
+        1 => Ok(()),
+        n => Err(format!(
+            "the same report again adds no warning, yet {n} stand"
+        )),
+    });
+
+    let names_one = labels_of(&[("page_size", "128"), (START, "first_token")]);
+    let rebuilt = refreshed_with(&app_ctx, URL, &names_one).await;
+    assert_eq!(
+        rebuilt
+            .metadata()
+            .spec
+            .labels
+            .get(START)
+            .map(String::as_str),
+        Some("first_token")
+    );
+    logs_assert(|lines: &[&str]| match grammar_start_warnings(lines) {
+        1 => Ok(()),
+        n => Err(format!(
+            "a report that names a start adds no warning, yet {n} stand"
+        )),
+    });
+}
+
+/// A worker registered on a read that found nothing was not warned of, for
+/// its engine had named nothing yet. The first refresh that reads its engine
+/// and finds no start owes the warning, once: not again when the same report
+/// comes back, nor at a later report that still names no start.
+#[tokio::test]
+#[traced_test]
+async fn a_worker_registered_unread_is_warned_at_its_first_refresh_without_a_grammar_start() {
+    const URL: &str = "grpc://unread:9000";
+    let worker = grpc_worker_a_grammar_reaches(URL, HashMap::new(), HashMap::new());
+    let app_ctx = make_app_context(std::slice::from_ref(&worker));
+    let silent = labels_of(&[("page_size", "128")]);
+
+    let rebuilt = refreshed_with(&app_ctx, URL, &silent).await;
+    assert_eq!(*rebuilt.metadata().discovered_labels, silent);
+    logs_assert(|lines: &[&str]| match grammar_start_warnings(lines) {
+        1 => Ok(()),
+        n => Err(format!(
+            "one warning at the first refresh that names no start, not {n}"
+        )),
+    });
+
+    refreshed_with(&app_ctx, URL, &silent).await;
+    refreshed_with(&app_ctx, URL, &labels_of(&[("page_size", "256")])).await;
+    logs_assert(|lines: &[&str]| match grammar_start_warnings(lines) {
+        1 => Ok(()),
+        n => Err(format!(
+            "a later refresh of the same state adds no warning, yet {n} stand"
+        )),
+    });
+}
+
+/// A refresh the registry drops writes no warning: the worker changed while
+/// its engine was read, and it stays as the newer registration holds it, its
+/// grammar start included.
+#[tokio::test]
+#[traced_test]
+async fn a_dropped_label_refresh_does_not_warn_of_a_grammar_start() {
+    const URL: &str = "grpc://start-kept:9000";
+    const START: &str = "constrained_decoding_start";
+    let named = labels_of(&[("page_size", "128"), (START, "after_reasoning")]);
+    let worker = grpc_worker_a_grammar_reaches(URL, named.clone(), named);
+    let app_ctx = make_app_context(std::slice::from_ref(&worker));
+    let silent = labels_of(&[("page_size", "128")]);
+    let mut refresh = make_refresh_context(Arc::clone(&app_ctx), Arc::clone(&worker), silent);
+    // An update lands while the engine is read: the registry replaces the
+    // worker, and the snapshot of the refresh is stale.
+    let id = app_ctx.worker_registry.get_id_by_url(URL).unwrap();
+    let patched: Arc<dyn Worker> = Arc::new(
+        worker
+            .as_any()
+            .downcast_ref::<BasicWorker>()
+            .expect("a BasicWorker")
+            .clone(),
+    );
+    assert!(app_ctx.worker_registry.replace(&id, patched));
+    step_succeeds(UpdateWorkerPropertiesStep.execute(&mut refresh).await);
+    let kept = app_ctx
+        .worker_registry
+        .get_by_url(URL)
+        .expect("the worker stays registered");
+    assert_eq!(
+        kept.metadata().spec.labels.get(START).map(String::as_str),
+        Some("after_reasoning"),
+        "a stale snapshot is not written back"
+    );
+    logs_assert(|lines: &[&str]| match grammar_start_warnings(lines) {
+        0 => Ok(()),
+        n => Err(format!("a dropped refresh wrote {n} warnings")),
+    });
 }

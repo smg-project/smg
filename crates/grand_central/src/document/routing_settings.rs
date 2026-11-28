@@ -2,11 +2,6 @@
 //! the types it is made of, and why some settings have no document
 //! ([`RoutingSettingsError`]).
 
-#![expect(
-    clippy::exhaustive_structs,
-    reason = "a caller still builds or matches these types whole: each mark comes with its call"
-)]
-
 mod translation;
 
 use std::collections::BTreeMap;
@@ -150,7 +145,16 @@ use crate::{
 /// which need not be that key, so the pin is refused beside one. The copy
 /// of the cache boundaries at the top of the configuration decides nothing
 /// either: each policy reads its own.
+///
+/// The record is closed, so a gateway can name every setting in one literal:
+/// a setting that joins then stops its build until the gateway states it. A
+/// literal that takes the rest from the default leaves a new setting out by
+/// silence, and it decides by this crate's default with no word.
 #[derive(Clone, Debug, PartialEq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "closed by its doc: a literal with no rest stops its build at a new setting"
+)]
 pub struct RoutingSettings {
     /// The kinds of worker the gateway routes to, with each side's own policy.
     pub mode: ModeSettings,
@@ -270,7 +274,14 @@ pub enum ConnectionModeSetting {
 }
 
 /// The settings of the sticky override this module reads.
+///
+/// The record is closed, as the settings that hold it are: a literal of it
+/// with no rest stops its build at a field that joins.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::exhaustive_structs,
+    reason = "closed by its doc: a literal with no rest stops its build at a new setting"
+)]
 pub struct RoutingKeyOverrideSettings {
     /// A request that carries a sticky key is placed by the sticky sessions'
     /// rule, whatever the policy.
@@ -656,9 +667,9 @@ impl RoutingSettings {
     /// binding with an encode side.
     ///
     /// The manual policy on both sides of a pair runs under the plan of
-    /// three sides, and under the encode mode's own plan: its rule places
+    /// three sides, and under the encode mode's own plan. Its rule places
     /// the pair's two sides, each by its own session, and the encode side
-    /// places an item by its content.
+    /// places an item by its own policy.
     ///
     /// A pure function of the settings. The document is not validated
     /// here, a plan with an encode side in a gateway of many routers
@@ -666,7 +677,7 @@ impl RoutingSettings {
     /// names there a stage its build does not run yet.
     pub fn policy_document(&self) -> Result<PolicySpec, RoutingSettingsError> {
         refuse_unsupported(self)?;
-        if let Some(three) = three_sided(self)? {
+        if let Some(three) = three_sided(&self.mode, &self.policy, self.enable_igw)? {
             if let Some(said) = taken(written(self, three), true) {
                 return said;
             }
@@ -779,7 +790,7 @@ impl RoutingSettings {
         }
         // The plan that document was written from ([`written_from`]),
         // written again with the labels' sides.
-        let plan = match three_sided(self)? {
+        let plan = match three_sided(&self.mode, &self.policy, self.enable_igw)? {
             Some(three) if written_from(&three, &document) => three,
             _ => match both_families(self)? {
                 Some(both) if written_from(&both, &document) => both,

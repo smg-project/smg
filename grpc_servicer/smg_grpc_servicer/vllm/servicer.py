@@ -33,6 +33,11 @@ from vllm.multimodal.inputs import (
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
+from smg_grpc_servicer.constrained_decoding import (
+    VLLM_SCHEMA_BACKENDS,
+    answer_schema_in_place_of_tag,
+    structural_tag_vocabulary,
+)
 from smg_grpc_servicer.kv_relay import Engine, relay
 from smg_grpc_servicer.load_record import engine_load_from
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
@@ -131,6 +136,16 @@ def _takes_reasoning_ended(engine) -> bool:
     """
     generate = getattr(engine, "generate", None)
     return generate is not None and "reasoning_ended" in inspect.signature(generate).parameters
+
+
+def _structured_outputs_backend(engine) -> str:
+    """The structured-outputs backend the engine was started with.
+
+    Read off its config rather than a version: an engine whose config names
+    none runs its default ("auto").
+    """
+    section = EngineConfigView(getattr(engine, "vllm_config", None)).structured_outputs
+    return str(section.backend or "auto")
 
 
 def _managed_ranks(engine) -> list[int]:
@@ -260,6 +275,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self.start_time = start_time
         # Read once: the engine's signature does not change under a servicer.
         self._takes_reasoning_ended = _takes_reasoning_ended(async_llm)
+        # Read once: the structured-outputs backend the engine was started
+        # with, which decides how an answer's structural tag is sent.
+        self._structured_outputs_backend = _structured_outputs_backend(async_llm)
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
@@ -568,6 +586,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 request.sampling_params,
                 stream=request.stream,
                 kv_transfer_params=kv_transfer_params,
+                structured_outputs_backend=self._structured_outputs_backend,
             )
             if ec_transfer_params is not None:
                 sampling_params.extra_args = {
@@ -1072,6 +1091,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # older package.
         if "cache_partition_fields" in info.DESCRIPTOR.fields_by_name:
             info.cache_partition_fields = "cache_salt"
+        # The vocabulary of structural-tag nodes the engine's grammar backend
+        # takes, as the Rust launcher reports it: the Router spells an older
+        # xgrammar's structural tags in the older vocabulary.
+        if "structural_tag_vocabulary" in info.DESCRIPTOR.fields_by_name:
+            view = EngineConfigView(self.engine.vllm_config)
+            info.structural_tag_vocabulary = structural_tag_vocabulary(
+                str(view.structured_outputs.backend or "auto")
+            )
         ec_config = getattr(self.engine.vllm_config, "ec_transfer_config", None)
         if "supports_ec_transfer" in info.DESCRIPTOR.fields_by_name:
             info.supports_ec_transfer = ec_config is not None
@@ -1304,6 +1331,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         params: vllm_engine_pb2.SamplingParams,
         stream: bool = True,
         kv_transfer_params: dict | None = None,
+        structured_outputs_backend: str = "auto",
     ) -> SamplingParams:
         """
         Convert protobuf SamplingParams to vLLM SamplingParams.
@@ -1312,6 +1340,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             params: Protobuf SamplingParams message
             stream: Whether streaming is enabled
             kv_transfer_params: Connector KV-transfer params dict (PD disaggregation)
+            structured_outputs_backend: The backend the engine was started with; a
+                structural tag that is a JSON answer's schema alone goes as that
+                schema to one the tag is not spelled for
 
         Returns:
             vLLM SamplingParams with detokenize=False and structured_outputs
@@ -1331,7 +1362,20 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             elif constraint_field == "grammar":
                 structured_outputs = StructuredOutputsParams(grammar=params.grammar)
             elif constraint_field == "structural_tag":
-                structured_outputs = StructuredOutputsParams(structural_tag=params.structural_tag)
+                schema = answer_schema_in_place_of_tag(
+                    params.structural_tag, structured_outputs_backend, VLLM_SCHEMA_BACKENDS
+                )
+                if schema is not None:
+                    logger.debug(
+                        "a structural tag that is a JSON answer's schema alone goes to the "
+                        "%s backend as that schema",
+                        structured_outputs_backend,
+                    )
+                    structured_outputs = StructuredOutputsParams(json=schema)
+                else:
+                    structured_outputs = StructuredOutputsParams(
+                        structural_tag=params.structural_tag
+                    )
             elif constraint_field == "json_object":
                 structured_outputs = StructuredOutputsParams(json_object=params.json_object)
             elif constraint_field == "choice":

@@ -95,11 +95,30 @@ fn member(entry: &Entry) -> (MembershipChange, &WorkerRow, u64) {
     }
 }
 
+/// A status event: the change it tells, the models its row serves and its
+/// epoch. It holds no row.
+fn status(entry: &Entry) -> (MembershipChange, &[String], u64) {
+    match &entry.event {
+        Event::Status {
+            epoch,
+            id,
+            from,
+            to,
+            models,
+        } => {
+            let (id, from, to) = (*id, *from, *to);
+            let change = MembershipChange::StatusChanged { id, from, to };
+            (change, models, *epoch)
+        }
+        other => panic!("a status event, not {other:?}"),
+    }
+}
+
 /// The row a membership event's write took out of the table.
 fn left(entry: &Entry) -> Option<&WorkerRow> {
     match &entry.event {
         Event::Member { left, .. } => left.as_deref(),
-        Event::Term | Event::Generation { .. } => None,
+        Event::Status { .. } | Event::Term | Event::Generation { .. } => None,
     }
 }
 
@@ -163,7 +182,8 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
         (a, WorkerStatus::Pending, 1, 1)
     );
 
-    let (change, row, epoch) = member(&entries[2]);
+    // A status tells no row: the change, and the models its row serves.
+    let (change, models, epoch) = status(&entries[2]);
     assert_eq!(
         change,
         MembershipChange::StatusChanged {
@@ -172,10 +192,7 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
             to: WorkerStatus::Ready
         }
     );
-    assert_eq!(
-        (row.status, row.revision, epoch),
-        (WorkerStatus::Ready, 1, 2)
-    );
+    assert_eq!((models, epoch), (&["m".to_owned()][..], 2));
 
     let (change, row, epoch) = member(&entries[3]);
     assert_eq!(change, MembershipChange::Relabelled { id: a });
@@ -201,7 +218,7 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
         "no other write took a row out"
     );
 
-    let (change, row, _) = member(&entries[7]);
+    let (change, models, _) = status(&entries[7]);
     assert_eq!(
         change,
         MembershipChange::StatusChanged {
@@ -210,9 +227,9 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
             to: WorkerStatus::NotReady
         }
     );
-    assert_eq!(row.status, WorkerStatus::NotReady);
+    assert_eq!(models, ["m".to_owned()]);
 
-    let (change, row, _) = member(&entries[8]);
+    let (change, models, _) = status(&entries[8]);
     assert_eq!(
         change,
         MembershipChange::StatusChanged {
@@ -221,7 +238,7 @@ fn every_journaled_entry_tells_one_event_in_the_stores_order() {
             to: WorkerStatus::Ready
         }
     );
-    assert_eq!(row.status, WorkerStatus::Ready);
+    assert_eq!(models, ["m".to_owned()]);
 
     match &entries[9].event {
         Event::Member {
@@ -360,6 +377,19 @@ impl Journal for Told {
         true
     }
 
+    fn status(
+        &self,
+        _: Option<Position>,
+        _: Option<u64>,
+        _: u64,
+        _: WorkerId,
+        _: WorkerStatus,
+        _: WorkerStatus,
+        _: Arc<[String]>,
+    ) -> bool {
+        true
+    }
+
     fn term_rose(&self, term: u64) {
         self.terms.lock().push(term);
     }
@@ -444,6 +474,20 @@ impl Twin {
                     self.rows.insert(other.id(), row.clone());
                 }
             },
+            // A status tells no row: the row the twin holds takes the
+            // status, and serves the models the event names.
+            Event::Status {
+                id,
+                from,
+                to,
+                models,
+                ..
+            } => {
+                let row = self.rows.get_mut(id).expect("a status of a row it holds");
+                assert_eq!(row.status, *from, "the status the row left");
+                assert_eq!(row.facts.models[..], models[..], "the models it serves");
+                row.status = *to;
+            }
             Event::Term | Event::Generation { .. } => {}
         }
     }
@@ -543,7 +587,8 @@ fn a_cut_and_the_tail_after_it_are_the_next_cut_under_writers() {
         let mut twin = Twin::of(from);
         let after = &entries[place(from)..place(to)];
         for entry in after {
-            members += u32::from(matches!(entry.event, Event::Member { .. }));
+            let member = matches!(entry.event, Event::Member { .. } | Event::Status { .. });
+            members += u32::from(member);
             twin.apply(&entry.event);
         }
         moved += u32::from(!after.is_empty());
@@ -624,6 +669,17 @@ fn applies(standby: &MemoryStore, entry: &Entry) {
         } => {
             let (change, row) = told(*change, row.as_deref());
             standby.follow(entry.at, *epoch, change, row);
+        }
+        Event::Status {
+            epoch,
+            id,
+            from,
+            to,
+            ..
+        } => {
+            let (id, from, to) = (*id, *from, *to);
+            let change = MembershipChange::StatusChanged { id, from, to };
+            standby.follow(entry.at, *epoch, change, None);
         }
         Event::Term => standby.follow_term(entry.at),
         Event::Generation { generation } => {

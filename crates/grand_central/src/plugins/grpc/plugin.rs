@@ -572,8 +572,8 @@ impl Open {
 #[derive(Default)]
 struct Opens([Open; 4]);
 
-/// One engine build's hold on a plugin. The engine hands every lifecycle
-/// event to the scorers and the picker of every profile, and a plugin bound
+/// One engine build's hold on a plugin. The engine hands a lifecycle
+/// event to the stages of every profile that take it, and a plugin bound
 /// to several profiles hears it once: the bound sets a build takes from its
 /// one binder share the build's observer, the first scorer or picker adapter
 /// made from any of them. A later build over the same connected plugin (a

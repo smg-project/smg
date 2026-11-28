@@ -70,8 +70,8 @@ impl<G: Generation> Objects<G> {
     pub(super) fn counted<S: WorkersStore + ?Sized>(&self, store: &S, row: WorkerId) {
         let object = {
             let held = self.held.read();
-            let laid = held.objects.get(&row).and_then(|id| held.rows.get(id));
-            laid.map(|laid| Arc::clone(&laid.object))
+            let laid = held.objects.get(&row);
+            laid.map(|(_, laid)| Arc::clone(&laid.object))
         };
         if let Some(object) = object {
             store.host_count(row, Box::new(ObjectCount(object)));

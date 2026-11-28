@@ -95,7 +95,9 @@ use crate::{
         DerivedKeys, KeySource,
     },
     engine::{
-        decision::{Decision, PairSide, Pick, ShedReason, Target, MAX_TARGETS},
+        decision::{
+            Decision, PairSide, Pick, ShedReason, Target, ADMITS, BUDGET, ENCODE_ITEMS, MAX_TARGETS,
+        },
         decision_engine::{
             AlonePick, DecideOutcome, DecisionRefused, Plain, Request, RequestMaker, TextKey,
             TokenKey, WorkerLists,
@@ -122,9 +124,11 @@ use crate::{
 
 /// A request's headers, as its caller holds them.
 ///
-/// The engine reads the headers the document names and no other: the
-/// sources of a request's routing value and of its client's value, and the
-/// headers its view shows a stage ([`AppliedSpec::view_headers`]).
+/// The engine reads the headers the document names: the sources of a
+/// request's routing value and of its client's value, and the headers its
+/// view shows a stage ([`AppliedSpec::view_headers`]). It reads one more
+/// where the request's host names it, for the id a kept decision is found
+/// by ([`PlaceRequest::explain_id_header`]), and no other.
 pub trait HeaderRead {
     /// The value of the header `name`, where the request carries it. `name`
     /// is lowercase, as a document writes it.
@@ -276,14 +280,22 @@ pub struct PlaceRequest<'a> {
     /// The request's own id, where it has one: a source of its routing
     /// value where the document names it, and what a decision the engine
     /// kept of the request is found by ([`InProcess::explained`]). A
-    /// request with none is found by its `explain_id`, and is not kept
-    /// where it states neither.
+    /// request with none is found by its `explain_id`, or else by the
+    /// header its `explain_id_header` names, and is not kept where it
+    /// states none of the three.
     pub request_id: Option<&'a str>,
     /// The id a decision the engine kept of the request is found by where
     /// the request states no id of its own: its host's name for it. It is
     /// no source of a routing value and no lease holds it. The engine
     /// reads it under a document that keeps a sample, and nowhere else.
     pub explain_id: Option<&'a str>,
+    /// The name of the header that holds its host's id of the request,
+    /// lowercase: for a host that holds that id among the request's
+    /// headers and states no `explain_id`, which wins. Under a document
+    /// that keeps a sample the engine reads the header's value off
+    /// `headers`, for a request that states no id of its own. Under a
+    /// document that keeps none, no request pays a read for it.
+    pub explain_id_header: Option<&'a str>,
     /// The tenant the request is of.
     pub tenant: Option<&'a str>,
     /// The request's priority band.
@@ -452,6 +464,7 @@ impl<'a> PlaceRequest<'a> {
             headers: &(),
             request_id: None,
             explain_id: None,
+            explain_id_header: None,
             tenant: None,
             priority: 0,
             streaming: false,
@@ -1279,9 +1292,16 @@ impl RequestMaker for Made<'_, '_> {
         self.request.request_id.map_or(&[], str::as_bytes)
     }
 
-    // The id its host states for a kept decision alone, as it stated it.
+    // The id its host states for a kept decision alone: the word it
+    // stated, or else the value of the header it named, read here and
+    // nowhere ahead of the call.
     fn explain_id(&self) -> &[u8] {
-        self.request.explain_id.map_or(&[], str::as_bytes)
+        let request = self.request;
+        match (request.explain_id, request.explain_id_header) {
+            (Some(id), _) => id.as_bytes(),
+            (None, Some(name)) => request.headers.header(name).unwrap_or(&[]),
+            (None, None) => &[],
+        }
     }
 
     // Asked where a plain request's pick is leased, ahead of its making:
@@ -1420,7 +1440,11 @@ pub enum Unplaced {
         /// (`target-worker`). Under [`ShedReason::PolicyDeclined`] the
         /// name `binding` says that the spec in force binds no plan of
         /// the request's kind for its model: a caller answers that no
-        /// retry changes it. A caller's refusal line names it.
+        /// retry changes it. Two sheds of a pair over whole lists name a
+        /// stage by the list judged, which may be another than the one
+        /// that ended a pass
+        /// ([`Shed::emptied_by`](crate::engine::decision::Shed::emptied_by)).
+        /// A caller's refusal line names it.
         emptied_by: &'static str,
         /// The seconds after which a retry may find room: a caller's
         /// retry hint.
@@ -1430,14 +1454,27 @@ pub enum Unplaced {
         /// ([`Shed::side`](crate::engine::decision::Shed::side)): a
         /// pair's caller answers for that role. A decision's own side
         /// passes as it is. A pair shed under the worker it names
-        /// (`target-worker`) names the side that worker was missed on. A
-        /// first decision's shed that stands behind a rule names the side
-        /// of the list the gateway's own pair selection judges there.
-        /// `None` for a single request, for a pair refused before either
-        /// side was read, and for a refusal the call itself makes of no
-        /// one list: under the route's rule (`admits`), whose lists its
-        /// caller judges, under the budget, and for what the call does
-        /// not place.
+        /// (`target-worker`) names the side that worker was missed on:
+        /// the side its number reached nobody on, or the side its
+        /// decision was left with nobody on. Where no pair the call named
+        /// could be sent to, that is the decode side where a target of
+        /// the call's last ask lost its decode alone, its prefill being
+        /// one that could be sent to, and the prefill side otherwise. A
+        /// first decision's shed as saturated that stands behind a rule
+        /// names the side of the list the gateway's own pair selection
+        /// judges there.
+        /// `None` for a single request, for a pair refused
+        /// before either side was read, and for a refusal behind the
+        /// route's rule that is made of no one list its caller holds: the
+        /// shed under the rule's name (`admits`), and a first decision's
+        /// shed with no endpoint that stands where the rule takes no
+        /// worker of a list, since the rule narrowed the lists that
+        /// decision judged. A pair held to its named prefill alone
+        /// answers both under `target-worker`, on no side. One made where
+        /// no prefill of the lists pairs with a decode keeps its side: the
+        /// rule is not asked behind it.
+        /// `None` too under the budget, and for what the call does not
+        /// place.
         side: Option<PairSide>,
     },
     /// The engine queued the request. A caller that holds no request
@@ -1465,9 +1502,10 @@ pub enum Unplaced {
     /// For a single request, for a pair and for an encode request's pair,
     /// a rule that answers each worker one way within a call is not the
     /// cause: a request whose rule takes no worker of a list is shed,
-    /// under the rule's name (`admits`) or by its first decision's shed as
-    /// saturated where that stands, and one whose rule takes some is
-    /// decided among them. Under a profile that filters by health a list
+    /// under the rule's name (`admits`), by its first decision's shed
+    /// where that stands, or by a pair's one decision more over the rule's
+    /// prefills, and one whose rule takes some is decided among
+    /// them. Under a profile that filters by health a list
     /// with no ready worker is shed by that filter. So this answer is left
     /// for a worker that stopped being ready between a decision's read of
     /// it and the send, for a profile that lists no such filter, and for a
@@ -1510,20 +1548,6 @@ fn admitted(request: &PlaceRequest<'_>, worker: &dyn Worker) -> bool {
 pub(super) fn sendable(request: &PlaceRequest<'_>, worker: &dyn Worker) -> bool {
     ready(worker) && admitted(request, worker)
 }
-
-/// What a request that carries encode items over other lists than an
-/// encode request's three is declined under: no list of it holds an encoder.
-const ENCODE_ITEMS: &str = "encode-items";
-
-/// What a request is shed under where its route's rule takes no worker of
-/// its list: the rule's own name on a request ([`PlaceRequest::admits`]).
-/// A pair's first decision's shed as saturated is the answer in its place
-/// where that shed stands ([`pair::again`]).
-const ADMITS: &str = "admits";
-
-/// What a request is shed under where its call's earlier decisions left
-/// none of its budget ([`PlaceRequest::budget_micros`]).
-const BUDGET: &str = "budget";
 
 /// The refusal of a request this call does not place, by name: the shed a
 /// decision answers for what no stage of it runs.
@@ -1609,6 +1633,29 @@ pub(super) fn walk<'a>(
     missed: &mut Vec<WorkerId>,
     sides: impl Fn(&Target) -> Result<Sides, [Option<WorkerId>; 2]>,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
+    walk_naming_side(engine, decided, later, now, missed, None, sides)
+}
+
+/// [`walk`], which names a side too. Where no target holds, `unsent` is
+/// told the side the walk could not send to ([`Call::unsent`]): the decode
+/// side where a target lost its decode alone, its prefill being one that
+/// could be sent to, and the prefill side otherwise. A pair's ask hands
+/// it. A walk that takes a target writes nothing, and a walk handed no
+/// `unsent` names no side.
+///
+/// # Errors
+///
+/// The decision's shed or its queue ([`picked`]).
+#[inline]
+pub(super) fn walk_naming_side<'a>(
+    engine: Loaded<'static, '_>,
+    decided: DecideOutcome,
+    later: bool,
+    now: Instant,
+    missed: &mut Vec<WorkerId>,
+    unsent: Option<&mut Option<PairSide>>,
+    sides: impl Fn(&Target) -> Result<Sides, [Option<WorkerId>; 2]>,
+) -> Result<Option<Placement<'a>>, Unplaced> {
     let pick = picked(&decided.decision)?;
     let mut failed = [[None; 2]; MAX_TARGETS];
     let mut ask = || {
@@ -1633,10 +1680,24 @@ pub(super) fn walk<'a>(
     };
     let Some((index, (worker, decode))) = held else {
         give_up(engine.object, decided, later, now);
-        for id in failed.into_iter().flatten().flatten() {
-            if !missed.contains(&id) {
-                missed.push(id);
+        // A target that lost its decode alone had a prefill that could be
+        // sent to. The rows are read once: for the side, and for the ids
+        // the next decision is told.
+        let mut decode_alone = false;
+        for ids in failed {
+            decode_alone |= matches!(ids, [None, Some(_)]);
+            for id in ids.into_iter().flatten() {
+                if !missed.contains(&id) {
+                    missed.push(id);
+                }
             }
+        }
+        if let Some(unsent) = unsent {
+            *unsent = Some(if decode_alone {
+                PairSide::Decode
+            } else {
+                PairSide::Prefill
+            });
         }
         return Ok(None);
     };
@@ -1673,10 +1734,11 @@ pub(super) fn give_up(
 /// holds no decision: behind the call's first decision none of whose
 /// targets can be sent to, whether it refused them or they were not ready,
 /// and behind a pair's or an encode request's first decision that sheds
-/// the request as saturated. A request that states no rule keeps no
-/// places: its later asks are made over its lists whole. A rule that
-/// panics here leaves no lease behind. Out of line: a request whose first
-/// decision takes a target runs none of it.
+/// the request: as saturated, or with no endpoint where the pair's own
+/// test sends it to the rule ([`pair::goes_to_the_rule`]). A request that
+/// states no rule keeps no places: its later asks are made over its lists
+/// whole. A rule that panics here leaves no lease behind. Out of line: a
+/// request whose first decision takes a target runs none of it.
 ///
 /// A worker that is not ready is asked too. A rule that takes no worker
 /// is so told from a rule whose workers are not ready: the first is the
@@ -1690,9 +1752,10 @@ pub(super) fn give_up(
 /// # Errors
 ///
 /// The shed of a request whose rule takes no worker of the list
-/// ([`ShedReason::NoEndpoints`], under `admits`): no further decision is
-/// made. A pair's routine answers its first decision's shed as saturated
-/// in its place, where that shed stands ([`pair::again`]).
+/// ([`ShedReason::NoEndpoints`], under `admits`): a single request is
+/// asked no further decision. A pair's routine answers its first
+/// decision's shed in its place where that shed stands, or the shed of
+/// one decision more over the rule's prefills ([`pair::again`]).
 #[cold]
 #[inline(never)]
 fn hold_to_rule(
@@ -1752,6 +1815,31 @@ pub(super) struct Call {
     /// lookup (`whole`). A prompt is hashed once a call, however many asks
     /// the call takes.
     hashes: OnceCell<PromptHashes>,
+    /// The side of a pair that the call's last walk with no target could
+    /// not send to, written by that walk ([`walk_naming_side`]): the
+    /// decode side where a target of the walk lost its decode alone, its
+    /// prefill being one that could be sent to, and the prefill side
+    /// otherwise. A pair that names its worker and ends with no worker
+    /// for its asks is shed on it ([`target`]).
+    ///
+    /// The order is that of the gateway's own pair selection, which asks
+    /// the prefill first. Its hash policy reads the health of the worker
+    /// at a named place once more at its pick, and one that is not
+    /// healthy and eligible then is that policy's miss: the pair is
+    /// declined for the prefill's role, and no decode is picked
+    /// (`target_among` in
+    /// `model_gateway/src/policies/consistent_hashing.rs`, and the prefill
+    /// policy's decline in `pair_pass`,
+    /// `model_gateway/src/routers/common/placement.rs`). Behind the
+    /// prefill's pick that selection reads the pick's partners a second
+    /// time: nobody open there is the decode's role, and so is a number
+    /// that reaches none of them (`pair_pass`: its read of the pick's
+    /// open partners, and the decode policy's decline behind it).
+    ///
+    /// `None` ahead of such a walk, and for the call of a single request
+    /// and of an encode request that carries items: their walks write
+    /// none.
+    unsent: Option<PairSide>,
     /// The prompt's whole list of block hashes, where the call's making
     /// left the list to the lookup that reads it ([`Made::hashed_whole`]):
     /// made where that lookup first asks, once a call, and `None` under a
@@ -2025,24 +2113,46 @@ impl InProcess {
     /// attempt tried is handed again where no other is left. The call's
     /// two later decisions are made among them: three decisions a call.
     /// A request whose rule takes no worker of a list is shed
-    /// with no endpoint, under `admits`. A pair that states no hard demand,
+    /// with no endpoint, under `admits`. A pair whose first decision shed
+    /// it with no endpoint keeps that shed there but in the last case
+    /// below, under the stage that
+    /// decision named and with no side; where no prefill of its lists
+    /// pairs with a decode, or the pair states a hard demand, that shed
+    /// answers with its side and the rule is not asked behind it. Behind
+    /// a hard demand a pair's decision is handed the workers that meet
+    /// it, a part of each list, and its shed is not judged by the count
+    /// of a list: it is saturated where the overload veto left a pass
+    /// nobody, and else has no endpoint. A pair that states no hard demand,
     /// and whose host states no places of the prefills or the decodes
     /// ([`PairLists::prefill_places`](crate::engine::PairLists::prefill_places),
     /// [`PairLists::decode_places`](crate::engine::PairLists::decode_places)),
-    /// is answered otherwise in two cases, behind a first decision that
-    /// shed it as saturated and said the list it shed over, which a
-    /// decision does under a document that sheds a list wholly over its
-    /// thresholds. That shed is its answer where the rule takes no prefill
+    /// is answered otherwise in three cases, under a document that sheds
+    /// a list wholly over its thresholds. Two stand behind a first
+    /// decision that shed it as saturated and said the list it shed over.
+    /// That shed is its answer where the rule takes no prefill
     /// and the decision shed over the prefills. It is its answer too where
     /// the rule takes a prefill and no decode: where one of its prefills
     /// can take the request and the decision shed over the decodes, and
     /// where none can, one is ready and every ready one is over its
-    /// thresholds. One whose rule takes workers none of which is ready, or
+    /// thresholds. In the third the rule takes a prefill and no decode,
+    /// and no such shed stands: one decision more is held to the rule's
+    /// prefills, with no decode lent, and its shed as saturated over
+    /// those of them that pair with a decode is the answer, for the
+    /// prefill side. One whose rule takes workers
+    /// none of which is ready, or
     /// workers of a pair's two lists no two of which pair, is answered by
-    /// the decision held to them, which names what left nobody. An encode
+    /// the decision held to them, which names what left nobody. Behind a
+    /// shed made over the prefills, a rule whose every prefill pairs with
+    /// no decode is answered as one that takes no prefill. An encode
     /// request is held so over its pair's two lists, with the items it
     /// carries or with none: the rule is asked of no encoder, and the
-    /// encoders' list is decided as its caller lent it.
+    /// encoders' list is decided as its caller lent it. One that states an
+    /// item, or holds its decode to the ones that take images, is not
+    /// answered so behind a rule whose every prefill pairs with no decode:
+    /// its decodes are asked too, and where the rule takes one a decision
+    /// among the rule's workers answers. Nor is the third case's decision
+    /// made for it: with no such shed standing it keeps the answer it had,
+    /// under `admits` or by its first decision's shed with no endpoint.
     ///
     /// A decision that is given up has written what its stages write as
     /// they decide, and its release takes none of that back: the tokens a
@@ -2074,10 +2184,13 @@ impl InProcess {
     /// held to the workers the rule takes on each of its two lists, as a
     /// single request's are to those of its one: three decisions a call.
     /// Which workers pair is the caller's word, in the classes its lists
-    /// carry: no pair is tested here again. Prefills with an open partner
-    /// that are all at the caller's limit answer
+    /// carry: no pair is tested here again. Where the prefill side's
+    /// filters leave its run nobody and a prefill with an open partner
+    /// stands but for the caller's limit, the answer is
     /// [`Unplaced::PrefillsFull`], on which the caller waits for room and
-    /// places the request again.
+    /// places the request again. So it is where the pair's default takes a
+    /// prefill at that limit, under a profile that lists it as a hard
+    /// filter.
     ///
     /// A request with an encode request's three lists is decided over the
     /// three ([`InProcess::decide_encode_at`]), with the items it
@@ -2090,10 +2203,16 @@ impl InProcess {
     /// makes three decisions at most, each given the request's whole
     /// budget. Behind the first of them, and behind a first decision that
     /// sheds the request as saturated over a list of its pair, the rule
-    /// is asked of the pair's two lists, and the later decisions are made
-    /// among the workers it takes on each, as a pair's are. A shed made
-    /// over the encoders stands, and no rule is asked behind it: the rule
-    /// narrows nothing of them. An encoder is read by its state alone:
+    /// is asked of the pair's two lists, and the later decisions are
+    /// made among the workers it takes on each, as a pair's are. A
+    /// request with no item whose decode is held to no images is its
+    /// pair's alone: its first shed with no endpoint goes to the rule as
+    /// a pair's does. One that states an item, or holds its decode to
+    /// the ones that take images, keeps such a shed, and its pair's
+    /// decision asks no question of a shed: it is answered as it was
+    /// before the question stood. A shed made for the encoders
+    /// stands, and no rule is asked behind it: the rule narrows nothing of
+    /// them. An encoder is read by its state alone:
     /// the route's rule is asked of the pair's two workers and of its two
     /// lists. With no item the three lists are placed as their pair.
     ///
@@ -2135,8 +2254,9 @@ impl InProcess {
     /// Where it is not, the decision is
     /// held to the prefill's place and the decode is its own profile's
     /// pick. A named prefill at the caller's admission limit is waited
-    /// for ([`Unplaced::PrefillsFull`]), a named decode with no free room
-    /// is taken, and a retry is handed the pair again. A number that
+    /// for where that decision says so ([`Unplaced::PrefillsFull`]), a
+    /// named decode with no free room is taken, and a retry is handed
+    /// the pair again. A number that
     /// reaches no worker on a side, and a pair the held decision cannot
     /// place, shed the request under `target-worker`. Where no decode can
     /// be sent to and the binding steers decodes that are all over their

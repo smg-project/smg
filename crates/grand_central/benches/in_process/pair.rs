@@ -28,10 +28,17 @@
 //! ([`InProcess::place`]): the model, the two lists and a prompt of the
 //! plain request's size, with both dispatches and each side's end said of
 //! the placement. Such a request states no later decode, and its run
-//! refuses no pair but by `--refused overload`. `--entry place_ruled` and
+//! takes every `--refused` but `limit`. `--entry place_ruled` and
 //! `--entry place_held` state a route's rule with it (the bench's `ruled`
 //! file). `--entry place_named` asks the one call with a pair that names
-//! its worker ([`NAMED`]).
+//! its worker ([`NAMED`]). `--entry place_alone` states a rule that takes
+//! every prefill behind the first and no decode, over a cell whose every
+//! such prefill is over its thresholds under a binding that sheds a list
+//! wholly over them: each request is shed, and a turn counts the shed.
+//!
+//! A request by the one call states the hard demands of its cell's
+//! request. The cell `pair_consistent_hashing_bounded` bounds its
+//! completion ([`bounded`]): a demand a pair's decodes alone are held to.
 //!
 //! Every worker has a load report, and a prefill states its rate as its
 //! measured input rate too: the one drain a prefill's record reads. Under
@@ -46,8 +53,15 @@
 //! refused the way the run states. A cell that leaves that path counts no
 //! turn. `--refused overload` puts every decode over its thresholds under
 //! a binding that sheds a list wholly over them: each request is shed as
-//! saturated, by the engine's entry and by the one call alike. The
-//! result's `conversions=` counts the two lists together.
+//! saturated, by the engine's entry and by the one call alike. `--refused
+//! outage` takes every decode out of service under such a binding, and
+//! `--refused partners` under the cell's own: each request is shed with no
+//! endpoint, by either entry too. `--no-room N` leaves the last `N`
+//! decodes of the cell with no room at their host's gate ([`Rooms`]): every
+//! other place stays open, and each pair goes to a decode that has one.
+//! `--live-gates 1` gives the cell a host that reads each place's worker at
+//! every answer of its gate ([`Gates`]), with `--no-room N` or without it.
+//! The result's `conversions=` counts the two lists together.
 
 use std::{
     cell::OnceCell,
@@ -62,7 +76,7 @@ use std::{
 use smg_grand_central::{
     document::{AppliedSpec, Assignment, PolicySpec},
     engine::{
-        prefills_full, Decided, Decision, DecodeVerdict, Identity, InProcess, LiftedVeto,
+        prefills_full, Decided, Decision, DecodeVerdict, Demands, Identity, InProcess, LiftedVeto,
         PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest, Plain, Prompt,
         PublishedList, Request, RequestMaker, ShedReason, Unplaced, WorkerLists,
     },
@@ -118,6 +132,15 @@ pub(super) fn of(name: &str) -> PolicySpec {
 pub(super) fn request(seed: u64) -> Request<'static> {
     let mut request = plain(seed);
     request.facts.phase = Phase::Prefill;
+    request
+}
+
+/// [`request`] that bounds its completion, as a host states a request's
+/// budget: a pair's decodes alone are held to it. No worker of a run
+/// states a window, so each meets the bound.
+pub(super) fn bounded(seed: u64) -> Request<'static> {
+    let mut request = request(seed);
+    request.constraints.demands.output_window = 256;
     request
 }
 
@@ -218,6 +241,51 @@ impl PairAdmission for Full {
     }
 }
 
+/// A pair's host whose first decodes alone have a room: every prefill has
+/// capacity, and no decode from the stated place on has a room.
+#[derive(Debug)]
+struct Rooms(usize);
+
+impl PairAdmission for Rooms {
+    fn has_capacity(&self, _: usize) -> bool {
+        true
+    }
+
+    fn has_room(&self, decode: usize) -> bool {
+        decode < self.0
+    }
+}
+
+/// A pair's host that reads each place's worker at every answer, as a
+/// gateway that keeps its gate on its workers does: a prefill has capacity
+/// by its load, and a decode ahead of the stated place has a room by its
+/// running window, its admitted requests and the rooms waited for at its
+/// gate. No decode from the stated place on has a room. The engine asks
+/// each place of the two lists once a decision, ahead of a pair's draws.
+#[derive(Debug)]
+struct Gates {
+    prefills: Arc<[Arc<dyn Worker>]>,
+    decodes: Arc<[Arc<dyn Worker>]>,
+    rooms: usize,
+}
+
+impl PairAdmission for Gates {
+    fn has_capacity(&self, prefill: usize) -> bool {
+        self.prefills
+            .get(prefill)
+            .is_some_and(|worker| worker.load() < usize::MAX)
+    }
+
+    fn has_room(&self, decode: usize) -> bool {
+        decode < self.rooms
+            && self.decodes.get(decode).is_some_and(|worker| {
+                worker.max_running_requests().is_none_or(|window| {
+                    worker.pd_admitted() + worker.pd_waiting_rooms() < usize::from(window)
+                })
+            })
+    }
+}
+
 /// What a run states refuses every pair of its cell (`--refused`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Refused {
@@ -233,6 +301,9 @@ pub(super) enum Refused {
     /// thresholds: every decode is over them, and each request is shed as
     /// saturated.
     Overload,
+    /// The decode side under such a binding: no decode is ready, and each
+    /// request is shed with no endpoint.
+    Outage,
 }
 
 impl Refused {
@@ -242,6 +313,7 @@ impl Refused {
             "limit" => Self::Limit,
             "partners" => Self::Partners,
             "overload" => Self::Overload,
+            "outage" => Self::Outage,
             other => panic!("nothing refuses a pair by {other}"),
         }
     }
@@ -255,11 +327,17 @@ struct Decodes {
     classes: PartnerClasses,
     admission: &'static (dyn PairAdmission + Sync),
     refused: Refused,
+    /// The hard demands the cell's request states: a request by the one
+    /// call states them too.
+    demands: Demands,
     /// Under a sessions rule, how far behind a pair's decision its later
     /// decode is asked for, sent and ended. It is a second more than the
     /// rule's idle time and its sweep interval together. The pair's key has
     /// ended by then, at the rule's first sweep past its idle time.
     idle_out: Option<Duration>,
+    /// Whether the run's rule takes the prefills behind the first alone
+    /// ([`ruled::ALONE`]): each request is then shed behind the rule.
+    alone: bool,
 }
 
 /// One turn's pair request as its host states it: the request of
@@ -320,11 +398,12 @@ impl Decodes {
     }
 
     /// One pair request of `host` by the one call: the model, the two
-    /// lists and a prompt of the plain request's size, with both sides'
-    /// dispatch and end said of the placement. With `rule` the request
-    /// states the run's rule of its route ([`ruled::admits`]), and with
-    /// `named` the worker it names ([`NAMED`]). The call answers workers
-    /// and no place of a list, so the place this says is the first.
+    /// lists, the cell's hard demands and a prompt of the plain request's
+    /// size, with both sides' dispatch and end said of the placement. With
+    /// `rule` the request states the run's rule of its route
+    /// ([`ruled::admits`]), and with `named` the worker it names
+    /// ([`NAMED`]). The call answers workers and no place of a list, so the
+    /// place this says is the first.
     fn called(&self, host: &Host, rule: bool, named: bool) -> Option<u32> {
         let mut request = PlaceRequest {
             prompt: Prompt {
@@ -332,20 +411,33 @@ impl Decodes {
                 ..Prompt::NONE
             },
             admits: ruled::admits(rule),
+            demands: self.demands,
             ..PlaceRequest::of(MODEL, self.lists(host))
         };
         if named {
             request.headers = &NUMBER;
         }
         let mut answer = host.engine.place(&request);
-        if self.refused == Refused::Overload {
-            // A run whose every decode is over its thresholds counts the
-            // turns shed as saturated.
-            let shed = |unplaced: &Unplaced| {
-                let saturated = ShedReason::Saturated;
-                matches!(unplaced, Unplaced::Shed { reason, .. } if *reason == saturated)
+        // A rule that takes prefills over their thresholds alone: the turn
+        // is a shed, as saturated behind the one decision more that is held
+        // to them, and with no endpoint where no such decision is made.
+        if self.alone {
+            return matches!(answer, Err(Unplaced::Shed { .. })).then_some(0);
+        }
+        // A run whose every decode is over its thresholds counts the turns
+        // shed as saturated, and one whose every decode is out of service
+        // the turns shed with no endpoint.
+        let counted = match self.refused {
+            Refused::Overload => Some(ShedReason::Saturated),
+            Refused::Partners | Refused::Outage => Some(ShedReason::NoEndpoints),
+            Refused::Limit | Refused::No => None,
+        };
+        if let Some(counted) = counted {
+            let reason = match &answer {
+                Err(Unplaced::Shed { reason, .. }) => Some(*reason),
+                _ => None,
             };
-            return answer.as_ref().err().is_some_and(shed).then_some(0);
+            return (reason == Some(counted)).then_some(0);
         }
         let placement = answer.as_mut().ok()?;
         if placement.owes_events() {
@@ -375,16 +467,19 @@ impl Decodes {
         };
         // A run that refuses every pair counts the turns refused the way it
         // states: by full prefills under the limit, by a shed as saturated
-        // under the overload veto, by any other shed where the decode side
-        // refuses.
+        // under the overload veto, by a shed with no endpoint under an
+        // outage, by any other answer where the decode side refuses.
         if self.refused != Refused::No {
             let decision = &decided.decision;
             let full = prefills_full(decision);
-            let saturated =
-                matches!(decision, Decision::Shed(shed) if shed.reason == ShedReason::Saturated);
+            let reason = match decision {
+                Decision::Shed(shed) => Some(shed.reason),
+                _ => None,
+            };
             let stated = match self.refused {
                 Refused::Limit => full,
-                Refused::Overload => saturated && !full,
+                Refused::Overload => reason == Some(ShedReason::Saturated) && !full,
+                Refused::Outage => reason == Some(ShedReason::NoEndpoints) && !full,
                 Refused::Partners | Refused::No => !full,
             };
             return (decision.pick().is_none() && stated).then_some(0);
@@ -452,6 +547,7 @@ pub(super) fn runs(run: &Run) -> bool {
     }
     // A shadow profile decides beside a single request's decision.
     assert!(run.shadow == Shadowed::No, "a pair's cell runs no shadow");
+    assert!(run.other_models == 0, "a pair's cell states no other model");
     let side = |side: &str, worker_type| -> Arc<[Arc<dyn Worker>]> {
         let url = |at: usize| format!("http://{side}-{at:04}:8000");
         (0..run.workers)
@@ -460,6 +556,19 @@ pub(super) fn runs(run: &Run) -> bool {
     };
     let prefills = side("prefill", WorkerType::Prefill);
     let decodes = side("decode", WorkerType::Decode);
+    // The rule of `place_alone` takes every prefill behind the first: the
+    // cell puts those over their thresholds beside the open first one.
+    let alone = run.entry == ruled::ALONE;
+    if alone {
+        let own = run.refused == Refused::No && !run.overloaded && run.workers > 1;
+        assert!(
+            own,
+            "place_alone states its own lists, of two workers or more"
+        );
+        for worker in prefills.iter().skip(1) {
+            worker.set_overloaded(true);
+        }
+    }
     if run.overloaded {
         // A pair's prefill side is put to no rule: the cell puts its decodes
         // over their thresholds and leaves its prefills open.
@@ -470,7 +579,7 @@ pub(super) fn runs(run: &Run) -> bool {
         // default makes the pair of the least load.
         over(&prefills);
     }
-    if run.refused == Refused::Partners {
+    if matches!(run.refused, Refused::Partners | Refused::Outage) {
         for worker in decodes.iter() {
             worker.set_status(WorkerStatus::NotReady);
         }
@@ -480,6 +589,8 @@ pub(super) fn runs(run: &Run) -> bool {
         for worker in decodes.iter() {
             worker.set_overloaded(true);
         }
+    }
+    if alone || matches!(run.refused, Refused::Overload | Refused::Outage) {
         // Each binding sheds a list wholly over its thresholds.
         for binding in &mut document.bindings {
             let mut overload = binding.overload.take().unwrap_or_default();
@@ -501,14 +612,31 @@ pub(super) fn runs(run: &Run) -> bool {
         list: published(&decodes),
         admission: if run.refused == Refused::Limit {
             &Full
+        } else if run.live_gates || run.no_room != 0 {
+            assert!(
+                run.no_room < decodes.len(),
+                "a pair needs a decode with a room"
+            );
+            let rooms = decodes.len() - run.no_room;
+            if run.live_gates {
+                Box::leak(Box::new(Gates {
+                    prefills: Arc::clone(&prefills),
+                    decodes: Arc::clone(&decodes),
+                    rooms,
+                }))
+            } else {
+                Box::leak(Box::new(Rooms(rooms)))
+            }
         } else {
             &Open
         },
         refused: run.refused,
+        demands: request(0).constraints.demands,
         idle_out: rule.map(|rule| {
             let ends = u64::from(rule.ttl_s) + u64::from(rule.sweep_s);
             Duration::from_secs(ends + 1)
         }),
+        alone,
     };
     let mut receiver = None;
     let feed = TestFeed::attached_to(|loads| receiver = loads);
@@ -538,8 +666,11 @@ pub(super) fn runs(run: &Run) -> bool {
     let converted = || host.conversions() + engine.conversions(decode_side.list.lent());
     // The one call a host makes for a request, where the run asks it.
     if place::asked_with_lists(run, true) {
-        let open = matches!(run.refused, Refused::No | Refused::Overload);
-        assert!(open, "the one call's pair is open, or shed as saturated");
+        let answered = run.refused != Refused::Limit;
+        assert!(
+            answered,
+            "the one call's pair is open, or shed by its decodes"
+        );
         // The one call answers workers and no trace: nothing there says
         // which pairs the default made.
         assert!(

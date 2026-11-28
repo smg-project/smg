@@ -233,11 +233,11 @@ async fn a_bind_refuses_by_name_before_anything_serves() {
     ));
 
     let mut missing = config();
-    missing.listeners[0].tls = Some(Tls {
-        cert: PathBuf::from("/nonexistent/server.pem"),
-        key: PathBuf::from("/nonexistent/server.key"),
-        client_ca: None,
-    });
+    missing.listeners[0].tls = Some(Tls::of(
+        PathBuf::from("/nonexistent/server.pem"),
+        PathBuf::from("/nonexistent/server.key"),
+        None,
+    ));
     assert!(matches!(
         Controller::bind(missing).await,
         Err(Error::Tls { name, source: TlsError::Read { path, .. } })
@@ -261,11 +261,7 @@ async fn a_bind_refuses_by_name_before_anything_serves() {
     )
     .expect("write");
     let mut unparsable = config();
-    unparsable.listeners[0].tls = Some(Tls {
-        cert: garbage,
-        key,
-        client_ca: None,
-    });
+    unparsable.listeners[0].tls = Some(Tls::of(garbage, key, None));
     assert!(matches!(
         Controller::bind(unparsable).await,
         Err(Error::TlsConfig { name, .. }) if name == "gateway"
@@ -339,16 +335,8 @@ async fn mutual_tls_admits_the_authoritys_clients_and_refuses_the_rest() {
     let key = write(dir.path(), "server.key", &server.key).expect("write");
 
     let mut config = config();
-    config.listeners[0].tls = Some(Tls {
-        cert: cert.clone(),
-        key: key.clone(),
-        client_ca: Some(ca),
-    });
-    config.listeners[1].tls = Some(Tls {
-        cert,
-        key,
-        client_ca: None,
-    });
+    config.listeners[0].tls = Some(Tls::of(cert.clone(), key.clone(), Some(ca)));
+    config.listeners[1].tls = Some(Tls::of(cert, key, None));
     let mut controller = Controller::bind(config).await.expect("bind");
     // A listener has one credential rule: the one that verifies its callers
     // against a client CA takes no identity as told.

@@ -12,13 +12,16 @@ use std::{
 
 use parking_lot::Mutex;
 
-use crate::store::{Journal, MembershipChange, Position, WorkerRow};
+use crate::{
+    engine::view::WorkerId,
+    store::{Journal, MembershipChange, Position, WorkerRow, WorkerStatus},
+};
 
 /// One replicated write, as the store told it.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Event {
-    /// A membership or status write.
+    /// A membership write.
     Member {
         /// The membership epoch the write made.
         epoch: u64,
@@ -29,6 +32,18 @@ pub enum Event {
         /// The row the write took out: a removal's row, a replacement's old
         /// incarnation.
         left: Option<Arc<WorkerRow>>,
+    },
+    /// A status write: the row `id` left `from` and took `to`. It holds no
+    /// row.
+    Status {
+        /// The membership epoch the write made.
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        /// The models the row serves at the write: the one fact of its row
+        /// a reader of a status reads, a watch that asked for some.
+        models: Arc<[String]>,
     },
     /// The store's term rose: the first position of a term, one of the
     /// watched kinds. It changes nothing a standby holds; it is why the
@@ -83,13 +98,6 @@ pub enum NotLeading {
 #[derive(Debug, Default)]
 pub struct ReadStamp(Option<u64>);
 
-#[cfg(test)]
-thread_local! {
-    /// How many times this thread searched the ring ([`Kept::until`]): a
-    /// case reads it to count the searches of one read.
-    static SEARCHES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
 /// The ring: the retained events, oldest first.
 struct Kept {
     events: VecDeque<Entry>,
@@ -130,8 +138,9 @@ impl Kept {
     /// ([`first_after`]). A reader stands near the head, and its search
     /// takes steps by its distance from there, not by the ring's size.
     fn until(&self, seq: u64) -> usize {
+        // A case's count of searches: only this function sees every one.
         #[cfg(test)]
-        SEARCHES.with(|searches| searches.set(searches.get() + 1));
+        tests::SEARCHES.with(|searches| searches.set(searches.get() + 1));
         first_after(self.events.len(), |index| {
             self.events
                 .get(index)
@@ -455,15 +464,16 @@ impl Log {
     /// the log's term is `term` and the store's own writes stand under it.
     /// A refusal carries the term the log stands at, so no caller reads the
     /// log again for its words. Four callers read it, each in its own
-    /// turn: the service's guard, the replication's check, the door's check
+    /// turn: the election's reader, the replication's check, the door's check
     /// of its term and the door's word for a status it writes. The check
     /// runs ahead of a life's mint, of each row a registration writes or
-    /// removes and of a refresh's write, and once more behind a drain that
-    /// wrote nothing. The word is asked under an object's lock and under
+    /// removes and of a refresh's write, and once more behind a write the
+    /// store did not take. The word is asked under an object's lock and under
     /// the store's membership lock: this read takes the log's lock alone,
     /// and no holder of the log's lock takes one of those two. A write
     /// that names its term meets the same test once more, in the take of
-    /// the log's lock that gives its event a place ([`Journal::member`]).
+    /// the log's lock that gives its event a place ([`Journal::member`],
+    /// [`Journal::status`]).
     pub fn leads(&self, term: u64) -> Result<(), NotLeading> {
         let ring = self.ring.lock();
         self.leads_in(&ring, term)
@@ -605,6 +615,12 @@ impl Log {
     /// answers yes, one that is let go too: its store moves its tables as
     /// it did.
     fn push(&self, by: Option<Position>, under: Option<u64>, event: Event) -> bool {
+        // An applier's write goes by its leader's place: it names no term
+        // of the store's own.
+        debug_assert!(
+            by.is_none() || under.is_none(),
+            "a write names an applier's place or a term, never both"
+        );
         let mut ring = self.ring.lock();
         if under.is_some_and(|term| self.leads_in(&ring, term).is_err()) {
             return false;
@@ -716,7 +732,8 @@ impl Log {
     /// there under that term, the leader's own, so a position and its term
     /// name one history on every replica that holds them. The applier's
     /// write names it, through the store's door for a followed write
-    /// ([`Journal::member`]), and no other write does. Refused
+    /// ([`Journal::member`], [`Journal::status`]), and no other write
+    /// does. Refused
     /// unless `at` is the position after the head, under a named term not
     /// below any the log has seen, and the head is a leader's write or the
     /// start: a gap, a replay, a falling term and a write of the store's
@@ -888,6 +905,15 @@ impl Journal for Log {
         row: Option<&WorkerRow>,
         left: Option<&WorkerRow>,
     ) -> bool {
+        // A status has its own call and its own kind of entry. Taken
+        // here as a membership write, it would be kept where such a write
+        // is kept, as an entry with no wire form: no watch is told such
+        // an entry, and a standby that is sent one stops. So the log
+        // takes none: nothing is appended, no applier's hold ends, and
+        // the answer is no.
+        if matches!(change, MembershipChange::StatusChanged { .. }) {
+            return false;
+        }
         // The rows are copied before the log's lock is taken.
         let copy = |row: &WorkerRow| Arc::new(row.clone());
         self.push(
@@ -898,6 +924,30 @@ impl Journal for Log {
                 change,
                 row: row.map(copy),
                 left: left.map(copy),
+            },
+        )
+    }
+
+    fn status(
+        &self,
+        at: Option<Position>,
+        term: Option<u64>,
+        epoch: u64,
+        id: WorkerId,
+        from: WorkerStatus,
+        to: WorkerStatus,
+        models: Arc<[String]>,
+    ) -> bool {
+        // The list is shared as it was handed: no row is copied here.
+        self.push(
+            at,
+            term,
+            Event::Status {
+                epoch,
+                id,
+                from,
+                to,
+                models,
             },
         )
     }

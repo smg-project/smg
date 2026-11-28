@@ -6,9 +6,9 @@
 //! with four schemas, about two fifths of the allocation calls of a
 //! tool-calling request, spent on trees that are the same from one request of
 //! an application to the next (the tool set is the application's, the
-//! messages are the turn's). The table here keeps the prepared value by the
-//! tools' serialized bytes; a hit compares the bytes, so a request reads with
-//! a value made of tools equal to its own.
+//! messages are the turn's). The table here keeps the prepared value by a key
+//! walked from the typed tools ([`write_key`]); a hit compares the key's
+//! bytes, so a request reads with a value made of tools equal to its own.
 
 use std::{
     cell::RefCell,
@@ -17,9 +17,9 @@ use std::{
 };
 
 use llm_tokenizer::chat_template::PreparedTools;
-use openai_protocol::common::Tool;
+use openai_protocol::common::{Function, Tool};
 use parking_lot::RwLock;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// How many distinct tool sets are kept before the table starts over: an
 /// application's tool sets come to a handful, a gateway serving many
@@ -28,11 +28,12 @@ use serde_json::Value;
 /// bound.
 const PREPARED_TOOLS_KEPT: usize = 64;
 
-/// The largest tool set looked up, by its serialized bytes: a set above it is
-/// prepared for its request alone, before any key is hashed or kept. What an
-/// entry keeps is larger than its key (the JSON values, the render's values
-/// of the same content and the `tojson` texts the tools come to keep), so the
-/// kept side is bounded by weight below, not by this.
+/// The largest tool set looked up, by its key's bytes (about its serialized
+/// size, [`write_key`]): a set above it is prepared for its request alone,
+/// before any key is hashed or kept. What an entry keeps is larger than its
+/// key (the JSON values, the render's values of the same content and the
+/// `tojson` texts the tools come to keep), so the kept side is bounded by
+/// weight below, not by this.
 const PREPARED_TOOLS_MAX_KEY_BYTES: usize = 64 * 1024;
 
 /// The most a kept set may weigh ([`set_weight`]): a heavier one is prepared
@@ -49,7 +50,7 @@ const PREPARED_TOOLS_MAX_SET_WEIGHT: usize = 1024 * 1024;
 /// sorted form beside the charged one).
 const PREPARED_TOOLS_KEPT_WEIGHT: usize = 16 * 1024 * 1024;
 
-/// The kept values by the tools' serialized bytes, and the weight they sum to.
+/// The kept values by the tools' key bytes, and the weight they sum to.
 static PREPARED_TOOLS: LazyLock<RwLock<Kept>> = LazyLock::new(|| RwLock::new(Kept::default()));
 
 #[derive(Default)]
@@ -61,7 +62,7 @@ struct Kept {
 /// What an entry costs kept: its key, the values ([`kept_weight`]) and the
 /// `tojson` texts its tools keep as the renders go, up to
 /// [`PreparedTools::KEPT_TOJSON_TEXTS_PER_TOOL`] per tool, charged at that cap
-/// as the tool's share of the key bytes each (a compact form's size; an
+/// as the tool's share of the key bytes each (about a compact form's size; an
 /// `indent` form runs about twice that, and the values' term dominates, so
 /// the table's bound stays close whatever the template asks of the filter).
 fn set_weight(key_len: usize, values: &[Value]) -> usize {
@@ -95,9 +96,129 @@ fn kept_weight(tools: &[Value]) -> usize {
 }
 
 thread_local! {
-    /// The serialization of a request's tools, the table's key: one buffer
-    /// per thread, reused, so a hit allocates nothing.
+    /// The key of a request's tools ([`write_key`]): one buffer per thread,
+    /// reused, so a hit allocates nothing.
     static KEY: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The bytes that say what comes next in a key. A number stands in a key as
+/// its JSON text, which begins with a digit or a minus sign, as none of these
+/// does, and holds no `END`.
+const ABSENT: u8 = 0;
+const END: u8 = 0;
+const PRESENT: u8 = 1;
+const NULL: u8 = 2;
+const FALSE: u8 = 3;
+const TRUE: u8 = 4;
+const STRING: u8 = 5;
+const ARRAY: u8 = 6;
+const OBJECT: u8 = 7;
+
+/// The table's key of a request's tools: the typed tools walked into bytes,
+/// in the request's order, a text behind its length, a value behind its tag,
+/// an array up to its end mark. The bytes read back one way only, so two tool
+/// sets share a key exactly when they are equal in every field and in order:
+/// when they serialize to the same bytes and prepare to the same value. A
+/// request with tools pays the walk on every lookup, at a fraction of the
+/// serialization it stands for (a string is copied whole, where a JSON writer
+/// reads its every byte for an escape). The key of a set within the size
+/// bound is no longer than the set serialized, so what the bounds admitted
+/// by the serialized bytes they still admit.
+fn write_key(key: &mut Vec<u8>, tools: &[Tool]) -> Result<(), serde_json::Error> {
+    for tool in tools {
+        // Taken apart whole: a field added to either record does not build
+        // here until the key reads it.
+        let Tool {
+            tool_type,
+            function:
+                Function {
+                    name,
+                    description,
+                    parameters,
+                    strict,
+                    extra,
+                },
+        } = tool;
+        key_text(key, tool_type);
+        key_text(key, name);
+        match description {
+            Some(description) => {
+                key.push(PRESENT);
+                key_text(key, description);
+            }
+            None => key.push(ABSENT),
+        }
+        match parameters {
+            Some(schema) => key_value(key, schema)?,
+            None => key.push(ABSENT),
+        }
+        key.push(match strict {
+            Some(true) => TRUE,
+            Some(false) => FALSE,
+            None => ABSENT,
+        });
+        key_map(key, extra)?;
+    }
+    Ok(())
+}
+
+fn key_value(key: &mut Vec<u8>, value: &Value) -> Result<(), serde_json::Error> {
+    match value {
+        Value::Null => key.push(NULL),
+        Value::Bool(flag) => key.push(if *flag { TRUE } else { FALSE }),
+        Value::Number(number) => {
+            // As it serializes, so two numbers share a key exactly when
+            // they share a text.
+            serde_json::to_writer(&mut *key, number)?;
+            key.push(END);
+        }
+        Value::String(text) => {
+            key.push(STRING);
+            key_text(key, text);
+        }
+        Value::Array(items) => {
+            key.push(ARRAY);
+            for item in items {
+                key_value(key, item)?;
+            }
+            key.push(END);
+        }
+        Value::Object(fields) => {
+            key.push(OBJECT);
+            key_map(key, fields)?;
+        }
+    }
+    Ok(())
+}
+
+fn key_map(key: &mut Vec<u8>, fields: &Map<String, Value>) -> Result<(), serde_json::Error> {
+    key_len(key, fields.len());
+    for (name, value) in fields {
+        key_text(key, name);
+        key_value(key, value)?;
+    }
+    Ok(())
+}
+
+fn key_text(key: &mut Vec<u8>, text: &str) {
+    key_len(key, text.len());
+    key.extend_from_slice(text.as_bytes());
+}
+
+/// A length seven bits to a byte, the low ones first, the last byte alone
+/// under 128: one byte for most names and two for most descriptions, where
+/// the serialized form spends two quotes and a separator.
+fn key_len(key: &mut Vec<u8>, len: usize) {
+    let mut rest = len;
+    loop {
+        let [low, ..] = rest.to_le_bytes();
+        if rest < 0x80 {
+            key.push(low);
+            return;
+        }
+        key.push(low | 0x80);
+        rest >>= 7;
+    }
 }
 
 /// The tools of a request prepared for the template: the value kept when a
@@ -106,8 +227,7 @@ pub(crate) fn prepare_tools(tools: &[Tool]) -> Result<Arc<PreparedTools>, String
     KEY.with(|key| {
         let mut key = key.borrow_mut();
         key.clear();
-        serde_json::to_writer(&mut *key, tools)
-            .map_err(|e| format!("Failed to serialize tools: {e}"))?;
+        write_key(&mut key, tools).map_err(|e| format!("Failed to serialize tools: {e}"))?;
         if key.len() > PREPARED_TOOLS_MAX_KEY_BYTES {
             // Not kept; the buffer goes back to empty so a worker thread
             // holds at most the cap of it.
@@ -179,227 +299,5 @@ fn tool_value(tool: &Tool) -> Result<Value, serde_json::Error> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Mutex;
-
-    use serde_json::json;
-
-    use super::*;
-
-    /// The table is one per process: the tests that read its state run one
-    /// at a time.
-    static SERIAL: Mutex<()> = Mutex::new(());
-
-    fn tool(name: &str, description: &str) -> Tool {
-        serde_json::from_value(json!({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}
-            }
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn a_tool_set_is_prepared_once_and_shared_by_the_next_request_with_the_same_tools() {
-        let _serial = SERIAL.lock().unwrap();
-        let tools = [
-            tool("prepared_once_a", "the first"),
-            tool("prepared_once_b", "the second"),
-        ];
-        let first = prepare_tools(&tools).unwrap();
-        assert_eq!(
-            first.tools(),
-            tools
-                .iter()
-                .map(|tool| serde_json::to_value(tool).unwrap())
-                .collect::<Vec<_>>(),
-            "the prepared values are the request's tools as JSON values"
-        );
-        let equal = [tools[0].clone(), tools[1].clone()];
-        assert!(
-            Arc::ptr_eq(&first, &prepare_tools(&equal).unwrap()),
-            "equal tools share the one kept value"
-        );
-        let other = [tool("prepared_once_a", "another description")];
-        let third = prepare_tools(&other).unwrap();
-        assert!(
-            !Arc::ptr_eq(&first, &third),
-            "other tools are another value"
-        );
-        assert_eq!(third.tools(), [serde_json::to_value(&other[0]).unwrap()]);
-        let reordered = [tools[1].clone(), tools[0].clone()];
-        assert!(
-            !Arc::ptr_eq(&first, &prepare_tools(&reordered).unwrap()),
-            "the same tools in another order render differently and are another value"
-        );
-    }
-
-    #[test]
-    fn the_table_starts_over_at_its_bound_and_keeps_no_oversize_set() {
-        let _serial = SERIAL.lock().unwrap();
-        let first_tools = [tool("bound_first", "kept until the bound")];
-        let first = prepare_tools(&first_tools).unwrap();
-        for i in 0..PREPARED_TOOLS_KEPT {
-            prepare_tools(&[tool(&format!("bound_{i}"), "one of many")]).unwrap();
-        }
-        assert!(
-            PREPARED_TOOLS.read().sets.len() <= PREPARED_TOOLS_KEPT,
-            "the table never holds more than its bound"
-        );
-        assert!(
-            !Arc::ptr_eq(&first, &prepare_tools(&first_tools).unwrap()),
-            "a set the restart dropped is prepared again"
-        );
-        let oversize = [tool("oversize", &"x".repeat(PREPARED_TOOLS_MAX_KEY_BYTES))];
-        let once = prepare_tools(&oversize).unwrap();
-        let twice = prepare_tools(&oversize).unwrap();
-        assert!(
-            !Arc::ptr_eq(&once, &twice),
-            "a set above the size bound is prepared for its request alone"
-        );
-        assert_eq!(once.tools(), twice.tools());
-        KEY.with(|key| {
-            assert!(
-                key.borrow().capacity() <= PREPARED_TOOLS_MAX_KEY_BYTES,
-                "the buffer is dropped back after an oversize set"
-            );
-        });
-    }
-
-    #[test]
-    fn the_table_starts_over_when_the_kept_sets_would_exceed_their_weight() {
-        let _serial = SERIAL.lock().unwrap();
-        let first_tools = [tool("weight_first", "kept until the budget")];
-        let first = prepare_tools(&first_tools).unwrap();
-        // A set of many small values: light on the wire, heavy kept. Under the
-        // per-set cap, so a run of them fills the table's weight long before
-        // its count.
-        let enum_tool = |name: &str| -> Tool {
-            serde_json::from_value(json!({"type": "function", "function": {"name": name,
-                "parameters": {"type": "object", "properties": {"code": {"type": "integer", "enum": (0..4000).collect::<Vec<_>>()}}}}}))
-            .unwrap()
-        };
-        let one = [enum_tool("weight_probe")];
-        let weight = set_weight(
-            serde_json::to_vec(&one).unwrap().len(),
-            &one.iter()
-                .map(|t| serde_json::to_value(t).unwrap())
-                .collect::<Vec<_>>(),
-        );
-        assert!(weight < PREPARED_TOOLS_MAX_SET_WEIGHT, "{weight}");
-        let sets = PREPARED_TOOLS_KEPT_WEIGHT / weight + 2;
-        assert!(
-            sets < PREPARED_TOOLS_KEPT,
-            "{sets} sets of {weight} fill the weight before the count"
-        );
-        for i in 0..sets {
-            prepare_tools(&[enum_tool(&format!("weight_{i}"))]).unwrap();
-        }
-        let kept = PREPARED_TOOLS.read();
-        assert!(
-            kept.weight <= PREPARED_TOOLS_KEPT_WEIGHT,
-            "the kept sets stay within their weight ({})",
-            kept.weight
-        );
-        drop(kept);
-        assert!(
-            !Arc::ptr_eq(&first, &prepare_tools(&first_tools).unwrap()),
-            "a set the weight's restart dropped is prepared again"
-        );
-        // Heavy kept, light on the wire: 12,000 one-digit numbers serialize to
-        // about 24 KiB, under the key cap, and weigh past the per-set cap.
-        let heavy = [serde_json::from_value::<Tool>(json!({"type": "function", "function": {"name": "heavy",
-            "parameters": {"type": "object", "properties": {"code": {"type": "integer", "enum": (0..12000).map(|i| i % 10).collect::<Vec<_>>()}}}}})).unwrap()];
-        let heavy_key = serde_json::to_vec(&heavy).unwrap().len();
-        let heavy_weight = set_weight(
-            heavy_key,
-            &heavy
-                .iter()
-                .map(|t| serde_json::to_value(t).unwrap())
-                .collect::<Vec<_>>(),
-        );
-        assert!(
-            heavy_key <= PREPARED_TOOLS_MAX_KEY_BYTES
-                && heavy_weight > PREPARED_TOOLS_MAX_SET_WEIGHT,
-            "{heavy_key} bytes, {heavy_weight} weight"
-        );
-        assert!(
-            !Arc::ptr_eq(
-                &prepare_tools(&heavy).unwrap(),
-                &prepare_tools(&heavy).unwrap()
-            ),
-            "a set above the weight cap is prepared for its request alone"
-        );
-    }
-
-    fn declared(function: Value) -> Tool {
-        serde_json::from_value(json!({"type": "function", "function": function})).unwrap()
-    }
-
-    /// A tool declared without a schema (the field absent or `null`) reaches
-    /// the template with `"parameters": null` in the schema's place, as the
-    /// engine's own template reads the declaration; a client's own `{}`
-    /// stays `{}`. The kept sets tell the two apart: the serialized key of a
-    /// schema-less tool leaves the field out, the key of a `{}` tool carries it.
-    #[test]
-    fn a_tool_without_a_schema_reaches_the_template_with_a_null_schema_in_its_place() {
-        let _serial = SERIAL.lock().unwrap();
-        let without = [
-            declared(json!({"name": "schema_less_absent", "description": "no schema given"})),
-            declared(json!({"name": "schema_less_null", "parameters": null, "strict": false})),
-        ];
-        let prepared = prepare_tools(&without).unwrap();
-        assert_eq!(
-            prepared.tools(),
-            [
-                json!({"type": "function", "function": {
-                    "name": "schema_less_absent", "description": "no schema given", "parameters": null}}),
-                json!({"type": "function", "function": {
-                    "name": "schema_less_null", "parameters": null, "strict": false}}),
-            ],
-            "the schema's place is after the description, or after the name, before the rest"
-        );
-        let keys: Vec<Vec<&str>> = prepared
-            .tools()
-            .iter()
-            .map(|tool| {
-                tool["function"]
-                    .as_object()
-                    .unwrap()
-                    .keys()
-                    .map(String::as_str)
-                    .collect()
-            })
-            .collect();
-        assert_eq!(
-            keys,
-            [
-                vec!["name", "description", "parameters"],
-                vec!["name", "parameters", "strict"]
-            ]
-        );
-
-        assert!(
-            Arc::ptr_eq(
-                &prepare_tools(&without[..1]).unwrap(),
-                &prepare_tools(&without[..1]).unwrap()
-            ),
-            "a schema-less set is kept and shared like any other"
-        );
-        let with_empty = [declared(json!({"name": "schema_less_absent",
-            "description": "no schema given", "parameters": {}}))];
-        let empty = prepare_tools(&with_empty).unwrap();
-        assert_eq!(
-            empty.tools()[0]["function"]["parameters"],
-            json!({}),
-            "a client's own empty schema renders as it was given"
-        );
-        assert!(
-            !Arc::ptr_eq(&prepare_tools(&without[..1]).unwrap(), &empty),
-            "a schema-less tool and the same tool with an empty schema are kept apart"
-        );
-    }
-}
+#[path = "../../../../tests/unit/routers/grpc/utils/prepared_tools/tests.rs"]
+mod tests;

@@ -14,12 +14,12 @@ use super::*;
 use crate::{
     document::spec::{Assignment, ShadowSpec},
     engine::{
-        decision::LiftedVeto,
+        decision::{LiftedVeto, ShadowKind},
         in_process::{
             place::{Made, PlaceRequest},
             with_shadow::tests::{Heard, Rule, Takes},
         },
-        shadow::{ShadowSide, SHADOW_FLOOR},
+        shadow::{ShadowSide, Shadowed, SHADOW_FLOOR},
     },
     policies::consistent_hashing::{Head, LentRing},
 };

@@ -3,7 +3,6 @@ use std::cell::RefCell;
 type Hook = Box<dyn FnOnce()>;
 
 thread_local! {
-    static RELEASED: RefCell<Option<Hook>> = const { RefCell::new(None) };
     static TURNED: RefCell<Option<Hook>> = const { RefCell::new(None) };
 }
 
@@ -19,21 +18,6 @@ pub(crate) fn on_turn(hook: impl FnOnce() + 'static) {
 /// The hook of [`on_turn`] runs. It is taken out first.
 pub(super) fn turned() {
     let hook = TURNED.with(|held| held.borrow_mut().take());
-    if let Some(hook) = hook {
-        hook();
-    }
-}
-
-/// `hook` runs once, behind the workers lock of this thread's next
-/// write by that body.
-pub(crate) fn on_release(hook: impl FnOnce() + 'static) {
-    RELEASED.with(|held| *held.borrow_mut() = Some(Box::new(hook)));
-}
-
-/// The hook runs. It is taken out first: a registration the hook
-/// itself makes meets none.
-pub(super) fn released() {
-    let hook = RELEASED.with(|held| held.borrow_mut().take());
     if let Some(hook) = hook {
         hook();
     }

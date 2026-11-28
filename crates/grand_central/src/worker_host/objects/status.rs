@@ -20,6 +20,13 @@
 //! store's lock. A holder's write of a row holds that turn, then an
 //! object's lock, then the store's: one order for the three.
 //!
+//! A tell hands a store that tells a journal the models its object serves,
+//! read in that same critical section and ahead of the store's lock: the
+//! log's entry of a status names them and no row. Of the table's row a
+//! leader's status entry holds one thing alone, the status the row left,
+//! which is the log's own word. A store with no journal is handed none,
+//! and no list is built for it.
+//!
 //! A tell the store refuses writes nothing, and the call does not try it
 //! again: the row left the revision the object was built from, no row
 //! stands, or the writer's term ended. A writer that names its term hands
@@ -31,10 +38,12 @@
 //! object takes the status its row holds, and where no row stands for it
 //! the status it left.
 //!
-//! From the table to an object there are two ways, both of a told status.
-//! A standby's applier and a gateway's watcher lay the status their
-//! leader's log tells ([`mod@super::standby`]). And a tell the store
-//! refuses gives the object the status its row holds, as said above.
+//! From the table to an object there are three ways, each of a told
+//! status. A standby's applier and a gateway's watcher lay the status
+//! their leader's log tells ([`mod@super::standby`]). A tell the store
+//! refuses gives the object the status its row holds, as said above. And
+//! a removal the store refuses for its term lays its object again in the
+//! status its row holds ([`mod@super::write`]).
 
 use std::sync::Arc;
 
@@ -52,6 +61,20 @@ use crate::{
 
 /// An object's move: the status it left, then the one that stands.
 type Moved = Option<(ObjectStatus, ObjectStatus)>;
+
+/// The ids of the models `object` serves, in its cards' order, as the one
+/// shared list a status entry holds. Each id is copied, and no card. A
+/// status write of this module calls it under the object's mutation
+/// lock. A standby's applier calls it in the holder's turn, with no lock
+/// of the object.
+pub(super) fn served(object: &dyn Worker) -> Arc<[String]> {
+    let mut ids = Vec::new();
+    object.any_model(&mut |card| {
+        ids.push(card.id.clone());
+        false
+    });
+    ids.into()
+}
 
 /// What a status write does to its object, read under the object's lock.
 #[derive(Clone, Copy)]
@@ -170,9 +193,21 @@ impl<G: Generation> Objects<G> {
 
     /// Tell `store` the status of the object that stands for `row`, behind
     /// a write that laid the object in another's place: it took the
-    /// standing object's status there, and the table holds its own.
-    pub(super) fn tell_row(&self, store: &MemoryStore, row: WorkerId, revision: u64) {
-        self.row_status(store, row, revision, LeadWord::FREE, Write::Tell(None));
+    /// standing object's status there, and the table holds its own. `term`
+    /// is the term of that write, where its caller named one: the status
+    /// goes to the store's journal under it, as the row's event did.
+    pub(super) fn tell_row(
+        &self,
+        store: &MemoryStore,
+        row: WorkerId,
+        revision: u64,
+        term: Option<u64>,
+    ) {
+        let word = LeadWord {
+            term,
+            ..LeadWord::FREE
+        };
+        self.row_status(store, row, revision, word, Write::Tell(None));
     }
 
     /// Settle the status of the object that stands for `row` with the
@@ -240,7 +275,9 @@ impl<G: Generation> Objects<G> {
     /// stood in, the move with it. What laid it settles the two. A door
     /// tells the store its object's status behind the put
     /// ([`Self::tell_row`]). A told row's put and a cut are followed by
-    /// the table's status ([`mod@super::standby`]).
+    /// the table's status ([`mod@super::standby`]). A removal the store
+    /// refused for its term laid a new object in the table's status
+    /// ([`mod@super::write`]): the move left with the old one.
     fn status_under(
         &self,
         store: &MemoryStore,
@@ -269,7 +306,12 @@ impl<G: Generation> Objects<G> {
             // A call can wait here for the object's lock through the end of
             // its term: it tells nothing.
             let told = if (word.leads)() {
-                store.status_told(standing.row, status, standing.revision, word)
+                // The models the object serves at this instant, read under
+                // its lock and handed ahead of the store's: the log's entry
+                // of a status names them, and no row of the table. A store
+                // that tells no entry is handed none, and no list is built.
+                let models = store.journals().then(|| served(object.as_ref()));
+                store.status_told(standing.row, status, standing.revision, word, models)
             } else {
                 HealthWrite::Stale
             };

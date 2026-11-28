@@ -57,8 +57,11 @@ thought; or nothing. Then the calls. A forced call is written at once, so withou
 would take the thought away, and the model, held to the call from its first token, answers worse
 than it reasons. Where the generation prompt itself ends with that close (a request with thinking
 switched off: the template closed the thought in the model's place, `Format::thought_closed`), a
-forced call starts at once: its tag holds no thought and no second close. The `auto` tag and a
-JSON answer's tag still admit them.
+forced call starts at once: its tag holds no thought and no second close. The `auto` tag still
+admits them. A JSON answer's grammar takes no closed reading (`Format::answer_grammar_for`): asked
+as on a prompt with no marker it admits them too. A caller that read the prompt closed asks the
+answer as after the thought (`reasoning_open` with `GrammarStart::AfterReasoning`) and gets the
+schema alone, as the gateway does.
 
 Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
 trigger inside whatever message the model is writing. Mistral's named arguments take a tag per tool
