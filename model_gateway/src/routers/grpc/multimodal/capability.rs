@@ -18,7 +18,7 @@ use anyhow::Result;
 use axum::response::Response;
 use llm_multimodal::{EncoderInputFormat, Modality};
 use smg_worker::{
-    identity::basic::{RuntimeType, Worker, WorkerType, NIXL_CONNECTOR},
+    identity::basic::{RuntimeType, Worker, WorkerType, MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
     labels::SUPPORTS_VISION_LABEL,
 };
 
@@ -29,7 +29,10 @@ use super::{
     refs::worker_accepts_media_refs,
     MultimodalIntermediate,
 };
-use crate::routers::{common::snapshot::WorkerRegistry, error};
+use crate::routers::{
+    common::{kv_transfer::mints_kv_engine_id, snapshot::WorkerRegistry},
+    error,
+};
 
 /// What the media gates read from a model's workers together, before one of
 /// them is selected. The answers depend on the membership alone: a worker
@@ -156,10 +159,37 @@ pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
 /// its prefill has an engine id, which a decode worker cannot answer for, so
 /// its workers stay held to the references predicate too.
 pub(crate) fn worker_takes_stripped_refs_side(worker: &dyn Worker) -> bool {
+    decode_takes_media_identity(worker)
+        && worker.metadata().spec.kv_connector.as_deref() == Some(NIXL_CONNECTOR)
+}
+
+/// Whether a decode worker's side of a single-sample media-references
+/// request is made of its prefill's media identity: a vLLM engine running as
+/// a language model only, which the sequential dispatch serves
+/// `RefsThenIdentity` whether or not it processes references itself
+/// (`sequential_pd`). Paired with a prefill that returns no identity
+/// ([`prefill_returns_media_identity`]), the dispatch refuses the request.
+pub(crate) fn decode_takes_media_identity(worker: &dyn Worker) -> bool {
+    worker.metadata().spec.runtime_type == RuntimeType::Vllm && worker_language_model_only(worker)
+}
+
+/// Whether `worker`, a prefill worker, returns the media identity a
+/// stripped references side is made of ([`decode_takes_media_identity`]):
+/// the sequential dispatch asks it for one on its connector
+/// (`sequential_pd::solicits_identity`): NIXL always, Mooncake when its
+/// handoff is minted an engine id (`kv_transfer::mints_kv_engine_id`, the
+/// dispatch's reading without its warning), and no other connector. The
+/// dispatch reads a pair's connector off its prefill, so a decode paired
+/// with a prefill on no connector, which lenient pairing allows, is asked
+/// for no identity and refuses the request.
+pub(crate) fn prefill_returns_media_identity(worker: &dyn Worker) -> bool {
     let spec = &worker.metadata().spec;
     spec.runtime_type == RuntimeType::Vllm
-        && worker_language_model_only(worker)
-        && spec.kv_connector.as_deref() == Some(NIXL_CONNECTOR)
+        && match spec.kv_connector.as_deref() {
+            Some(NIXL_CONNECTOR) => true,
+            Some(MOONCAKE_CONNECTOR) => mints_kv_engine_id(worker),
+            _ => false,
+        }
 }
 
 /// Whether every worker of `model_id` that a request's pixels go to runs

@@ -533,13 +533,7 @@ fn effective_kv_engine_id(
 /// a DP>1 engine behind an unexpanded worker must not be minted for.
 pub(crate) fn connector_mode_for_worker(worker: &dyn Worker) -> KvConnectorMode {
     let meta = worker.metadata();
-    let dp_label = meta.spec.labels.get("dp_size");
-    let label_dp = dp_label.and_then(|s| s.parse::<usize>().ok().filter(|v| *v > 0));
-    let engine_id = if worker.dp_size().is_none() && dp_label.is_some() && label_dp.is_none() {
-        // A dp_size label that does not parse as a positive integer means the
-        // DP topology is unknown, not absent. Minting an unsuffixed engine id
-        // could target the wrong engine core, so fail closed: no mint, decode
-        // recomputes the prompt.
+    let engine_id = worker_kv_engine_id(worker).unwrap_or_else(|dp_label| {
         warn!(
             worker = %worker.redacted_url(),
             dp_size = ?dp_label,
@@ -547,16 +541,41 @@ pub(crate) fn connector_mode_for_worker(worker: &dyn Worker) -> KvConnectorMode 
              skipping KV engine-id minting"
         );
         None
-    } else {
-        let dp_size = worker.dp_size().or(label_dp);
-        effective_kv_engine_id(worker.kv_engine_id().as_deref(), dp_size, worker.dp_rank())
-    };
+    });
     kv_connector_mode(
         meta.spec.kv_connector.as_deref(),
         &meta.spec.bootstrap_host,
         meta.spec.bootstrap_port,
         engine_id.as_deref(),
     )
+}
+
+/// The KV engine id a handoff to `worker` is minted for: its discovered id
+/// under its DP topology ([`effective_kv_engine_id`]), or none. A `dp_size`
+/// label that does not parse as a positive integer, where no size was
+/// discovered, means the topology is unknown, not absent: minting an
+/// unsuffixed id could target the wrong engine core, so nothing is minted,
+/// and the label comes back for the caller to report.
+fn worker_kv_engine_id(worker: &dyn Worker) -> Result<Option<String>, Option<&String>> {
+    let dp_label = worker.metadata().spec.labels.get("dp_size");
+    let label_dp = dp_label.and_then(|s| s.parse::<usize>().ok().filter(|v| *v > 0));
+    if worker.dp_size().is_none() && dp_label.is_some() && label_dp.is_none() {
+        return Err(dp_label);
+    }
+    let dp_size = worker.dp_size().or(label_dp);
+    Ok(effective_kv_engine_id(
+        worker.kv_engine_id().as_deref(),
+        dp_size,
+        worker.dp_rank(),
+    ))
+}
+
+/// Whether a handoff to `worker` is minted a KV engine id, as
+/// [`connector_mode_for_worker`] reads it but without its warning: for a
+/// caller that asks of every candidate on every request (selection's
+/// probes), where the dispatch's own read reports a bad label once.
+pub(crate) fn mints_kv_engine_id(worker: &dyn Worker) -> bool {
+    matches!(worker_kv_engine_id(worker), Ok(Some(_)))
 }
 
 /// Prefill-side params for Mooncake: the engine pins blocks under the minted id.
