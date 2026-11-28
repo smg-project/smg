@@ -5294,8 +5294,10 @@ pub(crate) fn decode_frame_bytes(
                     } else if let Some(image) = plain_bmp {
                         image
                     } else {
-                        // No other decoder is held to that: its buffer
-                        // arrives zeroed, as the crate's own vector does.
+                        // No other decoder is held to that (a GIF pixel
+                        // beyond its colour table is never written): its
+                        // buffer arrives zeroed, as the crate's own vector
+                        // does.
                         eight_bit_into_pool(decoder, true)?
                     };
                     oriented(image, orientation)
