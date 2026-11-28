@@ -155,11 +155,12 @@ pub(crate) use membership_writer::{
 };
 pub use membership_writer::{
     MembershipWriteOutcome, MembershipWriteRefused, MembershipWriter, Over, Precondition, Remover,
+    RowRevision,
 };
 #[cfg(feature = "controller")]
 pub(crate) use object::dial_address;
 pub use object::object;
-pub use objects::{Objects, RowRevision};
+pub use objects::Objects;
 pub use steps::{
     registrant_of, registration_into_store, registration_into_store_keeping_credentials,
     removal_from_store, remover_of, DrainWorkersInStore, NoCredentials, RegistrantError,

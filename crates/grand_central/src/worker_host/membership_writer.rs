@@ -15,9 +15,12 @@ use smg_worker::{
     settings::UnhealthyRemovalScope,
 };
 
-use super::{kv_feed::asks_events, object::object, RowRevision};
+use super::object::object;
 use crate::{
-    engine::view::WorkerId,
+    engine::{
+        view::{Phase, Role, WireModes, WorkerId},
+        Engine,
+    },
     store::{
         membership::{FactPastBound, NotRegistrant, WorkerFactsChange},
         pairing::PairingDescriptor,
@@ -129,6 +132,18 @@ pub enum Precondition {
     AtRevision(RowRevision),
     /// Anything: an upsert.
     Any,
+}
+
+/// The row an object stands for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RowRevision {
+    /// The row's id in the store: where a write about the object's worker
+    /// lands.
+    pub row: WorkerId,
+    /// The row's revision the object was built from: the guard a write of
+    /// the row's health names.
+    pub revision: u64,
 }
 
 /// The object a guarded write replaces, named by the write's verb: the
@@ -378,6 +393,28 @@ pub(crate) trait Turn {
 /// that store answers its turn ([`Turn::asks_events`]).
 pub(crate) fn asks_events_under(facts: &WorkerFacts, store: &MemoryStore) -> bool {
     store.deciding(|world| asks_events(facts, world.spec().engine()))
+}
+
+/// Whether a found row asks for its engine's cache events under `engine`:
+/// whether a decision reads the index for the row's first model, the one
+/// the row is indexed under, in the phase of the row's role. Only a gRPC
+/// worker streams.
+fn asks_events(facts: &WorkerFacts, engine: &Engine) -> bool {
+    facts.wire_modes.contains(WireModes::GRPC)
+        && facts
+            .models
+            .first()
+            .is_some_and(|model| engine.needs_for(model, phase_of(facts.role)).events)
+}
+
+/// The phase a role's pool decides: what a binding is matched on.
+const fn phase_of(role: Role) -> Phase {
+    match role {
+        Role::Single => Phase::Single,
+        Role::Prefill => Phase::Prefill,
+        Role::Decode => Phase::Decode,
+        Role::Encode => Phase::Encode,
+    }
 }
 
 fn made_by(row: &WorkerRow, maker: &Registrant) -> Result<(), MembershipWriteRefused> {

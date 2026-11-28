@@ -5,7 +5,7 @@ use std::{sync::Arc, time::Instant};
 
 use smg_worker::identity::basic::Worker;
 
-use super::{found::facts, object::row_status, objects::RowRevision};
+use super::{found::facts, membership_writer::RowRevision, object::row_status};
 use crate::{
     engine::{demands::DemandFacts, view::WireModes},
     store::{

@@ -41,7 +41,7 @@ use super::{
     credentials::{Credentials, RegistrationInFlight},
     found::engine_of,
     kv_tables::KvTables,
-    membership_writer::{MembershipWriteOutcome, MembershipWriteRefused},
+    membership_writer::{MembershipWriteOutcome, MembershipWriteRefused, RowRevision},
     object::{builder, dial_address, external, status, takes_default, thresholds, unchecked},
     remainder::RowRemainder,
 };
@@ -64,18 +64,6 @@ mod read;
 mod standby;
 mod status;
 mod write;
-
-/// The row an object stands for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub struct RowRevision {
-    /// The row's id in the store: where a write about the object's worker
-    /// lands.
-    pub row: WorkerId,
-    /// The row's revision the object was built from: the guard a write of
-    /// the row's health names.
-    pub revision: u64,
-}
 
 /// A row and the object that stands for it: two pointers, so a copy
 /// names the same remainder and the same object.
