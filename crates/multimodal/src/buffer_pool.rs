@@ -7,8 +7,8 @@
 //! mapping, or pages the allocator had given back), so every request faulted
 //! them in page by page and the kernel zeroed each page right before the
 //! producer overwrote it: about 5,200 minor faults and 20 MB of page zeroing
-//! per 1024x768 request. The producers write every byte they ask for, so
-//! nothing in those buffers has to be zero: this pool keeps them. A producer
+//! per 1024x768 request. Most producers write every byte they ask for, so
+//! nothing in their buffers has to be zero: this pool keeps them. A producer
 //! takes a buffer of the length it needs and fills it (one that may leave a
 //! byte unwritten takes its buffer cleared, `take_zeroed`); the buffer
 //! comes back when the request is done with it: the frame dropped
