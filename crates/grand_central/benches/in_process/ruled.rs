@@ -12,7 +12,9 @@
 //!
 //! A single request's cell, a pair's and an encode request's take both
 //! entries. An encode request's rule is its pair's: it is asked of the
-//! prefills and of the decodes, and of no encoder.
+//! prefills and of the decodes, and of no encoder. An encode request's
+//! cell whose request states a hard demand takes neither entry: the one
+//! call's request there states none.
 //!
 //! `--entry place_alone`, in a pair's cell alone: the one call asked with
 //! a rule that takes every prefill behind the list's first and no decode.

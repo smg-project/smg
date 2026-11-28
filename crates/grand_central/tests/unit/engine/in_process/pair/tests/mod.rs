@@ -689,6 +689,418 @@ fn a_pairs_prefill_is_held_to_neither_the_completions_bound_nor_a_constraints_wa
     assert_eq!(shed_of(&decision), narrow);
 }
 
+/// A place no list holds: the mark of a list that no judged side wrote.
+const MARK: u32 = u32::MAX;
+
+/// A side is judged only where its role is held to a part of the demand
+/// ([`Demands::held_by`]): a side held to none is not judged, and stands
+/// as it was stated. A completion's bound and a constraint's way judge
+/// the decodes alone. The input's bound judges each side. The answers are
+/// the ones a judged side gives: a side that is not judged keeps every
+/// place its host states, and none where its host states no place.
+///
+/// A side that is judged writes the places it keeps into its decision's
+/// list for it: the thread's list here, where no decision is asked
+/// inside another. Where the lists are read, each starts empty, or as
+/// one or two marks no place can be, and a judged side keeps a place: a
+/// list that stands as it started tells a side this decision's demand
+/// did not judge. Under a completion's bound the prefills' list stands
+/// whatever it held, whichever places their host states, a list of no
+/// place too, and whatever its vetoes mask and hold.
+///
+/// A side that is not judged keeps its host's standing vetoes too. Under
+/// a completion's bound the targets of twelve decisions name the prefills
+/// their host states that no veto masks. Where a veto masks each of them,
+/// the pair is made past the mask, onto the ones no hold stands on. Where
+/// a hold stands on each, the pair is shed at the health stage.
+#[test]
+fn a_side_held_to_no_part_of_a_demand_is_not_judged() {
+    use crate::engine::decision::LiftedVeto;
+
+    // The frame of one decision: what both lists start as, the places the
+    // prefills' host states, and the places of theirs that its standing
+    // vetoes mask and hold.
+    type Frame<'a> = (&'a [u32], Option<&'a [u32]>, [&'a [u32]; 2]);
+    // A row of the vetoes' table: the places the prefills' host states,
+    // the places of theirs that its vetoes mask and hold, the prefills
+    // that the targets of twelve decisions name, and whether each pair is
+    // made past the prefills' mask.
+    type Row<'a> = (Option<&'a [u32]>, [&'a [u32]; 2], &'a [u32], bool);
+    // Every worker states a window of 4,096. The first decode alone
+    // states a way to decide a constraint.
+    let host = stating(2, 2, |side, at| FixedFacts {
+        demands: DemandFacts {
+            window: 4_096,
+            decoding: if (side, at) == (1, 0) { 3 } else { 0 },
+            ..DemandFacts::default()
+        },
+        ..FixedFacts::default()
+    });
+    // One decision under `demands` in a frame, drawn by `seed`, and whether
+    // its demand wrote each side's list, the prefills' and then the
+    // decodes'.
+    let decided = |demands: Demands, seed: u64, (start, places, vetoes): Frame<'_>| {
+        let lists = [start.to_vec(), start.to_vec()];
+        BUFFERS.with_borrow_mut(|buffers| buffers.meeting = lists);
+        let (cx, vetoes) = (demanding(demands), [vetoes, [&[][..]; 2]]);
+        let decision = host.decide_vetoed(&OPEN, (seed, None), cx, [places, None], vetoes);
+        let written = BUFFERS.with_borrow(|buffers| {
+            let [prefills, decodes] = &buffers.meeting;
+            [prefills.as_slice() != start, decodes.as_slice() != start]
+        });
+        (decision, written)
+    };
+    // The sides one decision's demand judged, then the places twelve
+    // decisions name on each side.
+    let judged = |demands: Demands| {
+        let (decision, sides) = decided(demands, 0, (&[MARK], None, [&[], &[]]));
+        assert!(decision.pick().is_some(), "a pick: {decision:?}");
+        let cx = demanding(demands);
+        (sides, places_named(&host, cx, [None, None]))
+    };
+    let both = BTreeSet::from([0, 1]);
+    let all = (both.clone(), both.clone());
+    let none = Demands::default();
+    assert_eq!(judged(none), ([false, false], all.clone()), "no demand");
+    let way = Demands {
+        decoding: 3,
+        ..none
+    };
+    let one = (both, BTreeSet::from([0]));
+    assert_eq!(judged(way), ([false, true], one), "a way: the decodes");
+    let budget = Demands {
+        output_window: 1_024,
+        ..none
+    };
+    let decodes = ([false, true], all.clone());
+    assert_eq!(judged(budget), decodes, "a budget: the decodes");
+    let prompt = Demands {
+        input_window: 1_024,
+        ..none
+    };
+    assert_eq!(judged(prompt), ([true, true], all), "the input: each side");
+    // Under a budget the prefills' list stands as it started, and the
+    // decodes' is written: whatever the lists held, whichever places the
+    // prefills' host states and whether a veto masks their second place.
+    // A side that is not judged keeps what its host states, a list of no
+    // place too: the pair is shed over it, under no stage's name.
+    let nowhere = (ShedReason::NoEndpoints, "none");
+    for start in [&[][..], &[MARK][..], &[MARK, MARK - 1][..]] {
+        for places in [None, Some(&[][..]), Some(&[0][..]), Some(&[0, 1][..])] {
+            for masked in [&[][..], &[1][..]] {
+                let (decision, sides) = decided(budget, 0, (start, places, [masked, &[]]));
+                let told = format!("{start:?}, {places:?}, {masked:?}");
+                assert_eq!(sides, [false, true], "{told}");
+                if places.is_some_and(<[u32]>::is_empty) {
+                    assert_eq!(shed_of(&decision), nowhere, "{told}");
+                } else {
+                    assert!(decision.pick().is_some(), "{told}: {decision:?}");
+                }
+            }
+        }
+    }
+    // The side keeps its places and its host's vetoes too, under a budget.
+    // A row that names nobody is shed at the health stage. No decision of
+    // a row writes the prefills' list.
+    let rows: [Row<'_>; 13] = [
+        (None, [&[], &[]], &[0, 1], false),
+        (None, [&[0], &[]], &[1], false),
+        (None, [&[1], &[]], &[0], false),
+        (None, [&[0, 1], &[]], &[0, 1], true),
+        (None, [&[0, 1], &[0]], &[1], true),
+        (None, [&[0, 1], &[1]], &[0], true),
+        (None, [&[0, 1], &[0, 1]], &[], false),
+        (Some(&[0]), [&[], &[]], &[0], false),
+        (Some(&[1]), [&[], &[]], &[1], false),
+        (Some(&[1]), [&[0], &[]], &[1], false),
+        (Some(&[0]), [&[0], &[]], &[0], true),
+        (Some(&[1]), [&[1], &[]], &[1], true),
+        (Some(&[0]), [&[0], &[0]], &[], false),
+    ];
+    let held = (ShedReason::NoEndpoints, "healthy");
+    for start in [&[][..], &[MARK][..]] {
+        for (places, vetoes, taken, lifted) in rows {
+            let told = format!("{start:?}, {places:?}, {vetoes:?}");
+            let past = if lifted {
+                LiftedVeto::Liveness
+            } else {
+                LiftedVeto::None
+            };
+            let mut prefills = BTreeSet::new();
+            for seed in 0..12 {
+                let (decision, sides) = decided(budget, seed, (start, places, vetoes));
+                assert_eq!(sides, [false, true], "{told}");
+                if taken.is_empty() {
+                    assert_eq!(shed_of(&decision), held, "{told}");
+                } else {
+                    assert!(decision.pick().is_some(), "{told}: {decision:?}");
+                    assert_eq!(decision.trace().lifted, past, "{told}");
+                    prefills.extend(named(&decision).iter().map(|target| target.position));
+                }
+            }
+            let prefills: Vec<u32> = prefills.into_iter().collect();
+            assert_eq!(prefills, taken, "{told}");
+        }
+    }
+}
+
+/// [`Beside::meeting`] judges a side where its part of the demand states
+/// something, and nowhere else. A side whose part is empty is handed back
+/// as it was stated: its places, its mask, its holds, and the unmet demand
+/// it names or none. Its list stands as it was. A side that is judged is
+/// stated with no unmet demand, as its callers state it. Under a part
+/// that states something it is held as a single request's list is
+/// ([`single::held_in`]), over the places it states. Its list is that
+/// rule's. Where the rule holds the list, the side's places are the
+/// rule's. Where it refuses, the side keeps its places and names the
+/// demand the rule leaves unmet. Its mask and its holds stand.
+///
+/// Pools of no worker, one, two and three, of two kinds. In one kind no
+/// worker states anything. In the other the first worker alone states a
+/// runtime, media by reference and a way to decide, and no window, and
+/// the others state a window of one token. No worker takes images. Every
+/// part of the pool is the side's mask and every part its holds. Its
+/// places are none stated, every part of the pool, and every part with
+/// the first place past the pool, each with each. Its list starts seven
+/// ways: empty, one place, two places out of order, and four lists that
+/// no judged side writes, which are one mark, two alike, three out of
+/// order, and a mark behind two places out of order. The parts that
+/// state something are a runtime, the input's bound, a completion's
+/// bound and a way to decide, each at one and at two, vision, media by
+/// reference, and the two bounds as one number, at one and at two. Eight
+/// frames by hand then read the places, the unmet demand and the list of
+/// a side that a part narrows, leaves whole and refuses.
+#[test]
+fn a_side_is_judged_where_its_part_of_a_demand_states_something_and_nowhere_else() {
+    use crate::engine::{demands::References, records::DecisionClock};
+
+    // What a side states: its places, its mask and its holds.
+    type Stated<'a> = (Option<&'a [u32]>, &'a [u32], &'a [u32]);
+    // A frame by hand: a pool, a part, the places a side states, and the
+    // places, the unmet demand and the list it comes back with.
+    type ByHand<'a> = (
+        &'a PoolRecords,
+        Demands,
+        Option<&'a [u32]>,
+        Option<&'a [u32]>,
+        Option<UnmetDemand>,
+        &'a [u32],
+    );
+    let starts: [&[u32]; 7] = [
+        &[],
+        &[0],
+        &[1, 0],
+        &[MARK],
+        &[MARK, MARK],
+        &[MARK - 1, MARK, MARK - 2],
+        &[1, 0, MARK],
+    ];
+    let none = Demands::default();
+    // A part that states something: each number at one and at two, vision,
+    // media by reference, and the two bounds as one number, at one and at
+    // two.
+    let part = |state: fn(&mut Demands)| {
+        let mut demands = none;
+        state(&mut demands);
+        demands
+    };
+    let runtime = part(|demands| demands.runtime = 1);
+    let pixels = part(|demands| demands.vision = true);
+    let budget = part(|demands| demands.output_window = 1);
+    let bounds = part(|demands| (demands.input_window, demands.output_window) = (2, 2));
+    let parts = [
+        runtime,
+        part(|demands| demands.runtime = 2),
+        pixels,
+        part(|demands| demands.references = References::Any),
+        part(|demands| demands.input_window = 1),
+        part(|demands| demands.input_window = 2),
+        budget,
+        part(|demands| demands.output_window = 2),
+        part(|demands| demands.decoding = 1),
+        part(|demands| demands.decoding = 2),
+        part(|demands| (demands.input_window, demands.output_window) = (1, 1)),
+        bounds,
+    ];
+    // One state of a side over a pool's records, under each start of its
+    // list. The empty part hands it back, with the unmet demand it names
+    // or none, and leaves its list. A part that states something holds it
+    // and its list as a single request's rule does.
+    let told = |records: &PoolRecords, (places, stalled, held): Stated<'_>| {
+        for start in starts {
+            for unmet in [None, Some(UnmetDemand::Vision)] {
+                let stated = Beside {
+                    places,
+                    stalled,
+                    held,
+                    unmet,
+                };
+                let mut kept = start.to_vec();
+                let side = stated.meeting(records, none, &mut kept);
+                let back = (side.places, side.stalled, side.held, side.unmet);
+                assert_eq!(back, (places, stalled, held, unmet), "{start:?}");
+                assert_eq!(kept, start, "{places:?}, {stalled:?}, {held:?}");
+            }
+            let stated = Beside {
+                places,
+                stalled,
+                held,
+                unmet: None,
+            };
+            for part in parts {
+                let cx = Constraints {
+                    demands: part,
+                    places,
+                    ..Constraints::default()
+                };
+                let mut ruled = Vec::new();
+                let rule = match single::held_in(records, cx, &mut ruled) {
+                    Ok(cx) => (cx.places, None),
+                    Err(unmet) => (places, Some(unmet)),
+                };
+                let mut kept = start.to_vec();
+                let side = stated.meeting(records, part, &mut kept);
+                let back = (side.places, side.stalled, side.held, side.unmet);
+                assert_eq!(back, (rule.0, stalled, held, rule.1), "{start:?}, {part:?}");
+                assert_eq!(kept, ruled, "{places:?}, {start:?}, {part:?}");
+            }
+        }
+    };
+    // Three workers. A pool of them states nothing, or its first worker
+    // alone states a runtime, media by reference and a way to decide, and
+    // the others a window of one token.
+    let host = Host::of(3, 1);
+    let (spec, _) = hearing();
+    let clock = DecisionClock::new();
+    let records_of = |pool: usize, stating: bool| {
+        PoolRecords::with_fixed_facts(&host.prefills[..pool], &spec, &clock, |worker| {
+            let demands = match (stating, Arc::ptr_eq(worker, &host.prefills[0])) {
+                (false, _) => DemandFacts::default(),
+                (true, true) => DemandFacts {
+                    runtime: 1,
+                    references: true,
+                    decoding: 1,
+                    ..DemandFacts::default()
+                },
+                (true, false) => DemandFacts {
+                    window: 1,
+                    ..DemandFacts::default()
+                },
+            };
+            FixedFacts {
+                demands,
+                ..FixedFacts::default()
+            }
+        })
+    };
+    // Every part of the places under `end`, each in the list's order.
+    let parts_under = |end: u32| -> Vec<Vec<u32>> {
+        (0u32..1 << end)
+            .map(|bits| (0..end).filter(|at| (bits >> at) & 1 == 1).collect())
+            .collect()
+    };
+    for pool in 0u32..=3 {
+        let every = parts_under(pool);
+        // The places a side states: every part of the pool, and every
+        // part with the first place past it.
+        let listed = parts_under(pool + 1);
+        for stating in [false, true] {
+            let records = records_of(pool as usize, stating);
+            for stalled in &every {
+                for held in &every {
+                    told(&records, (None, stalled, held));
+                    for places in &listed {
+                        told(&records, (Some(places), stalled, held));
+                    }
+                }
+            }
+        }
+    }
+    // By hand, with no mask, no hold and a marked list. Over the three
+    // workers that state something, a runtime keeps the first worker of
+    // every place, leaves a list of that worker whole, and is named over a
+    // list of the other two. Vision is named over every place. Of a list
+    // of the third worker and the first, the two bounds as one number keep
+    // the first worker. Over the second worker alone they are named. A
+    // completion's bound of one token leaves every place whole and writes
+    // each into the list. Over the three that state nothing, a runtime is
+    // named.
+    let (full, bare) = (records_of(3, true), records_of(3, false));
+    let wire = Some(UnmetDemand::Runtime);
+    let (blind, narrow) = (Some(UnmetDemand::Vision), Some(UnmetDemand::Window));
+    let frames: [ByHand<'_>; 8] = [
+        (&full, runtime, None, Some(&[0]), None, &[0]),
+        (&full, runtime, Some(&[0]), Some(&[0]), None, &[0]),
+        (&full, runtime, Some(&[1, 2]), Some(&[1, 2]), wire, &[]),
+        (&full, pixels, None, None, blind, &[]),
+        (&full, bounds, Some(&[2, 0]), Some(&[0]), None, &[0]),
+        (&full, bounds, Some(&[1]), Some(&[1]), narrow, &[]),
+        (&full, budget, None, None, None, &[0, 1, 2]),
+        (&bare, runtime, None, None, wire, &[]),
+    ];
+    for (records, part, places, back, unmet, list) in frames {
+        let stated = Beside {
+            places,
+            stalled: &[],
+            held: &[],
+            unmet: None,
+        };
+        let mut kept = vec![MARK];
+        let side = stated.meeting(records, part, &mut kept);
+        let handed = (side.places, side.unmet);
+        assert_eq!(handed, (back, unmet), "{places:?}, {part:?}");
+        assert_eq!(kept, list, "{places:?}, {part:?}");
+    }
+}
+
+/// A pair's sides are held to the pipeline a request pins its media by
+/// reference to, each side by its own worker. A side whose worker
+/// processes that media by the other pipeline sheds the pair under
+/// `pipeline`: the prefills' side where each side's does, and the
+/// decodes' where the prefill has the pipeline named.
+///
+/// Every worker processes media by reference. The prefill does it by a
+/// pipeline of its own or by its registering host's, and so does the
+/// decode: four fleets. A request pinned to a pipeline is picked where
+/// both workers have it.
+#[test]
+fn a_pairs_sides_are_held_to_the_pipeline_a_request_pins_its_references_to() {
+    use crate::engine::demands::References;
+
+    let piped = (ShedReason::NoEndpoints, "pipeline");
+    let sides = [PairSide::Prefill, PairSide::Decode];
+    // Whether each side's worker has its host's pipeline: the prefill,
+    // then the decode.
+    for hosts in [[false, false], [false, true], [true, false], [true, true]] {
+        let host = stating(1, 1, |side, _| FixedFacts {
+            demands: DemandFacts {
+                references: true,
+                host_pipeline: hosts[side],
+                ..DemandFacts::default()
+            },
+            ..FixedFacts::default()
+        });
+        // A pin to the caller's pipeline is met by a worker that has its
+        // host's, and a pin to the worker's by one that has its own.
+        let pins = [(References::Caller, true), (References::Worker, false)];
+        for (references, wanted) in pins {
+            let cx = demanding(Demands {
+                references,
+                ..Demands::default()
+            });
+            let decision = host.decide_among(&OPEN, 0, None, cx, [None, None]);
+            let told = format!("{hosts:?}, {references:?}");
+            // The first side whose worker has the other pipeline.
+            let Some(unmet) = hosts.iter().position(|&has| has != wanted) else {
+                assert!(decision.pick().is_some(), "{told}: {decision:?}");
+                continue;
+            };
+            let shed = (shed_of(&decision), side_of(&decision));
+            assert_eq!(shed, (piped, Some(sides[unmet])), "{told}");
+        }
+    }
+}
+
 /// A side the demand leaves nobody sheds the pair with no endpoint
 /// under the stage of the demand that took that side's last worker, as
 /// a single request's list is shed, and the shed names that side.

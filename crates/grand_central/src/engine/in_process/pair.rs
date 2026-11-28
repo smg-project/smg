@@ -348,10 +348,16 @@ impl<'a> Beside<'a> {
     /// rule ([`single::held_in`]): they are written into `kept`, a list
     /// the calling thread keeps for the side. Where every worker the side
     /// may take meets the demands it stands as it was stated, and where
-    /// none does it names the demand that took the last one. Out of line:
+    /// none does it names the demand that took the last one. `demands` is
+    /// the side's own part ([`Demands::held_by`]): where it states nothing
+    /// no record is judged, as under a single request's rule. The side
+    /// then stands as it was stated, and `kept` as it was. Out of line:
     /// its code stays off the path of a pair that states no demand.
     #[inline(never)]
     fn meeting(self, records: &PoolRecords, demands: Demands, kept: &'a mut Vec<u32>) -> Self {
+        if demands.is_none() {
+            return self;
+        }
         let stated = Constraints {
             demands,
             places: self.places,
@@ -429,11 +435,12 @@ impl<'a> PairLists<'a> {
     /// [`Self::sides_of`] for a request that states a hard demand: each
     /// side held to the places of its list whose worker meets `demands` as
     /// that side's role is held to it, among the places its host states
-    /// ([`Beside::meeting`]). `kept` takes the places, the prefills' first.
-    /// `Err` names the demand that left a side nobody, the prefills'
-    /// first, and that side. An encode request's decision judges its
-    /// pair's two lists here, so a side is held one way under a pair's
-    /// decision and under its.
+    /// ([`Beside::meeting`]). `kept` takes the places of each side that is
+    /// judged, the prefills' first: a side whose part of the demand is
+    /// empty leaves its list as it was. `Err` names the demand that left a
+    /// side nobody, the prefills' first, and that side. An encode request's
+    /// decision holds its pair's two lists here, so a side is held one way
+    /// under a pair's decision and under its.
     pub(super) fn sides_meeting<'s>(
         &self,
         cx: &Constraints<'s>,
@@ -999,9 +1006,11 @@ fn held_prefill<'a, 'f>(
 /// prefills' first, and the engine's scratch. An encode request's decision
 /// keeps its encoders' records here too ([`super::encode`]): a pair's
 /// leaves them as they were. A request that states a hard demand keeps
-/// each side's places that meet it here, the prefills' first, a pair's and
-/// an encode request's alike: such a request allocates nothing once each
-/// list has grown to its side.
+/// here the places that meet it of each side it judges, the prefills'
+/// first, a pair's and an encode request's alike: such a request allocates
+/// nothing once each list has grown to its side. A side the demand does
+/// not hold leaves its list as an earlier request wrote it, and nothing
+/// reads a list that its own request did not write.
 /// A side whose phase reads who holds the prompt keeps its list's column
 /// here, the prefills' first. A pair asked by its draws keeps what its
 /// host's admission answered of every place here for that decision.

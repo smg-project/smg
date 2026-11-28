@@ -3,12 +3,12 @@
 //! entry.
 //!
 //! It is asked for a cell whose request is plain and carries no key, and
-//! for a cell that hands lists of its own, a pair's or an encode request's
-//! ([`asked_with_lists`]). For a plain cell the caller states the model,
-//! its list and a prompt of the size the plain request states, and says
-//! the dispatch and the end of the placement it is answered. It lends no
-//! load snapshot: the engine reads its own. The result line names the
-//! entry asked (`entry=`).
+//! for a cell that hands lists of its own ([`asked_with_lists`]): a
+//! pair's, or an encode request's whose request states no hard demand.
+//! For a plain cell the caller states the model, its list and a prompt of
+//! the size the plain request states, and says the dispatch and the end
+//! of the placement it is answered. It lends no load snapshot: the engine
+//! reads its own. The result line names the entry asked (`entry=`).
 //!
 //! Every request of a plain cell states its prompt's entry in a token tree
 //! ([`Prompt::entry`]), as a host that lends one states it for each
@@ -170,11 +170,12 @@ pub(super) fn word() -> &'static str {
 }
 
 /// Whether `run` asks the one call of a cell that hands lists of its own,
-/// which its own file runs: a pair's, or an encode request's. Either takes
-/// a route's rule, which its file then states ([`ruled::stated`]). A pair's
-/// cell names a worker too (`names`): an encode request's names none, and
-/// the run stops on that entry. The result line's word says the entry
-/// asked.
+/// which its own file runs: a pair's, or an encode request's whose request
+/// states no hard demand (its file stops the run on one that states one).
+/// Either takes a route's rule, which its file then states
+/// ([`ruled::stated`]). A pair's cell names a worker too (`names`): an
+/// encode request's names none, and the run stops on that entry. The
+/// result line's word says the entry asked.
 pub(super) fn asked_with_lists(run: &Run, names: bool) -> bool {
     let named = run.entry == pair::NAMED;
     assert!(names || !named, "such a cell names no worker");

@@ -378,6 +378,15 @@ const CELLS: &[Cell] = &[
         words: encode::words,
         ..Cell::PLAIN
     },
+    // An encode request with items that demands vision: its encoders alone
+    // are held to the demand, and neither side of its pair is.
+    Cell {
+        name: "encode_vision_round_robin",
+        document: || encode::of("round_robin"),
+        request: encode::seeing,
+        words: encode::words,
+        ..Cell::PLAIN
+    },
     Cell {
         name: "least_load",
         document: || preset("least_load"),

@@ -36,6 +36,14 @@
 //! `encode_ring_own` no ring is lent, and the encode stage's own ring
 //! places each item.
 //!
+//! A cell named `encode_vision_...` states a hard demand for vision
+//! ([`seeing`]). With items that demand is the encoders' to meet, and no
+//! part of it is either side's of the pair: the cell counts an encode
+//! request's decision under a demand that judges neither side. It is
+//! asked through the engine's entry: the one call's request here states no
+//! demand, and a run of such a cell stops under `--entry place`,
+//! `place_ruled` and `place_held`.
+//!
 //! Every worker of the three lists has a load report, and a prefill states
 //! its rate as its measured input rate too, as in a pair's cell. Under a
 //! document that declares the bench's signal each decode's report states a
@@ -103,6 +111,14 @@ const TEXTS: usize = 1_024;
 pub(super) fn request(seed: u64) -> Request<'static> {
     let mut request = pair::request(seed);
     request.facts.media = images();
+    request
+}
+
+/// [`request`] that demands vision, as a host states it of a request whose
+/// media holds pixels. Every encoder of the run takes images.
+pub(super) fn seeing(seed: u64) -> Request<'static> {
+    let mut request = request(seed);
+    request.constraints.demands.vision = true;
     request
 }
 
@@ -394,6 +410,17 @@ pub(super) fn runs(run: &Run) -> bool {
     assert!(
         run.entry != ruled::ALONE,
         "a pair's cell alone takes place_alone"
+    );
+    // The one call's request states no hard demand here: a cell whose
+    // request demands one is asked through the engine's entry alone.
+    assert!(
+        !one_call || request(0).constraints.demands.is_none(),
+        "the place entries take an encode cell whose request states no demand"
+    );
+    // A cell named for a demand sends it: its first request is read here.
+    assert!(
+        !name.starts_with("encode_vision_") || request(0).constraints.demands.vision,
+        "a cell named `encode_vision_...` sends a request that demands vision"
     );
     // The run's rule of its route, where its entry states one.
     let rule = one_call && ruled::stated(run);
