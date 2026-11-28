@@ -543,8 +543,9 @@ fn a_prompt_goes_back_to_its_worker_under_the_next_document() {
     }
 }
 
-/// The `random` preset under the generation `number`, picked by the `hears`
-/// of `stages` ([`hearing_stages`]), after `edit`.
+/// The `random` preset as `edit` leaves it. Ahead of `edit` it bears the
+/// generation `number`, and its profile is picked by the `hears` of
+/// `stages` ([`hearing_stages`]): an `edit` may turn either.
 fn hearing_over(
     stages: &StageRegistry,
     number: u64,
@@ -1001,11 +1002,16 @@ enum Says {
     Second,
     /// As [`Self::First`], and the first keeps reports.
     Reports,
+    /// As [`Self::First`], and each names this word of a lease too: the
+    /// word's list holds both, and every other list is as under
+    /// [`Self::First`].
+    Also(EventKind),
 }
 
 /// A scorer that answers of itself by a switch its case turns and by its
-/// place in its profile, the first or the second, and keeps the words it
-/// hears. It implements the dispatch and the release.
+/// place in its profile, the first or the second. It implements the
+/// dispatch and the release, and keeps each of the two it hears: an issue
+/// or an end it names beside them is told to it and kept nowhere.
 #[derive(Debug)]
 struct Switched {
     heard: Heard,
@@ -1015,13 +1021,19 @@ struct Switched {
 
 impl Lifecycle for Switched {
     fn hears(&self) -> EventSet {
-        let crossed = *self.says.lock() == Says::Second;
+        let says = *self.says.lock();
+        let crossed = says == Says::Second;
         let kind = if self.second == crossed {
             EventKind::Released
         } else {
             EventKind::Dispatched
         };
-        EventSet::NONE.with(kind)
+        let named = EventSet::NONE.with(kind);
+        if let Says::Also(also) = says {
+            named.with(also)
+        } else {
+            named
+        }
     }
 
     fn keeps_loads(&self) -> bool {
@@ -1060,16 +1072,38 @@ impl Scorer for Switched {
 /// kept. Where the two named each other's word there, each word's list
 /// holds one scorer in both engines and another one: the profile is built
 /// new. Where the first said it keeps reports there, the profile is built
-/// new too.
+/// new too. So it is where both named one word of a lease there, beside
+/// their own or as their own: that word's list then holds both scorers,
+/// and it alone differs. The case asks so of every word of a lease, as the
+/// crate lists them.
 ///
-/// A dispatch under the later document then reaches the one scorer that
-/// named it at the build that made it, and no other. Where the two named
+/// Each answer is asked under two pickers. The picker `hears` names every
+/// word of a lease: each word's list holds it beside the scorers that
+/// name the word, so two lists that differ are both filled. The preset's
+/// own `random` names none: a word that neither scorer names has an empty
+/// list. Where the list is empty in both engines, the compare goes on
+/// behind it. Where the later build filled it, the two differ. Each
+/// pass is held to its picker: under `hears` each document's validation
+/// built one, and the one in force heard the issue and the dispatch.
+/// Under `random` no validation built a `hears`.
+///
+/// A dispatch under the later document then reaches the scorers that
+/// named it at the build that made them, and no other. Where the two named
 /// each other's word, a standing scorer kept would be told a dispatch it
 /// never named.
 #[test]
 fn a_later_document_keeps_a_profile_its_build_listed_as_the_standing_one() {
-    for later in [Says::First, Says::Second, Says::Reports] {
-        let (mut stages, _) = hearing_stages();
+    // Every word of a lease, read off the crate's own list of them: a word
+    // added there is asked of the keep with no line changed here.
+    let kinds = EventKind::ALL.iter().copied();
+    let kinds = kinds.filter(|&kind| EventSet::LEASE.contains(kind));
+    let answers = [Says::First, Says::Second, Says::Reports];
+    let answers: Vec<Says> = answers.into_iter().chain(kinds.map(Says::Also)).collect();
+    // Each answer under each of the two pickers.
+    let picks = ["hears", "random"].into_iter();
+    let passes = picks.flat_map(|pick| answers.iter().map(move |&later| (pick, later)));
+    for (pick, later) in passes {
+        let (mut stages, picked) = hearing_stages();
         // The scorers' lists, in the order the table built the scorers:
         // a document's first and its second, by turns.
         let scored = Arc::new(Mutex::new(Vec::new()));
@@ -1093,6 +1127,9 @@ fn a_later_document_keeps_a_profile_its_build_listed_as_the_standing_one() {
         let scoring = |document: &mut PolicySpec| {
             let profile = document.profiles.get_mut("random");
             let profile = profile.expect("the preset's profile");
+            // The pass's picker in the place of the helper's `hears`:
+            // neither keeps a report.
+            profile.pick = pick.into();
             profile.score.extend(["switched".into(), "switched".into()]);
         };
         let engine = InProcess::new(hearing_over(&stages, 1, scoring));
@@ -1106,7 +1143,7 @@ fn a_later_document_keeps_a_profile_its_build_listed_as_the_standing_one() {
         let in_force = engine.spec();
         let profile = |of: &SpecHandle| Arc::clone(&of.0.spec.engine().profiles()[0]);
         let kept = Arc::ptr_eq(&profile(&in_force), &profile(&stood));
-        assert_eq!(kept, later == Says::First, "{later:?}");
+        assert_eq!(kept, later == Says::First, "{pick}, {later:?}");
 
         let members = PublishedList::new(pool(2));
         let asks = Asks::of(request(), Some(&members));
@@ -1115,18 +1152,42 @@ fn a_later_document_keeps_a_profile_its_build_listed_as_the_standing_one() {
         let mut held = decided.expect("a decision");
         assert!(held.take(0).is_some(), "the first target");
         held.dispatched(now);
-        // The scorer that named the dispatch at the build that made it,
-        // by the place the table built it at: the standing second where
-        // the profile is kept, and of the later document's two the first
-        // under `Second` and the second under `Reports`.
-        let named = match later {
-            Says::First => 1,
-            Says::Second => 2,
-            Says::Reports => 3,
+        // The scorers that named the dispatch at the build that made
+        // them, by the places the table built them at: the standing
+        // second where the profile is kept; of the later document's two
+        // the first under `Second`, both where each named the dispatch
+        // too, and the second under every other answer.
+        let named: &[usize] = match later {
+            Says::First => &[1],
+            Says::Second => &[2],
+            Says::Also(EventKind::Dispatched) => &[2, 3],
+            Says::Reports | Says::Also(_) => &[3],
         };
         for at in 0..4 {
-            let told: &[&str] = if at == named { &["dispatched"] } else { &[] };
-            assert_eq!(words(&scored, at), told, "{later:?}: the scorer at {at}");
+            let told: &[&str] = if named.contains(&at) {
+                &["dispatched"]
+            } else {
+                &[]
+            };
+            assert_eq!(
+                words(&scored, at),
+                told,
+                "{pick}, {later:?}: the scorer at {at}"
+            );
+        }
+        // The pass's picker is each document's own. Under `hears` each
+        // document's validation built one, and the one of the profile in
+        // force heard the issue and the dispatch: it stands in every
+        // word's list. Under `random` no validation built a `hears`.
+        if pick == "hears" {
+            let in_force = usize::from(!kept);
+            assert_eq!(picked.lock().len(), 2, "{later:?}: a picker a document");
+            let heard = words(&picked, in_force);
+            assert_eq!(heard, ["issued", "dispatched"], "{later:?}: in force");
+            let other = words(&picked, 1 - in_force);
+            assert!(other.is_empty(), "{later:?}: the other document's");
+        } else {
+            assert!(picked.lock().is_empty(), "{later:?}: no `hears` is built");
         }
     }
 }

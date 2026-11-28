@@ -4474,6 +4474,36 @@ impl Takers {
             }
         }
     }
+
+    /// The stages listed under the word `kind`, by their places and in
+    /// the engine's order. A change of membership and a signal are no
+    /// words of a lease: no stage is listed under either.
+    #[inline(always)]
+    fn of(&self, kind: EventKind) -> &[StagePlace] {
+        match kind {
+            EventKind::Issued => &self.issued,
+            EventKind::Dispatched => &self.dispatched,
+            EventKind::Completed => &self.completed,
+            EventKind::Released => &self.released,
+            EventKind::Membership | EventKind::Signal => &[],
+        }
+    }
+
+    /// Every word's list, each once: what two builds are compared by
+    /// ([`Engine::listed`]). The order of the answer is no part of it. The
+    /// pattern names each field of the record: where the compare is built,
+    /// under the `in-process` feature, a list added to the record does not
+    /// build until the pattern names it.
+    #[cfg(feature = "in-process")]
+    fn every(&self) -> [&[StagePlace]; 4] {
+        let Self {
+            issued,
+            dispatched,
+            completed,
+            released,
+        } = self;
+        [issued, dispatched, completed, released]
+    }
 }
 
 /// A stage keeps state for each decision slot, so each model decides at its
@@ -6313,18 +6343,20 @@ impl Engine {
     /// of sends. The lists of the stages that keep reports and that take
     /// each word are such tables ([`Self::listed`]): a stage kept is told
     /// as the build that made it listed it, and not as its twin of the
-    /// later build answered. Two tables are not compared. The profile's
+    /// later build answered. Three tables are not compared. The profile's
     /// needs are its stages' own, which its caller compares stage by
     /// stage, less a sample the marks rule. Whether its draw may be asked
-    /// first is read of the marks and the picker's name. A table added to
-    /// the making is added here.
+    /// first is read of the marks and the picker's name. Whether a whole
+    /// pass turns its set is read of the picker's name, in an engine a
+    /// document's build made, and no other engine keeps a profile. A table
+    /// added to the making is added here.
     #[cfg(feature = "in-process")]
     fn read_as(&self, at: usize, standing: &Self, stood: usize) -> bool {
         let asked = |of: &Self, at: usize| of.sent_of.get(at).is_some_and(Option::is_some);
         // Asked last: the two engines' lists are searched only where the
         // profile's other tables agree.
         let listed = || {
-            let mut lists = self.listed(at).into_iter().zip(standing.listed(stood));
+            let mut lists = self.listed(at).zip(standing.listed(stood));
             lists.all(|(here, there)| here.eq(there))
         };
         self.marks[at] == standing.marks[stood]
@@ -6339,16 +6371,15 @@ impl Engine {
     /// What the build listed of the profile at `at`: of the list of the
     /// stages that keep reports and of each word's list, the profile's
     /// stages by their places in it. Each list is in the engine's order,
-    /// so a profile's stages stand together in it.
+    /// so a profile's stages stand together in it. Two engines answer
+    /// their lists in one order, and no more is asked of that order.
     #[cfg(feature = "in-process")]
-    fn listed(&self, at: usize) -> [impl Iterator<Item = Option<usize>> + '_; 5] {
-        let Takers {
-            issued,
-            dispatched,
-            completed,
-            released,
-        } = &self.takers;
-        [&self.keepers, issued, dispatched, completed, released].map(|list| {
+    fn listed(
+        &self,
+        at: usize,
+    ) -> impl Iterator<Item = impl Iterator<Item = Option<usize>> + '_> + '_ {
+        let lists = std::iter::once(self.keepers.as_slice()).chain(self.takers.every());
+        lists.map(move |list| {
             let from = list.partition_point(|place| place.profile() < at);
             let upto = list.partition_point(|place| place.profile() <= at);
             list[from..upto].iter().map(|place| place.within())
@@ -10574,11 +10605,19 @@ impl Engine {
     /// The stages' part of a release, behind the table's
     /// ([`Self::released_table`]).
     pub(crate) fn released_stages(&self, lease: &Lease, reason: ReleaseReason) {
-        tell_released(self.stages(&self.takers.released), lease, reason);
+        let stages = self.stages(self.taking(EventKind::Released));
+        tell_released(stages, lease, reason);
+    }
+
+    /// The places of this engine's stages that take the word `kind`: its
+    /// list of them ([`Takers`]), in the engine's order.
+    #[inline(always)]
+    fn taking(&self, kind: EventKind) -> &[StagePlace] {
+        self.takers.of(kind)
     }
 
     /// The stages of `takers`, one of this engine's lists of the stages
-    /// that take a word ([`Takers`]), in the list's order.
+    /// that take a word ([`Self::taking`]), in the list's order.
     #[inline(always)]
     fn stages<'a>(&'a self, takers: &'a [StagePlace]) -> impl Iterator<Item = &'a dyn Lifecycle> {
         takers.iter().map(|place| place.stage(&self.profiles))
@@ -10634,7 +10673,7 @@ impl Engine {
         side: Side,
         since_decision_micros: u32,
     ) {
-        let stages = self.stages(&self.takers.dispatched);
+        let stages = self.stages(self.taking(EventKind::Dispatched));
         tell_dispatched(stages, lease, target, side, since_decision_micros);
     }
 }
@@ -10720,8 +10759,8 @@ pub(crate) struct Stood<'a> {
 #[cfg(feature = "in-process")]
 impl<'a> Stood<'a> {
     /// The stages of `takers`, one of the engine's lists of the stages
-    /// that take a word ([`Takers`]), whose profile stood: in the list's
-    /// order.
+    /// that take a word ([`Engine::taking`]), whose profile stood: in the
+    /// list's order.
     #[inline]
     fn stages(self, takers: &'a [StagePlace]) -> impl Iterator<Item = &'a dyn Lifecycle> {
         let Self { engine, below } = self;
@@ -10816,7 +10855,7 @@ impl Issuing for Stood<'_> {
     }
 
     fn dispatched_stages(self, lease: &Lease, target: &Target, side: Side, since_micros: u32) {
-        let stages = self.stages(&self.engine.takers.dispatched);
+        let stages = self.stages(self.engine.taking(EventKind::Dispatched));
         tell_dispatched(stages, lease, target, side, since_micros);
     }
 
@@ -10826,15 +10865,18 @@ impl Issuing for Stood<'_> {
     }
 
     fn released_stages(self, lease: &Lease, reason: ReleaseReason) {
-        tell_released(self.stages(&self.engine.takers.released), lease, reason);
+        let stages = self.stages(self.engine.taking(EventKind::Released));
+        tell_released(stages, lease, reason);
     }
 
     fn decision_issued(self, lease: &Lease, decision: &Decision) {
-        tell_issued(self.stages(&self.engine.takers.issued), lease, decision);
+        let stages = self.stages(self.engine.taking(EventKind::Issued));
+        tell_issued(stages, lease, decision);
     }
 
     fn completed(self, lease: &Lease, outcome: &Outcome) {
-        tell_completed(self.stages(&self.engine.takers.completed), lease, outcome);
+        let stages = self.stages(self.engine.taking(EventKind::Completed));
+        tell_completed(stages, lease, outcome);
     }
 }
 
@@ -10899,7 +10941,8 @@ impl Engine {
 
 impl Lifecycle for Engine {
     fn on_decision_issued(&self, lease: &Lease, decision: &Decision) {
-        tell_issued(self.stages(&self.takers.issued), lease, decision);
+        let stages = self.stages(self.taking(EventKind::Issued));
+        tell_issued(stages, lease, decision);
     }
 
     #[inline(always)]
@@ -10916,7 +10959,8 @@ impl Lifecycle for Engine {
     }
 
     fn on_completed(&self, lease: &Lease, outcome: &Outcome) {
-        tell_completed(self.stages(&self.takers.completed), lease, outcome);
+        let stages = self.stages(self.taking(EventKind::Completed));
+        tell_completed(stages, lease, outcome);
     }
 
     fn on_released(&self, lease: &Lease, reason: ReleaseReason) {
