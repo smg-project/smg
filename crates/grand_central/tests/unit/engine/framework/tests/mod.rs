@@ -23,6 +23,7 @@ use crate::{
         pickers::{self, Best, CountFirst},
         scorers::{self, LeastRequests},
     },
+    tracking::lease::{Lease, Membership, Outcome, ReleaseReason, Side, Signal},
 };
 
 mod class_tables;
