@@ -19,6 +19,7 @@
     reason = "the guests' assembly and the loads run inside the tests; a failure there is the test's failure"
 )]
 
+#[path = "../support"]
 mod support {
     pub mod wasm_guest;
 }

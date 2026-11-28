@@ -377,6 +377,11 @@ name = "grpc_runtime"
 path = "tests/plugin/grpc_runtime.rs"
 required-features = ["controller"]
 
+# A program of its own: its case files name the root's items by `crate::`.
+[[test]]
+name = "wasm_plugin"
+path = "tests/plugin/wasm_plugin.rs"
+
 # A program of its own: the contracts' page names it by `--test wit`.
 [[test]]
 name = "wit"
