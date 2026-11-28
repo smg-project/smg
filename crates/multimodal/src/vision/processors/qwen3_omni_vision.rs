@@ -218,7 +218,10 @@ mod tests {
     use image::{DynamicImage, RgbImage};
 
     use super::*;
-    use crate::vision::{processor::ModelSpecificValue, processors::Qwen3VLProcessor};
+    use crate::{
+        test_support::{hex, lcg_rgb_image},
+        vision::{processor::ModelSpecificValue, processors::Qwen3VLProcessor},
+    };
 
     #[test]
     fn omni_multiframe_resize_differs_from_qwen3_volume_budget() {
@@ -343,6 +346,113 @@ mod tests {
         assert_eq!(
             omni.image_input_elements(4096, 3136),
             omni.inner.image_input_elements(4096, 3136)
+        );
+    }
+
+    /// `output` against one run of the reference on the same bytes: the
+    /// shape and the grid of its tensor, four of its f32 values by index and
+    /// the SHA-256 of them all.
+    fn assert_reference(
+        output: &PreprocessedEncoderInputs,
+        grid_key: &str,
+        shape: [usize; 2],
+        grid: [i64; 3],
+        witnesses: [(usize, f32); 4],
+        digest: &str,
+    ) {
+        use sha2::{Digest, Sha256};
+
+        assert_eq!(output.encoder_input.shape(), &shape, "{grid_key}");
+        let actual = output.model_specific.get(grid_key);
+        assert!(
+            matches!(
+                actual,
+                Some(ModelSpecificValue::IntTensor { data, shape })
+                    if data[..] == grid && shape[..] == [1, 3]
+            ),
+            "{grid_key}: {actual:?}, not {grid:?}"
+        );
+        let bytes = output.encoder_input.write_as(EncoderDtype::Float32);
+        let bytes: &[u8] = &bytes;
+        for (index, reference) in witnesses {
+            let value = f32::from_le_bytes(bytes[index * 4..index * 4 + 4].try_into().unwrap());
+            assert!(
+                value.to_bits() == reference.to_bits(),
+                "{grid_key} {grid:?} element {index}: {value} (the reference {reference})"
+            );
+        }
+        assert_eq!(hex(&Sha256::digest(bytes)), digest, "{grid_key} {grid:?}");
+    }
+
+    /// Two seeded images and one clip of three seeded frames through the
+    /// processor as it is built without a config, against the reference
+    /// image and video processors of the family on the same bytes under the
+    /// family's own bounds: an image 3,136 to 12,845,056 pixels, a clip
+    /// frame 128 to 768 merged patches, sized frame by frame. Each input
+    /// comes out at another size than under the bounds of
+    /// `Qwen3VLProcessor`, whose fixtures pin the shared base (width x
+    /// height throughout): 37x23, under the image floor, at 96x64; 259x194,
+    /// above it, at 256x192; a 70x100 frame, under the frame floor, at
+    /// 320x448, the third frame repeated to fill the second temporal patch.
+    ///
+    /// The values are what the reference's `Qwen2VLImageProcessor` and
+    /// `Qwen2VLVideoProcessor` (transformers 5.17, torch 2.13, torchvision
+    /// 0.28) return for the same bytes. To make them again: build both with
+    /// `patch_size=16`, `merge_size=2`, `temporal_patch_size=2`, bicubic
+    /// resampling and a mean and std of 0.5; the image class with
+    /// `min_pixels=3136` and `max_pixels=12845056`; the video class with
+    /// `do_sample_frames=False` and
+    /// `size={"shortest_edge": 131072, "longest_edge": 786432}`; then read
+    /// `pixel_values` and `pixel_values_videos` as little-endian `f32`.
+    #[test]
+    fn images_and_a_clip_match_the_reference_bit_for_bit() {
+        let omni = Qwen3OmniVisionProcessor::new();
+
+        let image = lcg_rgb_image(37, 23, 7);
+        assert_reference(
+            &omni.preprocess(&[&image]).unwrap(),
+            "image_grid_thw",
+            [24, 1536],
+            [1, 4, 6],
+            [
+                (0, -0.2627451),
+                (1, -0.19215687),
+                (18_509, 0.62352943),
+                (36_863, 0.56078434),
+            ],
+            "6e6980c78b7555ec04d617ddadc4065c392edc8f21c768efa8da2b2c13d9806f",
+        );
+
+        let image = lcg_rgb_image(259, 194, 11);
+        assert_reference(
+            &omni.preprocess(&[&image]).unwrap(),
+            "image_grid_thw",
+            [192, 1536],
+            [1, 12, 16],
+            [
+                (0, 0.043137256),
+                (1, 0.34901962),
+                (147_533, 0.44313726),
+                (294_911, -0.96862745),
+            ],
+            "2e54dfc29ab8569c631a2305df465c2d10e5c35e07b47a89fc6f12eee146539b",
+        );
+
+        let frames: Vec<DynamicImage> = (21..24).map(|seed| lcg_rgb_image(70, 100, seed)).collect();
+        assert_reference(
+            &omni
+                .preprocess_video(&frames, &VideoClipOptions::sampled_at(2.0))
+                .unwrap(),
+            "video_grid_thw",
+            [1120, 1536],
+            [2, 28, 20],
+            [
+                (0, -0.6313726),
+                (1, -0.56078434),
+                (860_237, -0.25490198),
+                (1_720_319, -0.654902),
+            ],
+            "9742fb8bb1ba4e768a46becee972a412660931e11b81ad011e4b400db0347e5e",
         );
     }
 }
