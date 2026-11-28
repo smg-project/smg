@@ -6,6 +6,7 @@ mod ico_png_entry;
 mod max_long_side_pixel;
 mod opaque_composite;
 mod plain_bmp;
+mod pooled_general;
 mod pooled_png;
 mod seek_decode;
 mod sixteen_bit_colour;
