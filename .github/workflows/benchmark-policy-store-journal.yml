@@ -10,9 +10,6 @@ on:
       - 'crates/grand_central/Cargo.toml'
       - 'crates/grand_central/benches/store_journal.rs'
       - 'crates/grand_central/src/**'
-      - '!crates/grand_central/src/**/tests/**'
-      - '!crates/grand_central/src/**/tests.rs'
-      - '!crates/grand_central/src/**/*_test.rs'
   pull_request:
     branches: [ main, release/** ]
     paths:
@@ -22,9 +19,6 @@ on:
       - 'crates/grand_central/Cargo.toml'
       - 'crates/grand_central/benches/store_journal.rs'
       - 'crates/grand_central/src/**'
-      - '!crates/grand_central/src/**/tests/**'
-      - '!crates/grand_central/src/**/tests.rs'
-      - '!crates/grand_central/src/**/*_test.rs'
   workflow_dispatch:
   schedule:
     - cron: '0 0 * * 0'
