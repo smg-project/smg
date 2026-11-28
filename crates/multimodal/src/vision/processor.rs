@@ -228,6 +228,19 @@ pub trait VisionPreProcessor: Send + Sync {
         self.preprocess_video_rgb(frames, clip)
     }
 
+    /// [`preprocess_video`](Self::preprocess_video) for a clip whose decoder
+    /// reported how its frames were sampled from the source, as
+    /// [`preprocess_video_rgb_sampled`](Self::preprocess_video_rgb_sampled) is
+    /// for borrowed RGB frames. The default ignores `sampling`.
+    fn preprocess_video_sampled(
+        &self,
+        frames: &[DynamicImage],
+        clip: &VideoClipOptions,
+        _sampling: Option<&VideoSamplingInfo>,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.preprocess_video(frames, clip)
+    }
+
     /// Calculate the number of vision tokens for a given image size.
     ///
     /// This is used to determine how many placeholder tokens to insert

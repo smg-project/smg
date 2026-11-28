@@ -193,8 +193,11 @@ impl NemotronGeometry {
         if !(downsample_ratio > 0.0 && downsample_ratio <= 1.0) {
             return Err(Invalid("/downsample_ratio"));
         }
-        let dynamic = match field("/vision_config/args/min_num_patches") {
+        // The engine picks dynamic resolution by the key's presence, and its
+        // tiler takes no other shuffle than 2x2.
+        let dynamic = match config.pointer("/vision_config/args/min_num_patches") {
             None => None,
+            Some(_) if downsample_ratio != 0.5 => return Err(Invalid("/downsample_ratio")),
             Some(_) => {
                 let max = match number("/vision_config/args/max_num_patches")? {
                     max if max <= 0.0 => usize::MAX,
@@ -209,7 +212,11 @@ impl NemotronGeometry {
         let video_frame_size = match (target_patches, target_size) {
             (Some(_), Some(_)) => return Err(Invalid("/vision_config/video_target_img_size")),
             (Some(patches), None) => Some(patches),
-            (None, Some(size)) => Some(size.div_ceil(patch_size).pow(2)),
+            (None, Some(size)) => Some(
+                size.div_ceil(patch_size)
+                    .checked_pow(2)
+                    .ok_or(Invalid("/vision_config/video_target_img_size"))?,
+            ),
             (None, None) => None,
         }
         .map_or(VideoFrameSize::Square, |patches| VideoFrameSize::Patches {
@@ -1027,10 +1034,21 @@ impl VisionPreProcessor for NemotronOmniProcessor {
         )
     }
 
+    /// Refused in the reference layout, as
+    /// [`preprocess_video_rgb`](Self::preprocess_video_rgb) is.
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
         clip: &VideoClipOptions,
+    ) -> Result<PreprocessedEncoderInputs, TransformError> {
+        self.preprocess_video_sampled(frames, clip, None)
+    }
+
+    fn preprocess_video_sampled(
+        &self,
+        frames: &[DynamicImage],
+        clip: &VideoClipOptions,
+        sampling: Option<&VideoSamplingInfo>,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         let rgb: Vec<_> = frames.iter().map(rgb_bytes).collect();
         let refs: Vec<_> = rgb
@@ -1041,7 +1059,7 @@ impl VisionPreProcessor for NemotronOmniProcessor {
                 data: raw,
             })
             .collect();
-        self.preprocess_video_rgb(&refs, clip)
+        self.preprocess_video_rgb_sampled(&refs, clip, sampling)
     }
 
     /// Refused in the reference layout: its outputs need the frames' source
@@ -1491,6 +1509,37 @@ mod tests {
                 "/vision_config/args/max_num_patches"
             ))
         );
+        // The engine's dynamic tiler takes no shuffle but 2x2, and a null
+        // minimum still names dynamic resolution.
+        let mut fourfold = config("omni");
+        fourfold["downsample_ratio"] = json!(0.25);
+        assert_eq!(
+            NemotronGeometry::from_model_config(&fourfold),
+            Err(NemotronConfigError::Invalid("/downsample_ratio"))
+        );
+        let mut tiled = config("v2");
+        tiled["downsample_ratio"] = json!(0.25);
+        assert_eq!(
+            NemotronGeometry::from_model_config(&tiled).map(|g| g.shuffle()),
+            Ok(4)
+        );
+        let mut unset = config("omni");
+        unset["vision_config"]["args"]["min_num_patches"] = Value::Null;
+        assert_eq!(
+            NemotronGeometry::from_model_config(&unset),
+            Err(NemotronConfigError::Missing(
+                "/vision_config/args/min_num_patches"
+            ))
+        );
+        // A frame side whose patch count does not fit is refused, not wrapped.
+        let mut huge = config("v2");
+        huge["vision_config"]["video_target_img_size"] = json!(1_u64 << 36);
+        assert_eq!(
+            NemotronGeometry::from_model_config(&huge),
+            Err(NemotronConfigError::Invalid(
+                "/vision_config/video_target_img_size"
+            ))
+        );
     }
 
     /// Reference dynamic images: one flat patch batch whatever their sizes,
@@ -1591,7 +1640,8 @@ mod tests {
                 data,
             })
             .collect();
-        let clip = VideoClipOptions::sampled_at(30.0);
+        // The frame duration is the source's, not the sampled rate's.
+        let clip = VideoClipOptions::sampled_at(2.0);
         let sampling = VideoSamplingInfo {
             source_fps: 30.0,
             frame_indices: vec![0, 15, 29],
@@ -1603,14 +1653,41 @@ mod tests {
         // is padded by the engine) of 256 tokens.
         assert_eq!(omni.encoder_input.shape(), &[3, 3, 512, 512]);
         assert_eq!(omni.feature_token_counts, [2 * 256]);
+        // The engine reads each tensor's leading axis as the clip.
+        let tensor = |inputs: &PreprocessedEncoderInputs, key: &str| match inputs
+            .model_specific
+            .get(key)
+        {
+            Some(ModelSpecificValue::IntTensor { data, shape }) => (data.clone(), shape.clone()),
+            other => panic!("{key}: {other:?}"),
+        };
+        let side_tensors = |inputs: &PreprocessedEncoderInputs| {
+            ["video_num_patches", "frames_indices", "frame_duration_ms"]
+                .map(|key| tensor(inputs, key))
+        };
         assert_eq!(
-            ints(omni.model_specific.get("frames_indices")),
-            vec![0, 15, 29]
+            side_tensors(&omni),
+            [
+                (vec![3], vec![1]),
+                (vec![0, 15, 29], vec![1, 3]),
+                (vec![33], vec![1]),
+            ]
         );
-        assert_eq!(ints(omni.model_specific.get("frame_duration_ms")), vec![33]);
         let values = omni.encoder_input.as_f32();
         let first = |frame: usize| values[[frame, 0, 0, 0]];
         assert!(first(0) < first(1) && first(1) < first(2));
+        // The same clip as image frames keeps its sampling.
+        let images: Vec<_> = frames
+            .iter()
+            .map(|data| image::RgbImage::from_raw(32, 32, data.clone()).unwrap())
+            .map(DynamicImage::from)
+            .collect();
+        let from_images = processor("omni")
+            .preprocess_video_sampled(&images, &clip, Some(&sampling))
+            .unwrap();
+        assert_eq!(from_images.encoder_input.as_f32(), values);
+        assert_eq!(from_images.feature_token_counts, omni.feature_token_counts);
+        assert_eq!(side_tensors(&from_images), side_tensors(&omni));
         // One frame per tubelet on V2.
         assert_eq!(
             processor("v2")
@@ -1623,6 +1700,7 @@ mod tests {
         assert!(processor("omni")
             .preprocess_video_rgb(&refs, &clip)
             .is_err());
+        assert!(processor("omni").preprocess_video(&images, &clip).is_err());
         // A frame already at the target size still has its buffer checked.
         let short = vec![0u8; 512 * 512 * 3 - 1];
         let frame = [RgbFrameRef {
