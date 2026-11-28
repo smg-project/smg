@@ -229,7 +229,7 @@ A factory of the three `_with` calls takes a build context, `StageBuild`. It rea
 - Membership words end it too, among them a removal, a replacement or a resize of the row's worker and a join told of it.
 - Where the profile sets `sent_report_delay_ms`, the report that ends a send is sampled at least that long after it.
 - In a standalone controller's decision the report is its load monitor's. A spec that holds a stage that keeps reports is given none yet, so there no report ends a send.
-- When a send arrives with 8,192 or more held on a row, the tally lets one of the row's sends go at any age, or none. As a rule it is the oldest. None goes where the row then holds no more than 8,192: a release can have made room.
+- When a send arrives with 8,192 or more held on a row, the tally lets one of the row's sends go at any age, or none. As a rule it is the oldest. None goes where the row, the new send counted, holds no more than 8,192.
 
 **The load report reader.**
 
