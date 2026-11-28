@@ -56,6 +56,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use llm_tokenizer::traits::Tokenizer;
 use serde_json::{json, Value};
 
@@ -1010,8 +1011,9 @@ struct Store {
     /// The script files loaded so far, each once, with their answer counts.
     loaded: HashMap<PathBuf, usize>,
     /// The info answers a recorder kept beside a record file, by the path of
-    /// their call: the bytes of the first answer of each ([`info_beside`]).
-    info: HashMap<String, Vec<u8>>,
+    /// their call: the bytes of the first answer of each ([`info_beside`]),
+    /// which every reader shares ([`recorded_info`]).
+    info: HashMap<String, Bytes>,
     /// The workers that started in this process, by name: what the admin
     /// routes accept besides [`ALL`].
     workers: HashSet<String>,
@@ -1050,7 +1052,7 @@ impl Store {
         if answers.is_empty() || answers.iter().any(|(key, _)| names_an_ask(key)) {
             if let Some(info) = info_beside(path)? {
                 for (call, answer) in info {
-                    self.info.entry(call).or_insert(answer);
+                    self.info.entry(call).or_insert_with(|| answer.into());
                 }
                 // A file with no line beside that info file is a recording
                 // that holds nothing: every request misses it.
@@ -1309,8 +1311,9 @@ pub(crate) fn recorded() -> bool {
 /// path), where a record file with an info file beside it is loaded: a wire
 /// answers that call with them, so that a gateway reads of a replay what it
 /// read of the engine (the sampling defaults, the context length and the
-/// rest that shape the requests it sends on).
-pub(crate) fn recorded_info(call: &str) -> Option<Vec<u8>> {
+/// rest that shape the requests it sends on). The bytes are the ones the
+/// store keeps: a reader shares them and copies none.
+pub(crate) fn recorded_info(call: &str) -> Option<Bytes> {
     // Whatever the record file holds beside them: a session of info calls
     // alone leaves no recorded line.
     if !active() {
@@ -2450,6 +2453,33 @@ mod tests {
     }
 
     #[test]
+    fn the_readers_of_an_info_answer_hold_the_bytes_the_store_keeps() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let record = dir.path().join("record.jsonl");
+        std::fs::write(&record, "").expect("write");
+        std::fs::write(
+            dir.path().join("record.info.jsonl"),
+            r#"{"path": "/a.Service/GetTokenizer", "answer_hex": "0a01ff"}"#,
+        )
+        .expect("write");
+        let mut store = Store::default();
+        assert_eq!(store.load(&record).expect("loads"), 0);
+        // What `recorded_info` hands a wire, one reader beside another, as
+        // two fetches of a recorded tokenizer take it.
+        let read = || {
+            let answer = store.info.get("/a.Service/GetTokenizer");
+            answer.cloned().expect("the answer is kept")
+        };
+        let (one, other) = (read(), read());
+        assert_eq!(one, other);
+        assert_eq!(
+            one.as_ptr(),
+            other.as_ptr(),
+            "each reader holds a copy of its own of the answer"
+        );
+    }
+
+    #[test]
     fn a_file_with_no_line_is_a_recording_beside_the_info_file_of_a_recorder() {
         let dir = tempfile::tempdir().expect("temp dir");
         // What a recorder leaves of a session with no call: both files, no
@@ -2517,7 +2547,7 @@ mod tests {
         assert!(store.recorded);
         assert_eq!(
             store.info.get("/a.Service/GetModelInfo"),
-            Some(&vec![0x0a, 0x01, 0xff])
+            Some(&Bytes::from_static(&[0x0a, 0x01, 0xff]))
         );
 
         let worker = "grpc:9000";
