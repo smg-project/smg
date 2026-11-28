@@ -116,6 +116,7 @@ async fn lora_epd_media_refuses_an_unsupported_handoff_instead_of_running_vllm()
             PlacementInputs::default(),
             &[vec![1]],
             EpdDemands {
+                needs_thinking_budget: false,
                 wire,
                 encode: MediaDemands::NONE,
                 decode_vision: false,

@@ -84,10 +84,11 @@ use crate::{
     rate_limit::{RateLimitManager, UsageSettlement},
     routers::{
         common::{
+            attempt_ledger::closes_retry_window,
             json_response, placement,
             placement::{Candidates, WireConstraint},
             prefill_admission::PrefillAdmission,
-            retry::{is_retryable_response, BackoffCalculator},
+            retry::{is_retryable_response, mark_non_retryable, BackoffCalculator},
             snapshot::{RoutingPool, WorkerRegistry},
         },
         error,
@@ -835,6 +836,9 @@ impl RequestPipeline {
                 // follows: counted once, here, under its class and reason, as
                 // the HTTP routers count the answer of a route; the attempts
                 // are the retry families' count.
+                if dctx.routing.needs_thinking_budget && closes_retry_window(&failure) {
+                    mark_non_retryable(&mut failure);
+                }
                 let retryable = retry_config.filter(|_| is_retryable_response(&failure));
                 let Some(config) = retryable.filter(|_| !last_attempt) else {
                     self.record_error(metrics_endpoint, &dctx.model_id, &failure);
