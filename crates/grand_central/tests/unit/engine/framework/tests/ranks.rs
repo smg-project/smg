@@ -788,11 +788,14 @@ fn a_tie_band_wider_than_a_ranks_room_asks_every_row_every_stage() {
 
 /// A rank of the tests that says `1` of the scores `0`, which its
 /// first rows read; every other row reads nothing.
+#[cfg(debug_assertions)]
 #[derive(Debug)]
 struct Says(Vec<f32>, ScoreFront);
 
+#[cfg(debug_assertions)]
 impl Lifecycle for Says {}
 
+#[cfg(debug_assertions)]
 impl Scorer for Says {
     fn name(&self) -> &'static str {
         "says"
@@ -829,6 +832,7 @@ impl Scorer for Says {
 /// A decision over twelve rows under a rank that says `said` of
 /// `scores`, ahead of a stage that answers for a front alone: the
 /// profile is decided by rank, so the engine reads the word.
+#[cfg(debug_assertions)]
 fn told(scores: &[f32], said: ScoreFront) {
     let stages = vec![
         WeightedScorer {
@@ -1820,11 +1824,14 @@ fn a_picker_is_handed_a_front_by_its_word_and_not_by_its_name() {
 }
 
 /// A stage of the tests that says it orders nothing and returns a band.
+#[cfg(debug_assertions)]
 #[derive(Debug)]
 struct Banded;
 
+#[cfg(debug_assertions)]
 impl Lifecycle for Banded {}
 
+#[cfg(debug_assertions)]
 impl Scorer for Banded {
     fn name(&self) -> &'static str {
         "banded"
@@ -1905,11 +1912,14 @@ fn a_band_from_a_stage_that_orders_nothing_fails_a_debug_build_where_every_row_i
 /// A stage of the tests that says it orders nothing and returns no band
 /// where every row is asked. Handed a front, it returns a band beside
 /// the word that it must be asked whole.
+#[cfg(debug_assertions)]
 #[derive(Debug)]
 struct BandedWhole;
 
+#[cfg(debug_assertions)]
 impl Lifecycle for BandedWhole {}
 
+#[cfg(debug_assertions)]
 impl Scorer for BandedWhole {
     fn name(&self) -> &'static str {
         "banded-whole"

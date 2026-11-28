@@ -395,6 +395,7 @@ fn a_normalized_descriptor_holds_no_blank_value() {
 
 /// A worker of a descriptor that names `transport` as it is written, with
 /// no door before the rule.
+#[cfg(debug_assertions)]
 fn as_written(transport: &str) -> PairingDescriptor {
     PairingDescriptor {
         transport: Some(transport.to_string()),
