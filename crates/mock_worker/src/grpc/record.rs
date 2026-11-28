@@ -11,9 +11,10 @@
 //! the counts, the sampled logprobs, the scores of the token ids a scoring
 //! request asked, a refusal's status with the trailers
 //! that say what kind of failure it is, and under `recorded`
-//! what the request asked beyond its prompt. Each gRPC worker keeps the
-//! answers of `GetModelInfo` and `GetServerInfo` once each, as the bytes of
-//! the message, in `PATH` with its extension replaced by `info.jsonl`; of a
+//! what the request asked beyond its prompt. The gRPC workers of a process
+//! keep the answers of `GetModelInfo` and `GetServerInfo` once each between
+//! them, as the bytes of the message, in `PATH` with its extension replaced
+//! by `info.jsonl` (one file they share, [`info_file`]); of a
 //! server info answer's free-form maps it keeps what the gateway reads
 //! ([`server_info`]). A `GetTokenizer` fetch that ends well goes there as
 //! well, once a path: its chunks one behind the other, each behind its
@@ -22,14 +23,15 @@
 //! passes through and is not kept.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::File,
     future::Future,
     io::{ErrorKind, Write},
+    path::PathBuf,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, PoisonError,
+        Arc, Mutex, OnceLock, PoisonError, Weak,
     },
 };
 
@@ -146,10 +148,43 @@ struct Recorder {
     upstream: Channel,
     limit: usize,
     file: Arc<Mutex<File>>,
-    info: Arc<Mutex<(File, HashSet<String>)>>,
-    /// Whether a tokenizer fetch holds its chunks for the info file: one
-    /// does at a time, so the chunks that wait are those of one fetch.
-    fetching: Arc<AtomicBool>,
+    info: Arc<InfoFile>,
+}
+
+/// An info file as the recorders of this process that write it share it:
+/// the gRPC workers of a process take one ([`info_file`]), so a path is kept
+/// once between them.
+struct InfoFile {
+    /// The file with the paths it holds a line of.
+    kept: Mutex<(File, HashSet<String>)>,
+    /// Whether a tokenizer fetch holds its chunks for the file: one does at
+    /// a time, so the chunks that wait are those of one fetch.
+    fetching: AtomicBool,
+}
+
+/// The info files the running recorders of this process write, by the path
+/// their flags state: the workers of a process state one.
+static INFO_FILES: OnceLock<Mutex<HashMap<PathBuf, Weak<InfoFile>>>> = OnceLock::new();
+
+/// The info file at `path` as the recorders of this process share it: the
+/// one a running recorder writes under that path, else a new one over
+/// `opened`. A recorder that starts once the last of its path has stopped
+/// starts with no path kept, as a new process does.
+fn info_file(path: PathBuf, opened: File) -> Arc<InfoFile> {
+    let mut files = INFO_FILES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    files.retain(|_, file| file.strong_count() > 0);
+    if let Some(file) = files.get(&path).and_then(Weak::upgrade) {
+        return file;
+    }
+    let file = Arc::new(InfoFile {
+        kept: Mutex::new((opened, HashSet::new())),
+        fetching: AtomicBool::new(false),
+    });
+    files.insert(path, Arc::downgrade(&file));
+    file
 }
 
 /// Serve the recorder on `listener` until `shutdown` resolves.
@@ -180,9 +215,12 @@ pub(super) async fn serve(
 }
 
 /// The parts of a recorder as `cfg` states them: the engine's endpoint, the
-/// record file and the info file. What a process checks once before any
-/// worker starts ([`super::recorder_starts`]).
-pub(super) fn parts(cfg: &Config, upstream: &str) -> Result<(Endpoint, File, File), String> {
+/// record file and the info file behind its path. What a process checks once
+/// before any worker starts ([`super::recorder_starts`]).
+pub(super) fn parts(
+    cfg: &Config,
+    upstream: &str,
+) -> Result<(Endpoint, File, PathBuf, File), String> {
     let path = cfg
         .replay
         .record
@@ -208,21 +246,18 @@ pub(super) fn parts(cfg: &Config, upstream: &str) -> Result<(Endpoint, File, Fil
         .initial_connection_window_size(64 * 1024 * 1024)
         .tcp_nodelay(true);
     let record = append(path)?;
-    Ok((
-        upstream,
-        record,
-        append(&path.with_extension("info.jsonl"))?,
-    ))
+    let info_path = path.with_extension("info.jsonl");
+    let info = append(&info_path)?;
+    Ok((upstream, record, info_path, info))
 }
 
 fn open(cfg: &Config, upstream: &str) -> Result<Recorder, String> {
-    let (upstream, record, info) = parts(cfg, upstream)?;
+    let (upstream, record, info_path, info) = parts(cfg, upstream)?;
     Ok(Recorder {
         upstream: upstream.connect_lazy(),
         limit: cfg.grpc_max_message_bytes,
         file: Arc::new(Mutex::new(record)),
-        info: Arc::new(Mutex::new((info, HashSet::new()))),
-        fetching: Arc::default(),
+        info: info_file(info_path, info),
     })
 }
 
@@ -538,6 +573,7 @@ impl Exchange {
     fn info(&self) -> std::sync::MutexGuard<'_, (File, HashSet<String>)> {
         self.recorder
             .info
+            .kept
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -584,7 +620,7 @@ impl Exchange {
         let settled = self.tapped().waits;
         let waits = settled.unwrap_or_else(|| {
             let held = self.info().1.contains(&self.path);
-            let waits = !held && !self.recorder.fetching.swap(true, Ordering::AcqRel);
+            let waits = !held && !self.recorder.info.fetching.swap(true, Ordering::AcqRel);
             self.tapped().waits = Some(waits);
             waits
         });
@@ -596,7 +632,7 @@ impl Exchange {
             tapped.fetched = Vec::new();
             tapped.waits = Some(false);
             drop(tapped);
-            self.recorder.fetching.store(false, Ordering::Release);
+            self.recorder.info.fetching.store(false, Ordering::Release);
             tracing::warn!(
                 "recorder: a tokenizer fetch above {MAX_STREAM_BUNDLE_SIZE} bytes is not kept"
             );
@@ -637,8 +673,8 @@ impl Exchange {
         if info.1.contains(&self.path) {
             return;
         }
-        // One write call a line, as a record line is written:
-        // each gRPC worker appends through a handle of its own.
+        // One write call a line, as a record line is written: a recorder
+        // of another process may append through a handle of its own.
         let mut rest = line.as_bytes();
         while !rest.is_empty() {
             match info.0.write(rest) {
@@ -777,7 +813,7 @@ impl Drop for Exchange {
                 .get_mut()
                 .unwrap_or_else(PoisonError::into_inner);
             if tapped.waits == Some(true) {
-                self.recorder.fetching.store(false, Ordering::Release);
+                self.recorder.info.fetching.store(false, Ordering::Release);
             }
             return;
         }
@@ -1076,7 +1112,7 @@ mod tests {
         // A handle that takes no write stands in for a file that refuses one.
         let refusing = File::open(dir.path().join("session.info.jsonl")).expect("read only");
         let hand = |handle: File| {
-            let mut info = call.recorder.info.lock().expect("the info file");
+            let mut info = call.recorder.info.kept.lock().expect("the info file");
             std::mem::replace(&mut info.0, handle)
         };
         let taking = hand(refusing);

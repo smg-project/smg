@@ -96,8 +96,14 @@ async fn fetched(wire: SchedulerWire, address: &str) -> anyhow::Result<Fetched> 
     })
 }
 
-#[tokio::test]
-async fn a_recorder_keeps_the_tokenizer_fetch_made_through_it_once() -> anyhow::Result<()> {
+/// A wire by its name: what two fetches gave and the fetch lines its info
+/// file holds behind them.
+type Kept = (&'static str, [Fetched; 2], Vec<(String, String)>);
+
+/// What each wire kept and what is wanted of it: two fetches, one behind the
+/// other, through the first and the last of the `workers` gRPC workers of a
+/// recorder. The workers of a process serve the same flags: one record path.
+async fn two_fetches(workers: usize) -> anyhow::Result<(Vec<Kept>, Vec<Kept>)> {
     let dir = tempfile::tempdir().context("temp dir")?;
     // The engine: a replay whose record holds the fetch of each wire.
     let engine = dir.path().join("engine.jsonl");
@@ -115,8 +121,6 @@ async fn a_recorder_keeps_the_tokenizer_fetch_made_through_it_once() -> anyhow::
     std::fs::write(dir.path().join("engine.info.jsonl"), info)
         .context("the info file of the engine")?;
 
-    // Each wire: what two fetches through its recorder gave, one behind the
-    // other, and the fetch lines its info file holds behind them.
     let mut kept = Vec::new();
     let mut wanted = Vec::new();
     for (wire, service) in WIRES {
@@ -135,23 +139,26 @@ async fn a_recorder_keeps_the_tokenizer_fetch_made_through_it_once() -> anyhow::
         )
         .await?;
         let record = dir.path().join(format!("{name}.jsonl"));
-        let recorder = start(
-            wire,
-            Config {
-                model_id: "the-recorder".to_string(),
-                replay: ReplayConfig {
-                    record_upstream: Some(upstream.replacen("http://", "grpc://", 1)),
-                    record: Some(record.clone()),
-                    ..ReplayConfig::default()
+        let mut recorders = Vec::new();
+        for _ in 0..workers {
+            let recorder = start(
+                wire,
+                Config {
+                    model_id: "the-recorder".to_string(),
+                    replay: ReplayConfig {
+                        record_upstream: Some(upstream.replacen("http://", "grpc://", 1)),
+                        record: Some(record.clone()),
+                        ..ReplayConfig::default()
+                    },
+                    ..Config::default()
                 },
-                ..Config::default()
-            },
-        )
-        .await?;
-        let fetches = [
-            fetched(wire, &recorder).await?,
-            fetched(wire, &recorder).await?,
-        ];
+            )
+            .await?;
+            recorders.push(recorder);
+        }
+        let first = recorders.first().context("a worker of the recorder")?;
+        let last = recorders.last().context("a worker of the recorder")?;
+        let fetches = [fetched(wire, first).await?, fetched(wire, last).await?];
         let lines = std::fs::read_to_string(record.with_extension("info.jsonl"))
             .context("the info file of the recorder")?;
         let mut held = Vec::new();
@@ -176,9 +183,25 @@ async fn a_recorder_keeps_the_tokenizer_fetch_made_through_it_once() -> anyhow::
             vec![(format!("{service}/GetTokenizer"), sent.clone())],
         ));
     }
+    Ok((kept, wanted))
+}
+
+#[tokio::test]
+async fn a_recorder_keeps_the_tokenizer_fetch_made_through_it_once() -> anyhow::Result<()> {
+    let (kept, wanted) = two_fetches(1).await?;
     assert_eq!(
         kept, wanted,
         "each wire: both fetches whole, and one line of the fetch as the engine sent it"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_workers_of_a_recorder_keep_a_tokenizer_fetch_once() -> anyhow::Result<()> {
+    let (kept, wanted) = two_fetches(2).await?;
+    assert_eq!(
+        kept, wanted,
+        "each wire: a fetch whole through each worker, and one line of the fetch between them"
     );
     Ok(())
 }
