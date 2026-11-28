@@ -44,6 +44,10 @@ pub(crate) struct MessagesPrompt<'a> {
     /// The thinking preference the prompt is rendered with
     /// (`CreateMessageRequest::template_thinking`).
     pub thinking: Option<bool>,
+    /// Whether the `thinking` block is `adaptive`: the mode a template without
+    /// a thinking switch renders by itself, so the render writes no thought
+    /// prefix for it.
+    pub adaptive_thinking: bool,
     /// `output_config.effort` as the provider profile hands it to the
     /// template (`CreateMessageRequest::template_reasoning_effort_for`),
     /// rendered as the `reasoning_effort` kwarg.
@@ -52,6 +56,9 @@ pub(crate) struct MessagesPrompt<'a> {
     /// tells it; a renderer that declares the tools under `none` writes its
     /// instruction not to call them from it.
     pub tool_choice: Option<&'a messages::ToolChoice>,
+    /// The model's provider profile, whose thought prefix a template without
+    /// a thinking switch takes (`chat_utils::thinking_prefix`).
+    pub provider: ProviderProfile,
 }
 
 impl<'a> MessagesPrompt<'a> {
@@ -66,8 +73,10 @@ impl<'a> MessagesPrompt<'a> {
             messages: &request.messages,
             system: request.system.as_ref(),
             thinking: request.template_thinking_for(provider),
+            adaptive_thinking: super::parsers::asks_adaptive_thinking(request.thinking.as_ref()),
             reasoning_effort: request.template_reasoning_effort_for(provider),
             tool_choice: request.tool_choice.as_ref(),
+            provider,
         }
     }
 }
@@ -85,8 +94,10 @@ impl<'a> From<&'a CountMessageTokensRequest> for MessagesPrompt<'a> {
             messages: &request.messages,
             system: request.system.as_ref(),
             thinking: request.template_thinking_for(provider),
+            adaptive_thinking: super::parsers::asks_adaptive_thinking(request.thinking.as_ref()),
             reasoning_effort: request.template_reasoning_effort_for(provider),
             tool_choice: request.tool_choice.as_ref(),
+            provider,
         }
     }
 }
@@ -247,13 +258,17 @@ fn process_messages_prompt(
         ..Default::default()
     };
 
-    let rendered = tokenizer
-        .apply_chat_template_with_encoding_owned(
-            transformed_messages,
-            params,
-            assistant_prefix.as_deref(),
-        )
-        .map_err(|e| PromptError::of_render(&e))?;
+    // The render writes the thought prefix of a template without a thinking
+    // switch, as for Chat.
+    let rendered = chat_utils::apply_chat_template_with_thinking_prefix(
+        tokenizer,
+        request.provider,
+        transformed_messages,
+        params,
+        assistant_prefix,
+        continues_final_assistant || request.adaptive_thinking,
+    )
+    .map_err(|e| PromptError::of_render(&e))?;
 
     // Step 7: Build ProcessedMessages
     let text = anchor_rendered_markers(placeholder_tokens, &rendered.encoding, rendered.text);

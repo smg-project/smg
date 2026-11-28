@@ -23,6 +23,7 @@ use tool_parser::{
 };
 use tracing::warn;
 
+use super::chat_utils;
 use crate::routers::{
     common::snapshot::WorkerRegistry,
     grpc::{context::WorkerSelection, regular::symphony::ByAlias},
@@ -441,7 +442,9 @@ impl ModelNames<'_> {
 /// A template without a switch cannot turn thinking off, whatever the request
 /// asks: when its generation prompt opens the think block (GLM-5.3), the
 /// completion starts inside it and the parser must start there too, or the
-/// reasoning streams as content.
+/// reasoning streams as content. Where the gateway applies the preference
+/// itself by a prefix (`chat_utils::thinking_prefix`),
+/// [`reasoning_starts_in_prefill`] decides before this is asked.
 pub fn should_mark_reasoning_started(
     user_thinking: Option<bool>,
     tokenizer: &dyn Tokenizer,
@@ -598,6 +601,10 @@ fn resolve_thinking_pref(
 /// `continued_final_message`, not the request's ask: a template that cannot
 /// continue the message appends its text after the generation prompt, and
 /// the completion then starts wherever that prompt leaves it.
+/// `takes_no_prefix` names a request the gateway writes its thought prefix
+/// for in no case: one that asks to continue its final message, whatever the
+/// renderer made of it, and a Messages request whose `thinking` block is
+/// `adaptive`, the mode the template alone renders.
 pub fn reasoning_starts_in_prefill(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
@@ -605,6 +612,7 @@ pub fn reasoning_starts_in_prefill(
     continues_final_assistant: bool,
     tokenizer: &dyn Tokenizer,
     provider: ProviderProfile,
+    takes_no_prefix: bool,
 ) -> bool {
     if continues_final_assistant
         && tokenizer
@@ -613,10 +621,22 @@ pub fn reasoning_starts_in_prefill(
     {
         return false;
     }
-    should_mark_reasoning_started(
-        resolve_user_thinking(kwargs, reasoning_effort, thinking, tokenizer, provider),
-        tokenizer,
-    )
+    let thinking = resolve_user_thinking(kwargs, reasoning_effort, thinking, tokenizer, provider);
+    // Behind a thought prefix the gateway wrote for a template without a
+    // switch, the completion starts where the prefix leaves it: inside the
+    // thought behind the opening marker alone. The render writes the prefix
+    // behind the generation prompt of a request that continues no final
+    // message (`chat_utils::apply_chat_template_with_thinking_prefix`): a
+    // prompt without a generation prompt never reaches this line, and a
+    // continued message is read as before, where the template's own prompt
+    // leaves the completion. `chat_utils::thinking_prefix` says why the
+    // gateway writes that prefix and when it writes none.
+    if !takes_no_prefix
+        && chat_utils::thinking_prefix(provider, thinking, tokenizer, kwargs).is_some()
+    {
+        return thinking == Some(true);
+    }
+    should_mark_reasoning_started(thinking, tokenizer)
 }
 
 /// `reasoning_starts_in_prefill` for a chat request, without its rendered
@@ -681,6 +701,7 @@ pub fn chat_reasoning_starts_in_rendered_prefill_for(
         continued_final_message,
         tokenizer,
         provider,
+        request.continues_final_assistant(),
     )
 }
 
@@ -723,6 +744,20 @@ pub fn messages_reasoning_starts_in_prefill_for(
         continued_final_message,
         tokenizer,
         provider,
+        request.continues_final_assistant() || asks_adaptive_thinking(request.thinking.as_ref()),
+    )
+}
+
+/// Whether a Messages request's `thinking` block is `adaptive`: the mode a
+/// template without a thinking switch renders by itself, so the gateway
+/// writes no thought prefix for it and reads the response as before
+/// (`chat_utils::thinking_prefix`).
+pub(crate) fn asks_adaptive_thinking(
+    thinking: Option<&openai_protocol::messages::ThinkingConfig>,
+) -> bool {
+    matches!(
+        thinking,
+        Some(openai_protocol::messages::ThinkingConfig::Adaptive { .. })
     )
 }
 

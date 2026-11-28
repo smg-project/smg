@@ -971,6 +971,11 @@ mod tests {
 
     /// A tokenizer whose decoder drops each of `markers` as a special token.
     fn hiding(markers: &[&str]) -> Arc<dyn Tokenizer> {
+        hiding_under(markers, None)
+    }
+
+    /// [`hiding`]'s tokenizer with `template` as its chat template, where one is given.
+    fn hiding_under(markers: &[&str], template: Option<&str>) -> Arc<dyn Tokenizer> {
         let numbered = || markers.iter().zip(1_u32..);
         let added: Vec<serde_json::Value> = numbered()
             .map(|(marker, id)| {
@@ -992,9 +997,20 @@ mod tests {
         let file = tempfile::NamedTempFile::new().expect("a file");
         std::fs::write(file.path(), serde_json::to_vec(&definition).expect("JSON"))
             .expect("the definition written");
+        let path = file.path().to_str().expect("a path");
+        let Some(template) = template else {
+            return Arc::new(
+                llm_tokenizer::HuggingFaceTokenizer::from_file(path).expect("a tokenizer"),
+            );
+        };
+        let rendered_by = tempfile::NamedTempFile::new().expect("a file");
+        std::fs::write(rendered_by.path(), template).expect("the template written");
         Arc::new(
-            llm_tokenizer::HuggingFaceTokenizer::from_file(file.path().to_str().expect("a path"))
-                .expect("a tokenizer"),
+            llm_tokenizer::HuggingFaceTokenizer::from_file_with_chat_template(
+                path,
+                rendered_by.path().to_str(),
+            )
+            .expect("a tokenizer"),
         )
     }
 
@@ -1615,6 +1631,250 @@ mod tests {
                 turned.push(format!(
                     "{road}, workers that start {workers}\n  the switch off: {off:?}\n  the switch on: {on:?}"
                 ));
+            }
+        }
+        assert!(turned.is_empty(), "{}", turned.join("\n"));
+    }
+
+    /// The generation prompt of MiniMax M3's template with no marker of the thought, as a
+    /// template that reads no thinking switch writes it under every setting.
+    const TURN_WITH_NO_MARKER: &str = "]~b]user\nhi[e~[\n]~b]ai\n";
+    /// The starts the model's workers may name together for a grammar.
+    const STARTS: [Option<&str>; 3] = [Some("first_token"), Some("after_reasoning"), None];
+
+    /// A chat request that forces a call to the `lookup` tool by `choice`, with `fields` beside
+    /// it.
+    fn forcing(choice: &serde_json::Value, fields: &serde_json::Value) -> ChatCompletionRequest {
+        let mut body = json!({
+            "model": SERVED, "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": choice,
+            "tools": [{"type": "function", "function": {"name": "lookup",
+                "parameters": {"type": "object", "properties": {}}}}],
+        });
+        for (key, value) in fields.as_object().expect("an object of fields") {
+            body[key] = value.clone();
+        }
+        serde_json::from_value(body).expect("chat request")
+    }
+
+    /// A model id that selects the provider profile of the MiniMax family; [`SERVED`] selects none.
+    const OF_THE_FAMILY: &str = "MiniMaxAI/MiniMax-M3";
+
+    /// A Messages request that forces a call to the `lookup` tool (`tool_choice` of type `any`),
+    /// with `fields` beside it.
+    fn forcing_messages(fields: &serde_json::Value) -> CreateMessageRequest {
+        let mut body = json!({
+            "model": SERVED, "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "lookup",
+                "input_schema": {"type": "object", "properties": {}}}],
+            "tool_choice": {"type": "any"},
+        });
+        for (key, value) in fields.as_object().expect("an object of fields") {
+            body[key] = value.clone();
+        }
+        serde_json::from_value(body).expect("messages request")
+    }
+
+    /// The turn format of MiniMax M3 as a template that reads no thinking switch writes it:
+    /// [`TURN_WITH_NO_MARKER`] for the one user message, whatever the request says of thinking.
+    /// The turn's start is written by an expression, which keeps its last newline.
+    const TEMPLATE_WITH_NO_SWITCH: &str = "{% for m in messages %}]~b]{{ m.role }}\n\
+         {{ m.content }}[e~[\n{% endfor %}{{ \"]~b]ai\\n\" }}";
+
+    /// The gateway's components over one worker of the model id `id` that starts a grammar where
+    /// `start` says, its card naming the `minimax_m3` table, with a tokenizer registered for the
+    /// id whose chat template is [`TEMPLATE_WITH_NO_SWITCH`].
+    async fn pool_rendering(id: &str, start: Option<&str>) -> Arc<SharedComponents> {
+        pool_rendering_over(id, start, TEMPLATE_WITH_NO_SWITCH).await
+    }
+
+    /// [`pool_rendering`] with `template` as the chat template.
+    async fn pool_rendering_over(
+        id: &str,
+        start: Option<&str>,
+        template: &str,
+    ) -> Arc<SharedComponents> {
+        let start = start.map(|start| (WorkerGrammarStart::LABEL, start));
+        let components = pool_of(
+            ModelCard::new(id).with_reasoning_parser("minimax_m3"),
+            start.as_slice(),
+        );
+        let tokenizer = hiding_under(&["<mm:think>", "</mm:think>"], Some(template));
+        components
+            .tokenizer_registry
+            .load(id, id, "test", || async move { Ok(tokenizer) })
+            .await
+            .expect("the tokenizer registered");
+        components
+    }
+
+    /// What the engine's request carries for the chat request of `fields` that forces a call
+    /// ([`forcing`], `required`), once the chat stage prepared it over [`pool_rendering`] and the
+    /// decision read that preparation: the prompt the stage rendered, the constraint, and whether
+    /// the request says the grammar starts at the first token. The stage renders the template,
+    /// reads the thinking switch and derives the provider profile of the model id itself.
+    async fn staged_chat(
+        fields: &serde_json::Value,
+        id: &str,
+        start: Option<&str>,
+    ) -> (String, String, bool) {
+        staged_chat_over(fields, id, start, TEMPLATE_WITH_NO_SWITCH).await
+    }
+
+    /// [`staged_chat`] over a tokenizer whose chat template is `template`.
+    async fn staged_chat_over(
+        fields: &serde_json::Value,
+        id: &str,
+        start: Option<&str>,
+        template: &str,
+    ) -> (String, String, bool) {
+        use crate::routers::grpc::{
+            context::PreparationOutput, regular::stages::chat::ChatPreparationStage,
+        };
+        let request = Arc::new(forcing(&json!("required"), fields));
+        let components = pool_rendering_over(id, start, template).await;
+        let mut ctx = RequestContext::for_chat(Arc::clone(&request), None, id.into(), components);
+        ChatPreparationStage::new(&[])
+            .prepare(&mut ctx)
+            .await
+            .map_err(|response| response.status())
+            .expect("the chat stage prepared the request");
+        let Some(PreparationOutput::Chat {
+            processed_messages,
+            tool_constraints,
+            ..
+        }) = ctx.state.preparation.take()
+        else {
+            panic!("no chat preparation");
+        };
+        let provider = ctx.state.provider.expect("the stage derived the profile");
+        let decided = decide(
+            &mut ctx,
+            Asks::Chat(&request),
+            &request.effective_tool_list_for(provider),
+            &processed_messages.text,
+            tool_constraints,
+            |_| panic!("a forced call: no auto tag"),
+        )
+        .map_err(|response| response.status())
+        .expect("nothing refused");
+        (
+            processed_messages.text,
+            format!("{:?}", decided.tool_constraints),
+            decided.first_token,
+        )
+    }
+
+    /// [`staged_chat`] for the Messages request of `fields` ([`forcing_messages`]), through the
+    /// Messages stage.
+    async fn staged_messages(
+        fields: &serde_json::Value,
+        id: &str,
+        start: Option<&str>,
+    ) -> (String, String, bool) {
+        use crate::routers::grpc::{
+            common::stages::PipelineStage, context::PreparationOutput,
+            regular::stages::messages::MessagePreparationStage,
+        };
+        let request = Arc::new(forcing_messages(fields));
+        let components = pool_rendering(id, start).await;
+        let mut ctx = RequestContext::for_messages_carrying_its_tools(
+            Arc::clone(&request),
+            None,
+            id.into(),
+            components,
+        );
+        MessagePreparationStage::new(&[])
+            .execute(&mut ctx)
+            .await
+            .map_err(|response| response.status())
+            .expect("the Messages stage prepared the request");
+        let Some(PreparationOutput::Messages {
+            processed_messages,
+            tool_constraints,
+            ..
+        }) = ctx.state.preparation.take()
+        else {
+            panic!("no Messages preparation");
+        };
+        let decided = decide(
+            &mut ctx,
+            Asks::for_messages(&request, false),
+            &request.chat_tools(),
+            &processed_messages.text,
+            tool_constraints,
+            |_| panic!("a forced call: no auto tag"),
+        )
+        .map_err(|response| response.status())
+        .expect("nothing refused");
+        (
+            processed_messages.text,
+            format!("{:?}", decided.tool_constraints),
+            decided.first_token,
+        )
+    }
+
+    /// The thought prefix through the stages themselves, to what the engine's request carries.
+    /// Over a template that reads no thinking switch, under a model id of the MiniMax family
+    /// and a tokenizer that holds the thought's markers, the chat stage and the Messages stage
+    /// render a request that switches thinking off with the thought's close behind the turn's
+    /// start (`utils::chat_utils::thinking_prefix`). The decision reads that prompt as it reads
+    /// every prompt that closed the thought: the forced call's constraint is the call block
+    /// alone, with no thought and no second close ahead of it, wherever the model's workers
+    /// start a grammar, for a named call and for `required` alike. A request that says nothing
+    /// of thinking renders no marker, and its constraint leads with the optional thought.
+    #[tokio::test]
+    async fn a_forced_call_behind_the_thought_prefix_is_the_block_alone() {
+        const CLOSED_BY_THE_PREFIX: &str = "]~b]user\nhi[e~[\n]~b]ai\n</mm:think>";
+        let under = |choice: &serde_json::Value, thinking: Option<&str>| {
+            let mut fields = json!({"model": OF_THE_FAMILY, "tool_choice": choice});
+            if let Some(mode) = thinking {
+                fields["thinking"] = json!({"type": mode});
+            }
+            fields
+        };
+        let mut turned = Vec::new();
+        for start in STARTS {
+            for (choice, chat_choice, messages_choice) in [
+                ("required", json!("required"), json!({"type": "any"})),
+                (
+                    "a named call",
+                    json!({"type": "function", "function": {"name": "lookup"}}),
+                    json!({"type": "tool", "name": "lookup"}),
+                ),
+            ] {
+                let roads = [
+                    (
+                        "the chat stage",
+                        staged_chat(&under(&chat_choice, None), OF_THE_FAMILY, start).await,
+                        staged_chat(&under(&chat_choice, Some("disabled")), OF_THE_FAMILY, start)
+                            .await,
+                    ),
+                    (
+                        "the Messages stage",
+                        staged_messages(&under(&messages_choice, None), OF_THE_FAMILY, start).await,
+                        staged_messages(
+                            &under(&messages_choice, Some("disabled")),
+                            OF_THE_FAMILY,
+                            start,
+                        )
+                        .await,
+                    ),
+                ];
+                for (road, nothing, off) in roads {
+                    let holds = nothing.0 == TURN_WITH_NO_MARKER
+                        && nothing.1.contains("<mm:think>")
+                        && off.0 == CLOSED_BY_THE_PREFIX
+                        && off.1.contains("lookup")
+                        && !off.1.contains("mm:think");
+                    if !holds {
+                        turned.push(format!(
+                            "{road}, {choice}, workers that start at {start:?}:\n says nothing: \
+                             {nothing:?}\n disabled: {off:?}"
+                        ));
+                    }
+                }
             }
         }
         assert!(turned.is_empty(), "{}", turned.join("\n"));

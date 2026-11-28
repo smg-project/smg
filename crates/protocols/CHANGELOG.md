@@ -92,6 +92,13 @@ All notable changes to `openai-protocol` are recorded here, newest first.
 - `ModelCard` derives `PartialEq`: a caller that holds a worker's cards tells a refresh that
   repeats them from one that changes them (the gateway's model refresh publishes nothing for the
   first).
+- `ProviderProfile::thinking_prefix`: the prefix that applies a thinking preference behind the
+  generation prompt of a template with no thinking switch of its own. Under MiniMax the closing
+  thought marker while thinking is off and the opening one while it is on, the prefix a template
+  that reads `thinking_mode` writes itself; nothing without a preference, under every other
+  profile, and for a request whose `thinking_mode` template key holds any value but the
+  preference's own. The gateway writes it where the template has no switch and the tokenizer has
+  the marker as a token, and starts its reasoning parser where the prefix leaves the completion.
 
 ### Changed
 

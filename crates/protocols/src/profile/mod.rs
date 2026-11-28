@@ -262,6 +262,43 @@ impl ProviderProfile {
         }
     }
 
+    /// The prefix that applies a thinking preference behind the generation
+    /// prompt of a template with no thinking switch of its own: under MiniMax
+    /// the closing thought marker while thinking is off and the opening one
+    /// while it is on, the prefix the templates that read `thinking_mode`
+    /// write themselves and the one the instructions of a template without
+    /// the switch name ("When thinking is disabled, begin your response
+    /// directly after the `</mm:think>` prefix"). Such a template renders one
+    /// prompt whatever the request asks, so the gateway writes the prefix
+    /// where the tokenizer has the marker. `None` without a preference (the
+    /// template's default, the model decides), under every other profile, and
+    /// for a request whose `kwargs` hold the templates' key with any value but
+    /// the preference's own ([`Self::thinking_from_template_kwargs`]): a
+    /// template that reads the key applies it, and that request keeps the
+    /// prompt it had before the prefix.
+    pub fn thinking_prefix(
+        self,
+        thinking: Option<bool>,
+        kwargs: Option<&HashMap<String, serde_json::Value>>,
+    ) -> Option<&'static str> {
+        match self {
+            ProviderProfile::Minimax => thinking
+                .filter(|&on| {
+                    kwargs
+                        .and_then(|kwargs| kwargs.get(minimax::THINKING_MODE_KEY))
+                        .is_none_or(|_| self.thinking_from_template_kwargs(kwargs) == Some(on))
+                })
+                .map(|on| {
+                    if on {
+                        minimax::THOUGHT_OPEN
+                    } else {
+                        minimax::THOUGHT_CLOSE
+                    }
+                }),
+            _ => None,
+        }
+    }
+
     /// Record the configured model aliases (`alias -> served model id`).
     ///
     /// A served model id whose own name selects no vendor contract takes the
