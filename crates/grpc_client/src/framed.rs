@@ -1486,6 +1486,7 @@ mod tests {
                         items: vec![vllm::MediaRef {
                             modality: 1,
                             url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                            ..Default::default()
                         }],
                     }),
                     ..Default::default()

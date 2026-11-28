@@ -19,6 +19,9 @@ FETCHABLE_MODALITIES = tuple(_MODALITY_NAMES.values())
 
 BASE_SCHEMES = ("http", "https", "data")
 
+# Per-item hints a `MediaRef` may carry; this servicer's processors apply none.
+_ITEM_HINTS = ("max_long_side_pixel", "fps")
+
 
 @dataclass(frozen=True)
 class MediaRefItem:
@@ -26,8 +29,18 @@ class MediaRefItem:
     url: str
 
 
+def _item_hints(ref) -> list[str]:
+    """The per-item hints `ref` carries; none under a proto older than them."""
+    fields = ref.DESCRIPTOR.fields_by_name
+    return [name for name in _ITEM_HINTS if name in fields and ref.HasField(name)]
+
+
 def parse_media_refs(refs) -> list[MediaRefItem]:
-    """Validate a `MediaRefs` proto and return its items in prompt order."""
+    """Validate a `MediaRefs` proto and return its items in prompt order.
+
+    A reference that carries a per-item hint is refused: this servicer's
+    processors cannot apply it, and it never advertises `mm_item_hints`.
+    """
     items: list[MediaRefItem] = []
     for index, ref in enumerate(refs.items):
         modality = _MODALITY_NAMES.get(ref.modality)
@@ -36,6 +49,11 @@ def parse_media_refs(refs) -> list[MediaRefItem]:
             raise ValueError(f"media_refs[{index}]: unsupported modality {name}")
         if not ref.url:
             raise ValueError(f"media_refs[{index}]: empty url")
+        if hints := _item_hints(ref):
+            raise ValueError(
+                f"media_refs[{index}]: this worker does not apply per-item hints "
+                f"({', '.join(hints)}); the Rust servicer with --mm-processor smg applies them"
+            )
         items.append(MediaRefItem(modality=modality, url=ref.url))
     if not items:
         raise ValueError("media_refs is set but carries no items")

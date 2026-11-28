@@ -113,12 +113,15 @@ pub(super) async fn server_info(state: &State) -> vllm::GetServerInfoResponse {
     let mut info = server_facts(state);
     // Advertised only while the backend answers and the engine takes
     // multimodal input (a `--language-model-only` engine must not draw media
-    // references), as the Python servicer advertises it.
+    // references), as the Python servicer advertises it. The per-item hints
+    // ride the same gate; only smg's pipeline applies them, and the Python
+    // servicer, whose processors do not, never advertises them.
     if let Some(gate) = state.media.as_ref() {
         if state.model.supports_vision && gate.processor.probe().await {
             info.mm_processor = gate.processor.name().to_string();
             info.mm_media_ref_schemes = gate.processor.schemes();
             info.mm_processor_source = gate.processor.source().to_string();
+            info.mm_item_hints = gate.processor.applies_item_hints();
         }
     }
     info
