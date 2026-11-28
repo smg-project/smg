@@ -460,16 +460,22 @@ fn ring_order(engine: &Engine, facts: &RequestFacts<'_>, pool: &[Candidate]) -> 
 /// header that rule reads admitted by the view. No gateway composes the
 /// two: the composition is this engine's own.
 fn ring_under_a_rule(assignment: Assignment) -> Engine {
-    ring_under(assignment, None)
+    ring_under(assignment, None, None)
 }
 
 /// The same composition under a rule that delegates, with the rule's
 /// in-flight cap set: the manual preset's own rule has none.
 fn ring_under_a_cap(cap: u16) -> Engine {
-    ring_under(Assignment::Delegate, Some(cap))
+    ring_under(Assignment::Delegate, Some(cap), None)
 }
 
-fn ring_under(assignment: Assignment, cap: Option<u16>) -> Engine {
+/// The same composition under a rule that delegates and keeps an idle
+/// key for `ttl_s` seconds: `u32::MAX` is for ever.
+fn ring_under_a_ttl(ttl_s: u32) -> Engine {
+    ring_under(Assignment::Delegate, None, Some(ttl_s))
+}
+
+fn ring_under(assignment: Assignment, cap: Option<u16>, ttl_s: Option<u32>) -> Engine {
     let mut spec = PolicySpec::preset("consistent_hashing").expect("the preset's form");
     let manual = PolicySpec::preset("manual").expect("the preset's form");
     let mut rule = manual
@@ -480,6 +486,9 @@ fn ring_under(assignment: Assignment, cap: Option<u16>) -> Engine {
     rule.assignment = assignment;
     if let Some(cap) = cap {
         rule.inflight_cap = cap;
+    }
+    if let Some(ttl_s) = ttl_s {
+        rule.ttl_s = ttl_s;
     }
     spec.view.headers = manual.view.headers.clone();
     let binding = spec.bindings.first_mut().expect("the preset's binding");

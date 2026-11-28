@@ -3375,3 +3375,326 @@ fn a_read_leaves_every_sweep_to_the_hosts_pass_once_one_has_run() {
     assert_eq!(table.pins(mixed(2)), None, "the pass dropped it");
     assert_eq!(table.len(), 2);
 }
+
+/// A rule without a TTL, on a table no pass sweeps.
+const NO_TTL: SessionRule = SessionRule {
+    ttl_micros: None,
+    sweep_micros: 0,
+    ..ORIGINAL
+};
+
+/// Under a rule without a TTL a key whose claim is withdrawn with no
+/// target gives its room back, where the claim's decision alone read it.
+/// Under a TTL the key stays to its end.
+#[test]
+fn a_withdrawn_claims_key_gives_its_room_back_under_no_ttl() {
+    let table = SessionTable::new(0);
+    let pins = table.lookup(s(1), 10, &NO_TTL);
+    assert_eq!(
+        table.claim(s(1), pins, WorkerId(1), 10),
+        Claim::Made(WorkerId(1))
+    );
+    assert_eq!(table.len(), 1);
+    table.move_claim(s(1), WorkerId(1), WorkerId(0), 10);
+    assert_eq!(table.len(), 0, "the key of the withdrawn claim left");
+    assert_eq!(table.pins(s(1)), None);
+
+    let pins = table.lookup(s(2), 20, &RULE);
+    assert_eq!(
+        table.claim(s(2), pins, WorkerId(2), 20),
+        Claim::Made(WorkerId(2))
+    );
+    table.move_claim(s(2), WorkerId(2), WorkerId(0), 20);
+    assert_eq!(table.len(), 1, "under a TTL the key stays to its end");
+}
+
+/// A key whose decision named no worker gives its room back under a rule
+/// without a TTL, where that decision alone read it. A key that holds a
+/// claim or a pin stays, and so does every key under a TTL.
+#[test]
+fn a_key_no_worker_was_named_for_gives_its_room_back_under_no_ttl() {
+    let table = SessionTable::new(0);
+    let pins = table.lookup(s(1), 10, &NO_TTL);
+    assert_eq!(table.len(), 1);
+    table.unplaced(s(1), pins, 10);
+    assert_eq!(table.len(), 0, "the key no worker was named for left");
+
+    let pins = table.lookup(s(2), 20, &NO_TTL);
+    assert_eq!(
+        table.claim(s(2), pins, WorkerId(2), 20),
+        Claim::Made(WorkerId(2))
+    );
+    table.unplaced(s(2), pins, 20);
+    let pins = table.lookup(s(3), 20, &NO_TTL);
+    table.dispatched(s(3), SessionVerdict::Pinned, WorkerId(3), 20);
+    table.unplaced(s(3), pins, 20);
+    let pins = table.lookup(s(4), 20, &RULE);
+    table.unplaced(s(4), pins, 20);
+    assert_eq!(table.len(), 3, "a claim, a pin and a TTL keep their keys");
+    assert_eq!(table.pins(s(2)), Some([WorkerId(2), WorkerId(0)]));
+    assert_eq!(table.pins(s(3)), Some([WorkerId(3), WorkerId(0)]));
+}
+
+/// A key a second request read stays behind the withdrawal of the first
+/// request's claim: the second request followed that claim, and its
+/// dispatch pins the key. The second request reads at a later instant,
+/// or at the first one's own.
+#[test]
+fn a_request_sent_behind_a_withdrawn_claim_pins_its_key_under_no_ttl() {
+    for second in [20, 10] {
+        let table = SessionTable::new(0);
+        let pins = table.lookup(s(1), 10, &NO_TTL);
+        assert_eq!(
+            table.claim(s(1), pins, WorkerId(1), 10),
+            Claim::Made(WorkerId(1))
+        );
+        assert_eq!(
+            table.lookup(s(1), second, &NO_TTL),
+            [WorkerId(1), WorkerId(0)],
+            "the second request follows the claim"
+        );
+        table.move_claim(s(1), WorkerId(1), WorkerId(0), 10);
+        table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1), second);
+        assert_eq!(
+            table.lookup(s(1), 30, &NO_TTL),
+            [WorkerId(1), WorkerId(0)],
+            "the key follows the worker its second request, read at {second}, was sent to"
+        );
+    }
+}
+
+/// A key a second request read stays where that request names no
+/// worker: the first request's claim and dispatch pin the key. The
+/// second request reads at a later instant, or at the first one's own.
+#[test]
+fn a_claim_behind_another_decisions_end_pins_its_key_under_no_ttl() {
+    for second in [20, 10] {
+        let table = SessionTable::new(0);
+        let pins = table.lookup(s(1), 10, &NO_TTL);
+        let read = table.lookup(s(1), second, &NO_TTL);
+        table.unplaced(s(1), read, second);
+        assert_eq!(
+            table.claim(s(1), pins, WorkerId(1), 10),
+            Claim::Made(WorkerId(1))
+        );
+        table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(1)), WorkerId(1), 10);
+        assert_eq!(
+            table.lookup(s(1), 30, &NO_TTL),
+            [WorkerId(1), WorkerId(0)],
+            "the key follows the worker its first request claimed, beside a read at {second}"
+        );
+    }
+}
+
+/// A pair's decode call reads the key its first decision read, at a later
+/// instant or at that decision's own, and is told under that decision's
+/// lease. The key stays behind the withdrawal of the first decision's
+/// claim, and the call's dispatch pins it.
+#[test]
+fn a_decode_call_behind_its_pairs_withdrawn_claim_pins_its_key_under_no_ttl() {
+    for call in [20, 10] {
+        let table = SessionTable::new(0);
+        let pins = table.lookup(s(1), 10, &NO_TTL);
+        assert_eq!(
+            table.claim(s(1), pins, WorkerId(1), 10),
+            Claim::Made(WorkerId(1))
+        );
+        assert_eq!(
+            table.lookup(s(1), call, &NO_TTL),
+            [WorkerId(1), WorkerId(0)],
+            "the decode call follows its first decision's claim"
+        );
+        table.told_under(s(1), None, call, 10, WorkerId(1));
+        table.move_claim(s(1), WorkerId(1), WorkerId(0), 10);
+        assert_eq!(table.len(), 1, "the key its decode call read stays");
+        table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1), call);
+        assert_eq!(
+            table.lookup(s(1), 30, &NO_TTL),
+            [WorkerId(1), WorkerId(0)],
+            "the key follows the worker its decode call, read at {call}, was sent to"
+        );
+    }
+}
+
+/// A key whose last pin was a forgotten worker's leaves the table, and
+/// the request that reads it next makes it again. A request that read the
+/// pin before that follows the second request's claim by its own claim
+/// call, at the same instant: the key stays behind the withdrawal of that
+/// claim, and the follower's dispatch pins it.
+#[test]
+fn a_request_that_follows_a_claim_on_a_key_made_again_pins_its_key_under_no_ttl() {
+    let table = SessionTable::new(0);
+    table.lookup(s(1), 5, &NO_TTL);
+    table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(9), 5);
+    let read = table.lookup(s(1), 10, &NO_TTL);
+    assert_eq!(read, [WorkerId(9), WorkerId(0)]);
+    table.forget_workers(&[WorkerId(9)]);
+    assert_eq!(table.len(), 0, "the key of the forgotten worker left");
+    let pins = table.lookup(s(1), 10, &NO_TTL);
+    assert_eq!(
+        table.claim(s(1), pins, WorkerId(1), 10),
+        Claim::Made(WorkerId(1))
+    );
+    assert_eq!(
+        table.claim(s(1), read, WorkerId(2), 10),
+        Claim::Standing(WorkerId(1), [WorkerId(1), WorkerId(0)]),
+        "the request that read the forgotten pin follows the claim"
+    );
+    table.move_claim(s(1), WorkerId(1), WorkerId(0), 10);
+    table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(1), 10);
+    assert_eq!(
+        table.lookup(s(1), 30, &NO_TTL),
+        [WorkerId(1), WorkerId(0)],
+        "the key follows the worker its first request was sent to"
+    );
+}
+
+/// A request that read a forgotten worker's pin names no worker, beside a
+/// second request that read the key made again at the same instant: the
+/// key stays, and the second request's claim and dispatch pin it.
+#[test]
+fn a_claim_on_a_key_made_again_stands_behind_another_requests_end_under_no_ttl() {
+    let table = SessionTable::new(0);
+    table.lookup(s(1), 5, &NO_TTL);
+    table.dispatched(s(1), SessionVerdict::Pinned, WorkerId(9), 5);
+    let read = table.lookup(s(1), 10, &NO_TTL);
+    assert_eq!(read, [WorkerId(9), WorkerId(0)]);
+    table.forget_workers(&[WorkerId(9)]);
+    let pins = table.lookup(s(1), 10, &NO_TTL);
+    table.unplaced(s(1), read, 10);
+    assert_eq!(
+        table.claim(s(1), pins, WorkerId(1), 10),
+        Claim::Made(WorkerId(1))
+    );
+    table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(1)), WorkerId(1), 10);
+    assert_eq!(
+        table.lookup(s(1), 30, &NO_TTL),
+        [WorkerId(1), WorkerId(0)],
+        "the key follows the worker its second request claimed"
+    );
+}
+
+/// A request reads a key that holds no pin. Another request claims a
+/// worker in that life, and the worker is forgotten: the key leaves the
+/// table. A third request that reads the key at the first one's instant
+/// begins a new life. The first request names no worker: its end leaves
+/// the life it did not read, and the third request's claim and dispatch
+/// pin the key.
+#[test]
+fn a_request_that_names_no_worker_leaves_a_life_begun_since_its_read_under_no_ttl() {
+    let table = SessionTable::new(0);
+    let read = table.lookup(s(1), 10, &NO_TTL);
+    let other = table.lookup(s(1), 11, &NO_TTL);
+    assert_eq!(
+        table.claim(s(1), other, WorkerId(9), 11),
+        Claim::Made(WorkerId(9))
+    );
+    table.forget_workers(&[WorkerId(9)]);
+    assert_eq!(table.len(), 0, "the key of the forgotten worker left");
+    let pins = table.lookup(s(1), 10, &NO_TTL);
+    table.unplaced(s(1), read, 10);
+    assert_eq!(
+        table.claim(s(1), pins, WorkerId(1), 10),
+        Claim::Made(WorkerId(1))
+    );
+    table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(1)), WorkerId(1), 10);
+    assert_eq!(
+        table.lookup(s(1), 30, &NO_TTL),
+        [WorkerId(1), WorkerId(0)],
+        "the key follows the worker its third request claimed"
+    );
+}
+
+/// The same behind a pin: the request sent to the forgotten worker pinned
+/// the key before the worker left.
+#[test]
+fn a_request_that_names_no_worker_leaves_a_life_begun_since_a_pin_left_under_no_ttl() {
+    let table = SessionTable::new(0);
+    let read = table.lookup(s(1), 10, &NO_TTL);
+    let other = table.lookup(s(1), 11, &NO_TTL);
+    assert_eq!(
+        table.claim(s(1), other, WorkerId(9), 11),
+        Claim::Made(WorkerId(9))
+    );
+    table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(9)), WorkerId(9), 11);
+    table.forget_workers(&[WorkerId(9)]);
+    assert_eq!(table.len(), 0, "the key of the forgotten worker left");
+    let pins = table.lookup(s(1), 10, &NO_TTL);
+    table.unplaced(s(1), read, 10);
+    assert_eq!(
+        table.claim(s(1), pins, WorkerId(1), 10),
+        Claim::Made(WorkerId(1))
+    );
+    table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(1)), WorkerId(1), 10);
+    assert_eq!(
+        table.lookup(s(1), 30, &NO_TTL),
+        [WorkerId(1), WorkerId(0)],
+        "the key follows the worker its third request claimed"
+    );
+}
+
+/// A request whose claim lands in a life begun since its read, at its own
+/// instant, has its commit refused: the withdrawal leaves that life, and
+/// the claim and dispatch of the request that began it pin the key.
+#[test]
+fn a_withdrawn_claim_leaves_a_life_begun_since_its_read_under_no_ttl() {
+    let table = SessionTable::new(0);
+    let read = table.lookup(s(1), 10, &NO_TTL);
+    let other = table.lookup(s(1), 11, &NO_TTL);
+    assert_eq!(
+        table.claim(s(1), other, WorkerId(9), 11),
+        Claim::Made(WorkerId(9))
+    );
+    table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(9)), WorkerId(9), 11);
+    table.forget_workers(&[WorkerId(9)]);
+    let pins = table.lookup(s(1), 10, &NO_TTL);
+    assert_eq!(
+        table.claim(s(1), read, WorkerId(2), 10),
+        Claim::Made(WorkerId(2))
+    );
+    table.move_claim(s(1), WorkerId(2), WorkerId(0), 10);
+    assert_eq!(
+        table.claim(s(1), pins, WorkerId(1), 10),
+        Claim::Made(WorkerId(1))
+    );
+    table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(1)), WorkerId(1), 10);
+    assert_eq!(
+        table.lookup(s(1), 30, &NO_TTL),
+        [WorkerId(1), WorkerId(0)],
+        "the key follows the worker its third request claimed"
+    );
+}
+
+/// A request whose read a full table kept no row for names no worker.
+/// Room came back meanwhile, and another request began the key's life at
+/// the same instant: the first request's end leaves that life, and the
+/// other's claim and dispatch pin the key.
+#[test]
+fn a_read_a_full_table_refused_leaves_a_life_begun_since_under_no_ttl() {
+    let table = SessionTable::new(0);
+    table.lookup(s(2), 5, &NO_TTL);
+    table.dispatched(s(2), SessionVerdict::Pinned, WorkerId(9), 5);
+    // The count stands for the keys no test inserts: the table is full.
+    table.held.0.store(KEYS, Ordering::Relaxed);
+    let read = table.lookup(s(1), 10, &NO_TTL);
+    assert_eq!(read, [WorkerId(0); 2]);
+    assert_eq!(
+        table.pins(s(1)),
+        None,
+        "a full table keeps no row of the read"
+    );
+    // The forgotten worker's key leaves, and room is back.
+    table.forget_workers(&[WorkerId(9)]);
+    let pins = table.lookup(s(1), 10, &NO_TTL);
+    table.unplaced(s(1), read, 10);
+    assert_eq!(
+        table.claim(s(1), pins, WorkerId(1), 10),
+        Claim::Made(WorkerId(1))
+    );
+    table.dispatched(s(1), SessionVerdict::Claimed(WorkerId(1)), WorkerId(1), 10);
+    assert_eq!(
+        table.lookup(s(1), 30, &NO_TTL),
+        [WorkerId(1), WorkerId(0)],
+        "the key follows the worker its other request claimed"
+    );
+}

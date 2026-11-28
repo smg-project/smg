@@ -7118,8 +7118,13 @@ impl Engine {
         };
         let mut decision =
             self.decide_drawn(drawn, facts, pool, fixed, rows, &mut once, cx, scratch);
-        // A shed and the all-vetoed rule's pick claim nothing.
+        // A shed and the all-vetoed rule's pick claim nothing. A shed names
+        // no worker: under a rule without a TTL the key it read gives its
+        // room back.
         let Decision::Pick(pick) = &mut decision else {
+            if rule.ttl_micros.is_none() {
+                self.sessions.unplaced(key, pins, facts.now_micros);
+            }
             return Some(decision);
         };
         let first = pick.targets.first().map(|target| target.id);
@@ -7708,6 +7713,13 @@ impl Engine {
             // the veto lifted, and the claim's lead below reads that pass's
             // survivors.
             if let Some(shed) = vetoed::lifted(profile, index, facts, pool, set, cx, buf) {
+                // A shed names no worker, and the all-vetoed rule's pick
+                // pins no key ([`vetoed::steered`]): its dispatch writes
+                // nothing. Either way the key gives its room back under
+                // a rule without a TTL.
+                if WRITE_SESSIONS && rule.ttl_micros.is_none() {
+                    self.sessions.unplaced(key, pins, facts.now_micros);
+                }
                 return shed;
             }
         }
@@ -7836,6 +7848,9 @@ impl Engine {
                     }
                 }
             }
+        } else if WRITE_SESSIONS && rule.ttl_micros.is_none() {
+            // The placement names no worker: the key gives its room back.
+            self.sessions.unplaced(key, pins, facts.now_micros);
         }
         decision
     }

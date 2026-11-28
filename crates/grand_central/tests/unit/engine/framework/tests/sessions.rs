@@ -1192,3 +1192,30 @@ fn a_lease_takes_the_requests_session_and_the_picks_verdict() {
     bare.on_dispatched(&lease_of(&unruled), &target, Side::Single, 0);
     assert!(bare.sessions.is_empty(), "no rule, no row");
 }
+
+/// A keyed decision that names no worker keeps no row of its key under a
+/// rule without a TTL: the key's next request is placed as a new key's
+/// and pins it. Under a TTL the row stays to its end.
+#[test]
+fn a_keyed_decision_that_names_no_worker_gives_its_keys_room_back_under_no_ttl() {
+    let ttl = SessionRule {
+        ttl_micros: Some(1_000),
+        sweep_micros: 100,
+        ..SESSIONS
+    };
+    for (rule, rows, site) in [(SESSIONS, 0, "no TTL"), (ttl, 1, "a TTL")] {
+        // The picker declines a pool whose first survivor is of class 7.
+        let (engine, _) = probed(Box::new(RefusesClass(7)), Some(rule));
+        let mut pool = [candidate(0, 1), candidate(1, 2)];
+        pool[0].pair_class = 7;
+        let declined = decide_keyed(&engine, &pool, 41, 10);
+        assert!(declined.pick().is_none(), "{site}: the picker declined");
+        assert_eq!(engine.sessions().len(), rows, "{site}");
+        pool[0].pair_class = 0;
+        assert_eq!(place_keyed(&engine, &pool, 41, 20).position, 0, "{site}");
+        // The pin answers where the picker would decline again.
+        pool[0].pair_class = 7;
+        assert_eq!(place_keyed(&engine, &pool, 41, 30).position, 0, "{site}");
+        assert_eq!(engine.sessions().len(), 1, "{site}");
+    }
+}
