@@ -222,7 +222,7 @@ async fn a_leading_controller_registers_what_its_source_names_and_removes_what_i
     config.discovery = Some(DiscoverySettings::new(file.settings(), None, None)?);
     let controller = Controller::bind(config).await?;
     let discovery = controller.discovery.as_ref().expect("configured discovery");
-    assert!(Arc::ptr_eq(&discovery.fence, &controller.shared.fence));
+    assert!(Arc::ptr_eq(&discovery.fence, &controller.fence()));
     assert!(discovery.host.jobs().is_some(), "the bind hands no queue");
     let store = Arc::clone(&controller.shared.store);
 

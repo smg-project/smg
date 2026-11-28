@@ -17,6 +17,7 @@
     reason = "the served plugin, the certificates and the loads run inside the tests; a failure there is the test's failure"
 )]
 
+#[path = "../support"]
 mod support {
     pub mod grpc_plugin;
     pub mod said;

@@ -21,7 +21,7 @@ use smg_worker::{
 };
 
 use super::{
-    capability::runtime_supports_modality,
+    capability::{runtime_supports_modality, worker_takes_stripped_refs_side},
     config::MultimodalComponents,
     plan::{MediaPlan, PlaceholderTokens},
 };
@@ -618,17 +618,22 @@ pub(crate) fn resolve_mm_processing(
     Ok(resolved)
 }
 
-/// Post-selection check: every worker must accept references, and every URL
-/// scheme in the plan must be one every worker that advertised schemes fetches
-/// (the prefill worker processes them; the decode worker does too whenever the
-/// identity relay does not apply, as with n>1). A plan pinned to the
-/// gateway's own pipeline (`pin`, see [`media_refs_pipeline_pin`]) needs
-/// every worker on that pipeline, and a worker on it takes no audio; selection
-/// draws its candidates by the same pin, so this is the backstop.
+/// Post-selection check: every worker the references can reach must accept
+/// them, and every URL scheme in the plan must be one every such worker that
+/// advertised schemes fetches (the prefill worker processes them; the decode
+/// worker does too whenever the identity relay does not apply, as with n>1,
+/// but never when `refs_stripped_decode` and the decode worker is a vLLM
+/// language-model-only one: that side is served the prefill's media identity,
+/// stripped to text and content hashes, so no reference reaches it). A plan
+/// pinned to the gateway's own pipeline (`pin`, see
+/// [`media_refs_pipeline_pin`]) needs every worker on that pipeline, and a
+/// worker on it takes no audio; selection draws its candidates by the same
+/// pin, so this is the backstop.
 pub(crate) fn ensure_selection_supports_media_refs(
     workers: &WorkerSelection,
     plan: &MediaPlan,
     pin: PipelinePin,
+    refs_stripped_decode: bool,
 ) -> Result<(), MmRefsError> {
     let needs_pipeline = pin == PipelinePin::Only;
     let workers: Vec<&dyn Worker> = match workers {
@@ -642,7 +647,13 @@ pub(crate) fn ensure_selection_supports_media_refs(
             .collect(),
         WorkerSelection::Disaggregated {
             prefill, decode, ..
-        } => vec![prefill.as_ref(), &**decode],
+        } => {
+            if refs_stripped_decode && worker_takes_stripped_refs_side(&**decode) {
+                vec![prefill.as_ref()]
+            } else {
+                vec![prefill.as_ref(), &**decode]
+            }
+        }
     };
     if !workers
         .iter()

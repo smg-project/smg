@@ -461,7 +461,7 @@ fn three_processes_over_one_lease_object_hand_over_once_per_term() {
     dead_code,
     reason = "this binary starts replicas over the Lease object alone; the lease file's case reads the rest"
 )]
-#[path = "common/replicas.rs"]
+#[path = "../common/replicas.rs"]
 mod replicas;
 
 /// Writes at `kubeconfig` a client configuration that names the stand-in at

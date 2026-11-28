@@ -43,6 +43,7 @@ A host's registration and removal steps write rows at a membership door, `worker
 - The entry asks no maker, and the row keeps the maker it has.
 - The refreshed worker may differ in its labels and its pairing descriptor from its row, or from the object `worker_host::object` builds of the row. One that states any other fact is refused, and nothing is written.
 - That object holds a part of a second as a whole one, a threshold of zero as one, and a runtime's name as the worker crate reads it. The row keeps its own word of every fact that object holds narrower.
+- The pair rule and the encode classes read a row's runtime name as that object does. A name that is not empty and that the worker crate does not know is the exception. The object holds no runtime for it, and the two rules compare it as written.
 - A wait wider than a row holds reads as the widest number a row holds. Where the row's object waits past that number, a worker that waits longer still passes as that object.
 - The controller's door reads no descriptor of the worker. The row keeps the one it has, so a refresh there moves labels alone.
 - Labels that change are bounded as a registration's are. Equal labels with an equal descriptor write nothing.

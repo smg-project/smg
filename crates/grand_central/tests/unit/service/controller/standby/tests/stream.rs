@@ -423,7 +423,7 @@ async fn the_hello_names_the_standbys_place_and_each_batch_of_events_is_acknowle
     let place = standby.follower.place();
     assert!(place.seq > 0 && place.term == 1, "{place:?}");
     standing.send_replace(bed.holds("leader-1", 7));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     let applied = AtomicBool::new(false);
     let script = async {
         let mut opened = bed.opened().await;
@@ -474,7 +474,7 @@ async fn a_standby_reads_synced_at_the_frame_that_leaves_it_at_its_leaders_head(
         let tail = entries(&leader.1, place);
         let head = if stated { leader.1.head().seq } else { 0 };
         standing.send_replace(bed.holds("leader-1", 1));
-        let named = standby.shared.leader(None);
+        let named = standby.shared.leader_elsewhere();
         let applied = AtomicBool::new(false);
         let synced = || standby.shared.lag.age(Instant::now()).is_some();
         let script = async {
@@ -524,7 +524,7 @@ async fn a_head_stated_at_the_number_of_the_standbys_own_row_moves_no_sync() {
     let own = standby.follower.place();
     assert_eq!((own.seq, own.term), (followed.seq + 1, 0));
     standing.send_replace(bed.holds("leader-1", 1));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     let applied = AtomicBool::new(false);
     let script = async {
         let mut opened = bed.opened().await;
@@ -561,7 +561,7 @@ async fn a_restored_standby_reads_synced_once_it_applied_what_was_written_during
         let written = entries(&leader.1, place);
         let head = leader.1.head().seq;
         standing.send_replace(bed.holds("leader-1", 1));
-        let named = standby.shared.leader(None);
+        let named = standby.shared.leader_elsewhere();
         let applied = AtomicBool::new(false);
         let script = async {
             let mut opened = bed.opened().await;
@@ -594,7 +594,7 @@ async fn a_standby_that_applied_nothing_says_so_and_joins_at_its_leaders_first_w
     let (_elector, standing, standby) = standing_by(&bed, FIVE);
     let leader = led();
     standing.send_replace(bed.holds("leader-1", 1));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     let applied = AtomicBool::new(false);
     let script = async {
         let mut opened = bed.opened().await;
@@ -634,7 +634,7 @@ async fn a_resync_is_the_leaders_snapshot_in_parts_on_the_stream_it_holds() {
     assert_eq!(parts.len(), 2, "two parts of rows");
     let place = leader.1.head();
     standing.send_replace(bed.holds("leader-1", 1));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     let applied = AtomicBool::new(false);
     let script = async {
         let mut opened = bed.opened().await;
@@ -690,7 +690,7 @@ async fn a_resync_lands_the_generation_its_snapshots_first_part_states() {
     let told = leading.standing_sent().map(Box::new);
     parts[0].snapshot.as_mut().expect("a part").generation = told;
     standing.send_replace(bed.holds("leader-1", 1));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     let applied = AtomicBool::new(false);
     let script = async {
         let mut opened = bed.opened().await;
@@ -739,7 +739,7 @@ async fn a_stream_that_ends_inside_a_snapshot_leaves_the_store_as_it_was() {
         ("a batch of events", Ok(batch(&event))),
     ];
     standing.send_replace(bed.holds("leader-1", 1));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     for (what, next) in cut_short {
         let applied = AtomicBool::new(false);
         let script = async {
@@ -787,7 +787,7 @@ async fn a_standby_whose_event_did_not_land_reads_not_synced() {
     leader.0.upsert(facts("http://c:8000", 1));
     let past = entries(&leader.1, place).pop().expect("the leader wrote");
     standing.send_replace(bed.holds("leader-1", 1));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     let applied = AtomicBool::new(false);
     let mut turns = standby.shared.lag.turns();
     let synced = || standby.shared.lag.age(Instant::now()).is_some();
@@ -828,7 +828,7 @@ async fn an_event_that_does_not_land_asks_a_restore_and_two_in_a_row_wait_a_stre
         batch(&past)
     };
     standing.send_replace(bed.holds("leader-1", 7));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     let hello = |seq, term| {
         Some(Frame::Hello(proto::ReplicaHello {
             replica_id: "standby-0".to_owned(),
@@ -955,7 +955,7 @@ async fn a_first_batch_that_lands_in_part_ends_its_stream_as_one_that_applied() 
     follow(&standby.follower, &leader.1, now);
     let place = standby.follower.place();
     standing.send_replace(bed.holds("leader-1", 7));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     // One batch of the leader's next event twice: the first lands and
     // the second, at a number the log has passed, does not.
     leader.0.upsert(facts("http://halved:8000", 1));
@@ -991,7 +991,7 @@ async fn an_ask_states_the_floor_its_place_no_longer_names() {
     let place = standby.follower.place();
     assert_eq!(place.term, 9);
     standing.send_replace(bed.holds("leader-1", 7));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     standby.asks.store(true, Ordering::Relaxed);
     let applied = AtomicBool::new(false);
     let script = async {
@@ -1019,7 +1019,7 @@ async fn a_restore_ends_the_ask_and_the_next_hello_names_the_place_restored() {
     let parts = snapshot(&leader, now);
     let restored = leader.1.head();
     standing.send_replace(bed.holds("leader-1", 1));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     let hello = |place: Position| {
         Some(Frame::Hello(proto::ReplicaHello {
             replica_id: "standby-0".to_owned(),
@@ -1070,7 +1070,7 @@ async fn a_snapshot_the_log_does_not_follow_is_left_and_the_lease_read_again() {
     // A replica that still believes it leads term 1 restores it.
     let parts = snapshot(&led(), now);
     standing.send_replace(bed.holds("leader-1", 9));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     let applied = AtomicBool::new(false);
     let script = async {
         let opened = bed.opened().await;
@@ -1096,7 +1096,7 @@ async fn a_replica_that_leads_by_now_asks_no_restore() {
     let mut bed = Bed::new().await;
     let (mut elector, standing, standby) = standing_by(&bed, FIVE);
     standing.send_replace(bed.holds("leader-1", 1));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     // An event did not land, and the replica took its own lease since.
     standby.asks.store(true, Ordering::Relaxed);
     let took = elector.tick(Instant::now());
@@ -1330,7 +1330,7 @@ async fn a_leader_that_says_nothing_is_left_at_the_quiet_bound() {
     let mut bed = Bed::new().await;
     let (_elector, standing, mut standby) = standing_by(&bed, Duration::from_millis(100));
     standing.send_replace(bed.holds("leader-1", 1));
-    let named = standby.shared.leader(None);
+    let named = standby.shared.leader_elsewhere();
     // A stream that stands and brings no frame after its first. The
     // bound runs on the host's clock, from the dial to the stream's
     // opening and from there to the first frame, and a held host runs

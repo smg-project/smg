@@ -76,7 +76,7 @@ A send leaves the tally at the first of these events:
 - The worker is removed, joins again, is replaced or changes its number of ranks.
 - The end of `sent_ttl_ms`, where the profile sets it.
 
-The tally keeps 8,192 sends for a worker, and for each rank of a data-parallel worker, whether or not the profile sets `sent_ttl_ms`. One more send lets the oldest of them go.
+As a rule the tally keeps 8,192 sends for a worker, and for each rank of a data-parallel worker: one more send lets the oldest of them go. That holds whether or not the profile sets `sent_ttl_ms`.
 
 A profile that sets `sent_ttl_ms` or `sent_report_delay_ms` is refused unless one of its stages reads the tally. Of the built-in stages, these read it:
 
@@ -580,6 +580,7 @@ These rules stand beside the modes:
 Workers of the standalone service pair by their labels:
 
 - Over the registration RPC, the pairing descriptor accepts only a bootstrap port. The runtime comes from `spec.runtime`.
+- The pair rule and the encode classes read that name as the worker crate does. Two spellings of one runtime are one runtime to both. That crate's word for no runtime states none, like a row that names none. Another name it does not know is compared as written.
 - A worker registered this way, or found by the controller's own discovery, pairs by what its labels report, as a gateway reads them.
 - The labels report its transfer backend or `kv_connector`, its version, its KV layout facts and its operator's `pairing_protocol`.
 - The controller's discovery writes a found worker's pairing protocol and KV connector among that worker's labels.

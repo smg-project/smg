@@ -159,8 +159,8 @@ fn declared(function: Value) -> Tool {
 /// A tool declared without a schema (the field absent or `null`) reaches
 /// the template with `"parameters": null` in the schema's place, as the
 /// engine's own template reads the declaration; a client's own `{}`
-/// stays `{}`. The kept sets tell the two apart: the serialized key of a
-/// schema-less tool leaves the field out, the key of a `{}` tool carries it.
+/// stays `{}`. The kept sets tell the two apart: the key of a schema-less
+/// tool marks the schema absent, the key of a `{}` tool carries it.
 #[test]
 fn a_tool_without_a_schema_reaches_the_template_with_a_null_schema_in_its_place() {
     let _serial = SERIAL.lock().unwrap();
@@ -218,4 +218,151 @@ fn a_tool_without_a_schema_reaches_the_template_with_a_null_schema_in_its_place(
         !Arc::ptr_eq(&prepare_tools(&without[..1]).unwrap(), &empty),
         "a schema-less tool and the same tool with an empty schema are kept apart"
     );
+}
+
+fn key_of(tools: &[Tool]) -> Vec<u8> {
+    let mut key = Vec::new();
+    write_key(&mut key, tools).unwrap();
+    key
+}
+
+/// The key stands for the serialized tools: two sets share a key exactly
+/// when they serialize to the same bytes. Each function below differs from
+/// every other in one field, one value, one order or the place of one
+/// boundary; a set is one of them, or two in a row.
+#[test]
+fn two_tool_sets_share_a_key_exactly_when_they_serialize_alike() {
+    let functions = [
+        json!({"name": "a"}),
+        json!({"name": "b"}),
+        json!({"name": "a", "description": ""}),
+        json!({"name": "a", "description": "d"}),
+        json!({"name": "ad", "description": ""}),
+        json!({"name": "a", "strict": false}),
+        json!({"name": "a", "strict": true}),
+        json!({"name": "a", "description": "d", "strict": true}),
+        json!({"name": "a", "parameters": {}}),
+        json!({"name": "a", "parameters": {}, "strict": false}),
+        json!({"name": "a", "parameters": []}),
+        json!({"name": "a", "parameters": ""}),
+        json!({"name": "a", "parameters": false}),
+        json!({"name": "a", "parameters": true}),
+        json!({"name": "a", "parameters": 0}),
+        json!({"name": "a", "parameters": "0"}),
+        json!({"name": "a", "parameters": 0.0}),
+        json!({"name": "a", "parameters": -0.0}),
+        json!({"name": "a", "parameters": -1}),
+        json!({"name": "a", "parameters": 1}),
+        json!({"name": "a", "parameters": 1.5}),
+        json!({"name": "a", "parameters": [1]}),
+        json!({"name": "a", "parameters": [1, 2]}),
+        json!({"name": "a", "parameters": [12]}),
+        json!({"name": "a", "parameters": [[1], [2]]}),
+        json!({"name": "a", "parameters": [[1, 2]]}),
+        json!({"name": "a", "parameters": [[1], 2]}),
+        json!({"name": "a", "parameters": [[], []]}),
+        json!({"name": "a", "parameters": [[[]]]}),
+        json!({"name": "a", "parameters": [null]}),
+        json!({"name": "a", "parameters": [false]}),
+        json!({"name": "a", "parameters": ["ab", "c"]}),
+        json!({"name": "a", "parameters": ["a", "bc"]}),
+        json!({"name": "a", "parameters": ["abc"]}),
+        json!({"name": "a", "parameters": {"x": 1, "y": 2}}),
+        json!({"name": "a", "parameters": {"y": 2, "x": 1}}),
+        json!({"name": "a", "parameters": {"x": {"y": 2}}}),
+        json!({"name": "a", "parameters": {"x": 1}}),
+        json!({"name": "a", "parameters": {"x": null}}),
+        json!({"name": "a", "parameters": {"x": "null"}}),
+        json!({"name": "a", "parameters": {"x": []}}),
+        json!({"name": "a", "parameters": {"x": {}}}),
+        json!({"name": "a", "response": {"x": 1}}),
+        json!({"name": "a", "response": null}),
+        json!({"name": "a", "response": 1, "result": 2}),
+        json!({"name": "a", "result": 2, "response": 1}),
+        json!({"name": "a", "description": "x".repeat(127)}),
+        json!({"name": "a", "description": "x".repeat(128)}),
+        json!({"name": "a", "description": "x".repeat(16_384)}),
+    ];
+    let mut sets: Vec<Vec<Tool>> = vec![Vec::new()];
+    sets.extend(
+        functions
+            .iter()
+            .map(|function| vec![declared(function.clone())]),
+    );
+    let (a, b) = (
+        declared(functions[0].clone()),
+        declared(functions[1].clone()),
+    );
+    sets.extend([
+        vec![a.clone(), b.clone()],
+        vec![b.clone(), a.clone()],
+        vec![a.clone(), a],
+        vec![b.clone(), b],
+    ]);
+    sets.push(vec![serde_json::from_value(
+        json!({"type": "custom", "function": {"name": "a"}}),
+    )
+    .unwrap()]);
+
+    let texts: Vec<Vec<u8>> = sets
+        .iter()
+        .map(|set| serde_json::to_vec(set).unwrap())
+        .collect();
+    let keys: Vec<Vec<u8>> = sets.iter().map(|set| key_of(set.as_slice())).collect();
+    for (i, text) in texts.iter().enumerate() {
+        for (j, other) in texts.iter().enumerate() {
+            assert_eq!(
+                text == other,
+                i == j,
+                "the list holds no set twice: {i} and {j}"
+            );
+            assert_eq!(
+                keys[i] == keys[j],
+                i == j,
+                "the keys of {} and {}",
+                String::from_utf8_lossy(text),
+                String::from_utf8_lossy(other)
+            );
+        }
+    }
+
+    // Read from another text of the same tools, the key is the same: a
+    // schema given as `null` is a schema not given.
+    let absent = [declared(json!({"name": "a"}))];
+    let null = [declared(json!({"name": "a", "parameters": null}))];
+    assert_eq!(
+        serde_json::to_vec(&absent).unwrap(),
+        serde_json::to_vec(&null).unwrap()
+    );
+    assert_eq!(key_of(&absent), key_of(&null));
+    assert_eq!(key_of(&absent), keys[1], "and it is the key of the list's");
+}
+
+/// The table's bounds were set by the serialized bytes and read the key: a
+/// key is no longer than its set serialized, whatever the set is made of
+/// (many numbers, arrays in arrays, many fields, texts at the lengths where
+/// a length takes one more byte), so a set the table kept it still keeps.
+#[test]
+fn a_key_is_no_longer_than_its_tools_serialized() {
+    let many_fields: Map<String, Value> = (0..300).map(|i| (format!("k{i}"), json!(i))).collect();
+    let shapes = [
+        json!({"name": "n"}),
+        json!({"name": "n", "parameters": {"enum": (0..12_000).map(|i| i % 10).collect::<Vec<_>>()}}),
+        json!({"name": "n", "parameters": (0..200).map(|_| vec![0; 128]).collect::<Vec<_>>()}),
+        json!({"name": "n", "parameters": (0..200).map(|_| json!([])).collect::<Vec<_>>()}),
+        json!({"name": "n", "parameters": many_fields}),
+        json!({"name": "n", "parameters": ["x".repeat(127), "x".repeat(128), "x".repeat(16_383)]}),
+        json!({"name": "n".repeat(200), "description": "d".repeat(20_000),
+            "parameters": {("k".repeat(130)): "v".repeat(16_384)}}),
+    ];
+    for shape in shapes {
+        let set = [declared(shape)];
+        let (key, text) = (key_of(&set), serde_json::to_vec(&set).unwrap());
+        assert!(
+            text.len() <= PREPARED_TOOLS_MAX_KEY_BYTES && key.len() <= text.len(),
+            "{} key bytes for {} serialized",
+            key.len(),
+            text.len()
+        );
+    }
 }

@@ -1454,17 +1454,25 @@ pub enum Unplaced {
         /// ([`Shed::side`](crate::engine::decision::Shed::side)): a
         /// pair's caller answers for that role. A decision's own side
         /// passes as it is. A pair shed under the worker it names
-        /// (`target-worker`) names the side that worker was missed on. A
+        /// (`target-worker`) names the side that worker was missed on:
+        /// the side its number reached nobody on, or the side its
+        /// decision was left with nobody on. Where no pair the call named
+        /// could be sent to, that is the decode side where a target of
+        /// the call's last ask lost its decode alone, its prefill being
+        /// one that could be sent to, and the prefill side otherwise. A
         /// first decision's shed as saturated that stands behind a rule
         /// names the side of the list the gateway's own pair selection
-        /// judges there. `None` for a single request, for a pair refused
+        /// judges there.
+        /// `None` for a single request, for a pair refused
         /// before either side was read, and for a refusal behind the
         /// route's rule that is made of no one list its caller holds: the
         /// shed under the rule's name (`admits`), and a first decision's
         /// shed with no endpoint that stands where the rule takes no
         /// worker of a list, since the rule narrowed the lists that
-        /// decision judged. One made where no prefill of the lists pairs
-        /// with a decode keeps its side: the rule is not asked behind it.
+        /// decision judged. A pair held to its named prefill alone
+        /// answers both under `target-worker`, on no side. One made where
+        /// no prefill of the lists pairs with a decode keeps its side: the
+        /// rule is not asked behind it.
         /// `None` too under the budget, and for what the call does not
         /// place.
         side: Option<PairSide>,
@@ -1625,6 +1633,29 @@ pub(super) fn walk<'a>(
     missed: &mut Vec<WorkerId>,
     sides: impl Fn(&Target) -> Result<Sides, [Option<WorkerId>; 2]>,
 ) -> Result<Option<Placement<'a>>, Unplaced> {
+    walk_naming_side(engine, decided, later, now, missed, None, sides)
+}
+
+/// [`walk`], which names a side too. Where no target holds, `unsent` is
+/// told the side the walk could not send to ([`Call::unsent`]): the decode
+/// side where a target lost its decode alone, its prefill being one that
+/// could be sent to, and the prefill side otherwise. A pair's ask hands
+/// it. A walk that takes a target writes nothing, and a walk handed no
+/// `unsent` names no side.
+///
+/// # Errors
+///
+/// The decision's shed or its queue ([`picked`]).
+#[inline]
+pub(super) fn walk_naming_side<'a>(
+    engine: Loaded<'static, '_>,
+    decided: DecideOutcome,
+    later: bool,
+    now: Instant,
+    missed: &mut Vec<WorkerId>,
+    unsent: Option<&mut Option<PairSide>>,
+    sides: impl Fn(&Target) -> Result<Sides, [Option<WorkerId>; 2]>,
+) -> Result<Option<Placement<'a>>, Unplaced> {
     let pick = picked(&decided.decision)?;
     let mut failed = [[None; 2]; MAX_TARGETS];
     let mut ask = || {
@@ -1649,10 +1680,24 @@ pub(super) fn walk<'a>(
     };
     let Some((index, (worker, decode))) = held else {
         give_up(engine.object, decided, later, now);
-        for id in failed.into_iter().flatten().flatten() {
-            if !missed.contains(&id) {
-                missed.push(id);
+        // A target that lost its decode alone had a prefill that could be
+        // sent to. The rows are read once: for the side, and for the ids
+        // the next decision is told.
+        let mut decode_alone = false;
+        for ids in failed {
+            decode_alone |= matches!(ids, [None, Some(_)]);
+            for id in ids.into_iter().flatten() {
+                if !missed.contains(&id) {
+                    missed.push(id);
+                }
             }
+        }
+        if let Some(unsent) = unsent {
+            *unsent = Some(if decode_alone {
+                PairSide::Decode
+            } else {
+                PairSide::Prefill
+            });
         }
         return Ok(None);
     };
@@ -1770,6 +1815,31 @@ pub(super) struct Call {
     /// lookup (`whole`). A prompt is hashed once a call, however many asks
     /// the call takes.
     hashes: OnceCell<PromptHashes>,
+    /// The side of a pair that the call's last walk with no target could
+    /// not send to, written by that walk ([`walk_naming_side`]): the
+    /// decode side where a target of the walk lost its decode alone, its
+    /// prefill being one that could be sent to, and the prefill side
+    /// otherwise. A pair that names its worker and ends with no worker
+    /// for its asks is shed on it ([`target`]).
+    ///
+    /// The order is that of the gateway's own pair selection, which asks
+    /// the prefill first. Its hash policy reads the health of the worker
+    /// at a named place once more at its pick, and one that is not
+    /// healthy and eligible then is that policy's miss: the pair is
+    /// declined for the prefill's role, and no decode is picked
+    /// (`target_among` in
+    /// `model_gateway/src/policies/consistent_hashing.rs`, and the prefill
+    /// policy's decline in `pair_pass`,
+    /// `model_gateway/src/routers/common/placement.rs`). Behind the
+    /// prefill's pick that selection reads the pick's partners a second
+    /// time: nobody open there is the decode's role, and so is a number
+    /// that reaches none of them (`pair_pass`: its read of the pick's
+    /// open partners, and the decode policy's decline behind it).
+    ///
+    /// `None` ahead of such a walk, and for the call of a single request
+    /// and of an encode request that carries items: their walks write
+    /// none.
+    unsent: Option<PairSide>,
     /// The prompt's whole list of block hashes, where the call's making
     /// left the list to the lookup that reads it ([`Made::hashed_whole`]):
     /// made where that lookup first asks, once a call, and `None` under a
@@ -2114,10 +2184,13 @@ impl InProcess {
     /// held to the workers the rule takes on each of its two lists, as a
     /// single request's are to those of its one: three decisions a call.
     /// Which workers pair is the caller's word, in the classes its lists
-    /// carry: no pair is tested here again. Prefills with an open partner
-    /// that are all at the caller's limit answer
+    /// carry: no pair is tested here again. Where the prefill side's
+    /// filters leave its run nobody and a prefill with an open partner
+    /// stands but for the caller's limit, the answer is
     /// [`Unplaced::PrefillsFull`], on which the caller waits for room and
-    /// places the request again.
+    /// places the request again. So it is where the pair's default takes a
+    /// prefill at that limit, under a profile that lists it as a hard
+    /// filter.
     ///
     /// A request with an encode request's three lists is decided over the
     /// three ([`InProcess::decide_encode_at`]), with the items it
@@ -2181,8 +2254,9 @@ impl InProcess {
     /// Where it is not, the decision is
     /// held to the prefill's place and the decode is its own profile's
     /// pick. A named prefill at the caller's admission limit is waited
-    /// for ([`Unplaced::PrefillsFull`]), a named decode with no free room
-    /// is taken, and a retry is handed the pair again. A number that
+    /// for where that decision says so ([`Unplaced::PrefillsFull`]), a
+    /// named decode with no free room is taken, and a retry is handed
+    /// the pair again. A number that
     /// reaches no worker on a side, and a pair the held decision cannot
     /// place, shed the request under `target-worker`. Where no decode can
     /// be sent to and the binding steers decodes that are all over their

@@ -362,7 +362,9 @@ impl LeaseBackend for WritesSlowly {
 
 /// The loop over `elector` on a thread of the case's own, under a
 /// subscriber that keeps its lines. A second subscriber stays registered
-/// beside it, for the reason the fallen term's case gives.
+/// beside it, for the reason a case of `log_lines` gives where it builds
+/// its own loop:
+/// `a_fallen_term_logs_one_line_a_streak_and_one_more_when_it_falls_again`.
 struct Looping {
     lines: Logged,
     stop: mpsc::Sender<Word>,

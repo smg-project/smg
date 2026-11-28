@@ -34,8 +34,11 @@
 //! engine reports is the registration handshake's.
 //!
 //! What a stated value is follows the pairing rule
-//! ([`pairing`](crate::store::pairing)): a runtime is a kind's name, read
-//! as written, and an empty one is unknown; a connector is free text,
+//! ([`pairing`](crate::store::pairing)): a runtime's name is compared as
+//! it is handed and is never read, and an empty one is unknown. Whoever
+//! makes a member hands the reading: a worker host hands the worker
+//! crate's reading of a row's engine kind, and the row's own text where
+//! that crate does not know the kind. A connector is free text,
 //! which the store's door normalizes once a write
 //! ([`EncodeOffer::normalized`]), so a blank one states no connector.
 //!

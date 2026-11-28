@@ -4,8 +4,8 @@
 //! rest. A type that gains, loses or renames one stops the build of
 //! whatever states its list.
 //!
-//! The contracts' own check (`tests/contracts.rs`) states the lists of the
-//! types it holds to the two wires by the two macros here. No such pattern
+//! The contracts' own check (`tests/plugin/contracts.rs`) states the lists of
+//! the types it holds to the two wires by the two macros here. No such pattern
 //! of a type marked non-exhaustive builds outside this crate, so the lists
 //! of the marked types are stated here, beside the macros, and the check
 //! reads them: a new case of [`TransportClass`] still stops that check

@@ -71,11 +71,12 @@ async fn bed(settings: ElectionSettings) -> Bed {
     bed_with(settings, None, None).await
 }
 
-/// The same; with a ceiling, the presence table holds that many rows
-/// in place of the shared state's stock number.
+/// The same; with a `table`, the presence table is built with that grace
+/// period and that ceiling of rows, in place of the shared state's stock
+/// numbers.
 async fn bed_with(
     settings: ElectionSettings,
-    ceiling: Option<usize>,
+    table: Option<(Duration, usize)>,
     hello_deadline: Option<Duration>,
 ) -> Bed {
     let elector = Elector::alone(IDENTITY, settings).expect("the settings are in order");
@@ -93,9 +94,9 @@ async fn bed_with(
         2,
     )
     .expect("the deciders start");
-    if let Some(ceiling) = ceiling {
+    if let Some((grace, ceiling)) = table {
         shared.gateways = Arc::new(Gateways::new(
-            GRACE_PERIOD,
+            grace,
             ceiling,
             elector.fence(),
             Arc::clone(&shared.store),
@@ -352,6 +353,20 @@ async fn a_hello_is_welcomed_under_the_fences_term_and_the_gateway_is_present() 
     // Present from the Welcome, however long the session stands.
     assert!(bed.present(Instant::now()));
     assert!(bed.present(Instant::now() + 100 * GRACE_PERIOD));
+}
+
+/// A `Welcome` tells the grace period of the table its session stands
+/// in: a table built with half the stock period tells its own, and so
+/// does one built with twice the stock period.
+#[tokio::test]
+async fn a_welcome_tells_the_grace_period_of_its_sessions_table() {
+    for grace in [GRACE_PERIOD / 2, GRACE_PERIOD * 2] {
+        let mut bed = bed_with(PATIENT, Some((grace, PRESENT_MAX)), None).await;
+        bed.leads(1);
+        let mut session = open(bed.addr).await;
+        let welcome = session.welcomed(1).await;
+        assert_eq!(u128::from(welcome.grace_period_ms), grace.as_millis());
+    }
 }
 
 /// This build speaks its own protocol version and the one before it. A
@@ -868,7 +883,7 @@ async fn a_hello_past_the_ceiling_of_present_gateways_is_refused_by_name() {
     assert_eq!(stock.shared.gateways.ceiling(), PRESENT_MAX);
     assert_eq!(stock.shared.hello_deadline, HELLO_DEADLINE);
 
-    let mut bed = bed_with(PATIENT, Some(1), None).await;
+    let mut bed = bed_with(PATIENT, Some((GRACE_PERIOD, 1)), None).await;
     bed.leads(1);
     let mut first = open(bed.addr).await;
     first.welcomed(1).await;

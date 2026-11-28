@@ -262,7 +262,7 @@ tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "tes
 tracing-subscriber = { workspace = true }
 # The corpus test reads YAML documents.
 serde_yaml = { workspace = true }
-# The contract tests (tests/contracts.rs) compile the protocol to a
+# The contract tests (tests/plugin/contracts.rs) compile the protocol to a
 # descriptor set through protoc and resolve the WebAssembly world; no code
 # is generated and nothing at run time reads the files.
 prost-build = { version = "0.14.4", default-features = false }
@@ -310,6 +310,10 @@ required-features = ["controller"]
 name = "in_process"
 required-features = ["in-process"]
 
+# With no block here, Cargo finds a test program only at `tests/*.rs` and at
+# `tests/*/main.rs`. A program's root anywhere else under `tests/` takes a
+# block with a `path`: with none it is not built, and nothing says so.
+
 [[test]]
 name = "binary"
 required-features = ["controller"]
@@ -343,12 +347,19 @@ required-features = ["in-process", "worker-host"]
 name = "controller"
 required-features = ["controller"]
 
+# A program of its own: it starts child processes from its own test executable.
+[[test]]
+name = "elector_cell"
+path = "tests/replicas/elector_cell.rs"
+
 [[test]]
 name = "elector_k8s_cell"
+path = "tests/replicas/elector_k8s_cell.rs"
 required-features = ["kubernetes"]
 
 [[test]]
 name = "failover"
+path = "tests/replicas/failover.rs"
 required-features = ["client"]
 
 [[test]]
@@ -357,12 +368,24 @@ required-features = ["client"]
 
 [[test]]
 name = "grpc_plugin"
+path = "tests/plugin/grpc_plugin.rs"
 required-features = ["controller"]
 
 # Two cases in a process of their own: each lowers a limit of the process.
 [[test]]
 name = "grpc_runtime"
+path = "tests/plugin/grpc_runtime.rs"
 required-features = ["controller"]
+
+# A program of its own: the contracts' page names it by `--test wit`.
+[[test]]
+name = "wit"
+path = "tests/plugin/wit.rs"
+
+# A program of its own: the contracts' page names it by `--test contracts`.
+[[test]]
+name = "contracts"
+path = "tests/plugin/contracts.rs"
 
 [[test]]
 name = "membership_calls"
@@ -370,10 +393,12 @@ required-features = ["controller"]
 
 [[test]]
 name = "replicas"
+path = "tests/replicas/replicas.rs"
 required-features = ["controller"]
 
 [[test]]
 name = "replication"
+path = "tests/replicas/replication.rs"
 required-features = ["controller"]
 
 [[test]]

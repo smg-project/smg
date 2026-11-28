@@ -185,7 +185,10 @@ fn a_record_that_is_gone_logs_one_line_a_streak_and_one_more_when_it_goes_again(
     looks(&mut stood, 5);
     let (gone, text) = looping.stopped_with("the lease's record is gone or names no holder");
     assert_eq!(gone, 2, "{text}");
-    assert!(!text.contains("the lease's term fell"), "{text}");
+    assert!(
+        !text.contains("the lease's term is under the highest"),
+        "{text}"
+    );
     // The holder followed again after the first streak is named anew.
     assert_eq!(text.matches(": following").count(), 2, "{text}");
 }
@@ -346,7 +349,10 @@ fn an_emptied_record_is_gone() {
     let (gone, text) = looping.stopped_with("the lease's record is gone or names no holder");
     // No hold explains a fallen term, which never comes back: its line
     // is read before the bound.
-    assert!(!text.contains("the lease's term fell"), "{text}");
+    assert!(
+        !text.contains("the lease's term is under the highest"),
+        "{text}"
+    );
     // The bound on the clock: the case ended inside the wait. A host
     // that held it past the wait's end let the holder take again.
     let took = emptied.elapsed();

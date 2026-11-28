@@ -21,9 +21,9 @@
     dead_code,
     reason = "this binary dials loopback; the other helpers are the listeners' tests'"
 )]
-#[path = "common/net.rs"]
+#[path = "../common/net.rs"]
 mod net;
-#[path = "common/pair.rs"]
+#[path = "../common/pair.rs"]
 mod pair;
 
 use std::{
