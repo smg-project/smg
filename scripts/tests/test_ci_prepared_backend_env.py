@@ -457,7 +457,12 @@ fi
         # Simulate a bare pod without libibverbs.so.1 where TransferEngine import fails
         # and E2E_KV_BACKEND / E2E_SGLANG_TRANSFER_BACKEND are unset (default PD Mooncake).
         self.write_tool("ldconfig", "#!/bin/sh\nexit 0\n")
-        result = self.run_script("ci_install_sglang.sh", TEST_DRIVER_ABSENT="1")
+        result = self.run_script(
+            "ci_install_sglang.sh",
+            TEST_DRIVER_ABSENT="1",
+            E2E_KV_BACKEND="",
+            E2E_SGLANG_TRANSFER_BACKEND="",
+        )
         self.assertIn("Installing missing mooncake RDMA runtime libraries", result.stdout)
         self.assertIn(
             "apt-get install -y --no-install-recommends "
@@ -469,13 +474,17 @@ fi
         venv = self.make_prepared("trtllm")
         self.run_script("ci_setup_python_venv.sh", SMG_CI_BACKEND="trtllm")
         self.assertEqual(self.job.joinpath(".venv").resolve(), venv)
-        result = self.run_script("ci_install_trtllm.sh")
+        Path(self.env["GITHUB_ENV"]).write_text("")
+        result = self.run_script(
+            "ci_install_trtllm.sh",
+            SMG_TRTLLM_CUDA13_DIR=str(self.root / "missing-cuda-13.0"),
+        )
         self.assertIn("Using prepared TRT-LLM dependencies", result.stdout)
         self.assertIn("cuda-bindings IPC handle canary OK", result.stdout)
         self.assertNotIn("apt-get", self.commands())
         self.assertNotIn("pip install", self.commands())
         github_env = Path(self.env["GITHUB_ENV"]).read_text()
-        self.assertIn("CUDA_HOME=/usr/local/cuda-13.0", github_env)
+        self.assertIn(f"CUDA_HOME={self.env['CUDA_HOME']}", github_env)
         self.assertIn("LD_LIBRARY_PATH=", github_env)
 
     def test_trtllm_cpu_build_marks_prepared_env_without_sudo(self):

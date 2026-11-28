@@ -8,11 +8,13 @@
 #
 # This script points those caches at the node-shared NVMe mount
 # (/models/.ci-cache/jit by default), partitioned by:
-#   <engine>-<gpu_arch>-<version_hash>
-# where <gpu_arch> encodes the compute capability + driver major (NVIDIA) or
-# GCN target + ROCm release (AMD), and <version_hash> hashes the exact Python,
-# engine, PyTorch, Triton, FlashInfer, TVM-FFI, and nvcc versions. Different
-# engines, versions, drivers, or GPU architectures never share compiled code.
+#   <engine>-<trust_tier>-<gpu_arch>-<version_hash>
+# where <trust_tier> is "trusted" for main/release/tag non-PR events and
+# "untrusted" for PR/feature-branch runs, <gpu_arch> encodes the compute
+# capability + driver major (NVIDIA) or GCN target + ROCm release (AMD), and
+# <version_hash> hashes the exact Python, engine, PyTorch, Triton, FlashInfer,
+# TVM-FFI, and nvcc versions. Different engines, tiers, versions, drivers, or
+# GPU architectures do not accidentally reuse each other's compiled code.
 #
 # Usage: ci_setup_jit_cache.sh [engine]
 #
@@ -20,6 +22,7 @@
 #   E2E_ENGINE / $1             engine name (vllm, sglang, trtllm, tokenspeed)
 #   E2E_GPU_VENDOR              nvidia (default) or amd
 #   SMG_JIT_CACHE_ROOT          override cache root (default: <model-root>/.ci-cache/jit)
+#   SMG_JIT_CACHE_TRUST_TIER    override trust tier (default: trusted on main/release/tags, else untrusted)
 #   SMG_JIT_CACHE_MIN_FREE_GB   minimum free GiB required on the mount (default: 50)
 #   SMG_JIT_CACHE_MAX_AGE_DAYS  evict untouched entries older than N days (default: 7)
 #   SMG_JIT_CACHE_PYTHON        override python binary for version inspection
