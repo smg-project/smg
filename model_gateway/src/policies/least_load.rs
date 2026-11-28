@@ -1122,6 +1122,10 @@ impl LoadBalancingPolicy for LeastLoadPolicy {
         self.select_min_expected_wait(workers, &healthy, info, self.name())
     }
 
+    fn hears_request_complete(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "least_load"
     }

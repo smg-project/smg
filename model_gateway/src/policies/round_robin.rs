@@ -167,6 +167,10 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
         Some(healthy_indices[selected_idx])
     }
 
+    fn hears_request_complete(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "round_robin"
     }

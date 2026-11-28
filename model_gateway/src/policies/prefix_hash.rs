@@ -427,6 +427,10 @@ impl LoadBalancingPolicy for PrefixHashPolicy {
         result
     }
 
+    fn hears_request_complete(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "prefix_hash"
     }

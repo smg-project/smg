@@ -103,6 +103,17 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
         // Default: no-op for stateless policies
     }
 
+    /// Whether this policy acts on a request's end
+    /// ([`Self::on_request_complete`]).
+    ///
+    /// The registry asks where a policy enters it, and while none of its
+    /// policies hears, a request's end is reported to no policy. Yes by
+    /// default, so a policy that says nothing is told of every end as before;
+    /// a policy that leaves `on_request_complete` empty says no.
+    fn hears_request_complete(&self) -> bool {
+        true
+    }
+
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 

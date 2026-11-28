@@ -50,6 +50,10 @@ impl LoadBalancingPolicy for PassthroughPolicy {
             .position(|worker| info.admits(worker.routing_state()))
     }
 
+    fn hears_request_complete(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "passthrough"
     }

@@ -247,6 +247,10 @@ impl LoadBalancingPolicy for ConsistentHashingPolicy {
         result
     }
 
+    fn hears_request_complete(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "consistent_hashing"
     }
