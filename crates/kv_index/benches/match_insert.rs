@@ -489,8 +489,59 @@ fn bench_chain_index_store(c: &mut Criterion) {
     group.finish();
 }
 
+/// A chain index in which `holders` workers hold one 8-block head and the first `deep` of them
+/// the 64-block chain it starts: a prompt head the whole fleet holds, a few workers deeper.
+fn fleet_head(holders: usize, deep: usize) -> (ChainIndex, Vec<ContentHash>) {
+    let index = ChainIndex::with_max_workers(1024);
+    let blocks = chain_blocks(2, 64);
+    for w in 0..holders {
+        let worker = index.intern_worker(&tenant(w)).expect("worker id");
+        let held = if w < deep { 64 } else { 8 };
+        let mut map = ChainBlockMap::default();
+        index
+            .apply_stored(worker, &blocks[..held], None, &mut map)
+            .expect("store");
+    }
+    let request = blocks.iter().map(|block| block.content_hash).collect();
+    (index, request)
+}
+
+/// One lookup with every holder listed, out of line so a count reads it by name.
+#[inline(never)]
+fn lookup_listed(index: &ChainIndex, request: &[ContentHash]) -> usize {
+    let mut scored = 0usize;
+    index.score_into(request, |content| content.0, false, |_, _| scored += 1);
+    scored
+}
+
+/// One lookup that keeps the sixteen deepest holders, out of line as the listed one is. The
+/// draw is a caller's: one step of a stream and a multiply.
+#[inline(never)]
+fn lookup_deepest(
+    index: &ChainIndex,
+    request: &[ContentHash],
+    state: &mut u64,
+    kept: &mut Vec<(u32, u32)>,
+) -> usize {
+    const EVERY: [u64; 16] = [u64::MAX; 16];
+    index.deepest_into(
+        request,
+        |content| content.0,
+        &EVERY,
+        16,
+        |under| {
+            *state = mix(*state);
+            ((u128::from(*state) * u128::from(under)) >> 64) as u32
+        },
+        kept,
+    );
+    kept.len()
+}
+
 /// The lookup of the chain index: a request of 88 blocks that twenty workers hold whole (the
-/// Mooncake shape, one run walked), and the same request against two shards holding it on both.
+/// Mooncake shape, one run walked), the same request against two shards holding it on both, and a request
+/// whose 8-block head 64 and 512 workers hold, three of them all of it: every holder listed,
+/// and the sixteen deepest read under a cap.
 fn bench_chain_index_lookup(c: &mut Criterion) {
     let mut group = c.benchmark_group("chain_index_lookup");
     group.throughput(Throughput::Elements(1));
@@ -520,6 +571,21 @@ fn bench_chain_index_lookup(c: &mut Criterion) {
             scored
         });
     });
+    // A head the whole fleet holds: what a caller that keeps sixteen holders pays to have every
+    // holder listed, and what the read under a cap costs it.
+    for holders in [64usize, 512] {
+        let (fleet, request) = fleet_head(holders, 3);
+        group.bench_function(format!("64_blocks/{holders}_hold_the_head/listed"), |b| {
+            b.iter(|| lookup_listed(&fleet, &request));
+        });
+        group.bench_function(
+            format!("64_blocks/{holders}_hold_the_head/deepest_16"),
+            |b| {
+                let (mut state, mut kept) = (1u64, Vec::with_capacity(16));
+                b.iter(|| lookup_deepest(&fleet, &request, &mut state, &mut kept));
+            },
+        );
+    }
     group.finish();
 }
 

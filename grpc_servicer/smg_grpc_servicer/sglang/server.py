@@ -14,18 +14,17 @@ import threading
 import time
 from collections.abc import Callable
 from concurrent import futures
+from traceback import format_exc as get_exception_traceback
 from typing import Any
 
 import grpc
 from grpc_health.v1 import health_pb2_grpc
 from grpc_reflection.v1alpha import reflection
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.runtime_context import publish
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_process_tree
-from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 
 from smg_grpc_servicer.hostport import host_port, loopback_target
@@ -38,8 +37,10 @@ from smg_grpc_servicer.rust_lifecycle import (
     configuration_exit,
     guarded_exit,
 )
+from smg_grpc_servicer.sglang.compat import get_disaggregation_types
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
+from smg_grpc_servicer.sglang.model_artifacts import prepare_model_metadata
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager, init_request_tracing
 from smg_grpc_servicer.sglang.rust import (
     KV_EVENTS_ENV,
@@ -58,6 +59,8 @@ from smg_grpc_servicer.sglang.scheduler_watchdog import wait_for_scheduler_shutd
 from smg_grpc_servicer.sglang.servicer import SGLangSchedulerServicer
 from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, warmup_inputs, warmup_wire
 from smg_grpc_servicer.warmup import parse_setting, plan_for, run_warmup
+
+DisaggregationMode, FAKE_BOOTSTRAP_HOST = get_disaggregation_types()
 
 logger = logging.getLogger(__name__)
 
@@ -177,13 +180,14 @@ async def serve_grpc(
             if on_request_manager_ready is not None:
                 # The state of every launch on the Rust servicer, so a note; a
                 # warning when the launch asked for the sidecar's own /metrics
-                # (--enable-metrics), which nothing serves then.
+                # (--enable-metrics), whose frontend series it does not get.
                 asked_for_metrics = bool(getattr(server_args, "enable_metrics", False))
                 (logger.warning if asked_for_metrics else logger.info)(
                     "The Rust servicer has no request manager to wire SGLang's HTTP sidecar "
-                    "to (its /metrics, admin and profiling endpoints stay off); its own "
-                    "metrics endpoint is --metrics-port / %s; the Python servicer "
-                    "(--servicer-impl python / %s=python) keeps the sidecar",
+                    "to (its admin and profiling endpoints stay off); under --enable-metrics "
+                    "the launcher serves the scheduler's metrics on the sidecar's port; the "
+                    "frontend's request metrics are the servicer's own, on --metrics-port / %s; "
+                    "the Python servicer (--servicer-impl python / %s=python) keeps the sidecar",
                     METRICS_PORT_ENV,
                     SERVICER_IMPL_ENV,
                 )
@@ -199,6 +203,7 @@ async def serve_grpc(
         # is refused here as on the Rust path.
         if default_kv_events_config(server_args) is not None:
             announce_kv_events_default("SGLang", KV_EVENTS_ENV, logger)
+        prepare_model_metadata(server_args)
     except ServicerConfigError as error:
         # A knob the servicer cannot use: one named ERROR line and exit code
         # 2, before any scheduler or engine work, not a traceback.
@@ -664,7 +669,7 @@ def _planned_warmup(server_args: ServerArgs, model_info: Any, channel: Any) -> A
         return None
     if server_args.disaggregation_mode != DisaggregationMode.NULL.value:
         # This servicer's own warm-up request above carried the stand-in
-        # bootstrap already; the planned pass on a prefill or decode leg is
+        # bootstrap already; the planned pass on a prefill or decode side is
         # the Rust launcher's (this servicer's start-up is kept as it is).
         logger.info("Planned warm-up: none on a disaggregation role on this servicer")
         return None

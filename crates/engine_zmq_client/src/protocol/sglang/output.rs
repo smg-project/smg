@@ -697,6 +697,7 @@ fn load_of(
         num_running,
         num_waiting,
         kv_cache_usage: kv_used_tokens as f64 / kv_total_tokens as f64,
+        ..EngineLoad::default()
     })
 }
 

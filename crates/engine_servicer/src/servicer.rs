@@ -16,7 +16,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use engine_zmq_adapter::ZmqEngineClient;
+use engine_zmq_adapter::{is_leftover_handshake_socket, ZmqEngineClient};
 use engine_zmq_client::protocol::handshake::EngineCoreReadyResponse;
 use futures::FutureExt;
 use tokio::net::TcpListener;
@@ -32,8 +32,23 @@ use crate::{
     load_tracker::LoadTracker,
     metrics::{MetricsListener, ServicerMetrics, ServicerState, Snapshot},
     requests::RequestRegistry,
-    ServerThread, ServicerConfig, ServicerError, Shutdown,
+    ServerThread, ServicerConfig, ServicerError, Shutdown, STOP_MARGIN,
 };
+
+/// Close remaining listener connections once the lifecycle owner's drain grace expires.
+pub(crate) async fn serve_with_grace<E: std::fmt::Display>(
+    serving: impl Future<Output = Result<(), E>>,
+    shutdown: Shutdown,
+) -> Result<(), String> {
+    let forced = async { tokio::time::sleep(shutdown.await).await };
+    tokio::select! {
+        result = serving => result.map_err(|error| error.to_string()),
+        () = forced => {
+            warn!("gRPC servicer closed its remaining connections after the drain grace");
+            Ok(())
+        }
+    }
+}
 
 /// The proto integers a handshake figure is read into, each with the value
 /// it saturates at.
@@ -199,7 +214,7 @@ impl Shared {
     /// else the launcher's figure before the engines are up, else one. Not
     /// the handshake's `data_parallel_size`: ranks launched independently
     /// each report a size of one, so a four-rank engine read as one rank and
-    /// the gateway's `--dp-aware` expanded nothing.
+    /// the gateway registered one worker for it.
     pub(crate) fn rank_count(&self, launcher: i32) -> usize {
         self.engine
             .client
@@ -330,6 +345,44 @@ pub(crate) struct Server {
     metrics_listener: Option<MetricsListener>,
 }
 
+/// How long the shutdown waits for an `ipc://` handshake endpoint file to
+/// disappear after the connect task is gone: the socket library unlinks it
+/// from a task of this runtime, a few polls away even on a starved host.
+/// Half the stop margin at most, so a file that stays leaves the thread the
+/// other half to wind down and cannot turn a stop that drained in time into
+/// a timeout.
+const HANDSHAKE_RELEASE_BOUND: Duration = Duration::from_millis(500);
+const _: () = assert!(HANDSHAKE_RELEASE_BOUND.as_millis() * 2 <= STOP_MARGIN.as_millis());
+
+/// The `ipc://` handshake endpoint file this servicer is about to bind, read
+/// before the connect is spawned: `None` when the address names no file, and
+/// when something is already at the path that the bind sequence leaves there.
+/// That file is another process's (the bind fails as in use), and nothing
+/// here would release it. A leftover socket the bind sequence sweeps first
+/// counts as a free path: the file there at stop is this servicer's.
+async fn own_handshake_endpoint(handshake_address: &str) -> Option<String> {
+    let path = handshake_address.strip_prefix("ipc://")?;
+    (std::fs::metadata(path).is_err() || is_leftover_handshake_socket(handshake_address).await)
+        .then(|| path.to_owned())
+}
+
+/// Wait until the handshake endpoint file at `path` is gone, or `bound` has
+/// passed; a file still there is reported, never an error (the server stops
+/// either way).
+async fn await_handshake_release(path: &str, bound: Duration) {
+    let deadline = tokio::time::Instant::now() + bound;
+    while std::fs::metadata(path).is_ok() {
+        if tokio::time::Instant::now() >= deadline {
+            warn!(
+                path,
+                "the handshake endpoint file outlived the servicer's stop"
+            );
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 impl Server {
     /// Bind `config.bind_address` and serve `routes` (the wire's service) with
     /// the health service beside it, on a dedicated runtime thread named
@@ -340,9 +393,10 @@ impl Server {
     /// Once the listener is bound, `connect` gets the inputs of the engine
     /// connect (the endpoints and the engine count off `config`, its two
     /// start-up bounds, its silence bounds and the server's last-error slot)
-    /// and the future it returns runs on the server runtime, fire-and-forget:
-    /// the wire's engine connect, which gates health; dropping the runtime
-    /// with the server thread cancels it. The listening line names `engine`
+    /// and the future it returns runs on the server runtime in the background:
+    /// the wire's engine connect, which gates health; the shutdown aborts it
+    /// after the drain and waits for an `ipc://` handshake endpoint file of
+    /// its own to go before the thread ends. The listening line names `engine`
     /// with the bound address as the engines log it (the listener's
     /// `local_addr`, empty when the read fails).
     pub(crate) fn start<S, C, Fut>(
@@ -413,11 +467,12 @@ impl Server {
                     .local_addr()
                     .map(|address| address.to_string())
                     .unwrap_or_default();
+                let handshake_endpoint = own_handshake_endpoint(&handshake_address).await;
                 #[expect(
                     clippy::disallowed_methods,
-                    reason = "engine connect is fire-and-forget; the runtime drop cancels it"
+                    reason = "engine connect runs in the background; the shutdown aborts it below"
                 )]
-                let _connect = tokio::spawn(connect(ConnectInputs {
+                let connect_task = tokio::spawn(connect(ConnectInputs {
                     ipc_base_url,
                     handshake_address,
                     engine_count,
@@ -458,17 +513,18 @@ impl Server {
                         }),
                         shutdown.clone().map(|_| ()),
                     );
-                let forced = async move {
-                    let grace = shutdown.await;
-                    tokio::time::sleep(grace).await;
-                };
-                tokio::select! {
-                    result = graceful => result.map_err(|error| error.to_string()),
-                    () = forced => {
-                        warn!("gRPC servicer closed its remaining connections after the drain grace");
-                        Ok(())
-                    }
+                let result = serve_with_grace(graceful, shutdown).await;
+                // The handshake endpoint goes with the server, not with the
+                // runtime: a connect still waiting for its engine is ended
+                // here, so its socket drops while the runtime can still run
+                // the release of an `ipc://` endpoint file, and that release
+                // is awaited before the thread ends and `stop` returns.
+                connect_task.abort();
+                let _ = connect_task.await;
+                if let Some(path) = handshake_endpoint {
+                    await_handshake_release(&path, HANDSHAKE_RELEASE_BOUND).await;
                 }
+                result
             },
         )?;
         Ok(Self {
@@ -516,204 +572,5 @@ impl Server {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::mpsc;
-
-    use super::*;
-    use crate::{metrics::Identity, record_error};
-
-    fn shared() -> Shared {
-        let metrics = ServicerMetrics::new(
-            &Identity {
-                model: "m".to_string(),
-                wire: "test",
-                ranks: 1,
-                max_model_len: 8,
-                matches_string_stops: false,
-                processes_media: false,
-            },
-            false,
-        )
-        .expect("metrics without a listener");
-        Shared::new(None, metrics, None, None)
-    }
-
-    /// Before the engine is up every reader answers from the launcher's
-    /// figures alone: no capacity, the launcher's window or none, the
-    /// launcher's version or `unknown`, the launcher's ranks or one.
-    #[test]
-    fn the_handshake_readers_fall_back_to_the_launcher_before_the_engine_is_up() {
-        let shared = shared();
-        assert!(shared.ready().is_none());
-        assert_eq!(shared.kv_capacity_tokens(), 0);
-        assert_eq!(shared.running_window(64), 64);
-        assert_eq!(shared.running_window(0), 0);
-        assert_eq!(shared.engine_version("0.5.1", "wire-"), "0.5.1");
-        assert_eq!(shared.engine_version("", "wire-"), "unknown");
-        assert_eq!(shared.rank_count(4), 4);
-        assert_eq!(shared.rank_count(0), 1);
-        assert_eq!(shared.rank_count(-2), 1);
-    }
-
-    /// The drain switch closes admission with health; the readiness switch
-    /// admits the owner's own warm-up requests alone, and its release admits
-    /// everyone again.
-    #[test]
-    fn the_two_switches_differ_in_admission() {
-        let shared = shared();
-        assert!(shared.registry.is_accepting());
-        assert!(!shared.is_serving(), "no engine link yet");
-        assert_eq!(shared.health_message("healthy"), "Engine is starting");
-        assert_eq!(shared.snapshot().state, Some(ServicerState::Starting));
-
-        shared.set_ready(false);
-        assert!(
-            shared.registry.is_accepting(),
-            "readiness held: a hold is not a drain"
-        );
-        assert_eq!(shared.health_message("healthy"), "Warming up");
-        let refused = shared
-            .registry
-            .register("chatcmpl-1")
-            .err()
-            .expect("a foreign request is refused while readiness is held");
-        assert_eq!(refused.message(), "servicer is warming up");
-        let (own, _cancel) = shared
-            .registry
-            .register("smg-warmup-1")
-            .expect("the warm-up's own request is admitted");
-        drop(own);
-
-        shared.set_serving(false);
-        assert!(!shared.registry.is_accepting(), "a drain closes admission");
-        assert_eq!(shared.health_message("healthy"), "Draining");
-        assert_eq!(shared.snapshot().state, Some(ServicerState::Draining));
-
-        shared.set_serving(true);
-        assert!(shared.registry.is_accepting());
-        assert_eq!(shared.health_message("healthy"), "Engine is starting");
-        assert_eq!(
-            shared
-                .registry
-                .register("chatcmpl-2")
-                .err()
-                .expect("lifting the drain does not lift the readiness hold")
-                .message(),
-            "servicer is warming up"
-        );
-
-        shared.set_ready(true);
-        let (foreign, _cancel) = shared
-            .registry
-            .register("chatcmpl-2")
-            .expect("the release admits every request again");
-        drop(foreign);
-    }
-
-    /// Without a link the engine is "still connecting"; a recorded failure
-    /// names itself.
-    #[test]
-    fn the_engine_error_reads_the_link() {
-        let shared = shared();
-        assert!(!shared.engine_ready());
-        let status = shared.engine().err().expect("no client yet");
-        assert_eq!(status.code(), tonic::Code::Unavailable);
-        assert_eq!(status.message(), "engine is still connecting");
-
-        shared.engine.fail("refused".to_string());
-        let status = shared.engine().err().expect("still no client");
-        assert_eq!(status.message(), "engine connection failed: refused");
-        assert_eq!(shared.health_message("healthy"), "Engine connection failed");
-        assert_eq!(shared.snapshot().state, Some(ServicerState::EngineDown));
-    }
-
-    /// A wire of the shared state alone: no engine, no load figures.
-    struct TestState(Shared);
-
-    impl WireState for TestState {
-        fn shared(&self) -> &Shared {
-            &self.0
-        }
-    }
-
-    impl RankLoads for TestState {
-        fn rank_load(
-            &self,
-            _dp_rank: Option<i32>,
-        ) -> Option<smg_grpc_client::common_proto::EngineLoad> {
-            None
-        }
-
-        fn engine_link(&self) -> &EngineLink {
-            &self.0.engine
-        }
-
-        fn rank_count(&self) -> usize {
-            1
-        }
-    }
-
-    /// Once the listener is bound, the start hands the wire's connect the
-    /// inputs the configuration said and runs it on the server runtime; what
-    /// the connect records in its error slot is the server's last error.
-    #[test]
-    fn the_start_hands_the_connect_the_configurations_inputs_once_bound() {
-        let state = Arc::new(TestState(shared()));
-        let mut config =
-            ServicerConfig::new("127.0.0.1:0", "ipc:///tmp/engine", "tcp://127.0.0.1:1");
-        config.engine_count = 3;
-        config.engine_startup_timeout = Duration::from_secs(7);
-        config.engine_startup_ceiling = None;
-        config.engine_silence_timeout = Duration::from_secs(11);
-        config.engine_prefill_tokens_per_sec = 500;
-        let (seen_tx, seen_rx) = mpsc::channel();
-        let server = Server::start(
-            "smg-test-servicer",
-            config,
-            "test.Service",
-            "Test",
-            &state,
-            Routes::default(),
-            move |inputs| async move {
-                record_error(&inputs.last_error, "the test's connect failed".to_string());
-                let _ = seen_tx.send((
-                    inputs.ipc_base_url,
-                    inputs.handshake_address,
-                    inputs.engine_count,
-                    inputs.startup_timeout,
-                    inputs.startup_ceiling,
-                    inputs.silence.window,
-                    inputs.silence.prefill_tokens_per_sec,
-                    std::thread::current().name().map(str::to_string),
-                ));
-            },
-        )
-        .expect("the server starts");
-        let (ipc, handshake, engines, timeout, ceiling, window, rate, thread) = seen_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("the connect ran");
-        assert_eq!(ipc, "ipc:///tmp/engine");
-        assert_eq!(handshake, "tcp://127.0.0.1:1");
-        assert_eq!(engines, 3);
-        assert_eq!(timeout, Duration::from_secs(7));
-        assert_eq!(ceiling, None);
-        assert_eq!(window, Duration::from_secs(11));
-        assert_eq!(rate, 500);
-        assert_eq!(
-            thread.as_deref(),
-            Some("smg-servicer-rt"),
-            "the server runtime"
-        );
-        assert!(server.running());
-        assert_eq!(
-            server
-                .last_error()
-                .expect("the slot is readable")
-                .as_deref(),
-            Some("the test's connect failed")
-        );
-        server
-            .stop(&state.0, Duration::from_secs(5))
-            .expect("the server stops");
-    }
-}
+#[path = "../tests/unit/servicer/tests.rs"]
+mod tests;

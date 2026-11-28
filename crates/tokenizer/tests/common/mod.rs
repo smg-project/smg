@@ -7,9 +7,11 @@ pub mod hub_fetch;
 use std::{
     fs,
     path::{Path, PathBuf},
+    str::FromStr,
 };
 
 use rustls::crypto::ring;
+use serde_json::{json, Map, Value};
 use tokenizers::{
     decoders::byte_level::ByteLevel as ByteLevelDecoder,
     models::bpe::{Merges, Vocab, BPE},
@@ -17,15 +19,6 @@ use tokenizers::{
     processors::byte_level::ByteLevel as ByteLevelProcessor,
     AddedToken, Tokenizer,
 };
-
-// Tokenizer download configuration
-const TINYLLAMA_TOKENIZER_URL: &str =
-    "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json";
-/// Names another source of the TinyLlama tokenizer file: a mirror, or a stub
-/// standing in for the hub.
-const TINYLLAMA_TOKENIZER_URL_ENV: &str = "TINYLLAMA_TOKENIZER_URL";
-const CACHE_DIR: &str = ".tokenizer_cache";
-const TINYLLAMA_TOKENIZER_FILENAME: &str = "tinyllama_tokenizer.json";
 
 /// The blocking HTTP client of the download helpers. The client takes the
 /// process-level TLS crypto provider (reqwest's `rustls-no-provider`
@@ -51,18 +44,6 @@ pub fn http_client_builder() -> reqwest::blocking::ClientBuilder {
     reqwest::blocking::Client::builder()
 }
 
-/// The TinyLlama tokenizer file, downloaded into the cache once per process
-/// unless it is there already ([`hub_fetch::cached_download`]: one download
-/// at a time, a rate-limited hub waited out, a lock a failed download left
-/// poisoned taken back). Returns the path to the cached tokenizer file.
-pub fn ensure_tokenizer_cached() -> PathBuf {
-    let url = std::env::var(TINYLLAMA_TOKENIZER_URL_ENV)
-        .unwrap_or_else(|_| TINYLLAMA_TOKENIZER_URL.to_string());
-    let path = PathBuf::from(CACHE_DIR).join(TINYLLAMA_TOKENIZER_FILENAME);
-    hub_fetch::cached_download(&http_client(), &url, &path, 100);
-    path
-}
-
 /// Common test prompts for consistency across tests
 pub const TEST_PROMPTS: [&str; 4] = [
     "deep learning is",
@@ -71,12 +52,13 @@ pub const TEST_PROMPTS: [&str; 4] = [
     "another prompt",
 ];
 
-/// Pre-computed hashes for verification
+/// The hashes of the ids [`word_mark_bpe`] with [`WORD_MARK_MERGES`] gives
+/// [`TEST_PROMPTS`].
 pub const EXPECTED_HASHES: [u64; 4] = [
-    1209591529327510910,
-    4181375434596349981,
-    6245658446118930933,
-    5097285695902185237,
+    5768639699132919811,
+    2514674412739152298,
+    7348034889433778959,
+    3308952177018835361,
 ];
 
 const KIMI_K3_REPO: &str = "https://huggingface.co/moonshotai/Kimi-K3/resolve/main";
@@ -437,6 +419,109 @@ pub fn byte_level_bpe(merges: &[(&str, &str)], special_tokens: &[&str]) -> Token
         )
         .expect("the special tokens");
     tokenizer
+}
+
+/// Twelve merges of a small word-mark BPE, in rank order: `▁dee`, `ing`,
+/// `▁lea`, `▁is`, `an` and `▁an` with the pairs they are built from.
+pub const WORD_MARK_MERGES: [(&str, &str); 12] = [
+    ("▁", "d"),
+    ("e", "e"),
+    ("▁d", "ee"),
+    ("i", "n"),
+    ("in", "g"),
+    ("▁", "l"),
+    ("e", "a"),
+    ("▁l", "ea"),
+    ("▁", "i"),
+    ("▁i", "s"),
+    ("a", "n"),
+    ("▁", "an"),
+];
+
+/// A small BPE in the style of the Llama family's `tokenizer.json`, section
+/// for section: the normalizer writes the word mark `▁` in front of the text
+/// and in place of every space, there is no pre-tokenizer, a character
+/// outside the vocabulary is spelled by its UTF-8 bytes (byte fallback), an
+/// encoding that asks for special tokens starts with `<s>`, and the decoder
+/// turns `▁` back into a space, joins the byte tokens into characters and
+/// strips the first space. The vocabulary is `<unk>`, `<s>`, `</s>`, the 256
+/// byte tokens, `▁`, the lower-case letters, and `merges` applied in order.
+#[expect(
+    clippy::expect_used,
+    reason = "a helper of tests that stop on a broken setup"
+)]
+pub fn word_mark_bpe(merges: &[(&str, &str)]) -> Tokenizer {
+    let mut vocab = Map::new();
+    let mut add = |piece: String| {
+        let id = vocab.len();
+        assert!(
+            !vocab.contains_key(&piece),
+            "{piece:?} is in the vocabulary twice"
+        );
+        vocab.insert(piece, Value::from(id));
+    };
+    for special in ["<unk>", "<s>", "</s>"] {
+        add(special.to_string());
+    }
+    for byte in 0u32..256 {
+        add(format!("<0x{byte:02X}>"));
+    }
+    add("▁".to_string());
+    for letter in 'a'..='z' {
+        add(letter.to_string());
+    }
+    for (a, b) in merges {
+        add(format!("{a}{b}"));
+    }
+    let special = |id: u32, content: &str| {
+        json!({
+            "id": id, "content": content, "single_word": false, "lstrip": false,
+            "rstrip": false, "normalized": false, "special": true,
+        })
+    };
+    let file = json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": [special(0, "<unk>"), special(1, "<s>"), special(2, "</s>")],
+        "normalizer": {"type": "Sequence", "normalizers": [
+            {"type": "Prepend", "prepend": "▁"},
+            {"type": "Replace", "pattern": {"String": " "}, "content": "▁"},
+        ]},
+        "pre_tokenizer": null,
+        "post_processor": {
+            "type": "TemplateProcessing",
+            "single": [
+                {"SpecialToken": {"id": "<s>", "type_id": 0}},
+                {"Sequence": {"id": "A", "type_id": 0}},
+            ],
+            "pair": [
+                {"SpecialToken": {"id": "<s>", "type_id": 0}},
+                {"Sequence": {"id": "A", "type_id": 0}},
+                {"SpecialToken": {"id": "<s>", "type_id": 1}},
+                {"Sequence": {"id": "B", "type_id": 1}},
+            ],
+            "special_tokens": {"<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]}},
+        },
+        "decoder": {"type": "Sequence", "decoders": [
+            {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+            {"type": "ByteFallback"},
+            {"type": "Fuse"},
+            {"type": "Strip", "content": " ", "start": 1, "stop": 0},
+        ]},
+        "model": {
+            "type": "BPE",
+            "dropout": null,
+            "unk_token": "<unk>",
+            "continuing_subword_prefix": null,
+            "end_of_word_suffix": null,
+            "fuse_unk": true,
+            "byte_fallback": true,
+            "vocab": vocab,
+            "merges": merges.iter().map(|(a, b)| format!("{a} {b}")).collect::<Vec<_>>(),
+        },
+    });
+    Tokenizer::from_str(&file.to_string()).expect("a word-mark BPE")
 }
 
 /// A minimal tokenizer.json that loads cleanly: a one-word BPE vocabulary. The only

@@ -18,13 +18,19 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use http_body_util::BodyExt;
-use openai_protocol::transcription::{AudioFile, TranscriptionRequest};
+use openai_protocol::{
+    model_card::ModelCard,
+    transcription::{AudioFile, TranscriptionRequest},
+};
 use serde_json::json;
 use smg::{
-    routers::{pd_router::PDRouter, router::Router as HttpRouter, RouterTrait},
+    routers::{
+        grpc::backend_client::BasicWorkerBuilder, pd_router::PDRouter,
+        router::Router as HttpRouter, RouterTrait,
+    },
     tenant::{RouteRequestMeta, TenantKey},
-    worker::{BasicWorkerBuilder, ModelCard, Worker, WorkerType},
 };
+use smg_worker::identity::basic::{Worker, WorkerType};
 use tokio::{net::TcpListener, sync::oneshot, time::timeout};
 
 use super::streaming_chat_request;
@@ -186,7 +192,12 @@ async fn chat_relay_closes_upstream_when_client_disconnects_during_prefill() {
 
     let response = timeout(
         RELAY_STEP,
-        router.route_chat(None, &tenant_meta(), streaming_chat_request(), "mock-model"),
+        router.route_chat(
+            None,
+            &tenant_meta(),
+            Arc::new(streaming_chat_request()),
+            "mock-model",
+        ),
     )
     .await
     .expect("no routed response within the bound: the relay never started");
@@ -211,7 +222,12 @@ async fn chat_relay_closes_upstream_when_client_disconnects_mid_stream() {
 
     let response = timeout(
         RELAY_STEP,
-        router.route_chat(None, &tenant_meta(), streaming_chat_request(), "mock-model"),
+        router.route_chat(
+            None,
+            &tenant_meta(),
+            Arc::new(streaming_chat_request()),
+            "mock-model",
+        ),
     )
     .await
     .expect("no routed response within the bound: the relay never started");
@@ -300,7 +316,12 @@ async fn pd_decode_relay_closes_upstream_when_client_disconnects_during_prefill(
 
     let response = timeout(
         RELAY_STEP,
-        router.route_chat(None, &tenant_meta(), streaming_chat_request(), "mock-model"),
+        router.route_chat(
+            None,
+            &tenant_meta(),
+            Arc::new(streaming_chat_request()),
+            "mock-model",
+        ),
     )
     .await
     .expect("no routed response within the bound: the relay never started");

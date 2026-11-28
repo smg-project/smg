@@ -19,20 +19,34 @@ use llm_tokenizer::{
 };
 use serde::{Deserialize, Serialize};
 use smg_grpc_client::{tokenizer_bundle, tokenizer_bundle::StreamBundle};
+use smg_worker::{
+    identity::basic::{ConnectionMode, Worker},
+    worker::WorkerStatus,
+};
 use tracing::{debug, error, info, warn};
 use wfaas::{
     BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, StepExecutor, StepId, StepResult,
     WorkflowContext, WorkflowDefinition, WorkflowError, WorkflowResult,
 };
 
-use super::data::TokenizerWorkflowData;
+use super::{
+    data::{require_app_context, TokenizerWorkflowData},
+    tokenizer_shares::{self, FilesRead},
+};
 use crate::{
     app_context::AppContext,
     config::{TokenizerCacheConfig, TEMPLATE_PARSER},
-    routers::grpc::multimodal::{
-        load_image_preprocessor_config, load_video_preprocessor_config, MultimodalModelConfig,
+    routers::{
+        common::snapshot::WorkerRegistry,
+        grpc::{
+            backend_client::get_backend_client,
+            multimodal::{
+                load_image_preprocessor_config, load_video_preprocessor_config,
+                MultimodalModelConfig,
+            },
+        },
     },
-    worker::{ConnectionMode, Worker, WorkerRegistry},
+    workflow::steps::local::ReleaseTokenizerStep,
 };
 
 /// Configuration for adding a tokenizer
@@ -54,6 +68,14 @@ pub struct TokenizerConfigRequest {
     /// API callers should set this to true.
     #[serde(default)]
     pub fail_on_duplicate: bool,
+    /// Whether a worker's registration asked for the load: an entry it loads
+    /// afresh is the worker's (recorded by the loader under the registry's
+    /// per-name lock, before the entry is published), released with its
+    /// model's last worker, by the load itself when that worker left while
+    /// it ran; the startup entry's and an operator's requests leave this
+    /// false.
+    #[serde(skip)]
+    pub for_worker: bool,
 }
 
 /// Configuration for removing a tokenizer
@@ -263,12 +285,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         context: &mut WorkflowContext<TokenizerWorkflowData>,
     ) -> WorkflowResult<StepResult> {
         let config = &context.data.config;
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.app_context.as_ref())?.clone();
 
         info!(
             "Loading tokenizer '{}' (id: {}) from source: {}{}",
@@ -288,6 +305,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         let source = config.source.clone();
         let chat_template = config.chat_template_path.clone();
         let cache_config = config.cache_config.clone();
+        let for_worker = config.for_worker;
 
         // Load the tokenizer using the registry's load method
         // This handles: validation, deduplication, and loading
@@ -301,7 +319,7 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                 let name = name.clone();
                 let id = id.clone();
                 async move {
-                    load_tokenizer(
+                    let tokenizer = load_tokenizer(
                         &app_context,
                         &id,
                         &name,
@@ -309,7 +327,14 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
                         chat_template.as_deref(),
                         cache_cfg,
                     )
-                    .await
+                    .await?;
+                    // Recorded under the registry's per-name lock, before the
+                    // entry is published: a reader that sees the entry sees
+                    // the record.
+                    if for_worker {
+                        app_context.worker_loaded_tokenizers.insert(id);
+                    }
+                    Ok(tokenizer)
                 }
             })
             .await;
@@ -317,6 +342,12 @@ impl StepExecutor<TokenizerWorkflowData> for LoadTokenizerStep {
         match result {
             Ok(outcome) => {
                 let vocab_size = note_load_outcome(&app_context, config, &outcome)?;
+                // A worker's load looks at the worker registry again once it
+                // has published: the removal of the model's last worker while
+                // the load ran found no entry to take.
+                if for_worker && matches!(outcome, LoadOutcome::Loaded { .. }) {
+                    ReleaseTokenizerStep::release_if_unserved(&app_context, &name);
+                }
 
                 // Store vocab size in typed data
                 if let Some(size) = vocab_size {
@@ -352,12 +383,7 @@ async fn load_tokenizer(
     chat_template: Option<&str>,
     cache_cfg: Option<TokenizerCacheConfig>,
 ) -> Result<Arc<dyn Tokenizer>, String> {
-    let base_tokenizer = match factory::create_tokenizer_async_with_chat_template(
-        source,
-        chat_template,
-    )
-    .await
-    {
+    let base_tokenizer = match load_from_source(source, chat_template).await {
         Ok(tok) => tok,
         Err(local_err) => {
             debug!(
@@ -376,6 +402,25 @@ async fn load_tokenizer(
     };
 
     Ok(with_optional_cache(base_tokenizer, cache_cfg))
+}
+
+/// The tokenizer the factory makes of `source` and `chat_template`, or the
+/// one another name handed the same source already holds for the same files
+/// (see [`tokenizer_shares`]): a name over files a tokenizer was loaded from
+/// reads them once more to know that, and parses nothing.
+async fn load_from_source(
+    source: &str,
+    chat_template: Option<&str>,
+) -> anyhow::Result<Arc<dyn Tokenizer>> {
+    let read = {
+        let (source, chat_template) = (source.to_owned(), chat_template.map(str::to_owned));
+        move || FilesRead::of(&source, chat_template.as_deref())
+    };
+    tokenizer_shares::shares()
+        .load(read, || {
+            factory::create_tokenizer_async_with_chat_template(source, chat_template)
+        })
+        .await
 }
 
 /// What a load that ended means for the step: a tokenizer loaded is logged
@@ -500,28 +545,54 @@ fn try_load_multimodal_config(tokenizer_dir: &std::path::Path) -> Option<Multimo
     ))
 }
 
-/// Fetch a tokenizer from a healthy gRPC worker when local loading fails.
+/// Lists the model's ready gRPC workers, then its pending ones. A newly
+/// registered worker can serve its tokenizer before health checks promote it.
+fn tokenizer_workers(registry: &WorkerRegistry, model_id: &str) -> Vec<Arc<dyn Worker>> {
+    let mut ready = Vec::new();
+    let mut pending = Vec::new();
+    for worker in registry.get_by_model(model_id).iter() {
+        if *worker.connection_mode() != ConnectionMode::Grpc {
+            continue;
+        }
+        match worker.status() {
+            WorkerStatus::Ready => ready.push(Arc::clone(worker)),
+            WorkerStatus::Pending => pending.push(Arc::clone(worker)),
+            WorkerStatus::NotReady | WorkerStatus::Failed | WorkerStatus::Draining => {}
+        }
+    }
+    ready.extend(pending);
+    ready
+}
+
+/// Fetch a tokenizer from a serving gRPC worker when local loading fails,
+/// trying sources in the order returned by [`tokenizer_workers`].
 async fn fetch_tokenizer_from_worker(
     app_context: &AppContext,
     tokenizer_id: &str,
     model_id: &str,
     chat_template_path: Option<&str>,
 ) -> Result<Arc<dyn Tokenizer>, String> {
-    let workers = app_context.worker_registry.get_workers_filtered(
-        Some(model_id),
-        None,
-        Some(ConnectionMode::Grpc),
-        None,
-        true,
-    );
+    let workers = tokenizer_workers(&app_context.worker_registry, model_id);
 
     if workers.is_empty() {
         return Err(format!(
-            "No healthy gRPC worker available to fetch tokenizer for model '{model_id}'"
+            "No ready or pending gRPC worker available to fetch tokenizer for model '{model_id}'"
         ));
     }
 
-    let mut failures = Vec::new();
+    // A failed job keeps this error, so it names the first failure alone: a
+    // fleet that cannot serve the tokenizer would name every worker in each.
+    // For the same reason a fetch warns of its first bundle that fails to
+    // load, not of each.
+    let mut first_failure: Option<String> = None;
+    let mut load_warned = false;
+    let mut keep_first = |failure: String| {
+        if first_failure.is_none() {
+            first_failure = Some(failure);
+        } else {
+            debug!("Tokenizer fetch for model '{model_id}' failed on a further worker: {failure}");
+        }
+    };
     let worker_count = workers.len();
 
     for worker in workers {
@@ -535,7 +606,7 @@ async fn fetch_tokenizer_from_worker(
         let bundle = match fetch_bundle(worker.as_ref()).await {
             Ok(bundle) => bundle,
             Err(failure) => {
-                failures.push(failure);
+                keep_first(failure);
                 continue;
             }
         };
@@ -544,20 +615,26 @@ async fn fetch_tokenizer_from_worker(
             app_context,
             tokenizer_id,
             model_id,
-            &bundle,
+            bundle,
             chat_template_path,
-        ) {
+        )
+        .await
+        {
             Ok(tokenizer) => return Ok(tokenizer),
-            Err(e) => failures.push(format!(
-                "worker {} (runtime: {runtime}) bundle extraction/load failed: {e}",
-                worker.url(),
-            )),
+            Err(e) => {
+                let failure = format!("worker {} (runtime: {runtime}) {e}", worker.redacted_url());
+                if !load_warned {
+                    load_warned = true;
+                    warn!("Tokenizer fetch for model '{model_id}': {failure}");
+                }
+                keep_first(failure);
+            }
         };
     }
 
-    let failures_summary = failures.join("; ");
+    let first_failure = first_failure.unwrap_or_default();
     Err(format!(
-        "Failed to fetch tokenizer for model '{model_id}' from {worker_count} healthy gRPC worker(s): {failures_summary}"
+        "Failed to fetch tokenizer for model '{model_id}' from {worker_count} ready or pending gRPC worker(s), first failure: {first_failure}"
     ))
 }
 
@@ -567,18 +644,18 @@ async fn fetch_tokenizer_from_worker(
 async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
     let runtime = worker.metadata().spec.runtime_type;
 
-    let backend_client = match worker.get_backend_client().await {
+    let backend_client = match get_backend_client(worker).await {
         Ok(Some(client)) => client,
         Ok(None) => {
             return Err(format!(
                 "worker {} (runtime: {runtime}) does not provide a gRPC client",
-                worker.url(),
+                worker.redacted_url(),
             ));
         }
         Err(e) => {
             return Err(format!(
                 "failed to create gRPC client for worker {} (runtime: {runtime}): {e}",
-                worker.url(),
+                worker.redacted_url(),
             ));
         }
     };
@@ -603,7 +680,7 @@ async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
         }
         format!(
             "worker {} (runtime: {runtime}) get_tokenizer failed: {e}",
-            worker.url(),
+            worker.redacted_url(),
         )
     })?;
     debug!(
@@ -616,15 +693,19 @@ async fn fetch_bundle(worker: &dyn Worker) -> Result<StreamBundle, String> {
 
 /// The tokenizer of a bundle a worker served, loaded with the chat template;
 /// a multimodal configuration the bundle carries is registered under the
-/// tokenizer's id on the way.
-fn install_bundle(
+/// tokenizer's id on the way. The bundle is unpacked and parsed on the
+/// blocking pool (see [`on_the_pool`]), as the factory parses a source.
+async fn install_bundle(
     app_context: &AppContext,
     tokenizer_id: &str,
     model_id: &str,
-    bundle: &StreamBundle,
+    bundle: StreamBundle,
     chat_template_path: Option<&str>,
 ) -> Result<Arc<dyn Tokenizer>, String> {
-    let (tokenizer, mm_config) = load_tokenizer_from_bundle(bundle, chat_template_path)?;
+    let chat_template_path = chat_template_path.map(str::to_owned);
+    let (tokenizer, mm_config) =
+        on_the_pool(move || load_tokenizer_from_bundle(&bundle, chat_template_path.as_deref()))
+            .await?;
     if let Some(cfg) = mm_config {
         app_context
             .multimodal_config_registry
@@ -636,6 +717,15 @@ fn install_bundle(
         );
     }
     Ok(tokenizer)
+}
+
+/// `work` on the blocking pool. A panic of it unwinds the caller, as it did
+/// when the work ran on the step's task: the engine ends the attempt as a
+/// panic, with no retry.
+async fn on_the_pool<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    tokio::task::spawn_blocking(work)
+        .await
+        .unwrap_or_else(|ended| std::panic::resume_unwind(ended.into_panic()))
 }
 
 // ============================================================================
@@ -706,324 +796,9 @@ pub fn create_tokenizer_workflow_data(
 }
 
 #[cfg(test)]
-mod tests {
-    use openai_protocol::{model_card::ModelCard, worker::WorkerType};
+#[path = "../../tests/unit/workflow/tokenizer_registration/test_support.rs"]
+pub(crate) mod test_support;
 
-    use super::*;
-    use crate::worker::{test_support::no_health_check, BasicWorkerBuilder};
-
-    #[test]
-    fn worker_tokenizer_bundle_preserves_configured_template() {
-        use std::io::{Cursor, Write};
-
-        use sha2::{Digest, Sha256};
-        use zip::{write::SimpleFileOptions, ZipWriter};
-
-        let mut archive = ZipWriter::new(Cursor::new(Vec::new()));
-        for (name, data) in [
-            (
-                "tokenizer.json",
-                serde_json::json!({
-                    "version":"1.0", "truncation":null, "padding":null, "added_tokens":[],
-                    "normalizer":null, "pre_tokenizer":{"type":"Whitespace"},
-                    "post_processor":null, "decoder":null,
-                    "model":{"type":"BPE", "vocab":{"hello":0}, "merges":[]}
-                }),
-            ),
-            (
-                "tokenizer_config.json",
-                serde_json::json!({"chat_template":"worker_default"}),
-            ),
-        ] {
-            archive
-                .start_file(name, SimpleFileOptions::default())
-                .unwrap();
-            archive.write_all(data.to_string().as_bytes()).unwrap();
-        }
-        let compressed_data = archive.finish().unwrap().into_inner();
-        let bundle = StreamBundle {
-            sha256: Sha256::digest(&compressed_data)
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
-            compressed_data,
-        };
-        let dir = tempfile::tempdir().unwrap();
-        let template = dir.path().join("override.jinja");
-        std::fs::write(&template, "router_override").unwrap();
-        let messages = [serde_json::json!({"role":"user", "content":"hello"})];
-        let (default, _) = load_tokenizer_from_bundle(&bundle, None).unwrap();
-        assert_eq!(
-            default
-                .apply_chat_template(&messages, Default::default())
-                .unwrap(),
-            "worker_default"
-        );
-        let (overridden, _) = load_tokenizer_from_bundle(&bundle, template.to_str()).unwrap();
-        assert_eq!(
-            overridden
-                .apply_chat_template(&messages, Default::default())
-                .unwrap(),
-            "router_override"
-        );
-        let missing = dir.path().join("missing.jinja");
-        assert!(
-            load_tokenizer_from_bundle(&bundle, missing.to_str()).is_err(),
-            "an invalid configured override must not silently use the worker default"
-        );
-    }
-
-    #[test]
-    fn test_tokenizer_config_request_serialization() {
-        let config = TokenizerConfigRequest {
-            id: "test-uuid-1234".to_string(),
-            name: "test-model".to_string(),
-            source: "meta-llama/Llama-2-7b-hf".to_string(),
-            chat_template_path: None,
-            cache_config: None,
-            fail_on_duplicate: false,
-        };
-
-        let json = serde_json::to_string(&config).unwrap();
-        let parsed: TokenizerConfigRequest = serde_json::from_str(&json).unwrap();
-
-        assert_eq!(parsed.id, "test-uuid-1234");
-        assert_eq!(parsed.name, "test-model");
-        assert_eq!(parsed.source, "meta-llama/Llama-2-7b-hf");
-        assert!(parsed.chat_template_path.is_none());
-        assert!(parsed.cache_config.is_none());
-        assert!(!parsed.fail_on_duplicate);
-    }
-
-    #[test]
-    fn test_tokenizer_config_request_fail_on_duplicate_defaults_to_false() {
-        // Test that fail_on_duplicate defaults to false when not specified in JSON
-        let json = r#"{
-            "id": "test-uuid",
-            "name": "test-model",
-            "source": "/path/to/tokenizer"
-        }"#;
-        let parsed: TokenizerConfigRequest = serde_json::from_str(json).unwrap();
-        assert!(!parsed.fail_on_duplicate);
-    }
-
-    #[test]
-    fn test_tokenizer_config_request_fail_on_duplicate_true() {
-        let config = TokenizerConfigRequest {
-            id: "test-uuid-1234".to_string(),
-            name: "test-model".to_string(),
-            source: "meta-llama/Llama-2-7b-hf".to_string(),
-            chat_template_path: None,
-            cache_config: None,
-            fail_on_duplicate: true,
-        };
-
-        let json = serde_json::to_string(&config).unwrap();
-        let parsed: TokenizerConfigRequest = serde_json::from_str(&json).unwrap();
-        assert!(parsed.fail_on_duplicate);
-    }
-
-    #[test]
-    fn test_tokenizer_config_request_with_cache() {
-        let config = TokenizerConfigRequest {
-            id: "test-uuid-1234".to_string(),
-            name: "test-model".to_string(),
-            source: "meta-llama/Llama-2-7b-hf".to_string(),
-            chat_template_path: None,
-            cache_config: Some(TokenizerCacheConfig {
-                enable_l0: true,
-                l0_max_entries: 1000,
-                l0_max_memory: 256 * 1024 * 1024,
-                enable_l1: false,
-                l1_max_memory: 0,
-            }),
-            fail_on_duplicate: false,
-        };
-
-        let json = serde_json::to_string(&config).unwrap();
-        let parsed: TokenizerConfigRequest = serde_json::from_str(&json).unwrap();
-
-        assert!(parsed.cache_config.is_some());
-        let cache = parsed.cache_config.unwrap();
-        assert!(cache.enable_l0);
-        assert_eq!(cache.l0_max_entries, 1000);
-        assert!(!cache.enable_l1);
-    }
-
-    #[test]
-    fn test_workflow_creation() {
-        let mut workflow = create_tokenizer_registration_workflow();
-        assert_eq!(workflow.id.to_string(), "tokenizer_registration");
-        // Validate the workflow DAG
-        workflow
-            .validate()
-            .expect("Workflow validation should pass");
-    }
-
-    /// A worker registry serving `model`.
-    fn serving(model: &str) -> WorkerRegistry {
-        let workers = WorkerRegistry::new();
-        workers
-            .register(Arc::new(
-                BasicWorkerBuilder::new("grpc://worker:30000")
-                    .worker_type(WorkerType::Regular)
-                    .connection_mode(ConnectionMode::Grpc)
-                    .model(ModelCard::new(model))
-                    .health_config(no_health_check())
-                    .build(),
-            ))
-            .expect("register worker");
-        workers
-    }
-
-    /// A failed load is recorded once per model and entry (the log line's
-    /// allowance), a different reason is a new entry, and the next load,
-    /// accepted or succeeding, clears the record.
-    #[test]
-    fn a_load_failure_is_recorded_once_per_entry_and_cleared_by_the_next_load() {
-        let failures = TokenizerLoadFailures::new();
-        let registry = TokenizerRegistry::new();
-        let workers = serving("m");
-        let error = "Workflow failed at step load_tokenizer: boom".to_string();
-        assert_eq!(failures.get("m"), None);
-
-        failures.load_started("m");
-        assert_eq!(failures.get("m"), None);
-        note_tokenizer_load_outcome(&failures, &registry, &workers, "m", &Err(error.clone()));
-        assert_eq!(
-            failures.get("m"),
-            Some(TokenizerLoadFailure::Failed(error.clone()))
-        );
-        assert!(!failures.record("m", TokenizerLoadFailure::Failed(error.clone())));
-        assert!(failures.record("m", TokenizerLoadFailure::NoSource));
-        assert_eq!(failures.get("m"), Some(TokenizerLoadFailure::NoSource));
-        assert_eq!(failures.get("other"), None);
-
-        failures.load_started("m");
-        assert_eq!(failures.get("m"), None, "a load accepted: pending again");
-        note_tokenizer_load_outcome(
-            &failures,
-            &registry,
-            &workers,
-            "m",
-            &Ok("m completed".to_string()),
-        );
-        assert_eq!(failures.get("m"), None);
-        assert!(!failures.clear("m"));
-    }
-
-    /// While another load of the model is in flight, neither a registration
-    /// without a path nor an earlier load's failure is recorded: the last
-    /// load decides.
-    #[test]
-    fn a_failure_is_not_recorded_while_another_load_of_the_model_is_in_flight() {
-        let failures = TokenizerLoadFailures::new();
-        let registry = TokenizerRegistry::new();
-        let workers = serving("m");
-
-        failures.load_started("m");
-        assert!(!failures.record("m", TokenizerLoadFailure::NoSource));
-        assert_eq!(failures.get("m"), None);
-
-        failures.load_started("m");
-        note_tokenizer_load_outcome(
-            &failures,
-            &registry,
-            &workers,
-            "m",
-            &Err("first".to_string()),
-        );
-        assert_eq!(failures.get("m"), None, "a load is still in flight");
-        note_tokenizer_load_outcome(
-            &failures,
-            &registry,
-            &workers,
-            "m",
-            &Err("second".to_string()),
-        );
-        assert_eq!(
-            failures.get("m"),
-            Some(TokenizerLoadFailure::Failed("second".to_string()))
-        );
-    }
-
-    /// A load that ended without a count (none is taken outside the queue's
-    /// hand-over) leaves no state behind, and the model records as before.
-    #[test]
-    fn a_load_that_ended_without_a_count_leaves_nothing_behind() {
-        let failures = TokenizerLoadFailures::new();
-        assert!(failures.load_ended("m"));
-        assert_eq!(failures.get("m"), None);
-        assert!(failures.record("m", TokenizerLoadFailure::NoSource));
-        assert_eq!(failures.get("m"), Some(TokenizerLoadFailure::NoSource));
-        failures.load_started("m");
-        assert_eq!(
-            failures.get("m"),
-            None,
-            "pending while the load is in flight"
-        );
-        assert!(failures.load_ended("m"));
-        assert_eq!(
-            failures.get("m"),
-            None,
-            "the load that ended left no record"
-        );
-    }
-
-    /// A failed load of a name no served model carries (the start-up load,
-    /// named by its source; an operator's registration of another name) is
-    /// nobody's request: nothing is recorded.
-    #[test]
-    fn a_failed_load_of_a_name_nobody_serves_is_not_recorded() {
-        let failures = TokenizerLoadFailures::new();
-        let registry = TokenizerRegistry::new();
-        let workers = WorkerRegistry::new();
-        failures.load_started("/models/x");
-        note_tokenizer_load_outcome(
-            &failures,
-            &registry,
-            &workers,
-            "/models/x",
-            &Err("boom".to_string()),
-        );
-        assert_eq!(failures.get("/models/x"), None);
-    }
-
-    /// A registration that fails for a model whose tokenizer the registry
-    /// holds (a duplicate) takes nothing away and is not recorded.
-    #[tokio::test]
-    async fn a_failed_duplicate_registration_of_a_registered_tokenizer_is_no_failure() {
-        let failures = TokenizerLoadFailures::new();
-        let registry = TokenizerRegistry::new();
-        let workers = serving("m");
-        registry
-            .load("id", "m", "mock", || async {
-                factory::create_tokenizer_with_chat_template("mock", None)
-                    .map_err(|e| e.to_string())
-            })
-            .await
-            .expect("the mock tokenizer loads");
-        failures.load_started("m");
-        note_tokenizer_load_outcome(
-            &failures,
-            &registry,
-            &workers,
-            "m",
-            &Err("Tokenizer 'm' already exists (id: id)".to_string()),
-        );
-        assert_eq!(failures.get("m"), None);
-    }
-
-    /// A tokenizer removed while its model is served is recorded, once; one
-    /// of a name nobody serves is not.
-    #[test]
-    fn a_removed_tokenizer_is_recorded_only_for_a_served_model() {
-        let failures = TokenizerLoadFailures::new();
-        let workers = serving("m");
-        note_tokenizer_removed(&failures, &workers, "m");
-        assert_eq!(failures.get("m"), Some(TokenizerLoadFailure::Removed));
-        assert!(!failures.record("m", TokenizerLoadFailure::Removed));
-        note_tokenizer_removed(&failures, &workers, "other");
-        assert_eq!(failures.get("other"), None);
-    }
-}
+#[cfg(test)]
+#[path = "../../tests/unit/workflow/tokenizer_registration/tests.rs"]
+mod tests;

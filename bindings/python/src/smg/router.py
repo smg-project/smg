@@ -219,8 +219,9 @@ def build_control_plane_auth_config(
             "control-plane JWT authentication would otherwise be silently disabled"
         )
 
-    # Check if any auth is configured
-    has_api_keys = bool(api_keys)
+    # Check if any auth is configured; a control-plane key file counts, since
+    # the binding reads it into this config's keys.
+    has_api_keys = bool(api_keys) or args_dict.get("control_plane_api_keys_file") is not None
     has_jwt = jwt_issuer is not None and jwt_audience is not None
 
     if not has_api_keys and not has_jwt:
@@ -353,15 +354,23 @@ class Router:
             larger values spread picks across candidates. Default: 0.0
         max_payload_size: Maximum payload size in bytes. Default: 512 MiB
         max_tree_size: Maximum total size of each model's approximation tree for
-            cache-aware routing (chars for HTTP, tokens for gRPC), shared across
-            all workers; eviction keeps every tree at or under this bound.
+            cache-aware routing, summed over all workers: for requests routed by
+            text the chars of the nodes each worker stands on plus 1024 for each
+            such node, for requests routed by token ids (gRPC, and HTTP requests
+            that carry them) the tokens each worker holds, so a prefix that
+            several workers hold counts once for each of them; each eviction
+            cycle trims every tree back toward this bound, and writes take a
+            tree past it until the next cycle.
             Default: 2^26
-        dp_aware: Enable data parallelism aware schedule. Default: False
+        dp_aware: Deprecated, accepted and ignored: every registration reads an
+            engine's data-parallel size and registers one worker per rank (warned at
+            start-up). Default: False
         dp_minimum_tokens_scheduler: Choose a data-parallel rank per request from the
             ranks' reported token loads: the HTTP prefill-decode router, for an engine
-            registered as one worker. Under dp_aware the engine's ranks are workers and
-            the policy's pick among them is the rank choice, so this chooses nothing
-            there (warned at start-up). Default: False
+            registered as one worker. An engine that reports its data-parallel size
+            registers as one worker per rank and the policy's pick among them is the
+            rank choice, so this chooses nothing there (warned at start-up).
+            Default: False
         upstream_http2: Speak HTTP/2 to workers via prior knowledge (h2c on
             cleartext), multiplexing every request to a worker over one
             connection. Negotiated per worker at registration: a worker that
@@ -369,8 +378,7 @@ class Router:
         enable_igw: Enable IGW (Inference-Gateway) mode for multi-model support. When
             enabled, the router can manage multiple models simultaneously with per-model
             load balancing policies. Default: False
-        api_key: The api key used for the authorization with the worker. Useful when
-            the dp aware scheduling strategy is enabled. Default: None
+        api_key: The api key used for the authorization with the worker. Default: None
         log_dir: Directory to store log files. If None, logs are only output to
             console. Default: None
         log_level: Logging level. Options: 'debug', 'info', 'warn', 'error'.
@@ -438,6 +446,10 @@ class Router:
             'smg.ai/kv-connector'
         kv_engine_id_annotation: Kubernetes annotation containing KV engine IDs,
             aligned with worker_ports_annotation. Default: 'smg.ai/kv-engine-id'
+        pairing_protocol_label: Kubernetes Pod label containing the worker's
+            prefill/decode pairing protocol. A prefill and a decode pair only
+            when their protocols are equal. A Pod without the label states
+            none. Default: 'smg.ai/pairing-protocol'
         request_timeout_secs: Request timeout in seconds: the read of the body
             overall, and each attempt at an HTTP worker from its dispatch to
             its last message (504 call_upstream_timeout past it, the request's
@@ -487,6 +499,15 @@ class Router:
     def from_args(args: RouterArgs) -> Router:
         """Create a router from a RouterArgs instance."""
 
+        replaced = args.options_a_document_replaces()
+        if replaced:
+            # The settings by their names and values: a flag's spelling is
+            # the parser's, and one setting can have several.
+            settings = ", ".join(f"{name}={getattr(args, name)!r}" for name in replaced)
+            raise ValueError(
+                "A policy document replaces the routing settings, and these are set"
+                f" beside it: {settings}"
+            )
         args_dict = vars(args).copy()
         provider = args.selected_discovery_provider()
         for field in _DISCOVERY_FIELDS:
@@ -546,6 +567,7 @@ class Router:
                 pool_min=args_dict.get("oracle_pool_min", 1),
                 pool_max=args_dict.get("oracle_pool_max", 16),
                 pool_timeout_secs=args_dict.get("oracle_pool_timeout_secs", 30),
+                op_timeout_secs=args_dict.get("oracle_op_timeout_secs", 5),
             )
         args_dict["oracle_config"] = oracle_config
         args_dict["history_backend"] = history_backend
@@ -596,6 +618,7 @@ class Router:
             "oracle_pool_min",
             "oracle_pool_max",
             "oracle_pool_timeout_secs",
+            "oracle_op_timeout_secs",
             "postgres_db_url",
             "postgres_pool_max",
             "postgres_op_timeout_secs",

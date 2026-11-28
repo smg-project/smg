@@ -108,6 +108,8 @@ message ChoiceConstraint {
 }
 
 // Pre-tokenized input from Rust router
+// The gateway codec writes this message by hand around its field numbers and
+// GenerateRequest.tokenized = 2: change them together with crates/grpc_client/src/codec.rs.
 message TokenizedInput {
   string original_text = 1;  // For reference/debugging
   repeated uint32 input_ids = 2;  // Actual token IDs to process
@@ -247,6 +249,12 @@ message GenerateRequest {
 
   // Effective chat-template kwargs consumed by the engine reasoning parser.
   optional string chat_template_kwargs_json = 13;
+
+  // Prefix-cache salt of the request; unset for none. Requests share cached
+  // blocks only under one salt. The servicer refuses a salt that is empty,
+  // has more than 128 characters, has `@`, `/`, `\` or NUL, or starts with the
+  // reserved prefix `mm:`.
+  optional string cache_salt = 14;
 }
 
 // KV cache transfer parameters for Mooncake PD disaggregation
@@ -536,10 +544,15 @@ message GetServerInfoResponse {
   string ec_connector = 29;
   string ec_role = 30;
 
+  // The cache partition fields of GenerateRequest that the servicer reads,
+  // comma-separated: "cache_salt". "" when the servicer reads none. Flattened
+  // into the `cache_partition_fields` worker label.
+  string cache_partition_fields = 31;
+
   // The engine's requested gateway policy: "requested" or "always".
   // Empty leaves the gateway default unchanged. Flattened into the
   // constrained_decoding worker label; explicit worker configuration wins.
-  string constrained_decoding = 31;
+  string constrained_decoding = 32;
 }
 
 // =====================
@@ -589,4 +602,10 @@ message SchedulerLoad {
   int32 num_waiting_uncached_tokens = 12;
   // Computed input tokens per active prefill second; absent if unknown or stale.
   optional double prefill_throughput = 13;
+  // Values the engine reports by name, as a pushed record carries them
+  // (smg.grpc.common.EngineLoad.values, under the same field number). An
+  // answer's list is that answer's alone: a name it leaves out says nothing
+  // about that value. A value's age_ms is its sample's age as the answer is
+  // made. An old worker's answer has no list and states no value.
+  repeated smg.grpc.common.NamedValue values = 24;
 }

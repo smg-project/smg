@@ -22,6 +22,8 @@ pub(crate) struct GenerateRequestBuildingStage {
     settings: PlanSettings,
 }
 
+const FUNCTION: &str = "GenerateRequestBuildingStage::build_plan";
+
 impl GenerateRequestBuildingStage {
     pub fn new(settings: PlanSettings) -> Self {
         Self { settings }
@@ -32,15 +34,9 @@ impl GenerateRequestBuildingStage {
     /// The stage's work, a plain function (nothing in it awaits); the
     /// chat+generate dispatcher calls it directly.
     pub(crate) fn build_plan(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
-        let prep = stage_output(
-            ctx.state.preparation.as_ref(),
-            "GenerateRequestBuildingStage::build",
-        )?;
+        let prep = stage_output(ctx.state.preparation.as_ref(), FUNCTION)?;
 
-        let clients = stage_output(
-            ctx.state.clients.as_ref(),
-            "GenerateRequestBuildingStage::build",
-        )?;
+        let clients = stage_output(ctx.state.clients.as_ref(), FUNCTION)?;
 
         let generate_request = ctx.generate_request_arc();
 
@@ -69,7 +65,7 @@ impl GenerateRequestBuildingStage {
                 prep.token_ids().to_vec(),
             )
             .map_err(|e| {
-                error!(function = "GenerateRequestBuildingStage::build", error = %e, "Failed to build generate request");
+                error!(function = FUNCTION, error = %e, "Failed to build generate request");
                 error::bad_request("build_request_failed", e)
             })?;
 

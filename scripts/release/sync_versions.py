@@ -21,7 +21,8 @@ Usage:
                       above everything the branch will release: 1.15.0-dev once release/1.14 exists)
 
 Exit code 0 = the files follow the release (a report of what moved is printed), 1 = a rewrite
-did not take.
+did not take, or a floor could not be paired between the two files (named on stderr, with the
+counts, to move by hand; a rerun passes once main carries the release's floors).
 """
 
 from __future__ import annotations
@@ -73,12 +74,13 @@ def line_of(text: str, start: int, end: int) -> tuple[int, int]:
 
 def in_comment(text: str, start: int) -> bool:
     """Whether ``text[start]`` sits in a TOML comment: a ``#`` outside quotes earlier on its line
-    (a comment that quotes a floor names no requirement)."""
-    quoted = False
+    (a comment that quotes a floor names no requirement; a ``#`` inside a basic or a literal
+    string, a URL's fragment, opens no comment)."""
+    quote = ""
     for char in text[text.rfind("\n", 0, start) + 1 : start]:
-        if char == '"':
-            quoted = not quoted
-        elif char == "#" and not quoted:
+        if char in "\"'" and quote in ("", char):
+            quote = "" if quote else char  # a basic or a literal string opens and closes
+        elif char == "#" and not quote:
             return True
     return False
 
@@ -183,12 +185,34 @@ def main(argv: list[str] | None = None) -> int:
             continue
         theirs = floors(theirs_text, names)
         text = repo.read(component.version_file)
+        mine = floors(text, names)
+        # a name that occurs a different number of times in the two files cannot be paired by
+        # position (an extra added on one side since the cut may sit before an older one): while
+        # one of main's floors is below the release's highest, a move is pending under some
+        # pairing, so the name is refused with its counts, for a move by hand, and the run
+        # reports the failure; once main carries the release's floors there is nothing to pair
+        # and the name passes, so the recovery the message asks for clears the refusal
+        ambiguous = {
+            name
+            for name in mine.keys() & theirs.keys()
+            if len(mine[name]) != len(theirs[name])
+            and min(version_key(floor) for _, floor, _ in mine[name])
+            < max(version_key(floor) for _, floor, _ in theirs[name])
+        }
+        for name in sorted(ambiguous):
+            print(
+                f"sync_versions: {component.version_file}: {name}>= occurs"
+                f" {len(mine.get(name, []))} time(s) here and {len(theirs.get(name, []))} in {ref}:"
+                " the pairing is ambiguous, not moved (move it by hand)",
+                file=sys.stderr,
+            )
+            failed += 1
         seen: dict[str, int] = {}
         pieces: list[str] = []
         end = 0
         for match in FLOOR.finditer(text):
             name, floor = match[1], match[2]
-            if name not in names or in_comment(text, match.start()):
+            if name not in names or name in ambiguous or in_comment(text, match.start()):
                 continue
             k = seen.get(name, 0)
             seen[name] = k + 1

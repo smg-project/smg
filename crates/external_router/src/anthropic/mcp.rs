@@ -12,6 +12,7 @@ use openai_protocol::messages::{
     ThinkingBlock, Tool, ToolChoice, ToolReferenceBlock, ToolResultBlock, ToolResultContent,
     ToolResultContentBlock, ToolSearchToolResultBlock, ToolUseBlock, WebSearchToolResultBlock,
 };
+use serde::Deserialize;
 use serde_json::{Map, Value};
 use smg_mcp::{McpToolSession, ToolEntry, ToolExecutionInput};
 use tracing::{debug, info, warn};
@@ -30,11 +31,20 @@ pub(crate) struct IterationResult {
 }
 
 impl IterationResult {
-    /// Construct from a non-streaming `Message`.
-    pub(crate) fn from_message(message: &Message) -> Self {
-        let tool_use_blocks = extract_tool_calls(&message.content);
+    /// Construct from a non-streaming `Message`, taking its content: the
+    /// loop that reads the result owns the blocks from here and moves them
+    /// on (into the next round's prior blocks, or back into the message
+    /// for the final response), so the message is left with none. A round
+    /// copied them twice before (into the result, then again into the
+    /// prior blocks); what is still copied is the conversion into the next
+    /// request's input blocks and the tool calls `extract_tool_calls` reads
+    /// out of the blocks (their id, name and input), which the executor
+    /// copies once more into its inputs.
+    pub(crate) fn take_from(message: &mut Message) -> Self {
+        let content_blocks = std::mem::take(&mut message.content);
+        let tool_use_blocks = extract_tool_calls(&content_blocks);
         Self {
-            content_blocks: message.content.clone(),
+            content_blocks,
             tool_use_blocks,
             stop_reason: message.stop_reason.clone(),
         }
@@ -106,13 +116,17 @@ pub(crate) async fn process_iteration(
         "Executing MCP tool calls"
     );
 
-    let (mcp_calls, assistant_blocks, tool_result_blocks) = execute_mcp_tool_calls(
+    let (mcp_calls, assistant_blocks, tool_result_blocks) = match execute_mcp_tool_calls(
         &result.content_blocks,
         &result.tool_use_blocks,
         session,
         model_id,
     )
-    .await;
+    .await
+    {
+        Ok(executed) => executed,
+        Err(msg) => return ToolLoopAction::Error(msg),
+    };
 
     ToolLoopAction::Continue(ToolLoopContinuation {
         mcp_calls,
@@ -311,12 +325,17 @@ async fn execute_mcp_tool_calls(
     tool_calls: &[ToolUseBlock],
     session: &McpToolSession<'_>,
     model_id: &str,
-) -> (
-    Vec<McpToolCall>,
-    Vec<InputContentBlock>,
-    Vec<InputContentBlock>,
-) {
-    let assistant_content_blocks = build_assistant_content_blocks(content);
+) -> Result<
+    (
+        Vec<McpToolCall>,
+        Vec<InputContentBlock>,
+        Vec<InputContentBlock>,
+    ),
+    String,
+> {
+    // Built before any tool runs: an answer the next round cannot carry
+    // stops the loop with no tool's side effect.
+    let assistant_content_blocks = build_assistant_content_blocks(content)?;
 
     let mut mcp_calls = Vec::new();
     let mut tool_result_blocks: Vec<InputContentBlock> = Vec::new();
@@ -377,7 +396,7 @@ async fn execute_mcp_tool_calls(
         }));
     }
 
-    (mcp_calls, assistant_content_blocks, tool_result_blocks)
+    Ok((mcp_calls, assistant_content_blocks, tool_result_blocks))
 }
 
 // ============================================================================
@@ -596,7 +615,15 @@ fn convert_tool_entry_to_anthropic_tool(entry: &ToolEntry, defer_loading: bool) 
     }
 }
 
-fn build_assistant_content_blocks(content: &[ContentBlock]) -> Vec<InputContentBlock> {
+/// The answer's blocks as the assistant turn of the next round's request: each
+/// block in its input form. A block of a kind this build does not read goes
+/// back in the input form the request reads it into, so a field the crate does
+/// not model is dropped; one the request cannot carry is the error, naming its
+/// type, so the loop stops before it runs a tool rather than send the upstream
+/// an incomplete history.
+fn build_assistant_content_blocks(
+    content: &[ContentBlock],
+) -> Result<Vec<InputContentBlock>, String> {
     let mut blocks = Vec::new();
     for block in content {
         match block {
@@ -671,13 +698,24 @@ fn build_assistant_content_blocks(content: &[ContentBlock]) -> Vec<InputContentB
                     block_type: "tool_reference".to_string(),
                     tool_name: tool_name.clone(),
                     description: description.clone(),
+                    cache_control: None,
                 }));
             }
             // MCP blocks are handled separately by rebuild_response_with_mcp_blocks
             ContentBlock::McpToolUse { .. } | ContentBlock::McpToolResult { .. } => {}
+            ContentBlock::Other(block) => match InputContentBlock::deserialize(block) {
+                Ok(block) => blocks.push(block),
+                Err(error) => {
+                    let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
+                    warn!(%error, block_type, "an answer block the next round cannot carry");
+                    return Err(format!(
+                        "The answer holds a '{block_type}' block, which the MCP loop cannot carry into its next round; tool calls will not be executed"
+                    ));
+                }
+            },
         }
     }
-    blocks
+    Ok(blocks)
 }
 
 fn push_mcp_blocks(content: &mut Vec<ContentBlock>, call: &McpToolCall) {
@@ -696,7 +734,7 @@ fn push_mcp_blocks(content: &mut Vec<ContentBlock>, call: &McpToolCall) {
                 citations: None,
             }),
         ])),
-        is_error: call.is_error.then_some(true),
+        is_error: Some(call.is_error),
     });
 }
 
@@ -715,238 +753,5 @@ fn extract_output_from_value(output: &Value) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use serde_json::json;
-    use smg_mcp::Tool as McpTool;
-
-    use super::*;
-
-    #[test]
-    fn mcp_tool_schema_keeps_the_servers_key_order() {
-        // More keys than a hash map would keep in order by chance.
-        let names = [
-            "zeta", "alpha", "mu", "beta", "omega", "delta", "kappa", "gamma",
-        ];
-        let properties: Map<String, Value> = names
-            .iter()
-            .map(|name| (name.to_string(), json!({"type": "string"})))
-            .collect();
-        let schema = json!({
-            "type": "object",
-            "properties": properties,
-            "required": ["mu", "alpha"],
-            "title": "Lookup",
-            "additionalProperties": false,
-            "$defs": {}
-        });
-        let tool = McpTool::new(
-            "lookup".to_string(),
-            "look a value up",
-            schema.as_object().unwrap().clone(),
-        );
-        let entry = ToolEntry::from_server_tool("server", tool);
-        let custom = convert_tool_entry_to_anthropic_tool(&entry, false);
-        assert_eq!(
-            serde_json::to_string(&custom.input_schema).unwrap(),
-            serde_json::to_string(&schema).unwrap()
-        );
-    }
-
-    /// Every message as one line, `role: text` or `role: [block, ...]`, a
-    /// block named by its kind and id or text.
-    fn turns(request: &CreateMessageRequest) -> Vec<String> {
-        let label = |block: &InputContentBlock| match block {
-            InputContentBlock::ToolUse(call) => format!("tool_use {}", call.id),
-            InputContentBlock::ToolResult(result) => format!("tool_result {}", result.tool_use_id),
-            InputContentBlock::Text(text) => format!("text {}", text.text),
-            other => format!("{other:?}"),
-        };
-        request
-            .messages
-            .iter()
-            .map(|message| {
-                let role = format!("{:?}", message.role).to_lowercase();
-                match &message.content {
-                    InputContent::String(text) => format!("{role}: {text}"),
-                    InputContent::Blocks(blocks) => {
-                        let blocks: Vec<String> = blocks.iter().map(label).collect();
-                        format!("{role}: [{}]", blocks.join(", "))
-                    }
-                }
-            })
-            .collect()
-    }
-
-    /// The content blocks of `messages[index]`.
-    fn blocks_of(request: &CreateMessageRequest, index: usize) -> &[InputContentBlock] {
-        match &request.messages[index].content {
-            InputContent::Blocks(blocks) => blocks,
-            InputContent::String(text) => panic!("messages.{index} is the text {text:?}"),
-        }
-    }
-
-    /// A client replaying an earlier MCP answer sends its `mcp_tool_use` and
-    /// `mcp_tool_result` blocks back; the upstream gets the plain pair this
-    /// loop sent the first time, the call in the assistant turn and the
-    /// result in a user turn right after it, and every other block as it came.
-    #[test]
-    fn a_replayed_mcp_exchange_goes_upstream_as_the_plain_pair() {
-        let mut request: CreateMessageRequest = serde_json::from_value(json!({
-            "model": "m", "max_tokens": 8,
-            "messages": [
-                {"role": "user", "content": "look it up"},
-                {"role": "assistant", "content": [
-                    {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "lookup", "server_name": "s", "input": {"q": "x"}},
-                    {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}], "is_error": false},
-                    {"type": "text", "text": "it is 42"}
-                ]},
-                {"role": "user", "content": "thanks"}
-            ]
-        }))
-        .expect("a request");
-        plain_tool_pairs(&mut request.messages);
-        assert_eq!(
-            turns(&request),
-            [
-                "user: look it up",
-                "assistant: [tool_use mcptoolu_1]",
-                "user: [tool_result mcptoolu_1]",
-                "assistant: [text it is 42]",
-                "user: thanks",
-            ]
-        );
-        match blocks_of(&request, 1) {
-            [InputContentBlock::ToolUse(call)] => {
-                assert_eq!(call.name, "lookup");
-                assert_eq!(call.input, json!({"q": "x"}));
-            }
-            other => panic!("the plain call alone, not {other:?}"),
-        }
-        match blocks_of(&request, 2) {
-            [InputContentBlock::ToolResult(result)] => {
-                assert_eq!(result.is_error, Some(false));
-                assert_eq!(
-                    serde_json::to_value(&result.content).unwrap(),
-                    json!([{"type": "text", "text": "42"}])
-                );
-            }
-            other => panic!("the plain result alone, not {other:?}"),
-        }
-    }
-
-    /// Two calls in one replayed answer, each with its result and a text
-    /// after it: a user turn per result, and the text between them opens the
-    /// assistant's next turn with the second call.
-    #[test]
-    fn a_replayed_exchange_of_two_calls_opens_a_user_turn_per_result() {
-        let mut request: CreateMessageRequest = serde_json::from_value(json!({
-            "model": "m", "max_tokens": 8,
-            "messages": [
-                {"role": "user", "content": "look both up"},
-                {"role": "assistant", "content": [
-                    {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "lookup", "server_name": "s", "input": {"q": "x"}},
-                    {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}], "is_error": false},
-                    {"type": "text", "text": "x is 42"},
-                    {"type": "mcp_tool_use", "id": "mcptoolu_2", "name": "lookup", "server_name": "s", "input": {"q": "y"}},
-                    {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_2", "content": [{"type": "text", "text": "7"}], "is_error": false},
-                    {"type": "text", "text": "y is 7"}
-                ]}
-            ]
-        }))
-        .expect("a request");
-        plain_tool_pairs(&mut request.messages);
-        assert_eq!(
-            turns(&request),
-            [
-                "user: look both up",
-                "assistant: [tool_use mcptoolu_1]",
-                "user: [tool_result mcptoolu_1]",
-                "assistant: [text x is 42, tool_use mcptoolu_2]",
-                "user: [tool_result mcptoolu_2]",
-                "assistant: [text y is 7]",
-            ]
-        );
-    }
-
-    /// A non-streamed answer writes two parallel calls as sequential pairs;
-    /// the replay keeps them as one assistant turn with one user turn of
-    /// results, the shape the loop sent the first time.
-    #[test]
-    fn a_replayed_answer_of_sequential_pairs_keeps_its_parallel_calls_in_one_turn() {
-        let mut request: CreateMessageRequest = serde_json::from_value(json!({
-            "model": "m", "max_tokens": 8,
-            "messages": [
-                {"role": "user", "content": "look both up"},
-                {"role": "assistant", "content": [
-                    {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "lookup", "server_name": "s", "input": {"q": "x"}},
-                    {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}], "is_error": false},
-                    {"type": "mcp_tool_use", "id": "mcptoolu_2", "name": "lookup", "server_name": "s", "input": {"q": "y"}},
-                    {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_2", "content": [{"type": "text", "text": "7"}], "is_error": false},
-                    {"type": "text", "text": "x is 42, y is 7"}
-                ]}
-            ]
-        }))
-        .expect("a request");
-        plain_tool_pairs(&mut request.messages);
-        assert_eq!(
-            turns(&request),
-            [
-                "user: look both up",
-                "assistant: [tool_use mcptoolu_1, tool_use mcptoolu_2]",
-                "user: [tool_result mcptoolu_1, tool_result mcptoolu_2]",
-                "assistant: [text x is 42, y is 7]",
-            ]
-        );
-    }
-
-    /// A replayed answer that ends with its result closes on the user turn
-    /// that carries it, nothing after.
-    #[test]
-    fn a_replayed_answer_ending_with_its_result_closes_on_the_user_turn() {
-        let mut request: CreateMessageRequest = serde_json::from_value(json!({
-            "model": "m", "max_tokens": 8,
-            "messages": [
-                {"role": "user", "content": "look it up"},
-                {"role": "assistant", "content": [
-                    {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "lookup", "server_name": "s", "input": {"q": "x"}},
-                    {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}], "is_error": false}
-                ]}
-            ]
-        }))
-        .expect("a request");
-        plain_tool_pairs(&mut request.messages);
-        assert_eq!(
-            turns(&request),
-            [
-                "user: look it up",
-                "assistant: [tool_use mcptoolu_1]",
-                "user: [tool_result mcptoolu_1]",
-            ]
-        );
-    }
-
-    /// A request without an MCP block is left as it came, a plain tool pair
-    /// included.
-    #[test]
-    fn a_request_without_mcp_blocks_is_left_as_it_came() {
-        let messages = json!([
-            {"role": "user", "content": "look it up"},
-            {"role": "assistant", "content": [
-                {"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "x"}}
-            ]},
-            {"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": "toolu_1", "content": "42"}
-            ]}
-        ]);
-        let mut request: CreateMessageRequest = serde_json::from_value(json!({
-            "model": "m", "max_tokens": 8, "messages": messages
-        }))
-        .expect("a request");
-        let before: Vec<InputMessage> = serde_json::from_value(messages).expect("messages");
-        plain_tool_pairs(&mut request.messages);
-        assert_eq!(
-            serde_json::to_value(&request.messages).unwrap(),
-            serde_json::to_value(&before).unwrap()
-        );
-    }
-}
+#[path = "../../tests/unit/anthropic/mcp/tests.rs"]
+mod tests;

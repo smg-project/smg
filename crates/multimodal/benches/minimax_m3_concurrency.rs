@@ -26,11 +26,12 @@ use rustls::crypto::ring;
 struct Fixture {
     url: String,
     cap: u32,
-    grid: [i64; 3],
+    /// The grid of the legacy arm, then of the source policy.
+    grids: [[i64; 3]; 2],
 }
 
 /// Encode deterministic fixtures outside all timed regions.
-fn fixture(w: u32, h: u32, cap: u32, grid: [i64; 3], alpha: bool) -> Fixture {
+fn fixture(w: u32, h: u32, cap: u32, grids: [[i64; 3]; 2], alpha: bool) -> Fixture {
     let image = DynamicImage::ImageRgb8(RgbImage::from_fn(w, h, |x, y| {
         image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
     }));
@@ -55,7 +56,7 @@ fn fixture(w: u32, h: u32, cap: u32, grid: [i64; 3], alpha: bool) -> Fixture {
             STANDARD.encode(encoded.get_ref())
         ),
         cap,
-        grid,
+        grids,
     }
 }
 
@@ -79,7 +80,7 @@ async fn run(
                     AsyncMultiModalTracker::new(connector).with_minimax_image_resize(direct);
                 tracker
                     .push_part(MediaContentPart::ImageUrl {
-                        url: fixture.url.clone(),
+                        url: fixture.url.clone().into(),
                         detail: None,
                         uuid: None,
                         max_long_side_pixel: Some(fixture.cap),
@@ -105,13 +106,14 @@ async fn run(
                 .await
                 .unwrap();
                 let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                let grid = fixture.grids[usize::from(direct)];
                 assert_eq!(
                     output.feature_token_counts,
-                    vec![(fixture.grid[1] * fixture.grid[2] / 4) as usize]
+                    vec![(grid[1] * grid[2] / 4) as usize]
                 );
                 assert!(matches!(output.model_specific.get("image_grid_thw"),
                 Some(ModelSpecificValue::IntTensor { data, shape })
-                if data.as_slice() == fixture.grid && shape.as_slice() == [1, 3]));
+                if data.as_slice() == grid && shape.as_slice() == [1, 3]));
                 elapsed
             }
         })
@@ -159,12 +161,12 @@ fn main() {
         Arc::new(MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap())
     });
     let fixtures = [
-        fixture(224, 224, 2016, [1, 16, 16], false),
-        fixture(1000, 500, 1008, [1, 36, 72], false),
-        fixture(1920, 1080, 1008, [1, 40, 72], false),
-        fixture(3840, 2160, 2016, [1, 80, 144], false),
+        fixture(224, 224, 2016, [[1, 16, 16]; 2], false),
+        fixture(1000, 500, 1008, [[1, 36, 72]; 2], false),
+        fixture(1920, 1080, 1008, [[1, 40, 72], [1, 42, 72]], false),
+        fixture(3840, 2160, 2016, [[1, 80, 144], [1, 82, 144]], false),
     ];
-    let rgba = [fixture(1920, 1080, 1008, [1, 40, 72], true)];
+    let rgba = [fixture(1920, 1080, 1008, [[1, 40, 72], [1, 42, 72]], true)];
     let selected = std::env::var("SMG_M3_BENCH_CASE").ok();
     if let Some(name) = &selected {
         assert!(

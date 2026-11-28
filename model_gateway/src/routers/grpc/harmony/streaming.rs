@@ -7,17 +7,19 @@ use std::{
 };
 
 use axum::response::Response;
+use bytes::BytesMut;
 use openai_protocol::{
-    chat::{
-        ChatCompletionRequest, ChatCompletionStreamResponse, ChatMessageDelta, ChatStreamChoice,
-    },
+    chat::{ChatCompletionRequest, ChatMessageDelta, ChatStreamChoice},
     common::{ChatLogProbs, FunctionCallDelta, ToolCall, ToolCallDelta},
+    event_types::{FunctionCallEvent, McpEvent},
     responses::{
         InputTokensDetails, OutputTokensDetails, ResponseStatus, ResponseUsage, ResponsesResponse,
         ResponsesUsage,
     },
 };
 use serde_json::json;
+use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
+use smg_grpc_client::is_request_timeout;
 use smg_mcp::{McpToolSession, DEFAULT_SERVER_LABEL};
 use tracing::{debug, error};
 
@@ -34,17 +36,19 @@ use crate::{
     routers::{
         common::{
             openai_bridge::{self, descriptor, FormatRegistry, ResponseFormat},
+            prefill_admission::PrefillLoadGuard,
             sse::{SseEncoder, SseSender},
         },
         grpc::{
             common::{
-                response_collection::drain_prefill,
+                response_collection::{drain_prefill, StreamedAnswer},
                 response_formatting::{known_spec_drafted, CompletionTokenTracker, TokenCounts},
                 responses::{
                     body_guards, build_sse_response_driven, driven_channel,
                     streaming::{
                         attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter,
                     },
+                    utils::custom_tool_input,
                     Reading, ReadingEnd,
                 },
             },
@@ -53,11 +57,13 @@ use crate::{
                 ProtoGenerateComplete, ProtoGenerateResponse, ProtoGenerateStreamChunk,
                 ProtoResponseVariant, ProtoStream,
             },
-            regular::streaming::ChatChunkWithUsage,
+            regular::{
+                processor::generation_start,
+                streaming::frames::{assistant_choice, ChatChunkFrame},
+            },
             utils,
         },
     },
-    worker::PrefillLoadGuard,
 };
 
 /// Whether a tool call of this `ResponseFormat` streams its arguments via
@@ -88,6 +94,38 @@ pub(crate) struct HarmonyStreamingProcessor;
 /// [`next_response`]): its callers end the stream on their error path, the
 /// one they take today when the client's leaving is met at a send.
 const CLIENT_LEFT: &str = "Client disconnected";
+const RETAIN_OUTPUT_ITEM: bool = true;
+const OMIT_OUTPUT_ITEM: bool = false;
+
+/// A Responses iteration that ended without a result: the message and the
+/// code of the `error` event its caller ends the stream with.
+#[derive(Debug)]
+pub(crate) struct IterationError {
+    pub(crate) message: String,
+    pub(crate) code: &'static str,
+}
+
+impl IterationError {
+    /// The engine's stream on `side` ended with `status`: one the gateway's
+    /// request timeout cut names the timeout's code, as the 504 and the
+    /// other streams do.
+    fn upstream(side: &str, status: &tonic::Status) -> Self {
+        let mut error = Self::from(format!("{side} stream error: {}", status.message()));
+        if is_request_timeout(status) {
+            error.code = REQUEST_TIMEOUT_CODE;
+        }
+        error
+    }
+}
+
+impl From<String> for IterationError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            code: "processing_error",
+        }
+    }
+}
 
 /// One read of the engine stream for the client of a Responses iteration
 /// (see [`next_response`]).
@@ -153,6 +191,10 @@ impl HarmonyStreamingProcessor {
     ) -> Response {
         let source = source.with_backend(metrics_labels::BACKEND_HARMONY);
         let guards = body_guards(load_guards, reservation.as_ref());
+        // The request's wait ahead of the dispatch the stream's clocks start
+        // at, read here: the reading runs outside the request's scope (see
+        // `context::dispatch_wait`).
+        let dispatch_wait = context::dispatch_wait(generation_start(&execution_result));
         // The body's channel (see `driven_channel`).
         let (tx, rx) = driven_channel();
         // Read for this client: the moment the response body is dropped, the
@@ -171,6 +213,7 @@ impl HarmonyStreamingProcessor {
                 // polling the body (see `utils::isolation`).
                 let result = utils::isolation::isolated(Self::process_single_stream(
                     dispatch_start,
+                    dispatch_wait,
                     stream,
                     dispatch,
                     chat_request,
@@ -203,6 +246,7 @@ impl HarmonyStreamingProcessor {
                     &tx,
                     router_stop_strings,
                     pd_timing,
+                    dispatch_wait,
                     prefill_guards,
                     reservation,
                 ))
@@ -250,8 +294,13 @@ impl HarmonyStreamingProcessor {
     }
 
     /// Process streaming chunks from a single stream
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "keeps the stream, request metadata and reservation separate"
+    )]
     async fn process_single_stream(
         start_time: Instant,
+        dispatch_wait: context::DispatchWait,
         grpc_stream: ProtoStream,
         dispatch: context::DispatchMetadata,
         original_request: Arc<ChatCompletionRequest>,
@@ -263,6 +312,7 @@ impl HarmonyStreamingProcessor {
         let mut cached_tokens = HashMap::new();
         Self::process_chat_decode_stream(
             start_time,
+            dispatch_wait,
             grpc_stream,
             &dispatch,
             &original_request,
@@ -289,6 +339,7 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         router_stop_strings: Vec<String>,
         pd_timing: context::PdTiming,
+        dispatch_wait: context::DispatchWait,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
@@ -296,10 +347,16 @@ impl HarmonyStreamingProcessor {
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
         let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
 
-        drain_prefill(&mut prefill_stream, prefill_guards, false, |complete| {
-            prompt_tokens.insert(complete.index(), complete.prompt_tokens());
-            cached_tokens.insert(complete.index(), complete.cached_tokens());
-        })
+        drain_prefill(
+            &mut prefill_stream,
+            prefill_guards,
+            false,
+            StreamedAnswer,
+            |complete| {
+                prompt_tokens.insert(complete.index(), complete.prompt_tokens());
+                cached_tokens.insert(complete.index(), complete.cached_tokens());
+            },
+        )
         .await
         .map_err(utils::StreamFailure::prefill)?;
 
@@ -307,6 +364,7 @@ impl HarmonyStreamingProcessor {
         // token yields honest PD TTFT.
         Self::process_chat_decode_stream(
             pd_timing.prefill_start,
+            dispatch_wait,
             decode_stream,
             &dispatch,
             &original_request,
@@ -333,10 +391,13 @@ impl HarmonyStreamingProcessor {
     /// and `cached_tokens` maps may be pre-populated from a prefill phase
     /// (prefill/decode stream) or empty (single stream). Values from `Complete` messages
     /// are inserted only if not already present. `pd_timing` is `Some` only in PD mode and
-    /// yields honest PD TTFT (prefill start to first decode token).
+    /// yields honest PD TTFT (prefill start to first decode token). `dispatch_wait` is the
+    /// request's wait ahead of the dispatch at `start_time`, read by the entry point inside
+    /// the request's scope (see [`context::dispatch_wait`]).
     #[expect(clippy::too_many_arguments)]
     async fn process_chat_decode_stream(
         start_time: Instant,
+        dispatch_wait: context::DispatchWait,
         mut decode_stream: ProtoStream,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
@@ -347,7 +408,7 @@ impl HarmonyStreamingProcessor {
         pd_timing: Option<context::PdTiming>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        let mut decode = ChatDecode::new(start_time, pd_timing);
+        let mut decode = ChatDecode::new(start_time, dispatch_wait, pd_timing, dispatch);
         while let Some(result) = decode_stream.next().await {
             let response = result.map_err(|e| {
                 utils::StreamFailure::upstream(e, decode.completion_tokens.delivered())
@@ -357,7 +418,6 @@ impl HarmonyStreamingProcessor {
                     decode
                         .chunk(
                             &chunk,
-                            dispatch,
                             original_request,
                             tx,
                             router_stop_strings,
@@ -370,7 +430,6 @@ impl HarmonyStreamingProcessor {
                     decode
                         .complete(
                             &complete,
-                            dispatch,
                             original_request,
                             tx,
                             prompt_tokens,
@@ -398,7 +457,6 @@ impl HarmonyStreamingProcessor {
                 prompt_tokens,
                 cached_tokens,
                 reservation,
-                dispatch,
                 original_request,
                 tx,
             )
@@ -408,94 +466,77 @@ impl HarmonyStreamingProcessor {
     /// Emit a chunk delta from Harmony channels
     #[expect(clippy::too_many_arguments)]
     async fn emit_chunk_delta(
-        delta: &HarmonyChannelDelta,
+        delta: HarmonyChannelDelta,
         index: u32,
         is_first: bool,
-        dispatch: &context::DispatchMetadata,
+        frame: &ChatChunkFrame,
+        buffer: &mut BytesMut,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
-        encoder: &mut SseEncoder,
         logprobs: Option<ChatLogProbs>,
     ) -> Result<(), String> {
         // On first chunk, emit role announcement separately
         if is_first {
-            Self::emit_role_chunk(index, dispatch, original_request, tx, encoder).await?;
+            Self::emit_role_chunk(index, frame, buffer, original_request, tx).await?;
         }
 
-        // Emit content delta (role is always None for content chunks)
+        // Emit content delta (role is always None for content chunks); the
+        // delta's texts move into the chunk.
         let chat_delta = ChatMessageDelta {
             role: None,
-            content: delta.final_delta.clone(),
-            tool_calls: delta.commentary_delta.as_ref().map(|tc_delta| {
+            content: delta.final_delta,
+            tool_calls: delta.commentary_delta.map(|tc_delta| {
+                let tool_type = tc_delta.id.is_some().then(|| "function".to_string());
                 vec![ToolCallDelta {
                     index: tc_delta.index as u32,
-                    id: tc_delta.id.clone(),
-                    tool_type: tc_delta.id.as_ref().map(|_| "function".to_string()),
-                    function: tc_delta.function.as_ref().map(|f| FunctionCallDelta {
-                        name: f.name.clone(),
-                        arguments: f.arguments.clone(),
+                    id: tc_delta.id,
+                    tool_type,
+                    function: tc_delta.function.map(|f| FunctionCallDelta {
+                        name: f.name,
+                        arguments: f.arguments,
                     }),
                 }]
             }),
-            reasoning_content: delta.analysis_delta.clone(),
+            reasoning_content: delta.analysis_delta,
         };
-
-        // Build and emit chunk
-        let chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
-                .created(dispatch.created)
-                .add_choice(ChatStreamChoice {
-                    index,
-                    delta: chat_delta,
-                    logprobs,
-                    finish_reason: None,
-                    matched_stop: None,
-                })
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build();
-
-        let sse_data = encoder
-            .encode_data(&ChatChunkWithUsage::new(
-                &chunk,
-                placeholder_usage(original_request),
-            ))
-            .map_err(|e| format!("JSON serialization error: {e}"))?;
-
-        tx.send(Ok(sse_data))
+        let choice = ChatStreamChoice {
+            index,
+            delta: chat_delta,
+            logprobs,
+            finish_reason: None,
+            matched_stop: None,
+        };
+        Self::send_choice(frame, buffer, &choice, original_request, tx)
             .await
-            .map_err(|_| "Failed to send chunk".to_string())?;
+            .map_err(|()| "Failed to send chunk".to_string())
+    }
 
-        Ok(())
+    /// One chunk carrying `choice`: written behind the stream's head and sent as a frame.
+    async fn send_choice(
+        frame: &ChatChunkFrame,
+        buffer: &mut BytesMut,
+        choice: &ChatStreamChoice,
+        original_request: &ChatCompletionRequest,
+        tx: &SseSender,
+    ) -> Result<(), ()> {
+        frame.write_chunk(buffer, choice, None, placeholder_usage(original_request));
+        tx.send(Ok(buffer.split().freeze())).await.map_err(|_| ())
     }
 
     /// The chunk that opens a choice: its role, as the engines' own servers
     /// send it before any content.
     async fn emit_role_chunk(
         index: u32,
-        dispatch: &context::DispatchMetadata,
+        frame: &ChatChunkFrame,
+        buffer: &mut BytesMut,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
-        encoder: &mut SseEncoder,
     ) -> Result<(), String> {
-        let role_chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
-                .created(dispatch.created)
-                .add_choice_role(index, "assistant")
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build();
-
-        let sse_data = encoder
-            .encode_data(&ChatChunkWithUsage::new(
-                &role_chunk,
-                placeholder_usage(original_request),
-            ))
-            .map_err(|e| format!("JSON serialization error: {e}"))?;
-
-        tx.send(Ok(sse_data))
+        let mut choice = assistant_choice(index, None, None, None);
+        choice.delta.role = Some("assistant".to_string());
+        Self::send_choice(frame, buffer, &choice, original_request, tx)
             .await
-            .map_err(|_| "Failed to send role chunk".to_string())?;
-
-        Ok(())
+            .map_err(|()| "Failed to send role chunk".to_string())
     }
 
     /// Emit final chunk with finish_reason
@@ -503,30 +544,19 @@ impl HarmonyStreamingProcessor {
         index: u32,
         finish_reason: &str,
         matched_stop: Option<&serde_json::Value>,
-        dispatch: &context::DispatchMetadata,
+        frame: &ChatChunkFrame,
+        buffer: &mut BytesMut,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
-        encoder: &mut SseEncoder,
     ) -> Result<(), String> {
-        let chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
-                .created(dispatch.created)
-                .add_choice_finish_reason(index, finish_reason, matched_stop.cloned())
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build();
-
-        let sse_data = encoder
-            .encode_data(&ChatChunkWithUsage::new(
-                &chunk,
-                placeholder_usage(original_request),
-            ))
-            .map_err(|e| format!("JSON serialization error: {e}"))?;
-
-        tx.send(Ok(sse_data))
+        let choice = ChatStreamChoice {
+            finish_reason: Some(finish_reason.to_string()),
+            matched_stop: matched_stop.cloned(),
+            ..assistant_choice(index, None, None, None)
+        };
+        Self::send_choice(frame, buffer, &choice, original_request, tx)
             .await
-            .map_err(|_| "Failed to send final chunk".to_string())?;
-
-        Ok(())
+            .map_err(|()| "Failed to send final chunk".to_string())
     }
 
     /// Emit the usage chunk at the end: the usage object the non-streamed
@@ -535,27 +565,14 @@ impl HarmonyStreamingProcessor {
     async fn emit_usage_chunk(
         counts: TokenCounts,
         parsed_reasoning_tokens: u32,
-        dispatch: &context::DispatchMetadata,
-        original_request: &ChatCompletionRequest,
+        frame: &ChatChunkFrame,
+        buffer: &mut BytesMut,
         tx: &SseSender,
-        encoder: &mut SseEncoder,
     ) -> Result<(), String> {
-        let usage_chunk =
-            ChatCompletionStreamResponse::builder(&dispatch.request_id, &original_request.model)
-                .created(dispatch.created)
-                .usage(chat_usage(counts, parsed_reasoning_tokens))
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build();
-
-        let sse_data = encoder
-            .encode_data(&usage_chunk)
-            .map_err(|e| format!("JSON serialization error: {e}"))?;
-
-        tx.send(Ok(sse_data))
+        frame.write_usage_chunk(buffer, &chat_usage(counts, parsed_reasoning_tokens));
+        tx.send(Ok(buffer.split().freeze()))
             .await
-            .map_err(|_| "Failed to send usage chunk".to_string())?;
-
-        Ok(())
+            .map_err(|_| "Failed to send usage chunk".to_string())
     }
 
     /// Process streaming chunks for Responses API iteration.
@@ -566,6 +583,10 @@ impl HarmonyStreamingProcessor {
     /// - Other tools → `function_call.*` events
     ///
     /// When no MCP context is provided, all tool calls are treated as function calls.
+    ///
+    /// `server_call_allowance` is the number of server calls the turn may still open items
+    /// for (the calls the request may run under its cap; none on the final turn after it), or
+    /// `None` where no session serves the turn.
     ///
     /// Answers the iteration's result with the engine's counts the terminal
     /// frame brought, for the settlement of the iteration's reservation;
@@ -579,7 +600,8 @@ impl HarmonyStreamingProcessor {
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
         router_stop_strings: &[String],
-    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
+        server_call_allowance: Option<usize>,
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), IterationError> {
         match execution_result {
             context::ExecutionResult::Single { stream, .. } => {
                 debug!("Processing Responses API single stream mode");
@@ -591,6 +613,7 @@ impl HarmonyStreamingProcessor {
                     format_registry,
                     router_stop_strings,
                     None,
+                    server_call_allowance,
                 )
                 .await
             }
@@ -612,15 +635,20 @@ impl HarmonyStreamingProcessor {
                     router_stop_strings,
                     pd_timing,
                     prefill_guards,
+                    server_call_allowance,
                 )
                 .await
             }
             context::ExecutionResult::Embedding { .. } => {
-                Err("Embeddings not supported in Responses API streaming".to_string())
+                Err("Embeddings not supported in Responses API streaming"
+                    .to_string()
+                    .into())
             }
             // Batch results exist only on the completions pipeline.
             context::ExecutionResult::Batch { .. } => {
-                Err("Batched results not supported in Responses API streaming".to_string())
+                Err("Batched results not supported in Responses API streaming"
+                    .to_string()
+                    .into())
             }
         }
     }
@@ -636,7 +664,8 @@ impl HarmonyStreamingProcessor {
         router_stop_strings: &[String],
         pd_timing: context::PdTiming,
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
-    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
+        server_call_allowance: Option<usize>,
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), IterationError> {
         // Phase 1: Drain prefill stream, for the client (see `next_response`):
         // a client that leaves during the prefill ends both sides at once. The
         // client's prompt-side usage is the prefill side's prefix-cache hit:
@@ -646,7 +675,13 @@ impl HarmonyStreamingProcessor {
         let drained = tokio::select! {
             biased;
             () = tx.closed() => None,
-            drained = drain_prefill(&mut prefill_stream, prefill_guards, false, |_| {}) => {
+            drained = drain_prefill(
+                &mut prefill_stream,
+                prefill_guards,
+                false,
+                StreamedAnswer,
+                |_| {},
+            ) => {
                 Some(drained)
             }
         };
@@ -657,10 +692,10 @@ impl HarmonyStreamingProcessor {
                 response_id = %emitter.response_id,
                 "Client left during the prefill of the Responses stream; the request is aborted on the engines"
             );
-            return Err(CLIENT_LEFT.to_string());
+            return Err(CLIENT_LEFT.to_string().into());
         };
         let prefill_cached_tokens =
-            drained.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+            drained.map_err(|status| IterationError::upstream("Prefill", &status))?;
         let decode_stream = decode_stream.decode_side(prefill_cached_tokens);
 
         // Phase 2: Process decode stream. Pass pd_timing so the first decode
@@ -673,6 +708,7 @@ impl HarmonyStreamingProcessor {
             format_registry,
             router_stop_strings,
             Some(pd_timing),
+            server_call_allowance,
         )
         .await;
 
@@ -683,6 +719,7 @@ impl HarmonyStreamingProcessor {
     /// Process decode stream for tool call events. `pd_timing` is `Some` only
     /// in PD mode and yields honest PD TTFT (prefill start to first decode
     /// frame).
+    #[expect(clippy::too_many_arguments)]
     async fn process_decode_stream(
         mut decode_stream: ProtoStream,
         emitter: &mut ResponseStreamEventEmitter,
@@ -691,8 +728,10 @@ impl HarmonyStreamingProcessor {
         format_registry: Option<&FormatRegistry>,
         router_stop_strings: &[String],
         pd_timing: Option<context::PdTiming>,
-    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), String> {
-        let mut decode = ResponsesDecode::new(pd_timing, router_stop_strings)?;
+        server_call_allowance: Option<usize>,
+    ) -> Result<(ResponsesIterationResult, Option<TokenCounts>), IterationError> {
+        let mut decode =
+            ResponsesDecode::new(pd_timing, router_stop_strings, server_call_allowance)?;
         // A fresh iteration: no finish until its terminal frame names one, so the finish of an
         // earlier turn of the request never reads for this one.
         emitter.set_finish_reason(None);
@@ -710,11 +749,11 @@ impl HarmonyStreamingProcessor {
                         response_id = %emitter.response_id,
                         "Client left during the Responses stream; the request is aborted on the engine"
                     );
-                    return Err(CLIENT_LEFT.to_string());
+                    return Err(CLIENT_LEFT.to_string().into());
                 }
             };
             decode.frames += 1;
-            let response = result.map_err(|e| format!("Decode stream error: {}", e.message()))?;
+            let response = result.map_err(|status| IterationError::upstream("Decode", &status))?;
             match response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
                     decode
@@ -747,7 +786,7 @@ impl HarmonyStreamingProcessor {
                 endpoint: metrics_labels::ENDPOINT_RESPONSES,
                 tail_tokens: decode.tail_tokens,
             });
-            drop(decode_stream);
+            decode_stream.abort_past_stop();
         } else {
             decode_stream.mark_completed();
         }
@@ -780,8 +819,11 @@ struct ResponsesDecode {
     /// The message item the first final-channel delta opened: its output index and id.
     message: Option<(usize, String)>,
     content_part_added: bool,
-    /// Each call's output index, item id and response format, by the parser's call index.
-    calls: HashMap<usize, (usize, String, Option<ResponseFormat>)>,
+    /// Each call's streamed item, by the parser's call index.
+    calls: HashMap<usize, OpenCall>,
+    /// The server calls the turn may open items for, its first ones (`None` where no session
+    /// serves the turn, so no call is a server's): a server call past them opens no item.
+    server_call_allowance: Option<usize>,
     finalized_analysis: Option<String>,
     // The terminal frame's counters (a disaggregated request's decode side carries the prefill
     // side's cache hit, see `ProtoStream::decode_side`); completion tokens are counted per chunk on
@@ -813,10 +855,66 @@ struct ResponsesDecode {
     engine_outlived: bool,
 }
 
+struct OpenCall {
+    output_index: usize,
+    item_id: String,
+    response_format: Option<ResponseFormat>,
+    custom: bool,
+    /// The item as `output_item.added` announced it, retained so a partial
+    /// call rejected by the completed parse can still be closed.
+    item: serde_json::Value,
+}
+
+impl OpenCall {
+    async fn open_custom(
+        name: &str,
+        call_id: &str,
+        emitter: &mut ResponseStreamEventEmitter,
+        tx: &SseSender,
+    ) -> Self {
+        let (output_index, item_id) = emitter.allocate_output_index(OutputItemKind::CustomToolCall);
+        let item = json!({"id": item_id, "type": "custom_tool_call", "name": name, "call_id": call_id, "input": ""});
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_output_item_added(output_index, &item, tx)
+                .await,
+        );
+        Self {
+            output_index,
+            item_id,
+            response_format: None,
+            custom: true,
+            item,
+        }
+    }
+
+    async fn close_custom(
+        &self,
+        arguments: &str,
+        emitter: &mut ResponseStreamEventEmitter,
+        tx: &SseSender,
+    ) {
+        emitter.function_call_status(arguments);
+        let input = custom_tool_input(arguments);
+        for event in emitter.custom_input_events(self.output_index, &self.item_id, &input) {
+            emitter.send_event_best_effort(&event, tx).await;
+        }
+        let mut item = self.item.clone();
+        item["input"] = json!(input);
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_output_item_done(self.output_index, item, RETAIN_OUTPUT_ITEM, tx)
+                .await,
+        );
+        emitter.complete_output_item(self.output_index);
+    }
+}
+
 impl ResponsesDecode {
     fn new(
         pd_timing: Option<context::PdTiming>,
         router_stop_strings: &[String],
+        server_call_allowance: Option<usize>,
     ) -> Result<Self, String> {
         let scanner = || {
             (!router_stop_strings.is_empty())
@@ -833,6 +931,7 @@ impl ResponsesDecode {
             message: None,
             content_part_added: false,
             calls: HashMap::new(),
+            server_call_allowance,
             finalized_analysis: None,
             prompt_tokens: 0,
             completion_tokens: 0,
@@ -995,8 +1094,11 @@ impl ResponsesDecode {
                 "role": "assistant",
                 "content": []
             });
-            let event = emitter.emit_output_item_added(output_index, &item);
-            emitter.send_event_best_effort(&event, tx).await;
+            ResponseStreamEventEmitter::sent(
+                emitter
+                    .send_output_item_added(output_index, &item, tx)
+                    .await,
+            );
             self.message = Some((output_index, item_id));
         }
         let Some((output_index, item_id)) = &self.message else {
@@ -1004,12 +1106,16 @@ impl ResponsesDecode {
         };
         let content_index = 0; // Single content part
         if !self.content_part_added {
-            let event = emitter.emit_content_part_added(*output_index, item_id, content_index);
-            emitter.send_event_best_effort(&event, tx).await;
+            ResponseStreamEventEmitter::sent(
+                emitter
+                    .send_content_part_added(*output_index, item_id, content_index, tx)
+                    .await,
+            );
             self.content_part_added = true;
         }
-        let event = emitter.emit_text_delta(text, *output_index, item_id, content_index);
-        emitter.send_event_best_effort(&event, tx).await;
+        emitter
+            .send_text_delta_best_effort(text, *output_index, item_id, content_index, tx)
+            .await;
         self.final_text.push_str(text);
     }
 
@@ -1029,10 +1135,10 @@ impl ResponsesDecode {
                 .await;
             return;
         }
-        let Some((output_index, item_id, response_format)) = self.calls.get(&call.index) else {
+        let Some(open) = self.calls.get(&call.index) else {
             return;
         };
-        if !streams_arguments(response_format.as_ref()) {
+        if open.custom || !streams_arguments(open.response_format.as_ref()) {
             return;
         }
         let Some(args) = call
@@ -1043,16 +1149,19 @@ impl ResponsesDecode {
         else {
             return;
         };
-        let event = match response_format {
-            Some(_) => emitter.emit_mcp_call_arguments_delta(*output_index, item_id, args),
-            None => emitter.emit_function_call_arguments_delta(*output_index, item_id, args),
+        let kind = match open.response_format {
+            Some(_) => McpEvent::CALL_ARGUMENTS_DELTA,
+            None => FunctionCallEvent::ARGUMENTS_DELTA,
         };
-        emitter.send_event_best_effort(&event, tx).await;
+        emitter
+            .send_arguments_delta_best_effort(kind, args, open.output_index, &open.item_id, tx)
+            .await;
     }
 
     /// A new call: its item allocated for the tool's format (an MCP tool's, where the session
     /// exposes it), `output_item.added`, the MCP progress events, and the first (empty)
-    /// arguments delta where the tool streams its arguments.
+    /// arguments delta where the tool streams its arguments. A server call past the turn's
+    /// allowance opens nothing.
     async fn open_call(
         &mut self,
         call: &HarmonyToolCallDelta,
@@ -1068,19 +1177,36 @@ impl ResponsesDecode {
             .and_then(|f| f.name.as_ref())
             .map(|n| n.as_str())
             .unwrap_or("");
-        // Determine response_format based on MCP context.
-        let response_format = session.and_then(|s| {
-            if s.has_exposed_tool(tool_name) {
-                format_registry.map(|reg| openai_bridge::lookup_tool_format(s, reg, tool_name))
-            } else {
-                None
+        let server = session.filter(|s| s.has_exposed_tool(tool_name));
+        if server.is_none() && emitter.is_custom_tool(tool_name) {
+            let open = OpenCall::open_custom(tool_name, call_id, emitter, tx).await;
+            self.calls.insert(call.index, open);
+            return;
+        }
+        // A server call past the turn's allowance opens no item: the loop will not run it (the
+        // request's cap, or the final turn after it), so it is parsed for the loop and dropped
+        // here, never emitted or stored as a completed call. Its place among the turn's server
+        // calls is read from the parser's completed messages, where the loop reads its
+        // permitted prefix, not counted over the deltas: a chunk that holds a whole call
+        // brings no delta for it.
+        if let (Some(server), Some(allowance)) = (server, self.server_call_allowance) {
+            let earlier = self
+                .parser
+                .get_messages()
+                .iter()
+                .filter_map(|message| message.recipient.as_deref()?.strip_prefix("functions."))
+                .filter(|name| server.has_exposed_tool(name))
+                .count();
+            if earlier >= allowance {
+                return;
             }
+        }
+        // The item's format: the server tool's from the registry, a function call's otherwise.
+        let response_format = server.and_then(|s| {
+            format_registry.map(|reg| openai_bridge::lookup_tool_format(s, reg, tool_name))
         });
         let type_str = ResponseStreamEventEmitter::type_str_for_format(response_format.as_ref());
         let (output_index, item_id) = emitter.allocate_output_index_for_format(response_format);
-        self.calls
-            .insert(call.index, (output_index, item_id.clone(), response_format));
-
         let mut item = json!({
             "id": item_id,
             "type": type_str,
@@ -1093,8 +1219,21 @@ impl ResponsesDecode {
             .map(|s| s.resolve_tool_server_label(tool_name))
             .unwrap_or_else(|| DEFAULT_SERVER_LABEL.to_string());
         attach_mcp_server_label(&mut item, Some(label.as_str()), response_format.as_ref());
-        let event = emitter.emit_output_item_added(output_index, &item);
-        emitter.send_event_best_effort(&event, tx).await;
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_output_item_added(output_index, &item, tx)
+                .await,
+        );
+        self.calls.insert(
+            call.index,
+            OpenCall {
+                output_index,
+                item_id: item_id.clone(),
+                response_format,
+                custom: false,
+                item,
+            },
+        );
 
         // Emit in_progress event for MCP tools
         if let Some(fmt) = response_format {
@@ -1112,11 +1251,13 @@ impl ResponsesDecode {
         // `*.searching` / `*.generating` events emitted above instead of streaming their
         // arguments.
         if streams_arguments(response_format.as_ref()) {
-            let event = match &response_format {
-                Some(_) => emitter.emit_mcp_call_arguments_delta(output_index, &item_id, ""),
-                None => emitter.emit_function_call_arguments_delta(output_index, &item_id, ""),
+            let kind = match &response_format {
+                Some(_) => McpEvent::CALL_ARGUMENTS_DELTA,
+                None => FunctionCallEvent::ARGUMENTS_DELTA,
             };
-            emitter.send_event_best_effort(&event, tx).await;
+            emitter
+                .send_arguments_delta_best_effort(kind, "", output_index, &item_id, tx)
+                .await;
         }
     }
 
@@ -1171,6 +1312,11 @@ impl ResponsesDecode {
             }
         }
         self.close_calls(emitter, tx, session).await;
+        // A terminal frame that read no call leaves the turn's calls to
+        // `recover_calls`, which reads a trailing cut call and closes it once.
+        if self.tool_calls.is_some() {
+            self.close_unread_calls(emitter, tx).await;
+        }
         self.close_message(emitter, tx).await;
     }
 
@@ -1187,43 +1333,58 @@ impl ResponsesDecode {
             return;
         };
         for (call_index, tool_call) in tool_calls.iter().enumerate() {
-            let Some((output_index, item_id, response_format)) = self.calls.get(&call_index) else {
-                continue;
-            };
             let tool_name = &tool_call.function.name;
             let args_str = tool_call.function.arguments.as_deref().unwrap_or("");
+            let Some(open) = self.calls.get(&call_index) else {
+                // A single engine chunk can contain the whole call, including its closing token.
+                if !session.is_some_and(|s| s.has_exposed_tool(tool_name))
+                    && emitter.is_custom_tool(tool_name)
+                {
+                    let open = OpenCall::open_custom(tool_name, &tool_call.id, emitter, tx).await;
+                    open.close_custom(args_str, emitter, tx).await;
+                }
+                continue;
+            };
+            if open.custom {
+                open.close_custom(args_str, emitter, tx).await;
+                continue;
+            }
 
-            if streams_arguments(response_format.as_ref()) {
-                let event = match response_format {
-                    Some(_) => {
-                        emitter.emit_mcp_call_arguments_done(*output_index, item_id, args_str)
-                    }
-                    None => {
-                        emitter.emit_function_call_arguments_done(*output_index, item_id, args_str)
-                    }
+            if streams_arguments(open.response_format.as_ref()) {
+                let event = match open.response_format {
+                    Some(_) => emitter.emit_mcp_call_arguments_done(
+                        open.output_index,
+                        &open.item_id,
+                        args_str,
+                    ),
+                    None => emitter.emit_function_call_arguments_done(
+                        open.output_index,
+                        &open.item_id,
+                        args_str,
+                    ),
                 };
                 emitter.send_event_best_effort(&event, tx).await;
             }
 
             // Emit completed event for MCP tools
-            if let Some(fmt) = *response_format {
-                let event = emitter.emit_tool_call_completed(*output_index, item_id, fmt);
+            if let Some(fmt) = open.response_format {
+                let event = emitter.emit_tool_call_completed(open.output_index, &open.item_id, fmt);
                 emitter.send_event_best_effort(&event, tx).await;
             }
 
             let type_str =
-                ResponseStreamEventEmitter::type_str_for_format(response_format.as_ref());
+                ResponseStreamEventEmitter::type_str_for_format(open.response_format.as_ref());
             // A function call's status is read through the emitter under this iteration's
             // finish (none when the stream ended before its terminal frame): a recovered call
             // the finish cut is `incomplete`, and the response reads it as cut on its terminal
             // event and stored object. A hosted or MCP call's item keeps `completed`; its
             // result replaces the item.
-            let status = match response_format {
+            let status = match open.response_format {
                 Some(_) => "completed",
                 None => emitter.function_call_status(args_str),
             };
             let mut item = json!({
-                "id": item_id,
+                "id": open.item_id,
                 "type": type_str,
                 "name": tool_name,
                 "call_id": &tool_call.id,
@@ -1233,11 +1394,64 @@ impl ResponsesDecode {
             let label = session
                 .map(|s| s.resolve_tool_server_label(tool_name))
                 .unwrap_or_else(|| DEFAULT_SERVER_LABEL.to_string());
-            attach_mcp_server_label(&mut item, Some(label.as_str()), response_format.as_ref());
+            attach_mcp_server_label(
+                &mut item,
+                Some(label.as_str()),
+                open.response_format.as_ref(),
+            );
 
-            let event = emitter.emit_output_item_done(*output_index, &item);
-            emitter.complete_output_item(*output_index);
-            emitter.send_event_best_effort(&event, tx).await;
+            ResponseStreamEventEmitter::sent(
+                emitter
+                    .send_output_item_done(open.output_index, item, RETAIN_OUTPUT_ITEM, tx)
+                    .await,
+            );
+            emitter.complete_output_item(open.output_index);
+        }
+    }
+
+    /// Every item opened past the calls the turn read closes with what the
+    /// parser holds of its arguments. The tool loop does not run these calls.
+    async fn close_unread_calls(&self, emitter: &mut ResponseStreamEventEmitter, tx: &SseSender) {
+        let read = self.tool_calls.as_ref().map_or(0, Vec::len);
+        let arguments = self
+            .parser
+            .extract_incomplete_commentary()
+            .and_then(|calls| calls.into_iter().next())
+            .and_then(|call| call.function.arguments)
+            .unwrap_or_default();
+        let Some(last) = self.calls.keys().copied().max() else {
+            return;
+        };
+        for index in read..=last {
+            let Some(open) = self.calls.get(&index) else {
+                continue;
+            };
+            if !open.custom && streams_arguments(open.response_format.as_ref()) {
+                let event = match open.response_format {
+                    Some(_) => emitter.emit_mcp_call_arguments_done(
+                        open.output_index,
+                        &open.item_id,
+                        &arguments,
+                    ),
+                    None => emitter.emit_function_call_arguments_done(
+                        open.output_index,
+                        &open.item_id,
+                        &arguments,
+                    ),
+                };
+                emitter.send_event_best_effort(&event, tx).await;
+            }
+            let mut item = open.item.clone();
+            // A discarded custom call never supplied decoded input for the client.
+            if !open.custom {
+                item["arguments"] = json!(&arguments);
+            }
+            item["status"] = json!("incomplete");
+            ResponseStreamEventEmitter::sent(
+                emitter
+                    .send_output_item_done(open.output_index, item, OMIT_OUTPUT_ITEM, tx)
+                    .await,
+            );
         }
     }
 
@@ -1248,10 +1462,16 @@ impl ResponsesDecode {
             return;
         };
         let content_index = 0;
-        let event = emitter.emit_text_done(*output_index, item_id, content_index);
-        emitter.send_event_best_effort(&event, tx).await;
-        let event = emitter.emit_content_part_done(*output_index, item_id, content_index);
-        emitter.send_event_best_effort(&event, tx).await;
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_text_done(*output_index, item_id, content_index, tx)
+                .await,
+        );
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_content_part_done(*output_index, item_id, content_index, tx)
+                .await,
+        );
         let item = json!({
             "id": item_id,
             "type": "message",
@@ -1264,10 +1484,14 @@ impl ResponsesDecode {
             // typed read keeps an item only with one.
             "status": emitter.message_status()
         });
-        let event = emitter.emit_output_item_done(*output_index, &item);
-        // Mark as completed before sending (so it's included in final output even if send fails)
+        // The sender keeps the item before the frame goes out: the item is in the final output
+        // whether or not the frame reached the client.
+        ResponseStreamEventEmitter::sent(
+            emitter
+                .send_output_item_done(*output_index, item, RETAIN_OUTPUT_ITEM, tx)
+                .await,
+        );
         emitter.complete_output_item(*output_index);
-        emitter.send_event_best_effort(&event, tx).await;
     }
 
     /// After the loop: a stream that brought frames but no calls from a terminal frame has its
@@ -1295,9 +1519,20 @@ impl ResponsesDecode {
         let (analysis_opt, commentary_opt, final_text_extracted) =
             HarmonyParserAdapter::parse_messages(&messages);
         self.tool_calls.clone_from(&commentary_opt);
-        // If no tool calls found, check for incomplete commentary in parser state
+        // If no tool calls found, check for incomplete commentary in parser state.
+        // A call that ended behind its header is read for a client tool alone:
+        // the loop would run a server tool on arguments the model never wrote.
         if self.tool_calls.is_none() {
-            self.tool_calls = self.parser.extract_incomplete_commentary();
+            let client_tool = self
+                .calls
+                .get(&0)
+                .is_some_and(|open| open.response_format.is_none());
+            self.tool_calls = self.parser.extract_incomplete_commentary().filter(|calls| {
+                client_tool
+                    || calls
+                        .iter()
+                        .any(|call| call.function.arguments.as_deref() != Some(""))
+            });
         }
         debug!(
             "Tool call extraction: completed_msgs={}, tool_calls={}, has_analysis={}, final_text_len={}",
@@ -1307,6 +1542,7 @@ impl ResponsesDecode {
             final_text_extracted.len()
         );
         self.close_calls(emitter, tx, session).await;
+        self.close_unread_calls(emitter, tx).await;
     }
 
     /// The engine's counts the stream brought (the terminal frame's counters).
@@ -1374,13 +1610,16 @@ impl ResponsesDecode {
 }
 
 /// One Harmony chat decode stream as it is read: a parser and its state per choice index
-/// (`n>1`), the router-side stop scanners, the counters the terminal frames bring, and the SSE
-/// encoder every chunk goes through. Each frame goes through [`Self::chunk`] or
+/// (`n>1`), the router-side stop scanners, the counters the terminal frames bring, and the head
+/// every chunk is written behind. Each frame goes through [`Self::chunk`] or
 /// [`Self::complete`]; [`Self::finish`] settles the usage and writes the usage chunk and the
 /// metrics once the stream has ended.
 struct ChatDecode {
     // Timing for metrics
     start_time: Instant,
+    /// The request's wait ahead of the dispatch at `start_time`, recorded at the stream's end
+    /// (see [`context::dispatch_wait`]).
+    dispatch_wait: context::DispatchWait,
     first_token_time: Option<Instant>,
     /// The PD dispatch instants, in PD mode: the first token records the PD pair against
     /// them and the metrics anchor at the prefill dispatch.
@@ -1420,14 +1659,22 @@ struct ChatDecode {
     /// Whether the client left during the read: the stream's verdict, taken before
     /// the finish so that no terminal router metric is recorded for a leaving client.
     client_left: bool,
-    // Reusable SSE encoder shared across every chunk emitted for this stream.
-    encoder: SseEncoder,
+    // The head every chunk of this stream repeats, serialized once, and the buffer the chunks
+    // are written into behind it.
+    frame: ChatChunkFrame,
+    buffer: BytesMut,
 }
 
 impl ChatDecode {
-    fn new(start_time: Instant, pd_timing: Option<context::PdTiming>) -> Self {
+    fn new(
+        start_time: Instant,
+        dispatch_wait: context::DispatchWait,
+        pd_timing: Option<context::PdTiming>,
+        dispatch: &context::DispatchMetadata,
+    ) -> Self {
         Self {
             start_time,
+            dispatch_wait,
             first_token_time: None,
             pd_timing,
             parsers: HashMap::new(),
@@ -1446,7 +1693,13 @@ impl ChatDecode {
             engine_outlived: false,
             tail_tokens: 0,
             client_left: false,
-            encoder: SseEncoder::new(),
+            frame: ChatChunkFrame::new(
+                &dispatch.request_id,
+                &dispatch.model,
+                dispatch.created,
+                dispatch.weight_version.as_deref(),
+            ),
+            buffer: BytesMut::with_capacity(4096),
         }
     }
 
@@ -1498,7 +1751,7 @@ impl ChatDecode {
             endpoint: metrics_labels::ENDPOINT_CHAT,
             tail_tokens: self.tail_tokens,
         });
-        drop(decode_stream);
+        decode_stream.abort_past_stop();
     }
 
     /// The stream's first engine output, for the TTFT; in PD mode the PD first-token pair is
@@ -1517,11 +1770,9 @@ impl ChatDecode {
     /// a router-side stop emits the choice's final chunk, closes the choice with the chunk's
     /// counts and swallows the rest of its stream (the request is aborted once every choice has
     /// closed).
-    #[expect(clippy::too_many_arguments)]
     async fn chunk(
         &mut self,
         chunk: &ProtoGenerateStreamChunk,
-        dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
         router_stop_strings: &[String],
@@ -1623,13 +1874,13 @@ impl ChatDecode {
         let is_first = self.is_firsts.get(&index).copied().unwrap_or(false);
         if has_payload || is_first || bare_logprobs {
             HarmonyStreamingProcessor::emit_chunk_delta(
-                &delta,
+                delta,
                 index,
                 is_first,
-                dispatch,
+                &self.frame,
+                &mut self.buffer,
                 original_request,
                 tx,
-                &mut self.encoder,
                 chunk_logprobs,
             )
             .await?;
@@ -1646,10 +1897,10 @@ impl ChatDecode {
                 index,
                 "stop",
                 Some(&serde_json::Value::String(stop)),
-                dispatch,
+                &self.frame,
+                &mut self.buffer,
                 original_request,
                 tx,
-                &mut self.encoder,
             )
             .await?;
             self.router_stopped.insert(index);
@@ -1683,7 +1934,6 @@ impl ChatDecode {
     async fn complete(
         &mut self,
         complete: &ProtoGenerateComplete,
-        dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
         prompt_tokens: &mut HashMap<u32, u32>,
@@ -1730,10 +1980,10 @@ impl ChatDecode {
             self.note_first_token(&original_request.model);
             HarmonyStreamingProcessor::emit_role_chunk(
                 index,
-                dispatch,
+                &self.frame,
+                &mut self.buffer,
                 original_request,
                 tx,
-                &mut self.encoder,
             )
             .await?;
             self.is_firsts.insert(index, false);
@@ -1748,10 +1998,10 @@ impl ChatDecode {
                 index,
                 complete.finish_reason(),
                 self.matched_stops.get(&index).and_then(|m| m.as_ref()),
-                dispatch,
+                &self.frame,
+                &mut self.buffer,
                 original_request,
                 tx,
-                &mut self.encoder,
             )
             .await?;
             return Ok(());
@@ -1777,13 +2027,13 @@ impl ChatDecode {
         };
         if flushed.analysis_delta.is_some() || flushed.final_delta.is_some() {
             HarmonyStreamingProcessor::emit_chunk_delta(
-                &flushed,
+                flushed,
                 index,
                 false,
-                dispatch,
+                &self.frame,
+                &mut self.buffer,
                 original_request,
                 tx,
-                &mut self.encoder,
                 None,
             )
             .await?;
@@ -1793,10 +2043,10 @@ impl ChatDecode {
             index,
             &final_output.finish_reason,
             matched_stop.as_ref(),
-            dispatch,
+            &self.frame,
+            &mut self.buffer,
             original_request,
             tx,
-            &mut self.encoder,
         )
         .await?;
         Ok(())
@@ -1809,7 +2059,6 @@ impl ChatDecode {
         prompt_tokens: &HashMap<u32, u32>,
         cached_tokens: &HashMap<u32, u32>,
         reservation: Option<Arc<SharedReservationHandle>>,
-        dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
     ) -> Result<(), utils::StreamFailure> {
@@ -1873,10 +2122,9 @@ impl ChatDecode {
             HarmonyStreamingProcessor::emit_usage_chunk(
                 counts,
                 self.parsed_reasoning_tokens,
-                dispatch,
-                original_request,
+                &self.frame,
+                &mut self.buffer,
                 tx,
-                &mut self.encoder,
             )
             .await?;
         }
@@ -1890,6 +2138,8 @@ impl ChatDecode {
             model_id: &original_request.model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
+            dispatch_wait: self.dispatch_wait.map(|waited| waited.since_entry),
+            dispatch_wait_after_body: self.dispatch_wait.map(|waited| waited.since_body),
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(counts.prompt as u64),
             cached_tokens: Some(u64::from(counts.cached)),
@@ -1897,12 +2147,6 @@ impl ChatDecode {
         });
 
         Ok(())
-    }
-}
-
-impl Default for HarmonyStreamingProcessor {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

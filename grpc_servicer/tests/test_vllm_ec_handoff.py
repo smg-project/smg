@@ -2,6 +2,7 @@
 
 import ast
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -12,8 +13,10 @@ from unittest.mock import AsyncMock, Mock
 import grpc
 import pytest
 from smg_grpc_proto import vllm_engine_pb2 as pb
+from smg_grpc_servicer import constrained_decoding
+from smg_grpc_servicer.vllm.config_view import EngineConfigView
 from smg_grpc_servicer.vllm.mm_keys import batches_missing_pixels, mm_batches
-from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload
+from smg_grpc_servicer.vllm.mm_salt import has_preprocessed_mm_payload, request_cache_salt
 
 
 class _Aborted(Exception):
@@ -24,11 +27,13 @@ def _generate(**overrides):
     """Compile the actual handler with engine-independent dependencies."""
     path = Path(__file__).parents[1] / "smg_grpc_servicer/vllm/servicer.py"
     module = ast.parse(path.read_text())
-    helper = next(
+    helpers = [
         n
         for n in module.body
-        if isinstance(n, ast.FunctionDef) and n.name == "_valid_cpu_ec_handle"
-    )
+        if isinstance(n, ast.FunctionDef)
+        and n.name
+        in ("_valid_cpu_ec_handle", "_takes_reasoning_ended", "_structured_outputs_backend")
+    ]
     cls = next(
         n for n in module.body if isinstance(n, ast.ClassDef) and n.name == "VllmEngineServicer"
     )
@@ -39,14 +44,17 @@ def _generate(**overrides):
     for arg in method.args.args:
         arg.annotation = None
     namespace = {
+        "inspect": inspect,
         "json": json,
         "asyncio": asyncio,
         "build_media_identity": Mock(),
+        "EngineConfigView": EngineConfigView,
         "time": time,
         "logger": logging.getLogger(__name__),
         "grpc": grpc,
         "mm_batches": mm_batches,
         "has_preprocessed_mm_payload": has_preprocessed_mm_payload,
+        "request_cache_salt": request_cache_salt,
         "batches_missing_pixels": batches_missing_pixels,
         "params_from_request": lambda req: (
             json.loads(req.kv_transfer_params_json)
@@ -65,7 +73,9 @@ def _generate(**overrides):
         "GracefulHTTPError": type("GracefulHTTPError", (Exception,), {}),
     }
     namespace.update(overrides)
-    exec(compile(ast.Module(body=[helper, method], type_ignores=[]), str(path), "exec"), namespace)
+    exec(
+        compile(ast.Module(body=[*helpers, method], type_ignores=[]), str(path), "exec"), namespace
+    )
     return namespace["Generate"]
 
 
@@ -125,6 +135,7 @@ async def test_grid_only_requires_a_handoff(hashes, consumer, ec, kv):
         ),
         _build_preprocessed_mm_inputs=build,
         _off_the_event_loop=AsyncMock(side_effect=lambda fn, *args: fn(*args)),
+        _structured_outputs_backend="auto",
         _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
             extra_args=None, logprobs=None, prompt_logprobs=None
         ),
@@ -201,6 +212,7 @@ async def test_encoder_only_validates_connector_specific_handles(consumer, conne
         ),
         _build_preprocessed_mm_inputs=lambda *args: {"prompt_token_ids": [1, 2]},
         _off_the_event_loop=AsyncMock(side_effect=lambda fn, *args: fn(*args)),
+        _structured_outputs_backend="auto",
         _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
             extra_args=None, logprobs=None, prompt_logprobs=None
         ),
@@ -253,6 +265,7 @@ async def test_reasoning_template_kwargs_reach_engine_or_fail_before_submission(
             renderer=SimpleNamespace(process_for_engine=lambda prompt, **kwargs: prompt),
             vllm_config=SimpleNamespace(ec_transfer_config=None),
         ),
+        _structured_outputs_backend="auto",
         _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
             extra_args=None, logprobs=None, prompt_logprobs=None
         ),
@@ -271,3 +284,208 @@ async def test_reasoning_template_kwargs_reach_engine_or_fail_before_submission(
         assert len(seen) == 1
         expected = {"chat_template_kwargs": {"thinking_mode": mode}} if mode else None
         assert seen[0].get("reasoning_parser_kwargs") == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("first_token", "constrained", "engine_takes", "handed"),
+    [
+        (True, True, True, True),
+        (True, False, True, False),
+        (False, True, True, False),
+        (True, True, False, False),
+    ],
+)
+async def test_grammar_from_first_token_reaches_engine_as_reasoning_ended(
+    first_token, constrained, engine_takes, handed
+):
+    """A shaped grammar's start reaches an engine whose generate() takes it."""
+    params = pb.SamplingParams(grammar_from_first_token=first_token)
+    if constrained:
+        params.json_schema = "{}"
+    request = pb.GenerateRequest(
+        request_id="start-test",
+        tokenized=pb.TokenizedInput(input_ids=[1, 2]),
+        sampling_params=params,
+    )
+    seen = []
+
+    async def generate(*, reasoning_ended="unsaid", **kwargs):
+        """Record the switch an engine that names the keyword is handed."""
+        seen.append(reasoning_ended)
+        if False:
+            yield
+
+    async def older_generate(**kwargs):
+        """Record the switch an engine that does not name the keyword is handed."""
+        seen.append(kwargs.get("reasoning_ended", "unsaid"))
+        if False:
+            yield
+
+    async def abort(code, message):
+        """Make gRPC validation failures observable to the test."""
+        raise _Aborted(code, message)
+
+    handler = _generate()
+    engine = SimpleNamespace(
+        generate=generate if engine_takes else older_generate,
+        renderer=SimpleNamespace(process_for_engine=lambda prompt, **kwargs: prompt),
+        vllm_config=SimpleNamespace(ec_transfer_config=None),
+    )
+    servicer = SimpleNamespace(
+        engine=engine,
+        # The servicer's own read, the one its constructor makes once.
+        _takes_reasoning_ended=handler.__globals__["_takes_reasoning_ended"](engine),
+        _structured_outputs_backend="auto",
+        _sampling_params_from_proto=lambda *args, **kwargs: SimpleNamespace(
+            extra_args=None, logprobs=None, prompt_logprobs=None
+        ),
+        _tokenization_kwargs_from_proto=lambda _: {},
+        _loads=Mock(),
+        _notify_kv_transfer_rejected=AsyncMock(),
+    )
+    context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
+    assert [reply async for reply in handler(servicer, request, context)] == []
+    assert seen == [True if handed else "unsaid"]
+
+
+def _converter():
+    """Compile the actual sampling-params conversion over plain records in
+    place of the engine's parameter classes."""
+    path = Path(__file__).parents[1] / "smg_grpc_servicer/vllm/servicer.py"
+    function = next(
+        n
+        for n in ast.walk(ast.parse(path.read_text()))
+        if isinstance(n, ast.FunctionDef) and n.name == "_sampling_params_from_proto"
+    )
+    function.decorator_list = []
+    function.returns = None
+    for arg in function.args.args:
+        arg.annotation = None
+    namespace = {
+        **vars(constrained_decoding),
+        "SamplingParams": SimpleNamespace,
+        "StructuredOutputsParams": dict,
+        "RequestOutputKind": SimpleNamespace(DELTA="delta", FINAL_ONLY="final_only"),
+        "logger": logging.getLogger(__name__),
+        "_XGRAMMAR_VALIDATES": _xgrammar_validates,
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+    return namespace["_sampling_params_from_proto"]
+
+
+_SCHEMAS = {
+    "plain": '{"type":"object","properties":{"zeta":{"type":"string"},"alpha":{"type":"integer"}}}',
+    "lacked": '{"type":"array","items":{"type":"string"},"uniqueItems":true}',
+    "unconverted": '{"type":"string","pattern":"(?=a)a"}',
+}
+
+
+def _xgrammar_validates(request):
+    """In place of the engine's own validation of a request under xgrammar:
+    it raises for a schema with a feature xgrammar lacks and for one the
+    conversion fails on, each with an error of its own kind."""
+    schema = request.structured_outputs["json"]
+    if schema == _SCHEMAS["lacked"]:
+        raise ValueError("a feature xgrammar lacks")
+    if schema == _SCHEMAS["unconverted"]:
+        raise RuntimeError("the conversion failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend", "schema", "bound", "sent_as"),
+    [
+        ("guidance", "plain", "bound", "json"),
+        ("outlines", "plain", "bound", "json"),
+        ("lm-format-enforcer", "plain", "bound", "json"),
+        ("guidance", "lacked", "free", "json"),
+        ("xgrammar", "plain", "bound", "structural_tag"),
+        ("auto", "plain", "bound", "structural_tag"),
+        ("xgrammar", "lacked", "bound", "json"),
+        ("auto", "lacked", "bound", "json"),
+        ("xgrammar", "unconverted", "bound", "json"),
+        ("auto", "unconverted", "bound", "json"),
+        ("xgrammar", "lacked", "free", "structural_tag"),
+        ("auto", "lacked", "free", "structural_tag"),
+    ],
+)
+async def test_an_answer_tag_reaches_another_backend_as_its_schema(backend, schema, bound, sent_as):
+    """A structural tag is spelled for xgrammar: one that is a JSON answer's
+    schema alone reaches an engine started with another backend as that
+    schema, and stays a tag under xgrammar and the engine's default. There
+    the engine validates a plain schema alone: one with a feature xgrammar
+    lacks, or one it fails to convert, is refused under a pinned xgrammar
+    and falls back under the default, so such a schema goes as the schema
+    and is answered as before a tag carried the bound. A tag without the
+    bound is not asked of the engine: it stays the tag it was before."""
+    schema = _SCHEMAS[schema]
+    bound = ',"max_whitespace_cnt":32' if bound == "bound" else ""
+    tag = '{"format":{"type":"json_schema","json_schema":' + schema + bound + "}}"
+    request = pb.GenerateRequest(
+        request_id="tag-test",
+        tokenized=pb.TokenizedInput(input_ids=[1, 2]),
+        sampling_params=pb.SamplingParams(structural_tag=tag),
+    )
+    seen = []
+
+    async def generate(**kwargs):
+        """Record the constraint the engine is handed."""
+        seen.append(kwargs["sampling_params"].structured_outputs)
+        if False:
+            yield
+
+    async def abort(code, message):
+        """Make gRPC validation failures observable to the test."""
+        raise _Aborted(code, message)
+
+    handler = _generate()
+    engine = SimpleNamespace(
+        generate=generate,
+        renderer=SimpleNamespace(process_for_engine=lambda prompt, **kwargs: prompt),
+        vllm_config=SimpleNamespace(
+            ec_transfer_config=None,
+            structured_outputs_config=SimpleNamespace(backend=backend),
+        ),
+    )
+    servicer = SimpleNamespace(
+        engine=engine,
+        # The servicer's own read, the one its constructor makes once.
+        _structured_outputs_backend=handler.__globals__["_structured_outputs_backend"](engine),
+        _sampling_params_from_proto=_converter(),
+        _tokenization_kwargs_from_proto=lambda _: {},
+        _loads=Mock(),
+        _notify_kv_transfer_rejected=AsyncMock(),
+    )
+    context = SimpleNamespace(abort=abort, invocation_metadata=lambda: ())
+    assert [reply async for reply in handler(servicer, request, context)] == []
+    assert seen == [{sent_as: schema if sent_as == "json" else tag}]
+
+
+def test_an_engine_without_the_judge_gets_the_schema_for_an_answer_tag():
+    """An engine release that holds no judge of a schema keeps the reading it
+    had before a tag carried the bound: under xgrammar, pinned or the
+    engine's default, every tag that is a JSON answer's schema alone goes as
+    that schema; another backend is not this function's."""
+    schema = '{"type":"object"}'
+    tag = '{"format":{"type":"json_schema","json_schema":' + schema + ',"max_whitespace_cnt":32}}'
+    for backend in ("auto", "xgrammar"):
+        assert constrained_decoding.answer_schema_the_engine_judges(tag, backend, None) == schema
+    assert constrained_decoding.answer_schema_the_engine_judges(tag, "guidance", None) is None
+
+
+def test_the_judges_error_reaches_the_debug_log(caplog):
+    """An error of the judge reads as a refusal, of whatever kind, and the
+    schema goes as the schema; the debug log holds the error itself, so a
+    request the engine's validation no longer takes does not read as a schema
+    the engine refused."""
+    schema = '{"type":"object"}'
+    tag = '{"format":{"type":"json_schema","json_schema":' + schema + ',"max_whitespace_cnt":32}}'
+
+    def broken(_plain):
+        raise TypeError("an argument the request lacks")
+
+    with caplog.at_level(logging.DEBUG, logger=constrained_decoding.__name__):
+        judged = constrained_decoding.answer_schema_the_engine_judges(tag, "xgrammar", broken)
+    assert judged == schema
+    assert "TypeError('an argument the request lacks')" in caplog.text

@@ -6,6 +6,7 @@ use axum::{
     http::{HeaderMap, HeaderValue},
 };
 use http::header::HeaderName;
+use openai_protocol::messages::MessagesBetas;
 
 use crate::error::HEADER_X_SMG_ERROR_CODE;
 
@@ -13,7 +14,8 @@ static HEADER_TARGET_WORKER: HeaderName = HeaderName::from_static("x-smg-target-
 static HEADER_ROUTING_KEY: HeaderName = HeaderName::from_static("x-smg-routing-key");
 static HEADER_ROUTING_TOKENS: HeaderName = HeaderName::from_static("x-smg-routing-tokens");
 static HEADER_MCP: HeaderName = HeaderName::from_static("x-smg-mcp");
-static HEADER_ROUTED_WORKER_ID: HeaderName = HeaderName::from_static("x-smg-routed-worker-id");
+/// The response header [`insert_routed_worker_id`] stamps.
+pub static HEADER_ROUTED_WORKER_ID: HeaderName = HeaderName::from_static("x-smg-routed-worker-id");
 
 /// `x-smg-routing-tokens` hard caps: token id count and header-value bytes.
 pub const ROUTING_TOKENS_HINT_MAX_IDS: usize = 512;
@@ -64,16 +66,19 @@ pub fn extract_routing_key_hint(headers: Option<&HeaderMap>) -> Option<&str> {
     extract_routing_key_hint_named(headers, &HEADER_ROUTING_KEY)
 }
 
-/// Whether the request's `anthropic-beta` header names the beta `name`
-/// (its dated form, `name-YYYY-MM-DD`): the header may repeat, and each value
-/// may list several betas, comma separated.
+/// Whether the request's `anthropic-beta` header names the beta `name` in
+/// its dated form, `name-YYYY-MM-DD` (the reading of [`MessagesBetas`],
+/// without building the set): the header may repeat, and each value may list
+/// several betas, comma separated. A longer beta name that begins with
+/// `name` is another beta, not this one.
 pub fn anthropic_beta_named(headers: &HeaderMap, name: &str) -> bool {
-    headers
-        .get_all("anthropic-beta")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(|beta| beta.trim().starts_with(name))
+    MessagesBetas::values_name(
+        headers
+            .get_all("anthropic-beta")
+            .iter()
+            .filter_map(|value| value.to_str().ok()),
+        name,
+    )
 }
 
 /// Declared size of the incoming raw body; pre-sizes reserialization buffers.
@@ -126,15 +131,29 @@ pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {
 
 /// Convert headers from reqwest Response to axum HeaderMap.
 ///
-/// Filters out hop-by-hop and SMG-owned headers that must not be forwarded.
+/// Filters out hop-by-hop and SMG-owned headers that must not be forwarded, and
+/// the upstream's `server` header: the upstream's software and version are not the
+/// client's to read, and the gateway's own answers carry no `server` header. An
+/// answer that also carries `transfer-encoding` loses its `content-length`
+/// (RFC 9112, 6.3): the gateway's own framing describes the body it sends.
+/// The upstream's `access-control-*` fields stay behind as well: only the
+/// gateway's CORS layer writes them.
 pub fn preserve_response_headers(reqwest_headers: &HeaderMap) -> HeaderMap {
     let mut headers = HeaderMap::new();
+    // A message with both fields is framed by its transfer coding: the length
+    // it also carries is removed before the message goes on (RFC 9112, 6.3).
+    let framed_by_transfer_coding = reqwest_headers.contains_key(http::header::TRANSFER_ENCODING);
 
     for (name, value) in reqwest_headers {
+        if framed_by_transfer_coding && name == http::header::CONTENT_LENGTH {
+            continue;
+        }
         // Use case-insensitive checks to avoid string allocation.
         if should_forward_header_no_alloc(name.as_str()) {
-            // The original name and value are already valid, so we can just clone them
-            headers.insert(name.clone(), value.clone());
+            // One pair per value: a header the upstream sent more than once
+            // (`set-cookie`, `vary`, `link`, `www-authenticate`) keeps every
+            // value, in order. The name and value are already valid: a clone.
+            headers.append(name.clone(), value.clone());
         }
     }
 
@@ -165,9 +184,18 @@ pub fn is_smg_owned_error_code_header(name: &str) -> bool {
     name.eq_ignore_ascii_case(HEADER_X_SMG_ERROR_CODE)
 }
 
-/// Determine if a header should be forwarded without allocating (case-insensitive)
-fn should_forward_header_no_alloc(name: &str) -> bool {
-    // List of headers that should NOT be forwarded (hop-by-hop or SMG error-code).
+/// Whether an upstream response header crosses the relay (case-insensitive, no allocation).
+///
+/// Every HTTP relay reads this one list: `preserve_response_headers` for the buffered
+/// and the OpenAI-style streamed answers, `anthropic::sse::build_sse_response` for the
+/// Messages streamed ones.
+pub(crate) fn should_forward_header_no_alloc(name: &str) -> bool {
+    const ACCESS_CONTROL_PREFIX: &str = "access-control-";
+
+    // List of headers that should NOT be forwarded: hop-by-hop, the SMG error-code
+    // marker, the upstream's `server` header, which names the upstream's software
+    // and version to every client while the gateway's own answers carry none, and
+    // the `access-control-*` family, which only the gateway's CORS layer writes.
     !(name.eq_ignore_ascii_case("connection")
         || name.eq_ignore_ascii_case("keep-alive")
         || name.eq_ignore_ascii_case("proxy-authenticate")
@@ -178,6 +206,10 @@ fn should_forward_header_no_alloc(name: &str) -> bool {
         || name.eq_ignore_ascii_case("upgrade")
         || name.eq_ignore_ascii_case("content-encoding")
         || name.eq_ignore_ascii_case("host")
+        || name.eq_ignore_ascii_case("server")
+        || name
+            .get(..ACCESS_CONTROL_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(ACCESS_CONTROL_PREFIX))
         || is_smg_owned_error_code_header(name))
 }
 
@@ -403,6 +435,10 @@ pub fn extract_forwardable_request_headers(headers: Option<&HeaderMap>) -> HashM
     forwarded
 }
 
+/// Whether a worker is sent a request header of this name: the routers' one
+/// allow-list of request headers. The gateway's own request-id header,
+/// `x-smg-request-id`, never joins it: the gateway states its own id of a
+/// request to Grand Central under that name, and no worker is sent it.
 #[inline]
 pub fn should_forward_request_header(name: &str) -> bool {
     const REQUEST_ID_PREFIX: &str = "x-request-id-";
@@ -427,412 +463,5 @@ pub fn should_forward_request_header(name: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use rustls::crypto::ring;
-
-    use super::*;
-
-    /// The beta is found in a repeated header and in a comma-separated list,
-    /// by its undated name; another beta or no header is not it.
-    #[test]
-    fn anthropic_beta_named_reads_repeated_and_listed_values() {
-        let mut headers = HeaderMap::new();
-        assert!(!anthropic_beta_named(&headers, "message-threads"));
-        headers.append(
-            "anthropic-beta",
-            HeaderValue::from_static("interleaved-thinking-2025-05-14"),
-        );
-        assert!(!anthropic_beta_named(&headers, "message-threads"));
-        assert!(anthropic_beta_named(&headers, "interleaved-thinking"));
-        headers.append(
-            "anthropic-beta",
-            HeaderValue::from_static(
-                "fine-grained-tool-streaming-2025-05-14, message-threads-2026-08-12",
-            ),
-        );
-        assert!(anthropic_beta_named(&headers, "message-threads"));
-        assert!(anthropic_beta_named(
-            &headers,
-            "fine-grained-tool-streaming"
-        ));
-        assert!(!anthropic_beta_named(&headers, "threads"));
-    }
-
-    #[test]
-    fn preserve_response_headers_drops_smg_owned_error_code() {
-        let mut upstream = HeaderMap::new();
-        upstream.insert(HEADER_X_SMG_ERROR_CODE, HeaderValue::from_static("forged"));
-        upstream.insert("x-upstream-id", HeaderValue::from_static("worker-a"));
-
-        let forwarded = preserve_response_headers(&upstream);
-
-        assert!(forwarded.get(HEADER_X_SMG_ERROR_CODE).is_none());
-        assert_eq!(forwarded.get("x-upstream-id").unwrap(), "worker-a");
-        assert!(is_smg_owned_error_code_header("X-SMG-Error-Code"));
-    }
-
-    /// The tests' HTTP client, the process-level TLS crypto provider
-    /// installed first; the request builders under test come from it.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test binary's client factory; the process TLS crypto provider is installed first"
-    )]
-    fn client() -> reqwest::Client {
-        let _ = ring::default_provider().install_default();
-        reqwest::Client::new()
-    }
-
-    #[test]
-    fn apply_forwarded_request_headers_user_auth_wins_without_duplicate() {
-        let client = client();
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            http::header::AUTHORIZATION,
-            HeaderValue::from_static("Bearer user-token"),
-        );
-        headers.insert("x-request-id", HeaderValue::from_static("abc"));
-        headers.insert("x-not-allowlisted", HeaderValue::from_static("nope"));
-        let worker_key = "worker-key".to_string();
-
-        let req = apply_forwarded_request_headers(
-            client.get("http://example.invalid/"),
-            Some(&headers),
-            Some(&worker_key),
-        )
-        .build()
-        .unwrap();
-
-        let auths: Vec<_> = req
-            .headers()
-            .get_all(http::header::AUTHORIZATION)
-            .iter()
-            .collect();
-        assert_eq!(auths.len(), 1, "exactly one Authorization header");
-        assert_eq!(auths[0].to_str().unwrap(), "Bearer user-token");
-        assert!(req.headers().get("x-request-id").is_some());
-        assert!(
-            req.headers().get("x-not-allowlisted").is_none(),
-            "non-allowlisted headers must not be forwarded"
-        );
-    }
-
-    #[test]
-    fn apply_forwarded_request_headers_falls_back_to_worker_key() {
-        let client = client();
-        let headers = HeaderMap::new(); // caller sent no Authorization
-        let worker_key = "worker-key".to_string();
-
-        let req = apply_forwarded_request_headers(
-            client.get("http://example.invalid/"),
-            Some(&headers),
-            Some(&worker_key),
-        )
-        .build()
-        .unwrap();
-
-        let auths: Vec<_> = req
-            .headers()
-            .get_all(http::header::AUTHORIZATION)
-            .iter()
-            .collect();
-        assert_eq!(auths.len(), 1);
-        assert_eq!(auths[0].to_str().unwrap(), "Bearer worker-key");
-    }
-
-    #[test]
-    fn test_extract_header_value_returns_value() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-smg-routing-key", "test-key".parse().unwrap());
-        assert_eq!(extract_routing_key(Some(&headers)), Some("test-key"));
-    }
-
-    #[test]
-    fn test_extract_header_value_returns_none_for_missing() {
-        let headers = HeaderMap::new();
-        assert_eq!(extract_routing_key(Some(&headers)), None);
-    }
-
-    #[test]
-    fn test_extract_header_value_returns_none_for_empty() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-smg-routing-key", "".parse().unwrap());
-        assert_eq!(extract_routing_key(Some(&headers)), None);
-    }
-
-    #[test]
-    fn test_extract_header_value_returns_none_for_none_headers() {
-        assert_eq!(extract_routing_key(None), None);
-    }
-
-    #[test]
-    fn test_extract_target_worker() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-smg-target-worker", "2".parse().unwrap());
-        assert_eq!(extract_target_worker(Some(&headers)), Some("2"));
-    }
-
-    #[test]
-    fn test_extract_target_worker_missing() {
-        let headers = HeaderMap::new();
-        assert_eq!(extract_target_worker(Some(&headers)), None);
-    }
-
-    #[test]
-    fn test_should_forward_request_header_whitelist() {
-        assert!(should_forward_request_header("authorization"));
-        assert!(should_forward_request_header("Authorization"));
-        assert!(should_forward_request_header("AUTHORIZATION"));
-        assert!(should_forward_request_header("x-request-id"));
-        assert!(should_forward_request_header("X-Request-Id"));
-        assert!(should_forward_request_header("x-correlation-id"));
-        assert!(should_forward_request_header("X-Correlation-ID"));
-        assert!(should_forward_request_header("traceparent"));
-        assert!(should_forward_request_header("Traceparent"));
-        assert!(should_forward_request_header("tracestate"));
-        assert!(should_forward_request_header("Tracestate"));
-        assert!(should_forward_request_header("x-request-id-user"));
-        assert!(should_forward_request_header("X-Request-ID-Span"));
-        assert!(should_forward_request_header("x-request-id-123"));
-        assert!(should_forward_request_header("x-smg-routing-key"));
-        assert!(should_forward_request_header("X-SMG-Routing-Key"));
-        assert!(should_forward_request_header("anthropic-version"));
-        assert!(should_forward_request_header("Anthropic-Beta"));
-        assert!(should_forward_request_header("x-override-priority"));
-        assert!(should_forward_request_header("X-Override-Priority"));
-    }
-
-    #[test]
-    fn test_should_forward_request_header_blocked() {
-        assert!(!should_forward_request_header("content-type"));
-        assert!(!should_forward_request_header("Content-Type"));
-        assert!(!should_forward_request_header("content-length"));
-        assert!(!should_forward_request_header("host"));
-        assert!(!should_forward_request_header("Host"));
-        assert!(!should_forward_request_header("connection"));
-        assert!(!should_forward_request_header("transfer-encoding"));
-        assert!(!should_forward_request_header("accept"));
-        assert!(!should_forward_request_header("accept-encoding"));
-        assert!(!should_forward_request_header("user-agent"));
-        assert!(!should_forward_request_header("cookie"));
-        assert!(!should_forward_request_header("x-custom-header"));
-        assert!(!should_forward_request_header("x-api-key"));
-        // Of the engine's x-override-* headers only the priority is forwarded.
-        assert!(!should_forward_request_header("x-override-rid"));
-        assert!(!should_forward_request_header("x-override-bootstrap-host"));
-        assert!(!should_forward_request_header("x-override-bootstrap-port"));
-        assert!(!should_forward_request_header("x-override-bootstrap-room"));
-        assert!(!should_forward_request_header("x-override-routed-dp-rank"));
-        assert!(!should_forward_request_header(
-            "x-override-disagg-prefill-dp-rank"
-        ));
-        assert!(!should_forward_request_header("x-override-conversation-id"));
-    }
-
-    #[test]
-    fn test_extract_forwardable_request_headers_filters_to_allowlist() {
-        let mut headers = HeaderMap::new();
-        headers.insert("authorization", "Bearer abc".parse().unwrap());
-        headers.insert("x-request-id", "req-123".parse().unwrap());
-        headers.insert("x-custom-header", "blocked".parse().unwrap());
-
-        let forwarded = extract_forwardable_request_headers(Some(&headers));
-
-        assert_eq!(
-            forwarded.get("authorization"),
-            Some(&"Bearer abc".to_string())
-        );
-        assert_eq!(forwarded.get("x-request-id"), Some(&"req-123".to_string()));
-        assert!(!forwarded.contains_key("x-custom-header"));
-    }
-
-    #[test]
-    fn test_extract_forwardable_request_headers_preserves_repeated_values() {
-        let mut headers = HeaderMap::new();
-        headers.append("tracestate", "vendor1=value1".parse().unwrap());
-        headers.append("tracestate", "vendor2=value2".parse().unwrap());
-
-        let forwarded = extract_forwardable_request_headers(Some(&headers));
-
-        assert_eq!(
-            forwarded.get("tracestate"),
-            Some(&"vendor1=value1, vendor2=value2".to_string())
-        );
-    }
-
-    #[test]
-    fn test_extract_auth_header_falls_back_with_non_auth_headers_present() {
-        let mut headers = HeaderMap::new();
-        headers.insert("openai-project", "project-123".parse().unwrap());
-
-        let auth = extract_auth_header(Some(&headers), Some(&"worker-secret".to_string()));
-
-        assert_eq!(auth.unwrap(), "Bearer worker-secret");
-    }
-
-    #[test]
-    fn test_provider_extract_auth_header_prefers_anthropic_key() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-api-key", "anthropic-key".parse().unwrap());
-
-        let auth = ApiProvider::Anthropic.extract_auth_header(Some(&headers), None);
-
-        assert_eq!(auth.unwrap(), "anthropic-key");
-    }
-
-    fn tokens_hint_headers(value: &str) -> HeaderMap {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-smg-routing-tokens", value.parse().unwrap());
-        headers
-    }
-
-    #[test]
-    fn test_parse_routing_tokens_hint_valid() {
-        let headers = tokens_hint_headers("1,2,3");
-        assert_eq!(
-            parse_routing_tokens_hint(Some(&headers)),
-            Some(vec![1, 2, 3])
-        );
-
-        let headers = tokens_hint_headers("42");
-        assert_eq!(parse_routing_tokens_hint(Some(&headers)), Some(vec![42]));
-
-        let headers = tokens_hint_headers(&format!("0,{}", u32::MAX));
-        assert_eq!(
-            parse_routing_tokens_hint(Some(&headers)),
-            Some(vec![0, u32::MAX])
-        );
-    }
-
-    #[test]
-    fn test_parse_routing_tokens_hint_exactly_max_ids() {
-        let value = vec!["7"; ROUTING_TOKENS_HINT_MAX_IDS].join(",");
-        let headers = tokens_hint_headers(&value);
-        let parsed = parse_routing_tokens_hint(Some(&headers)).unwrap();
-        assert_eq!(parsed.len(), ROUTING_TOKENS_HINT_MAX_IDS);
-    }
-
-    #[test]
-    fn test_parse_routing_tokens_hint_rejects_over_id_cap() {
-        let value = vec!["7"; ROUTING_TOKENS_HINT_MAX_IDS + 1].join(",");
-        let headers = tokens_hint_headers(&value);
-        assert_eq!(parse_routing_tokens_hint(Some(&headers)), None);
-    }
-
-    #[test]
-    fn test_parse_routing_tokens_hint_rejects_over_byte_cap() {
-        // 512 ids of 9 digits each stay under the id cap but exceed 4096 bytes.
-        let value = vec!["123456789"; ROUTING_TOKENS_HINT_MAX_IDS].join(",");
-        assert!(value.len() > ROUTING_TOKENS_HINT_MAX_BYTES);
-        let headers = tokens_hint_headers(&value);
-        assert_eq!(parse_routing_tokens_hint(Some(&headers)), None);
-    }
-
-    #[test]
-    fn test_parse_routing_tokens_hint_rejects_malformed() {
-        for value in [
-            "",
-            ",",
-            "1,,3",
-            "1,2,",
-            ",1",
-            "a",
-            "1,x,3",
-            "-1",
-            "+1",
-            "1, 2",
-            " 1",
-            "1.5",
-            "0x10",
-            "4294967296", // u32::MAX + 1
-            "999999999999999999999",
-        ] {
-            let headers = tokens_hint_headers(value);
-            assert_eq!(
-                parse_routing_tokens_hint(Some(&headers)),
-                None,
-                "value {value:?} must be ignored"
-            );
-        }
-    }
-
-    #[test]
-    fn test_parse_routing_tokens_hint_rejects_non_utf8() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-smg-routing-tokens",
-            HeaderValue::from_bytes(&[0xff, 0xfe]).unwrap(),
-        );
-        assert_eq!(parse_routing_tokens_hint(Some(&headers)), None);
-    }
-
-    #[test]
-    fn test_parse_routing_tokens_hint_missing() {
-        assert_eq!(parse_routing_tokens_hint(None), None);
-        let headers = HeaderMap::new();
-        assert_eq!(parse_routing_tokens_hint(Some(&headers)), None);
-    }
-
-    #[test]
-    fn test_extract_routing_key_hint_valid() {
-        let mut headers = HeaderMap::new();
-        headers.insert("x-smg-routing-key", "session-abc".parse().unwrap());
-        assert_eq!(
-            extract_routing_key_hint(Some(&headers)),
-            Some("session-abc")
-        );
-
-        let max_key = "k".repeat(ROUTING_KEY_HINT_MAX_BYTES);
-        let mut headers = HeaderMap::new();
-        headers.insert("x-smg-routing-key", max_key.parse().unwrap());
-        assert_eq!(
-            extract_routing_key_hint(Some(&headers)),
-            Some(max_key.as_str())
-        );
-    }
-
-    #[test]
-    fn test_extract_routing_key_hint_accepts_non_ascii_utf8() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-smg-routing-key",
-            HeaderValue::from_bytes("clé-café".as_bytes()).unwrap(),
-        );
-        assert_eq!(extract_routing_key_hint(Some(&headers)), Some("clé-café"));
-    }
-
-    #[test]
-    fn test_extract_routing_key_hint_named_reads_configured_header() {
-        let name = HeaderName::from_static("x-routing-key");
-        let mut headers = HeaderMap::new();
-        headers.insert("x-routing-key", "session-abc".parse().unwrap());
-        assert_eq!(
-            extract_routing_key_hint_named(Some(&headers), &name),
-            Some("session-abc")
-        );
-        // The default extractor stays bound to x-smg-routing-key.
-        assert_eq!(extract_routing_key_hint(Some(&headers)), None);
-    }
-
-    #[test]
-    fn test_extract_routing_key_hint_rejects_over_cap_empty_and_non_utf8() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-smg-routing-key",
-            "k".repeat(ROUTING_KEY_HINT_MAX_BYTES + 1).parse().unwrap(),
-        );
-        assert_eq!(extract_routing_key_hint(Some(&headers)), None);
-
-        let mut headers = HeaderMap::new();
-        headers.insert("x-smg-routing-key", "".parse().unwrap());
-        assert_eq!(extract_routing_key_hint(Some(&headers)), None);
-
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            "x-smg-routing-key",
-            HeaderValue::from_bytes(&[0xc3, 0x28]).unwrap(),
-        );
-        assert_eq!(extract_routing_key_hint(Some(&headers)), None);
-
-        assert_eq!(extract_routing_key_hint(None), None);
-    }
-}
+#[path = "../tests/unit/header_utils/tests.rs"]
+mod tests;

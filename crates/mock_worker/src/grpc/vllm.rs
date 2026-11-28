@@ -13,6 +13,7 @@
 use std::pin::Pin;
 
 use futures::{Stream, StreamExt};
+use prost::Message;
 use serde_json::{json, Value};
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
 use tonic::{Request, Response, Status};
@@ -21,13 +22,104 @@ use vllm::{
     vllm_engine_server::{VllmEngine, VllmEngineServer},
 };
 
-use super::{Frame, GenerateInput, LogProbs, MockScheduler, Rendezvous, TokenizerStream};
+use super::{
+    constraint, media_id, media_identity, Frame, GenerateInput, LogProbs, MediaSpan, MockScheduler,
+    Rendezvous, Shaping, TokenizerStream,
+};
 use crate::{
     config::{Config, Role},
     drain::InFlight,
     engine::KvEventStream,
-    script::MatchedStop,
+    replay::f32_json,
+    script::{self, MatchedStop},
 };
+
+/// The gRPC paths of this wire's two info calls, as a recorder writes them
+/// beside a record file ([`script::recorded_info`]).
+const MODEL_INFO_CALL: &str = "/vllm.grpc.engine.VllmEngine/GetModelInfo";
+const SERVER_INFO_CALL: &str = "/vllm.grpc.engine.VllmEngine/GetServerInfo";
+
+/// The model of a record file made on this wire ([`super::recorded_model`]).
+pub(super) fn recorded_model() -> Option<super::RecordedModel> {
+    let recorded = script::recorded_info(MODEL_INFO_CALL)?;
+    let info = vllm::GetModelInfoResponse::decode(recorded.as_slice()).ok()?;
+    Some(super::RecordedModel {
+        max_context_length: i32::try_from(info.max_context_length).unwrap_or(i32::MAX),
+        max_req_input_len: info.max_req_input_len,
+        vocab_size: i32::try_from(info.vocab_size).unwrap_or(i32::MAX),
+        supports_vision: info.supports_vision,
+        model_type: info.model_type,
+        architectures: info.architectures,
+        eos_token_ids: info.eos_token_ids,
+        pad_token_id: info.pad_token_id,
+        bos_token_id: info.bos_token_id,
+        default_sampling_params_json: info.default_sampling_params_json,
+    })
+}
+
+/// What a `Generate` request asks beyond its prompt, under the names every
+/// wire's recorded lines use (`recorded.asked`): the recorder writes it and a
+/// replay keys on it ([`script::ask_fold`]). A media item reads as its
+/// content hash, a batch that states no hash as the one item with no hash
+/// it counts for, at its place, and a media reference as the fold of its
+/// modality and URL whatever its length ([`media_id`]): a reference can carry
+/// a credential, and a record file keeps what this returns.
+pub(super) fn asked(request: &vllm::GenerateRequest) -> Value {
+    use vllm::sampling_params::Constraint;
+    let batches = || request.mm_inputs.iter().chain(&request.extra_mm_inputs);
+    let references = || request.media_refs.iter().flat_map(|refs| &refs.items);
+    let media: Vec<String> = batches()
+        .flat_map(|batch| {
+            let unstated = batch.mm_hashes.is_empty().then(|| media_id("", &[]));
+            let stated = batch.mm_hashes.iter().map(|hash| media_id(hash, &[]));
+            stated.chain(unstated)
+        })
+        .chain(
+            references()
+                .map(|item| media_id("", format!("{}\n{}", item.modality, item.url).as_bytes())),
+        )
+        .collect();
+    let unset = vllm::SamplingParams::default();
+    let params = request.sampling_params.as_ref().unwrap_or(&unset);
+    let shaping = Shaping {
+        min_p: params.min_p,
+        frequency_penalty: params.frequency_penalty,
+        presence_penalty: params.presence_penalty,
+        repetition_penalty: params.repetition_penalty,
+        min_new_tokens: params.min_tokens,
+        ignore_eos: params.ignore_eos,
+        no_stop_trim: params.include_stop_str_in_output,
+        logit_bias: (params.logit_bias.iter())
+            .map(|(token, bias)| (token.to_string(), *bias))
+            .collect(),
+        score_ids: &[],
+    };
+    shaping.join(json!({
+        "stream": request.stream,
+        "max_new_tokens": params.max_tokens,
+        "n": params.n,
+        "temperature": params.temperature.map(f32_json),
+        "top_p": f32_json(params.top_p),
+        "top_k": params.top_k,
+        "seed": params.seed,
+        "stop": params.stop,
+        "stop_token_ids": params.stop_token_ids,
+        "logprobs": params.logprobs,
+        // An item for each hash a batch states, as the other two wires
+        // count the same items, and one for a batch that states none.
+        "media": batches().map(|batch| batch.mm_hashes.len().max(1)).sum::<usize>()
+            + references().count(),
+        "media_ids": media,
+        "constraint": params.constraint.as_ref().map(|c| match c {
+            Constraint::JsonSchema(v) => constraint("json_schema", v.as_str()),
+            Constraint::Regex(v) => constraint("regex", v.as_str()),
+            Constraint::Grammar(v) => constraint("ebnf_grammar", v.as_str()),
+            Constraint::StructuralTag(v) => constraint("structural_tag", v.as_str()),
+            Constraint::JsonObject(v) => constraint("json_object", *v),
+            Constraint::Choice(v) => constraint("choice", v.choices.clone()),
+        }),
+    }))
+}
 
 pub(super) type Server = VllmEngineServer<MockScheduler>;
 type GenStream = Pin<Box<dyn Stream<Item = Result<vllm::GenerateResponse, Status>> + Send>>;
@@ -63,6 +155,7 @@ impl VllmEngine for MockScheduler {
         request: Request<vllm::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let mut req = request.into_inner();
+        let ask = script::recorded().then(|| script::ask_fold(&asked(&req)));
         // An encode worker answers the encoder's completion alone: nothing
         // reaches the core and no script is read, but the realistic engine's
         // fault and admission hooks apply as to the prefill role, and the
@@ -88,6 +181,40 @@ impl VllmEngine for MockScheduler {
                 Box::pin(in_flight.until_done(futures::stream::once(async move { Ok(complete) })));
             return Ok(Response::new(stream));
         }
+        // One road for a request's media, chosen as the engine's servicer
+        // chooses it. Where a batch carries tensors (pixels, or the grid
+        // tensors the decode side of a pair keeps), the i-th hash of each
+        // such batch keys the batch's i-th placeholder span, the tokens of
+        // the batch's image token id alone where it names one, and a batch
+        // without tensors keys nothing.
+        let batches = || req.mm_inputs.iter().chain(&req.extra_mm_inputs);
+        let tensors = |batch: &&vllm::MultimodalInputs| {
+            batch.pixel_values.is_some() || !batch.model_specific_tensors.is_empty()
+        };
+        let mut media: Vec<MediaSpan> = batches()
+            .filter(tensors)
+            .flat_map(|batch| {
+                let spans = batch.mm_hashes.iter().zip(&batch.mm_placeholders);
+                spans.map(|(hash, span)| MediaSpan {
+                    identity: media_identity(hash.as_bytes()),
+                    offset: span.offset,
+                    length: span.length,
+                    slot: batch.im_token_id,
+                })
+            })
+            .collect();
+        // Where no batch carries tensors, as on the decode side of a pair
+        // that holds the language model alone, every batch's hashes, in
+        // order, salt the prompt as a whole, folded with its first token
+        // into the key of that token.
+        let salt = if batches().any(|batch| tensors(&batch)) {
+            String::new()
+        } else {
+            batches()
+                .flat_map(|batch| batch.mm_hashes.iter().map(String::as_str))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         let (prompt_ids, rendered) = match req.input {
             Some(vllm::generate_request::Input::Tokenized(tokenized)) => {
                 (tokenized.input_ids, tokenized.original_text)
@@ -101,6 +228,14 @@ impl VllmEngine for MockScheduler {
             }
             None => (Vec::new(), String::new()),
         };
+        if let Some(first) = prompt_ids.first().filter(|_| !salt.is_empty()) {
+            media.push(MediaSpan {
+                identity: media_identity(format!("{first}:{salt}").as_bytes()),
+                offset: 0,
+                length: 1,
+                slot: None,
+            });
+        }
         let params = req.sampling_params.unwrap_or_default();
         // The pair's rendezvous on this wire is the connector's parameters,
         // opaque to the mock: present in either form, or absent. A typed
@@ -120,7 +255,7 @@ impl VllmEngine for MockScheduler {
                 Some(params) => Rendezvous::Emptied {
                     field: "kv_transfer_params",
                     host: params.remote_host,
-                    port: i32::try_from(params.remote_port).unwrap_or(i32::MAX),
+                    port: params.remote_port,
                 },
                 None => Rendezvous::None,
             }
@@ -140,6 +275,8 @@ impl VllmEngine for MockScheduler {
                 score_ids: Vec::new(),
                 pin: req.data_parallel_rank,
                 rendezvous,
+                media: Box::new(move || media),
+                ask,
             })
             .await?;
         Ok(Response::new(Box::pin(
@@ -147,11 +284,24 @@ impl VllmEngine for MockScheduler {
         )))
     }
 
+    /// One vector per request, deterministic from the input's ids
+    /// ([`super::embedding_of`]); the prompt tokens are the ids' count.
     async fn embed(
         &self,
-        _request: Request<vllm::EmbedRequest>,
+        request: Request<vllm::EmbedRequest>,
     ) -> Result<Response<vllm::EmbedResponse>, Status> {
-        Err(Status::unimplemented("mock-worker"))
+        let request = request.into_inner();
+        let input_ids = request
+            .tokenized
+            .as_ref()
+            .map(|tokenized| tokenized.input_ids.as_slice())
+            .unwrap_or(&[]);
+        let embedding = super::embedding_of(input_ids);
+        Ok(Response::new(vllm::EmbedResponse {
+            embedding_dim: embedding.len() as u32,
+            embedding,
+            prompt_tokens: input_ids.len() as u32,
+        }))
     }
 
     async fn health_check(
@@ -203,7 +353,18 @@ impl VllmEngine for MockScheduler {
         _request: Request<vllm::GetModelInfoRequest>,
     ) -> Result<Response<vllm::GetModelInfoResponse>, Status> {
         self.overrides.model_info().refusal("model info")?;
-        Ok(Response::new(vllm::GetModelInfoResponse {
+        // A replay of a record file made on this wire answers what the
+        // recorded engine did; a tokenizer stated on the command line is the
+        // one of this host, so its path goes in place of the engine's own.
+        if let Some(recorded) = script::recorded_info(MODEL_INFO_CALL) {
+            let mut info = vllm::GetModelInfoResponse::decode(recorded.as_slice())
+                .map_err(|e| Status::internal(format!("the recorded model info: {e}")))?;
+            if super::own_tokenizer(&self.cfg) {
+                info.tokenizer_path.clone_from(&self.cfg.tokenizer_path);
+            }
+            return Ok(Response::new(info));
+        }
+        let mut info = vllm::GetModelInfoResponse {
             model_path: self.cfg.model_id.clone(),
             is_generation: true,
             max_context_length: self.cfg.context_length,
@@ -216,7 +377,7 @@ impl VllmEngine for MockScheduler {
             supports_vision: self
                 .overrides
                 .info_bool("supports_vision")
-                .unwrap_or(self.cfg.role == Some(Role::Encode)),
+                .unwrap_or_else(|| self.cfg.role == Some(Role::Encode)),
             served_model_name: self.cfg.model_id.clone(),
             tokenizer_path: self.cfg.tokenizer_path.clone(),
             model_type: "mock".to_string(),
@@ -226,7 +387,20 @@ impl VllmEngine for MockScheduler {
             bos_token_id: 1,
             max_req_input_len: self.cfg.context_length.min(i32::MAX as u32) as i32,
             default_sampling_params_json: self.cfg.default_sampling_params_json.clone(),
-        }))
+        };
+        if let Some(model) = super::recorded_model() {
+            info.max_context_length = u32::try_from(model.max_context_length).unwrap_or(0);
+            info.max_req_input_len = model.max_req_input_len;
+            info.vocab_size = u32::try_from(model.vocab_size).unwrap_or(0);
+            info.supports_vision = model.supports_vision;
+            info.model_type = model.model_type;
+            info.architectures = model.architectures;
+            info.eos_token_ids = model.eos_token_ids;
+            info.pad_token_id = model.pad_token_id;
+            info.bos_token_id = model.bos_token_id;
+            info.default_sampling_params_json = model.default_sampling_params_json;
+        }
+        Ok(Response::new(info))
     }
 
     async fn get_server_info(
@@ -234,6 +408,11 @@ impl VllmEngine for MockScheduler {
         _request: Request<vllm::GetServerInfoRequest>,
     ) -> Result<Response<vllm::GetServerInfoResponse>, Status> {
         self.overrides.server_info().refusal("server info")?;
+        if let Some(recorded) = script::recorded_info(SERVER_INFO_CALL) {
+            return vllm::GetServerInfoResponse::decode(recorded.as_slice())
+                .map(Response::new)
+                .map_err(|e| Status::internal(format!("the recorded server info: {e}")));
+        }
         let mut info = vllm::GetServerInfoResponse {
             server_type: SERVER_TYPE.to_string(),
             data_parallel_size: i32::try_from(self.dp_size()).unwrap_or(i32::MAX),
@@ -292,7 +471,7 @@ impl VllmEngine for MockScheduler {
         request: Request<vllm::GetLoadsRequest>,
     ) -> Result<Response<vllm::GetLoadsResponse>, Status> {
         let loads: Vec<vllm::SchedulerLoad> = self
-            .load_rows(request.into_inner().dp_rank)
+            .load_rows(request.into_inner().dp_rank)?
             .into_iter()
             .map(|(dp_rank, s)| vllm::SchedulerLoad {
                 dp_rank,
@@ -308,6 +487,7 @@ impl VllmEngine for MockScheduler {
                 utilization: s.token_usage,
                 max_running_requests: s.max_running_requests,
                 num_waiting_uncached_tokens: s.num_waiting_uncached_tokens,
+                values: self.load_values(dp_rank),
             })
             .collect();
         Ok(Response::new(vllm::GetLoadsResponse {
@@ -696,7 +876,7 @@ mod tests {
         assert_eq!(frames.len(), 4, "three chunks and the completion");
         let chunk = match &frames[1] {
             GenResp::Chunk(chunk) => chunk,
-            other => panic!("not a chunk: {other:?}"),
+            other @ GenResp::Complete(_) => panic!("not a chunk: {other:?}"),
         };
         assert_eq!(chunk.token_ids, vec![8]);
         assert_eq!((chunk.prompt_tokens, chunk.completion_tokens), (4, 2));
@@ -735,7 +915,7 @@ mod tests {
                     3
                 );
             }
-            other => panic!("not a completion: {other:?}"),
+            other @ GenResp::Chunk(_) => panic!("not a completion: {other:?}"),
         }
     }
 
@@ -762,7 +942,9 @@ mod tests {
             .iter()
             .map(|frame| match frame {
                 GenResp::Complete(complete) => (complete.index, complete.output_ids.clone()),
-                other => panic!("a non-streaming request reads completions only: {other:?}"),
+                other @ GenResp::Chunk(_) => {
+                    panic!("a non-streaming request reads completions only: {other:?}")
+                }
             })
             .collect();
         assert_eq!(completions, vec![(0, vec![11]), (1, vec![12, 13])]);
@@ -918,11 +1100,11 @@ mod tests {
         }
     }
 
-    /// A typed pair that names no host or port is refused as that pair, not
-    /// as a missing `kv_transfer_params_json`: the legacy connector path sends
-    /// the typed pair, so an unresolved bootstrap host there reads under its
-    /// own field. The prefill side takes it, as it takes a request without
-    /// the parameters.
+    /// A typed pair that names no host or no port is refused as that pair,
+    /// not as a missing `kv_transfer_params_json`: the legacy connector path
+    /// sends the typed pair, so an unresolved bootstrap host there reads under
+    /// its own field, with the port as the wire carried it. The prefill side
+    /// takes it, as it takes a request without the parameters.
     #[tokio::test]
     async fn an_emptied_typed_pair_is_refused_under_its_own_field() {
         let (decode, _stop) = MockScheduler::for_tests(
@@ -962,6 +1144,22 @@ mod tests {
             .expect("no port, not a stream");
         assert!(
             refused.message().contains("host \"10.0.0.9\", port 0"),
+            "{refused:?}"
+        );
+        // The other half of the guard, with a port the wire's uint32 carries
+        // and an i32 would not: the refusal names it whole.
+        let mut no_host = request("vw-e4", &[1, 2, 3], false);
+        no_host.kv_transfer_params = Some(vllm::KvTransferParams {
+            remote_host: String::new(),
+            remote_port: 3_000_000_000,
+        });
+        let refused = decode
+            .generate(Request::new(no_host))
+            .await
+            .err()
+            .expect("no host, not a stream");
+        assert!(
+            refused.message().contains("host \"\", port 3000000000"),
             "{refused:?}"
         );
         let (prefill, _stop) = MockScheduler::for_tests(
@@ -1402,5 +1600,219 @@ mod tests {
             .await
             .expect_err("a service the worker does not serve");
         assert_eq!(unknown.code(), Code::NotFound);
+    }
+
+    /// A regular worker started with `--supports-vision true` reports it, and
+    /// the realistic engine keys a media item's tokens by the item's hash:
+    /// the same item is served from the cache, another item under the same
+    /// placeholder id parts the prompt at the item's first token.
+    #[tokio::test]
+    async fn a_media_items_tokens_are_cached_by_the_item() {
+        let (service, _stop) = MockScheduler::for_tests(
+            Config {
+                grpc_wire: SchedulerWire::Vllm,
+                supports_vision: Some(true),
+                realistic: true,
+                engine: engine::EngineParams {
+                    timing: engine::TimingModel::linear(),
+                    ..Default::default()
+                },
+                ..Config::default()
+            },
+            65_261,
+        );
+        let info = service
+            .get_model_info(Request::new(vllm::GetModelInfoRequest {}))
+            .await
+            .expect("model info")
+            .into_inner();
+        assert!(info.supports_vision, "the start flag's answer");
+        // A block of text, two blocks under the image token id, text again.
+        let ids: Vec<u32> = (100..116).chain([9; 32]).chain(200..219).collect();
+        let mut events = service
+            .subscribe_kv_events(Request::new(common::SubscribeKvEventsRequest::default()))
+            .await
+            .expect("subscribed")
+            .into_inner();
+        // A batch as a request carries it: its hashes, its spans, the image
+        // token id it names and whether it carries pixels.
+        let batch = |hashes: &[&str], spans: &[(u32, u32)], slot, pixels: bool| {
+            let span = |&(offset, length)| vllm::PlaceholderRange { offset, length };
+            vllm::MultimodalInputs {
+                im_token_id: slot,
+                mm_hashes: hashes.iter().map(ToString::to_string).collect(),
+                mm_placeholders: spans.iter().map(span).collect(),
+                pixel_values: pixels.then(vllm::TensorData::default),
+                ..Default::default()
+            }
+        };
+        let image = [(16, 32)];
+        let mut cached = Vec::new();
+        // A request's batches and one token it sends by its place: 9 at 16 is
+        // the prompt as it stands. "b2" names the span twice: the hash that
+        // comes first keys it, so it is the prompt of "b". "m7" and "m8" name
+        // the image token id and send a marker first under the span, which
+        // stays as sent: the image of "b" behind another marker parts there.
+        // "o-p" and "o-q" name that marker's id for a second item over the
+        // first one's span: the marker is the second item's, and another
+        // such item parts the prompt there. "b-c" ends an item of no named
+        // id halfway under an item of "c" that names the image token id: the
+        // first keeps its tokens and the rest are the second's, the prompt
+        // of "b" for one block more. "a-x" carries a batch of hashes
+        // alone beside the pixels of "a": it keys nothing. The last five
+        // carry no tensor, as the decode side of a pair does: the hashes
+        // salt the whole prompt whether or not a span is named, and the last
+        // of them, under the hashes of "d-a1", differs from it in the first
+        // token alone.
+        for (id, at, token, batches) in [
+            (
+                "vw-media-a1",
+                16,
+                9,
+                vec![batch(&["a"], &image, None, true)],
+            ),
+            (
+                "vw-media-a2",
+                16,
+                9,
+                vec![batch(&["a"], &image, None, true)],
+            ),
+            ("vw-media-b", 16, 9, vec![batch(&["b"], &image, None, true)]),
+            (
+                "vw-media-b2",
+                16,
+                9,
+                vec![batch(&["b", "c"], &[(16, 32), (16, 32)], None, true)],
+            ),
+            (
+                "vw-media-m7",
+                16,
+                7,
+                vec![batch(&["b"], &image, Some(9), true)],
+            ),
+            (
+                "vw-media-m8",
+                16,
+                8,
+                vec![batch(&["b"], &image, Some(9), true)],
+            ),
+            (
+                "vw-media-o-p",
+                16,
+                7,
+                vec![
+                    batch(&["b"], &image, Some(9), true),
+                    batch(&["p"], &[(16, 1)], Some(7), true),
+                ],
+            ),
+            (
+                "vw-media-o-q",
+                16,
+                7,
+                vec![
+                    batch(&["b"], &image, Some(9), true),
+                    batch(&["q"], &[(16, 1)], Some(7), true),
+                ],
+            ),
+            (
+                "vw-media-b-c",
+                16,
+                9,
+                vec![
+                    batch(&["b"], &[(16, 16)], None, true),
+                    batch(&["c"], &image, Some(9), true),
+                ],
+            ),
+            (
+                "vw-media-a-x",
+                16,
+                9,
+                vec![
+                    batch(&["a"], &image, None, true),
+                    batch(&["x"], &[], None, false),
+                ],
+            ),
+            (
+                "vw-media-d-a1",
+                16,
+                9,
+                vec![batch(&["a"], &[], None, false)],
+            ),
+            (
+                "vw-media-d-a2",
+                16,
+                9,
+                vec![batch(&["a"], &[], None, false)],
+            ),
+            (
+                "vw-media-d-b1",
+                16,
+                9,
+                vec![batch(&["b"], &image, None, false)],
+            ),
+            (
+                "vw-media-d-b2",
+                16,
+                9,
+                vec![batch(&["b"], &[], None, false)],
+            ),
+            (
+                "vw-media-d-a3",
+                0,
+                99,
+                vec![batch(&["a"], &[], None, false)],
+            ),
+        ] {
+            let mut ids = ids.clone();
+            ids[at] = token;
+            let mut req = request(id, &ids, false);
+            let mut batches = batches.into_iter();
+            req.mm_inputs = batches.next();
+            req.extra_mm_inputs = batches.collect();
+            read_frames(&service, req).await;
+            cached.push(
+                engine::records_since(0, usize::MAX)
+                    .into_iter()
+                    .find(|record| record.request_id == id)
+                    .map(|record| record.cached_tokens),
+            );
+        }
+        let expected = [0, 64, 16, 64, 16, 16, 16, 16, 32, 64, 0, 64, 0, 64, 0].map(Some);
+        assert_eq!(cached, expected);
+        // The item is in a block's key alone: the stored-block events keep
+        // the ids as sent, as the gateway's index hashes a request's. The
+        // first request's second block is the image token id sixteen times.
+        let stored = loop {
+            let batch = events.next().await.expect("an item").expect("a batch");
+            let stored = batch.events.into_iter().find_map(|event| match event.data {
+                Some(common::kv_cache_event::Data::Stored(stored)) => Some(stored),
+                _ => None,
+            });
+            if let Some(stored) = stored {
+                break stored;
+            }
+        };
+        assert_eq!(stored.blocks[1].token_ids, [9; 16]);
+    }
+
+    #[test]
+    fn a_media_reference_keys_on_its_modality_and_its_url() {
+        let asked_with = |modality: common::Modality, url: &str| {
+            let mut req = request("r", &[1, 2, 3], false);
+            req.media_refs = Some(vllm::MediaRefs {
+                items: vec![vllm::MediaRef {
+                    modality: modality as i32,
+                    url: url.to_string(),
+                }],
+            });
+            asked(&req)
+        };
+        let image = asked_with(common::Modality::Image, "http://a/1");
+        assert_eq!(image, asked_with(common::Modality::Image, "http://a/1"));
+        assert_ne!(image, asked_with(common::Modality::Image, "http://a/2"));
+        // The same URL under another modality asks another answer.
+        assert_ne!(image, asked_with(common::Modality::Video, "http://a/1"));
+        // A record file keeps the fold of a reference, never its URL.
+        assert!(!image.to_string().contains("http://"), "{image}");
     }
 }

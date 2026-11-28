@@ -29,8 +29,12 @@ use crate::{
     fanout::fan_out_n,
     pin_yield::PinYieldNote,
     sglang_encode::EncodeMediaRefs,
-    stream::{map_slim_output, matched_stop_of, poll_mapped, MappedGenerateStream, StreamState},
-    structured_outputs::ConstraintRef,
+    sglang_v41_items::PerImageItems,
+    stream::{
+        finish, map_slim_output, matched_stop_of, poll_mapped, FinishParts, MappedGenerateStream,
+        StreamState,
+    },
+    structured_outputs::{ConstraintRef, StructuredOutputsSupport},
 };
 
 /// Streaming generate output for one SGLang sub-request, mapping each
@@ -66,6 +70,8 @@ pub struct SglangGenerateStream {
     /// the tick's rows, the completion the whole list with absolute positions.
     hidden_states: Vec<Vec<f32>>,
     hidden_states_sent: usize,
+    /// A transport error is not an acknowledgement that native resources exited.
+    native_terminal_received: bool,
 }
 
 impl SglangGenerateStream {
@@ -81,6 +87,7 @@ impl SglangGenerateStream {
             selected_logprobs_delta: Vec::new(),
             hidden_states: Vec::new(),
             hidden_states_sent: 0,
+            native_terminal_received: false,
         }
     }
 
@@ -103,6 +110,11 @@ impl SglangGenerateStream {
     /// engine whose identity names no index.
     pub fn engine_index(&self) -> Option<u32> {
         self.inner.engine_index()
+    }
+
+    /// True only after a terminal scheduler output, including an acknowledged abort.
+    pub fn native_terminal_received(&self) -> bool {
+        self.native_terminal_received
     }
 
     /// Convert a stream item without discarding the SGLang-only rows: the
@@ -148,39 +160,20 @@ impl SglangGenerateStream {
         }
         response
     }
+}
 
-    /// Whether the engine already finished this choice and its terminal
-    /// `Complete` is parked behind the chunk just yielded (the finish tick
-    /// carried new tokens).
-    pub fn has_parked_complete(&self) -> bool {
-        self.pending.is_some()
+impl finish::Parts for SglangGenerateStream {
+    fn parked(&self) -> Option<&vllm::GenerateResponse> {
+        self.pending.as_ref()
     }
 
-    /// End this choice as aborted: the engine's own parked `Complete` when it
-    /// already finished, else the terminal `Complete` the Python servicer
-    /// yields after an `Abort` RPC (`finish_reason = "abort"`). The
-    /// engine-side request is aborted when the stream is dropped, so the
-    /// caller drops it next.
-    pub fn complete_aborted(&mut self) -> vllm::GenerateResponse {
-        if let Some(parked) = self.pending.take() {
-            return parked;
+    fn finish_parts(&mut self) -> FinishParts<'_> {
+        FinishParts {
+            state: &mut self.state,
+            index: self.index,
+            pending: &mut self.pending,
+            input_logprobs_emitted: &mut self.input_logprobs_emitted,
         }
-        let mut pending = None;
-        // No new tokens on a frontend finish, so `emit_tick` yields the
-        // `Complete` directly and parks nothing.
-        let mut response = self.state.emit_tick(
-            self.index,
-            Vec::new(),
-            None,
-            Some(("abort".to_string(), None)),
-            &mut pending,
-        );
-        self.state.attach_input_logprobs(
-            &mut self.pending,
-            &mut self.input_logprobs_emitted,
-            &mut response,
-        );
-        response
     }
 }
 
@@ -317,6 +310,7 @@ impl MappedGenerateStream for SglangGenerateStream {
         &mut self,
         mut output: SglangOutput,
     ) -> Result<vllm::GenerateResponse, tonic::Status> {
+        self.native_terminal_received |= output.finish_reason.is_some();
         if let Some(error) = &output.selected_logprobs_error {
             return Err(tonic::Status::internal(error.clone()));
         }
@@ -417,29 +411,63 @@ pub(crate) fn fan_out_sglang_requests(
     })
 }
 
+/// What the translation of a request reads of its connection: the facts of
+/// the handshakes and what the servicer that launched the engine noted.
+pub(crate) struct SglangConnection<'a> {
+    /// The bound the prompt admission applies ([`admit_prompt`]): the context
+    /// window the scheduler reported at the handshake, where an empty prompt,
+    /// or one that fills the window, is refused before it reaches the
+    /// scheduler; `0` bounds no prompt from above (a scheduler that reported
+    /// no window, or one that cuts a long prompt down itself).
+    pub(crate) max_model_len: u64,
+    /// How many scheduler ranks are connected.
+    pub(crate) ranks: usize,
+    /// How a request is placed among them ([`RankPlacement`]): by its
+    /// data-parallel pin, as the engine's own frontend places it
+    /// ([`routed_dp_rank`]), or, on the prefill side of a disaggregated pair,
+    /// by its room's residue ([`room_residue_rank`]).
+    pub(crate) placement: RankPlacement,
+    /// The connection's note of a pin's yield to the room, logged at WARN
+    /// once and at DEBUG after.
+    pub(crate) yields: &'a PinYieldNote,
+    /// What the ranks declared of a batch that goes on as one item an image
+    /// ([`PerImageItems`]).
+    pub(crate) per_image: PerImageItems,
+}
+
+/// The `server_args` entry that names the cache partition fields that
+/// `translate_request_sglang` gives to the scheduler. The gateway reads it as
+/// a worker label.
+pub fn cache_partition_fields_arg() -> (String, prost_types::Value) {
+    (
+        "cache_partition_fields".to_string(),
+        prost_types::Value {
+            kind: Some(prost_types::value::Kind::StringValue(
+                "cache_salt,extra_key".to_string(),
+            )),
+        },
+    )
+}
+
 /// Translate an SGLang proto `GenerateRequest` into the scheduler's
-/// `TokenizedGenerateReqInput`. ZMQ mode requires pre-tokenized input (SMG
-/// tokenizes upstream). The slim output carries sampled and prompt logprobs
-/// with their ranked and selected candidates, and the hidden states a request
-/// asks for. Multimodal inputs become the scheduler's processor output
-/// ([`translate_sglang_multimodal`]), and a disaggregated request's
-/// bootstrap fields ride the scheduler's own slots, as the Python servicer
-/// forwards them. `max_model_len` is the context window the scheduler
-/// reported at the handshake: an empty prompt, or one that fills the window,
-/// is refused before it reaches the scheduler ([`admit_prompt`]). `ranks` is
-/// how many scheduler ranks are connected and `placement` how a request is
-/// placed among them ([`RankPlacement`]): by its data-parallel pin, as the
-/// engine's own frontend places it ([`routed_dp_rank`]), or, on the prefill
-/// side of a disaggregated pair, by its room's residue
-/// ([`room_residue_rank`]), a pin's yield to the room logged on `yields`, the
-/// connection's note, at WARN once and at DEBUG after.
+/// `TokenizedGenerateReqInput`, as its `connection` takes it. ZMQ mode
+/// requires pre-tokenized input (SMG tokenizes upstream). The slim output
+/// carries sampled and prompt logprobs with their ranked and selected
+/// candidates, and the hidden states a request asks for. Multimodal inputs
+/// become the scheduler's processor output ([`translate_sglang_multimodal`]),
+/// and a disaggregated request's bootstrap fields ride the scheduler's own
+/// slots, as the Python servicer forwards them.
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
-    max_model_len: u64,
-    ranks: usize,
-    placement: RankPlacement,
-    yields: &PinYieldNote,
+    connection: &SglangConnection<'_>,
 ) -> Result<TokenizedGenerateReqInput, String> {
+    let &SglangConnection {
+        max_model_len,
+        ranks,
+        placement,
+        yields,
+        per_image,
+    } = connection;
     let tokenized = req
         .tokenized
         .ok_or_else(|| "ZMQ mode requires pre-tokenized input; no input provided".to_string())?;
@@ -471,6 +499,7 @@ pub(crate) fn translate_request_sglang(
                 *mm,
                 req.extra_mm_inputs,
                 input_ids.len(),
+                per_image,
             )?),
             None,
         ),
@@ -492,12 +521,25 @@ pub(crate) fn translate_request_sglang(
         ),
         None => (None, None, None),
     };
-    let routed_dp_rank = match (placement, bootstrap_room) {
-        (RankPlacement::RoomResidue, Some(room)) => {
-            room_residue_rank(room, req.data_parallel_rank, ranks, &req.request_id, yields)
+    let (routed_dp_rank, disagg_prefill_dp_rank) = match (placement, bootstrap_room) {
+        (RankPlacement::RoomResidue, Some(room)) => (
+            room_residue_rank(room, req.data_parallel_rank, ranks, &req.request_id, yields),
+            None,
+        ),
+        (RankPlacement::ReplicaRoomResidue, Some(room)) => {
+            let rank =
+                room_residue_rank(room, req.data_parallel_rank, ranks, &req.request_id, yields);
+            (rank, rank)
         }
-        _ => routed_dp_rank(req.data_parallel_rank, ranks)?,
+        _ => (routed_dp_rank(req.data_parallel_rank, ranks)?, None),
     };
+    let sglang_proto::CachePartition {
+        cache_salt,
+        extra_key,
+    } = req
+        .cache_partition
+        .map(|partition| *partition)
+        .unwrap_or_default();
     Ok(TokenizedGenerateReqInput {
         rid: req.request_id,
         input_text,
@@ -524,7 +566,12 @@ pub(crate) fn translate_request_sglang(
         bootstrap_port,
         bootstrap_room,
         routed_dp_rank,
+        disagg_prefill_dp_rank,
         require_reasoning: req.require_reasoning,
+        // An empty string is unset. SGLang's tokenizer manager applies that
+        // rule, and a request on this wire does not pass through it.
+        extra_key: extra_key.filter(|value| !value.is_empty()),
+        cache_salt: cache_salt.filter(|value| !value.is_empty()),
         ..TokenizedGenerateReqInput::default()
     })
 }
@@ -535,9 +582,13 @@ pub(crate) fn translate_request_sglang(
 /// worker, see [`crate::sglang_encode`]). A payload carrying tensors takes the
 /// processor-output path whatever references ride beside them (the engine's
 /// frontend processes such a request locally); one naming nothing is not a
-/// dispatch. A borrowing test: the translation's guard, free of copies.
+/// dispatch. Nor is a payload whose model tensors lay its images out one by
+/// one ([`PerImageItems::claims`]): they describe pixels, and without them
+/// the payload takes the tensor path, which refuses it, as the Python
+/// servicer does. A borrowing test: the translation's guard, free of copies.
 pub(crate) fn names_encode_refs(mm: &sglang_proto::MultimodalInputs) -> bool {
     mm.pixel_values.is_none()
+        && !PerImageItems::claims(mm)
         && !(mm.image_urls.is_empty() && mm.video_urls.is_empty() && mm.audio_urls.is_empty())
 }
 
@@ -562,10 +613,11 @@ pub(crate) fn translate_sglang_multimodal(
     mm: sglang_proto::MultimodalInputs,
     extras: Vec<sglang_proto::MultimodalInputs>,
     prompt_len: usize,
+    per_image: PerImageItems,
 ) -> Result<SglangWireMmInputs, String> {
-    let mut output = translate_sglang_batch(mm, prompt_len)?;
+    let mut output = translate_sglang_batch(mm, prompt_len, per_image)?;
     for batch in extras {
-        let translated = translate_sglang_batch(batch, prompt_len)?;
+        let translated = translate_sglang_batch(batch, prompt_len, per_image)?;
         if output
             .mm_items
             .iter()
@@ -584,9 +636,12 @@ pub(crate) fn translate_sglang_multimodal(
 }
 
 /// Translate one modality with its own tensor storage and absolute prompt offsets.
+/// The batch goes on as one item, or, where its model's scheduler reads one
+/// item an image, as those items ([`PerImageItems::cut`]).
 fn translate_sglang_batch(
     mm: sglang_proto::MultimodalInputs,
     prompt_len: usize,
+    per_image: PerImageItems,
 ) -> Result<SglangWireMmInputs, String> {
     let modality = if mm.modalities.iter().all(|name| name == "image") {
         // Empty metadata and repeated image labels are accepted by the
@@ -656,14 +711,18 @@ fn translate_sglang_batch(
     } else {
         Some(offsets)
     };
+    let item = SglangWireMmItem {
+        modality,
+        hash: mm.feature_hash,
+        offsets,
+        feature,
+        model_specific_data,
+    };
     Ok(SglangWireMmInputs {
-        mm_items: vec![SglangWireMmItem {
-            modality,
-            hash: mm.feature_hash,
-            offsets,
-            feature,
-            model_specific_data,
-        }],
+        mm_items: match per_image.cut(&item, mm.im_token_id)? {
+            Some(items) => items,
+            None => vec![item],
+        },
         im_token_id: mm.im_token_id,
         video_token_id: (modality == SglangWireModality::Video)
             .then_some(mm.im_token_id)
@@ -694,12 +753,19 @@ fn wire_tensor_sglang(
 /// default (`load_balance_method` `auto` resolves to `follow_bootstrap_room`
 /// there), its KV sender fails a request that runs on another rank than
 /// `bootstrap_room % dp_size`, and the decode side looks for the KV on that
-/// rank. The servicer that launched the engine says which
-/// (`ZmqEngineClient::note_engine_places_by_rendezvous_room`).
+/// rank. Among plain data-parallel replicas the request names that rank as
+/// well (`disagg_prefill_dp_rank`): each replica is attention-DP rank 0, so
+/// the sender fails an unnamed request on every replica but the first. Under
+/// attention DP the request stays unnamed: a named one skips the sender's
+/// registration of its rank, which a decode side that asks for it waits for.
+/// The servicer that launched the engine says which
+/// (`ZmqEngineClient::note_engine_places_by_rendezvous_room`,
+/// `ZmqEngineClient::note_engine_ranks_are_replicas`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RankPlacement {
     Pin,
     RoomResidue,
+    ReplicaRoomResidue,
 }
 
 /// The scheduler rank a disaggregated request goes to on a prefill side that
@@ -709,7 +775,7 @@ pub(crate) enum RankPlacement {
 /// connection, at DEBUG after), never refused, since placing by the pin
 /// would fail the request at the engine's KV sender. A single rank takes
 /// everything.
-fn room_residue_rank(
+pub(crate) fn room_residue_rank(
     room: i64,
     pin: Option<i32>,
     ranks: usize,
@@ -985,6 +1051,23 @@ pub(crate) fn constraint_ref(sp: &sglang_proto::SamplingParams) -> Option<Constr
     })
 }
 
+/// A structural tag that is a JSON answer's schema alone, swapped for that
+/// schema where the engine's backend is not the one the tag is spelled for
+/// ([`crate::structured_outputs::answer_schema_in_place_of_tag`]); every
+/// other constraint stays as it came.
+pub(crate) fn send_answer_tag_as_schema(
+    sp: &mut sglang_proto::SamplingParams,
+    support: StructuredOutputsSupport,
+) {
+    let schema =
+        crate::structured_outputs::answer_schema_in_place_of_tag(constraint_ref(sp), support);
+    if let Some(schema) = schema {
+        sp.constraint = Some(sglang_proto::sampling_params::Constraint::JsonSchema(
+            schema,
+        ));
+    }
+}
+
 /// The `err_type` the plugin stamps on the scheduler's abort of a request
 /// whose grammar rejected a sampled token (`req.grammar.accept_token` raised
 /// in the scheduler's own grammar paths; the scheduler leaves that finish a
@@ -1030,10 +1113,13 @@ mod tests {
     fn translate(req: sglang_proto::GenerateRequest) -> Result<WireRequest, String> {
         translate_request_sglang(
             req,
-            default_ready_response().max_model_len,
-            1,
-            RankPlacement::Pin,
-            &PinYieldNote::default(),
+            &SglangConnection {
+                max_model_len: default_ready_response().max_model_len,
+                ranks: 1,
+                placement: RankPlacement::Pin,
+                yields: &PinYieldNote::default(),
+                per_image: PerImageItems::default(),
+            },
         )
     }
 
@@ -1070,6 +1156,43 @@ mod tests {
         }
     }
 
+    /// A payload that carries `vit_grid`, the DeepSeek-V4.1 grid, is never
+    /// the encoders' input. With a reference of any modality in place of its
+    /// pixels it takes the tensor path, which refuses it; the reference path
+    /// would drop the grid and send the request on. The Python servicer
+    /// refuses the same payload.
+    #[test]
+    fn a_v41_grid_beside_a_reference_is_refused_not_dispatched() {
+        let url = || vec!["http://example.test/a".to_string()];
+        let mut marked = media_payload();
+        marked.pixel_values = None;
+        let grid: Vec<u8> = [1i64, 2].iter().flat_map(|v| v.to_le_bytes()).collect();
+        marked
+            .model_specific_tensors
+            .insert("vit_grid".to_string(), tensor("int64", vec![1, 2], grid));
+        let by_image = sglang_proto::MultimodalInputs {
+            image_urls: url(),
+            ..marked.clone()
+        };
+        let by_video = sglang_proto::MultimodalInputs {
+            video_urls: url(),
+            ..marked.clone()
+        };
+        let by_audio = sglang_proto::MultimodalInputs {
+            audio_urls: url(),
+            ..marked
+        };
+        for payload in [by_image, by_video, by_audio] {
+            assert!(!names_encode_refs(&payload));
+            assert_eq!(encode_media_refs(&payload), None);
+            let error = translate(media_request(payload)).unwrap_err();
+            assert!(
+                error.contains("media references but no preprocessed tensors"),
+                "{error:?}"
+            );
+        }
+    }
+
     #[test]
     /// Preserve item metadata regardless of which modality is the primary batch.
     fn mixed_media_keeps_each_modality_tensor_offsets_and_token_id() {
@@ -1089,7 +1212,9 @@ mod tests {
             (image.clone(), video.clone()),
             (video.clone(), image.clone()),
         ] {
-            let output = translate_sglang_multimodal(first, vec![second], 9).unwrap();
+            let output =
+                translate_sglang_multimodal(first, vec![second], 9, PerImageItems::default())
+                    .unwrap();
             assert_eq!(output.im_token_id, Some(7));
             assert_eq!(output.video_token_id, Some(8));
             assert_eq!(output.mm_items.len(), 2);
@@ -1104,9 +1229,14 @@ mod tests {
                 assert!(item.model_specific_data.contains_key(key));
             }
         }
-        assert!(translate_sglang_multimodal(image.clone(), vec![image], 9)
-            .unwrap_err()
-            .contains("one batch per modality"));
+        assert!(translate_sglang_multimodal(
+            image.clone(),
+            vec![image],
+            9,
+            PerImageItems::default()
+        )
+        .unwrap_err()
+        .contains("one batch per modality"));
     }
 
     fn media_request(mm: sglang_proto::MultimodalInputs) -> sglang_proto::GenerateRequest {
@@ -1171,13 +1301,16 @@ mod tests {
         mm.modalities = vec!["video".to_string()];
         let mut missing_id = mm.clone();
         missing_id.im_token_id = None;
-        assert!(translate_sglang_multimodal(missing_id, Vec::new(), 5)
-            .unwrap_err()
-            .contains("placeholder token id"));
+        assert!(
+            translate_sglang_multimodal(missing_id, Vec::new(), 5, PerImageItems::default())
+                .unwrap_err()
+                .contains("placeholder token id")
+        );
         let grid = mm.model_specific_tensors.remove("image_grid_thw").unwrap();
         mm.model_specific_tensors
             .insert("video_grid_thw".into(), grid.clone());
-        let output = translate_sglang_multimodal(mm, Vec::new(), 5).unwrap();
+        let output =
+            translate_sglang_multimodal(mm, Vec::new(), 5, PerImageItems::default()).unwrap();
         let item = &output.mm_items[0];
         assert_eq!(item.modality, SglangWireModality::Video);
         assert_eq!(output.video_token_id, Some(7));
@@ -1212,7 +1345,9 @@ mod tests {
         let mut references = media_payload();
         references.pixel_values = None;
         references.image_urls = vec!["http://example.test/a.png".to_string()];
-        let error = translate_sglang_multimodal(references, Vec::new(), 5).unwrap_err();
+        let error =
+            translate_sglang_multimodal(references, Vec::new(), 5, PerImageItems::default())
+                .unwrap_err();
         assert!(
             error.contains("media references but no preprocessed tensors"),
             "{error}"
@@ -1423,6 +1558,32 @@ mod tests {
         );
     }
 
+    /// A chat request's `min_tokens` survives the whole path to the engine:
+    /// the gateway's chat builder writes it to the proto, the translation
+    /// copies it, and the request decoded from the wire's bytes carries it.
+    #[test]
+    fn a_chat_requests_min_tokens_survive_the_wire() {
+        use openai_protocol::chat::ChatCompletionRequest;
+        use smg_grpc_client::sglang_scheduler::SglangSchedulerClient;
+
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "min_tokens": 30, "max_tokens": 40
+        }))
+        .expect("a chat request");
+        let proto = SglangSchedulerClient::build_generate_request_from_chat_parts(
+            "r1".to_string(),
+            &chat,
+            "hi".to_string(),
+            vec![1, 2, 3],
+            Default::default(),
+        )
+        .expect("the chat builder");
+        let wire = translate(proto).expect("the translation");
+        let back: WireRequest = decode_msgpack(&encode_msgpack(&wire).unwrap()).unwrap();
+        assert_eq!(back.sampling_params.min_new_tokens, 30);
+    }
+
     /// The rows become the proto's shapes: a tick's rows flattened on the
     /// chunk, one `HiddenStates` per position on the completion, the final
     /// layer, the positions absolute from the anchor the scheduler's counters
@@ -1600,6 +1761,58 @@ mod tests {
         );
     }
 
+    /// The cache partition reaches the scheduler as its two separate fields. An
+    /// empty string is unset.
+    #[test]
+    fn sglang_translation_forwards_the_cache_partition() {
+        let forwarded = |cache_partition| {
+            let wire = translate(sglang_proto::GenerateRequest {
+                request_id: "r".into(),
+                tokenized: Some(sglang_proto::TokenizedInput {
+                    input_ids: vec![1, 2],
+                    original_text: String::new(),
+                }),
+                cache_partition,
+                ..Default::default()
+            })
+            .unwrap();
+            (wire.cache_salt, wire.extra_key)
+        };
+        assert_eq!(forwarded(None), (None, None));
+        for (sent, expected) in [
+            ((None, None), (None, None)),
+            ((Some(""), Some("")), (None, None)),
+            ((Some("salt"), None), (Some("salt"), None)),
+            ((Some(""), Some("key")), (None, Some("key"))),
+            ((Some("salt"), Some("key")), (Some("salt"), Some("key"))),
+        ] {
+            let (cache_salt, extra_key) = forwarded(Some(Box::new(sglang_proto::CachePartition {
+                cache_salt: sent.0.map(String::from),
+                extra_key: sent.1.map(String::from),
+            })));
+            assert_eq!((cache_salt.as_deref(), extra_key.as_deref()), expected);
+        }
+    }
+
+    /// The direct-ZMQ lane gives both fields to the scheduler, so its worker
+    /// gets the `cache_partition_fields` label.
+    #[tokio::test]
+    async fn a_direct_zmq_worker_advertises_the_cache_partition_fields() {
+        use smg_grpc_client::engine_labels::ServerInfo;
+
+        use crate::client::ZmqServerInfo;
+
+        let (client, _engine, _dir) = connected_pair(RuntimeType::Sglang).await;
+        let ZmqServerInfo::Sglang(info) = client.server_info() else {
+            panic!("expected SGLang server info");
+        };
+        let labels = ServerInfo::Sglang(info).to_labels();
+        assert_eq!(
+            labels.get("cache_partition_fields").map(String::as_str),
+            Some("cache_salt,extra_key")
+        );
+    }
+
     /// The data-parallel pin is placed as the engine's own frontend places
     /// it: no pin stays unrouted, a pin names a connected rank, a pin on an
     /// engine of one rank is ignored, and a pin past the connected ranks (or
@@ -1618,10 +1831,13 @@ mod tests {
         let translate_among = |pin: Option<i32>, ranks: usize| {
             translate_request_sglang(
                 pinned(pin),
-                default_ready_response().max_model_len,
-                ranks,
-                RankPlacement::Pin,
-                &PinYieldNote::default(),
+                &SglangConnection {
+                    max_model_len: default_ready_response().max_model_len,
+                    ranks,
+                    placement: RankPlacement::Pin,
+                    yields: &PinYieldNote::default(),
+                    per_image: PerImageItems::default(),
+                },
             )
         };
         assert_eq!(translate_among(None, 2).unwrap().routed_dp_rank, None);
@@ -1680,10 +1896,13 @@ mod tests {
         let place = |placement: RankPlacement, room: Option<i32>, pin: Option<i32>, ranks| {
             translate_request_sglang(
                 disaggregated(room, pin),
-                default_ready_response().max_model_len,
-                ranks,
-                placement,
-                &PinYieldNote::default(),
+                &SglangConnection {
+                    max_model_len: default_ready_response().max_model_len,
+                    ranks,
+                    placement,
+                    yields: &PinYieldNote::default(),
+                    per_image: PerImageItems::default(),
+                },
             )
             .map(|wire| wire.routed_dp_rank)
         };
@@ -1739,16 +1958,77 @@ mod tests {
         // The room rides the wire beside the rank it placed the request on.
         let wire = translate_request_sglang(
             disaggregated(Some(7), Some(0)),
-            default_ready_response().max_model_len,
-            2,
-            RoomResidue,
-            &PinYieldNote::default(),
+            &SglangConnection {
+                max_model_len: default_ready_response().max_model_len,
+                ranks: 2,
+                placement: RoomResidue,
+                yields: &PinYieldNote::default(),
+                per_image: PerImageItems::default(),
+            },
         )
         .unwrap();
         assert_eq!(
             (wire.bootstrap_room, wire.routed_dp_rank),
             (Some(7), Some(1))
         );
+    }
+
+    #[test]
+    fn sglang_translation_names_the_prefill_rank_among_replicas() {
+        use RankPlacement::{Pin, ReplicaRoomResidue, RoomResidue};
+
+        let ranks_of = |placement: RankPlacement, room: Option<i32>, pin: Option<i32>, ranks| {
+            let wire = translate_request_sglang(
+                sglang_proto::GenerateRequest {
+                    request_id: "pd".into(),
+                    tokenized: Some(sglang_proto::TokenizedInput {
+                        original_text: String::new(),
+                        input_ids: vec![1, 2, 3],
+                    }),
+                    data_parallel_rank: pin,
+                    disaggregated_params: room.map(|room| sglang_proto::DisaggregatedParams {
+                        bootstrap_host: "10.0.0.1".into(),
+                        bootstrap_port: 8998,
+                        bootstrap_room: room,
+                    }),
+                    ..Default::default()
+                },
+                &SglangConnection {
+                    max_model_len: default_ready_response().max_model_len,
+                    ranks,
+                    placement,
+                    yields: &PinYieldNote::default(),
+                    per_image: PerImageItems::default(),
+                },
+            )
+            .unwrap();
+            (wire.routed_dp_rank, wire.disagg_prefill_dp_rank)
+        };
+        assert_eq!(
+            ranks_of(ReplicaRoomResidue, Some(7), None, 2),
+            (Some(1), Some(1))
+        );
+        assert_eq!(
+            ranks_of(ReplicaRoomResidue, Some(8), Some(1), 2),
+            (Some(0), Some(0)),
+            "the pin yields and the room's rank is the one named"
+        );
+        assert_eq!(
+            ranks_of(ReplicaRoomResidue, Some(7), None, 4),
+            (Some(3), Some(3))
+        );
+        assert_eq!(
+            ranks_of(ReplicaRoomResidue, Some(7), None, 1),
+            (None, None),
+            "a single rank has nothing to name"
+        );
+        assert_eq!(
+            ranks_of(ReplicaRoomResidue, None, Some(1), 2),
+            (Some(1), None),
+            "no room: the pin rule, nothing named"
+        );
+        assert_eq!(ranks_of(RoomResidue, Some(7), None, 2), (Some(1), None));
+        assert_eq!(ranks_of(Pin, Some(7), Some(1), 2), (Some(1), None));
     }
 
     /// A pin's yield to the room goes through the note of the connection it
@@ -1813,10 +2093,13 @@ mod tests {
             ] {
                 let result = translate_request_sglang(
                     request(prompt_len, sampling.clone()),
-                    max_model_len,
-                    1,
-                    RankPlacement::Pin,
-                    &PinYieldNote::default(),
+                    &SglangConnection {
+                        max_model_len,
+                        ranks: 1,
+                        placement: RankPlacement::Pin,
+                        yields: &PinYieldNote::default(),
+                        per_image: PerImageItems::default(),
+                    },
                 );
                 assert_eq!(
                     result.is_ok(),
@@ -1942,6 +2225,49 @@ mod tests {
                 .expect("generate");
             engine_task.await.unwrap();
             drop(stream);
+        }
+    }
+
+    /// A structural tag that is a JSON answer's schema alone reaches an engine
+    /// whose backend is pinned to another name than the tags are spelled for
+    /// as that schema, its keys in the order written; a call's tag reaches it
+    /// as it came.
+    #[tokio::test]
+    async fn an_answer_tag_reaches_a_pinned_other_backend_as_its_schema() {
+        use sglang_proto::sampling_params::Constraint;
+
+        use crate::test_support::{answer_tag, call_tag, pinned_other_backend, ANSWER_SCHEMA};
+
+        let (client, engine, _dir) = connected_pair(RuntimeType::Sglang).await;
+        client.set_structured_outputs_support(pinned_other_backend());
+        let (mut input, _output) = engine.split();
+        let mut streams = Vec::new();
+        for (id, tag, schema) in [
+            ("answer", answer_tag(), Some(ANSWER_SCHEMA)),
+            ("call", call_tag(), None),
+        ] {
+            let req = sglang_proto::GenerateRequest {
+                request_id: id.to_string(),
+                tokenized: Some(sglang_proto::TokenizedInput {
+                    input_ids: vec![1, 2, 3],
+                    original_text: String::new(),
+                }),
+                sampling_params: Some(sglang_proto::SamplingParams {
+                    constraint: Some(Constraint::StructuralTag(tag.clone())),
+                    ..Default::default()
+                }),
+                stream: true,
+                ..Default::default()
+            };
+            streams.push(client.generate_sglang_streams(req).await.expect(id));
+            let frames = input.recv_frames().await.unwrap();
+            let sent: WireRequest = decode_msgpack(frames[1].as_ref()).unwrap();
+            assert_eq!(sent.sampling_params.json_schema.as_deref(), schema, "{id}");
+            assert_eq!(
+                sent.sampling_params.structural_tag,
+                schema.is_none().then_some(tag),
+                "{id}"
+            );
         }
     }
 

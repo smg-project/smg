@@ -543,11 +543,11 @@ impl Format {
         })
     }
 
-    /// Where `prompt`, the rendered prompt, leaves the model's turn: the text past the last turn
-    /// opener or anchor, its markers replayed over the table from the state the output starts in
-    /// there. A prompt that ends at the opener starts the turn, unless it `continued` the final
-    /// assistant message and the message the opener ends was a thought: the turn is past its
-    /// thought then.
+    /// Where `prompt`, the rendered prompt, leaves the model's turn: the text past the turn's
+    /// opener or the last anchor, its markers replayed over the table from the state the output
+    /// starts in there. A prompt that ends at that opener starts the turn, unless it `continued`
+    /// the final assistant message and the message the opener ends was a thought: the turn is
+    /// past its thought then.
     pub fn output_position(&self, prompt: &str, continued: bool) -> OutputPosition {
         let Some((at, tail, from)) = self.turn_start(prompt) else {
             return OutputPosition::Elsewhere;

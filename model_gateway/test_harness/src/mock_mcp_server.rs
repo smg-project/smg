@@ -15,7 +15,7 @@ use rmcp::{
 };
 use tokio::{
     net::TcpListener,
-    sync::oneshot,
+    sync::{oneshot, watch},
     task::JoinHandle,
     time::{timeout, Duration},
 };
@@ -101,6 +101,7 @@ impl Drop for MockServerHarness {
 pub struct MockMCPServer {
     harness: MockServerHarness,
     calls: Arc<AtomicUsize>,
+    last_search_args: watch::Receiver<serde_json::Value>,
 }
 
 /// Mock MCP server that always fails tool execution with a caller-provided marker.
@@ -117,6 +118,10 @@ pub struct MockSearchResponseMCPServer {
 #[derive(Clone)]
 pub struct MockSearchServer {
     calls: Arc<AtomicUsize>,
+    last_search_args: watch::Sender<serde_json::Value>,
+    /// How long a search takes before it answers (zero unless a test asks):
+    /// the window in which a client leaves during a tool's execution.
+    latency: Duration,
     tool_router: ToolRouter<MockSearchServer>,
 }
 
@@ -174,23 +179,28 @@ impl MockSearchServer {
     pub fn new() -> Self {
         Self {
             calls: Arc::default(),
+            last_search_args: watch::channel(serde_json::Value::Null).0,
+            latency: Duration::ZERO,
             tool_router: Self::tool_router(),
         }
     }
 
     #[tool(description = "Mock web search tool")]
-    fn brave_web_search(
+    async fn brave_web_search(
         &self,
         Parameters(params): Parameters<serde_json::Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if !self.latency.is_zero() {
+            tokio::time::sleep(self.latency).await;
+        }
         let query = params
             .get("query")
             .and_then(|v| v.as_str())
             .unwrap_or("test");
-        Ok(CallToolResult::success(vec![ContentBlock::text(format!(
-            "Mock search results for: {query}"
-        ))]))
+        let result = format!("Mock search results for: {query}");
+        self.last_search_args.send_replace(params.into());
+        Ok(CallToolResult::success(vec![ContentBlock::text(result)]))
     }
 
     #[tool(description = "Mock local search tool")]
@@ -287,14 +297,9 @@ impl ServerHandler for MockSearchServer {
 }
 
 impl MockMCPServer {
-    fn router(calls: Arc<AtomicUsize>) -> axum::Router {
+    fn router(search: MockSearchServer) -> axum::Router {
         let service = StreamableHttpService::new(
-            move || {
-                Ok(MockSearchServer {
-                    calls: calls.clone(),
-                    ..MockSearchServer::new()
-                })
-            },
+            move || Ok(search.clone()),
             LocalSessionManager::default().into(),
             Default::default(),
         );
@@ -304,11 +309,26 @@ impl MockMCPServer {
 
     /// Start a mock MCP server on an available port
     pub async fn start() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let calls = Arc::default();
+        Self::start_with_latency(Duration::ZERO).await
+    }
+
+    /// Start a mock MCP server whose searches answer after `latency`.
+    pub async fn start_with_latency(
+        latency: Duration,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let search = MockSearchServer {
+            latency,
+            ..Default::default()
+        };
         Ok(Self {
-            harness: MockServerHarness::start(Self::router(Arc::clone(&calls))).await?,
-            calls,
+            calls: search.calls.clone(),
+            last_search_args: search.last_search_args.subscribe(),
+            harness: MockServerHarness::start(Self::router(search)).await?,
         })
+    }
+
+    pub fn last_search_args(&self) -> serde_json::Value {
+        self.last_search_args.borrow().clone()
     }
 
     pub fn call_count(&self) -> usize {

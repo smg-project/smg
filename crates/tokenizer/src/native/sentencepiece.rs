@@ -1,11 +1,13 @@
 //! A sentencepiece-style vocabulary with byte fallback on the native encode
 //! path (Gemma, Llama 2 and their kin). Such a vocabulary has no `ByteLevel`
 //! stage: the spaces of the text become the word marker U+2581 (a `Replace`
-//! normalizer, or the `Metaspace` pre-tokenizer of the Llama class, which
-//! also prepends the marker by its scheme), the text between two added
-//! tokens is one word of the model, and the model's `merge_word` makes a
-//! symbol of each character the vocabulary has and of each byte (`<0xHH>`)
-//! of one it has not, then merges. This module gives that word pieces: a cut
+//! normalizer, alone or after a `Prepend` normalizer that puts the marker
+//! before every text between added tokens, or the `Metaspace`
+//! pre-tokenizer of the Llama class, which also prepends the marker by its
+//! scheme), the text between two added tokens is one word of the model,
+//! and the model's `merge_word` makes a symbol of each character the
+//! vocabulary has and of each byte (`<0xHH>`) of one it has not, then
+//! merges. This module gives that word pieces: a cut
 //! between two adjacent bytes that no vocabulary token holds adjacent can
 //! never be crossed by a merge (a merge's product is a vocabulary token, and
 //! it would hold the pair), so the pieces merge on their own to the ids of
@@ -19,7 +21,7 @@
 //! time is written in the vocabulary's form for the merge alone.
 
 use rustc_hash::FxHashMap;
-use tokenizers::models::ModelWrapper;
+use tokenizers::{models::ModelWrapper, Model};
 
 use super::{
     merge::{ByteTokens, MergeTable},
@@ -27,7 +29,7 @@ use super::{
 };
 use crate::{
     encode_path::Declined,
-    word_cache::{entries_of, ReadBpe},
+    word_cache::{entries_of, ModelView, ReadBpe},
 };
 
 /// The word marker of a sentencepiece vocabulary.
@@ -36,8 +38,11 @@ pub(super) const WORD_MARKER: char = '\u{2581}';
 const MARKER_BYTES: [u8; 3] = [0xE2, 0x96, 0x81];
 /// No token for the character.
 const NO_ID: u32 = u32::MAX;
-/// Words of the bridge table: one bit per pair of bytes.
-const BRIDGE_WORDS: usize = 256 * 256 / 64;
+/// Entries of the bridge table: one byte per pair of bytes, 64 KiB. From a
+/// bit per pair (8 KiB) the gather of [`CharSymbols::pieces`] ran as many
+/// instructions a token as the test it replaced; from a byte, 15 to 21 %
+/// fewer (counted).
+const BRIDGE_PAIRS: usize = 256 * 256;
 /// Symbols the thread's scratch list keeps between merges, 16 KiB: a piece
 /// longer than this (a space-free text no vocabulary token cuts can be the
 /// whole unit) hands its list back after the merge, so a thread holds this
@@ -45,7 +50,8 @@ const BRIDGE_WORDS: usize = 256 * 256 / 64;
 pub(super) const MERGE_SCRATCH_SYMBOLS: usize = 4_096;
 
 /// Where the word marker is prepended: the `Metaspace` prepend scheme
-/// (`Never` for a `Replace` normalizer too, which prepends nothing).
+/// (`Never` for a `Replace` normalizer too, which prepends nothing), or
+/// the `Prepend` normalizer (`Every`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Marker {
     Never,
@@ -54,6 +60,11 @@ pub(super) enum Marker {
     First,
     /// Before every text between added tokens.
     Always,
+    /// Before every text between added tokens, one that starts with a space
+    /// or the marker too: the `Prepend` normalizer, which prepends to the
+    /// whole normalized text where `Metaspace` prepends only to one that
+    /// does not start with the marker.
+    Every,
 }
 
 /// The symbols a piece of a byte-fallback vocabulary starts from, where its
@@ -63,13 +74,13 @@ pub(super) struct CharSymbols {
     ascii: [u32; 128],
     /// The token of each other character the vocabulary has, by scalar value.
     beyond: FxHashMap<u32, u32>,
-    /// Bit `prev << 8 | cur`: no piece cut goes between the raw bytes
-    /// `prev` and `cur`: some vocabulary token holds them adjacent (a space
-    /// read as the marker, its last byte before the cut and its first byte
-    /// after it), or `cur` continues a UTF-8 character. Read from the
-    /// tokens' text, then rewritten for the raw text by
+    /// `true` at [`pair_entry`] of `prev` and `cur`: no piece cut goes between
+    /// the raw bytes `prev` and `cur`: some vocabulary token holds them
+    /// adjacent (a space read as the marker, its last byte before the cut and
+    /// its first byte after it), or `cur` continues a UTF-8 character. Read
+    /// from the tokens' text, then rewritten for the raw text by
     /// [`Self::bridge_raw_text`].
-    bridge: Box<[u64; BRIDGE_WORDS]>,
+    bridge: Box<[bool; BRIDGE_PAIRS]>,
     marker: Marker,
     /// The model's merges over its own ids.
     merges: MergeTable,
@@ -78,22 +89,25 @@ pub(super) struct CharSymbols {
 impl CharSymbols {
     /// The tables of `model`'s vocabulary (a BPE with byte fallback), or why
     /// the vocabulary declines: `ignore_merges` (it looks the whole text up,
-    /// which pieces cannot), a byte token missing or merges the table cannot
-    /// stand in for (the table's own declines, with the `<0xHH>` spelling of
-    /// the byte tokens), a token that spells a byte token inside it (a merge
-    /// could then cross a cut).
+    /// which pieces cannot), merges the table cannot stand in for (the
+    /// table's own declines, with the `<0xHH>` spelling of the byte tokens),
+    /// a byte token missing for a byte the fallback could reach (one beyond
+    /// ASCII, which may lie inside any character that is no token, or an
+    /// ASCII one whose character is no token; an ASCII character that is a
+    /// token never falls back, so its byte's token is not needed), a token
+    /// that spells a byte token inside it (a merge could then cross a cut).
     ///
     /// `read` is what the file's one-pass read saw of the model: the merge
     /// table takes the merges from it, and the entries are read by id when
     /// it says the ids are the range of the vocabulary (else through the
     /// vocabulary map, as without a read); `None` for a model built in
     /// memory.
-    pub(super) fn from_model(
-        model: &ModelWrapper,
+    pub(super) fn from_model<M: Model + ModelView>(
+        model: &M,
         marker: Marker,
         read: Option<&ReadBpe>,
     ) -> Result<Self, Declined> {
-        let ModelWrapper::BPE(bpe) = model else {
+        let ModelWrapper::BPE(bpe) = model.wrapper() else {
             return Err(Declined::from("the model is not BPE"));
         };
         if bpe.ignore_merges {
@@ -105,12 +119,23 @@ impl CharSymbols {
         let mut symbols = Self {
             ascii: [NO_ID; 128],
             beyond: FxHashMap::default(),
-            bridge: Box::new([0; BRIDGE_WORDS]),
+            bridge: Box::new([false; BRIDGE_PAIRS]),
             marker,
             merges,
         };
         for (id, token) in entries_of(bpe, read) {
             symbols.read_token(token.as_ref(), id)?;
+        }
+        // A byte without a token: the fallback spells the bytes of a
+        // character that is no token, so an ASCII byte whose character is
+        // one is never reached (a character beyond ASCII holds no ASCII
+        // byte); any other missing byte could be, and declines.
+        for byte in 0..=255u8 {
+            if symbols.merges.lacks_a_token_for_byte(byte)
+                && !(byte.is_ascii() && symbols.ascii[usize::from(byte)] != NO_ID)
+            {
+                return Err(Declined::from(format!("byte {byte:#04x} has no token")));
+            }
         }
         symbols.bridge_raw_text();
         Ok(symbols)
@@ -124,9 +149,8 @@ impl CharSymbols {
                 "the token {token:?} spells a byte token inside it"
             )));
         }
-        for pair in token.as_bytes().windows(2) {
-            let bit = usize::from(pair[0]) << 8 | usize::from(pair[1]);
-            self.bridge[bit >> 6] |= 1 << (bit & 63);
+        for pair in token.as_bytes().array_windows() {
+            self.bridge[pair_entry(*pair)] = true;
         }
         let mut chars = token.chars();
         if let (Some(c), None) = (chars.next(), chars.next()) {
@@ -146,14 +170,13 @@ impl CharSymbols {
     /// one is its first byte), and no cut goes before a byte that continues
     /// a character.
     fn bridge_raw_text(&mut self) {
-        let mut raw = Box::new([0u64; BRIDGE_WORDS]);
+        let mut raw = Box::new([false; BRIDGE_PAIRS]);
         for prev in 0..=255u8 {
             for cur in 0..=255u8 {
                 let before = if prev == b' ' { MARKER_BYTES[2] } else { prev };
                 let after = if cur == b' ' { MARKER_BYTES[0] } else { cur };
                 if is_continuation(cur) || self.bridged(before, after) {
-                    let bit = usize::from(prev) << 8 | usize::from(cur);
-                    raw[bit >> 6] |= 1 << (bit & 63);
+                    raw[pair_entry([prev, cur])] = true;
                 }
             }
         }
@@ -188,23 +211,41 @@ impl CharSymbols {
         self.merges.merges()
     }
 
+    /// The merges' operands in rank order ([`MergeTable::pairs_by_rank`]).
+    pub(super) fn pairs_by_rank(&self) -> Vec<[u32; 2]> {
+        self.merges.pairs_by_rank()
+    }
+
+    /// Bytes the vocabulary has no token for (none the fallback reaches,
+    /// see [`Self::from_model`]), for the load log.
+    pub(super) fn bytes_without_a_token(&self) -> usize {
+        self.merges.missing_bytes()
+    }
+
     /// Whether the word marker goes before a text: one that starts a text
-    /// between added tokens (`starts_text`), under the `Always` scheme; the
-    /// one at the start of the input (`at_input_start`), under `First`.
+    /// between added tokens (`starts_text`), under the `Always` scheme and
+    /// the `Prepend` normalizer (`Every`); the one at the start of the
+    /// input (`at_input_start`), under `First`.
     pub(super) fn prepends(&self, starts_text: bool, at_input_start: bool) -> bool {
         match self.marker {
             Marker::Never => false,
-            Marker::Always => starts_text,
+            Marker::Always | Marker::Every => starts_text,
             Marker::First => at_input_start,
         }
+    }
+
+    /// Whether the marker goes before a text that already starts with a
+    /// space or the marker (the `Prepend` normalizer puts it there;
+    /// `Metaspace` does not).
+    pub(super) fn prepends_to_a_marked_text(&self) -> bool {
+        self.marker == Marker::Every
     }
 
     /// Whether no cut goes between the raw bytes `prev` and `cur` (see the
     /// field).
     #[inline(always)]
     fn bridged(&self, prev: u8, cur: u8) -> bool {
-        let bit = usize::from(prev) << 8 | usize::from(cur);
-        (self.bridge[bit >> 6] >> (bit & 63)) & 1 != 0
+        self.bridge[pair_entry([prev, cur])]
     }
 
     /// The token of `c`, or [`NO_ID`].
@@ -238,15 +279,41 @@ impl CharSymbols {
     #[inline(always)]
     pub(super) fn pieces<F: FnMut(usize, usize)>(&self, text: &[u8], mut f: F) {
         let mut start = 0;
-        for (i, pair) in text.windows(2).enumerate() {
-            if !self.bridged(pair[0], pair[1]) {
-                f(start, i + 1);
-                start = i + 1;
+        // The answers of 64 pairs gathered as the bits of one word by a loop
+        // with no branch, then one step per cut: a test and a branch per
+        // pair follows the text, and took more than half of a token's missed
+        // branches on text read a second time (counted).
+        let mut tested = 0;
+        while tested + 1 < text.len() {
+            let rest = &text[tested..];
+            let bridged = match rest.first_chunk::<{ u64::BITS as usize + 1 }>() {
+                Some(block) => self.bridged_bits(block.array_windows()),
+                // The bits past the last pair are no cuts.
+                None => self.bridged_bits(rest.array_windows()) | (u64::MAX << (rest.len() - 1)),
+            };
+            let mut cuts = !bridged;
+            while cuts != 0 {
+                let at = tested + 1 + cuts.trailing_zeros() as usize;
+                f(start, at);
+                start = at;
+                cuts &= cuts - 1;
             }
+            tested += u64::BITS as usize;
         }
         if start < text.len() {
             f(start, text.len());
         }
+    }
+
+    /// The table's answers for up to 64 adjacent pairs as the bits of a
+    /// word, the first pair's lowest.
+    #[inline(always)]
+    fn bridged_bits<'t>(&self, pairs: impl Iterator<Item = &'t [u8; 2]>) -> u64 {
+        let mut bits = 0;
+        for (bit, pair) in pairs.enumerate() {
+            bits |= u64::from(self.bridge[pair_entry(*pair)]) << bit;
+        }
+        bits
     }
 
     /// Whether the raw text is cut at `p` (past its first byte, before its
@@ -269,6 +336,13 @@ impl CharSymbols {
             }
             let mut utf8 = [0u8; 4];
             for &byte in c.encode_utf8(&mut utf8).as_bytes() {
+                // The construction declines a missing byte the fallback
+                // could reach (see `from_model`): one spelled here has a
+                // token.
+                debug_assert!(
+                    !self.merges.lacks_a_token_for_byte(byte),
+                    "a byte without a token reached the fallback: {byte:#04x} in {c:?}"
+                );
                 symbols.push(self.merges.byte_id(byte));
             }
         }
@@ -294,6 +368,14 @@ fn is_byte_token(token: &str) -> bool {
 #[inline(always)]
 fn is_continuation(byte: u8) -> bool {
     (0x80..0xC0).contains(&byte)
+}
+
+/// The entry of a pair of adjacent bytes in a bridge table: the pair as the
+/// text holds it, read as one little-endian number, so the walk over a text
+/// tests each pair with one load.
+#[inline(always)]
+fn pair_entry(pair: [u8; 2]) -> usize {
+    usize::from(u16::from_le_bytes(pair))
 }
 
 #[cfg(test)]

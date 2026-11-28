@@ -1,6 +1,7 @@
 //! Policy paths a request walks without allocating, pinned: the registry's
-//! question whether some policy wants the request's text (the answer is kept
-//! where a policy is added or removed); the least-load decision, which
+//! questions whether some policy wants the request's text and whether a
+//! route keeps the request's body (the answer is kept where a policy is
+//! added or removed); the least-load decision, which
 //! allocates its eligible list and nothing else once it has dispatched to a
 //! worker; a request placed by a ring policy, which pays the ring's own
 //! lookup and nothing besides (prefix hash also its eligible list and its
@@ -32,16 +33,17 @@ use smg::{
     config::types::{ManualAssignmentMode, PolicyConfig, RoutingKeyOverrideConfig},
     observability::metrics::Metrics,
     policies::{
-        ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy, ManualPolicy,
-        PassthroughPolicy, PolicyRegistry, PowerOfTwoPolicy, PrefixHashConfig, PrefixHashPolicy,
-        RandomPolicy, SelectWorkerInfo,
+        hash_ring::HashRing, ConsistentHashingPolicy, LeastLoadPolicy, LoadBalancingPolicy,
+        ManualPolicy, PassthroughPolicy, PolicyRegistry, PowerOfTwoPolicy, PrefixHashConfig,
+        PrefixHashPolicy, RandomPolicy, SelectWorkerInfo,
     },
-    worker::{
-        load_state::{one_rank_load, TestFeed},
-        BasicWorkerBuilder, HashRing, Worker, WorkerType,
-    },
+    routers::grpc::backend_client::BasicWorkerBuilder,
 };
 use smg_external_router::metrics::handles::force_on_this_thread;
+use smg_worker::{
+    identity::basic::{Worker, WorkerType},
+    load::state::{one_rank_load, TestFeed},
+};
 
 struct Counting;
 
@@ -97,7 +99,8 @@ fn allocations_during(work: impl FnOnce()) -> usize {
 /// A cache-aware default (text wanted, no eviction thread) and 64 models on
 /// hinted cache-aware policies of their own: a request's question allocates
 /// nothing, with and without a routing key and token ids, however many
-/// models are registered.
+/// models are registered. So does the body question, which the HTTP
+/// router's content-blind dispatch asks of every request.
 #[test]
 fn a_request_asks_whether_text_is_wanted_without_allocating() {
     let registry = PolicyRegistry::with_override(
@@ -120,6 +123,8 @@ fn a_request_asks_whether_text_is_wanted_without_allocating() {
     assert!(registry.any_policy_needs_request_text(Some(&plain)));
     assert!(!registry.any_policy_needs_request_text(Some(&keyed)));
     assert!(!registry.any_policy_needs_request_text_with_tokens(Some(&plain)));
+    assert!(registry.any_policy_needs_request_body(Some(&plain)));
+    assert!(!registry.any_policy_needs_request_body(Some(&keyed)));
 
     let allocations = allocations_during(|| {
         for _ in 0..1_000 {
@@ -127,11 +132,13 @@ fn a_request_asks_whether_text_is_wanted_without_allocating() {
             black_box(registry.any_policy_needs_request_text(Some(&keyed)));
             black_box(registry.any_policy_needs_request_text_with_tokens(Some(&plain)));
             black_box(registry.any_policy_needs_request_text_with_tokens(None));
+            black_box(registry.any_policy_needs_request_body(Some(&plain)));
+            black_box(registry.any_policy_needs_request_body(Some(&keyed)));
         }
     });
     assert_eq!(
         allocations, 0,
-        "the text questions allocated {allocations} times over 4,000 requests"
+        "the text and body questions allocated {allocations} times over 6,000 requests"
     );
 }
 
@@ -145,7 +152,7 @@ fn a_request_asks_whether_text_is_wanted_without_allocating() {
 #[test]
 fn a_least_load_decision_allocates_its_eligible_list_and_nothing_else() {
     let policy = LeastLoadPolicy::new();
-    let feed = TestFeed::attached_to(&policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     let workers: Vec<Arc<dyn Worker>> = (0..8)
         .map(|i| {
             Arc::new(
@@ -356,7 +363,7 @@ fn a_power_of_two_random_or_passthrough_pick_allocates_nothing() {
     };
     let mut over_budget = Vec::new();
     for (name, policy) in &policies {
-        let feed = TestFeed::attached_to(policy.as_ref());
+        let feed = TestFeed::attached_to(|rx| policy.as_ref().set_load_receiver(rx));
         let workers: Vec<Arc<dyn Worker>> = (0..8)
             .map(|i| {
                 Arc::new(

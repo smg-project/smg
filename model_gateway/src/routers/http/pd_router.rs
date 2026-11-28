@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
@@ -27,33 +28,47 @@ use openai_protocol::{
     messages::{CountMessageTokensRequest, CreateMessageRequest},
     rerank::RerankRequest,
     responses::ResponsesRequest,
+    UNKNOWN_MODEL_ID,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{
     value::{to_raw_value, RawValue},
     Value,
 };
+use smg_worker::{
+    identity::{
+        basic::{RuntimeType, Worker, WorkerLoadGuard, WorkerType},
+        endpoint::Endpoint,
+    },
+    metrics::writers::Metrics as WorkerMetrics,
+};
 use tracing::{debug, error, warn};
 
 use super::{
     request_body::RawBody,
     stream_failure::{cause, head_success_recorded, RelaySource},
-    stream_relay::{relay_streaming_body, ChunkMode, ChunkStep, Relay},
+    stream_relay::{relay_streaming_body, ChunkHook, ChunkMode, ChunkStep, Relay},
     tenant_rate_limit::{self, TenantCharge},
 };
 use crate::{
+    app_context::AppContext,
     config::types::RetryConfig,
-    middleware::TenantRequestMeta,
+    middleware::{sse_keepalive::names_event_stream, TenantRequestMeta},
     observability::{
         events::{self, Event},
         metrics::{bool_to_static_str, metrics_labels, Metrics},
-        otel_trace::inject_trace_context_http,
+        otel_trace::with_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry, WorkerRole},
     rate_limit::RateLimitManager,
     routers::{
         common::{
-            attach_sized_body, header_utils,
+            attach_sized_body,
+            attempt_ledger::{
+                failed_side_type, is_definitive_failure, mark_failed_side, mark_upstream_answer,
+                AttemptLedger,
+            },
+            header_utils,
             kv_transfer::{
                 carries_moriio_peer_markers, connector_mode_for_worker, is_moriio_worker,
                 mooncake_decode_params, mooncake_prefill_params, moriio_decode_params,
@@ -63,14 +78,25 @@ use crate::{
                 NIXL_PREFILL_KV_PARAMS,
             },
             overload,
+            pair_index::{PdPairIndex, PdWire},
             pd_failure::{PdSide, SidePhase},
-            placement::{self, PairFailure, PlacementFailure, PlacementInputs, RefusalSite},
+            placement::{
+                self, CandidateFilter, PairFailure, Placed, PlacementFailure, PlacementInputs,
+                RefusalSite, RequestEnd, SingleMiss,
+            },
+            prefill_admission::{
+                acquire_prefill, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
+                PrefillAhead, PrefillSelectionContext,
+            },
             request_lease::{ReleasePoint, RequestLease, RoutingDerivatives},
+            responses_compat::lower_responses_request_for_local_backend,
             retry::{
                 is_request_timeout, is_retryable_response, request_timeout_response, RetryExecutor,
             },
             serialize_json_sized,
+            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
             sse::SseEncoder,
+            sse_rechunk::{find_frame_end, MAX_FRAME_BYTES},
             trim_serialization_slack,
         },
         error,
@@ -78,14 +104,12 @@ use crate::{
             error_reason_for_response, error_type_for_response, error_type_from_status,
             route_to_endpoint,
         },
-        http::router::send_with_stale_conn_retry,
+        http::router::{
+            convert_reqwest_error, read_body_capped, send_with_stale_conn_retry, worker_answered,
+            worker_body_too_large, BodyReadError, RerankResponseSpec, Router,
+        },
         prefill_queue_full, prefill_queue_timeout, RouterTrait, PD_PREFILL_QUEUE_FULL,
         PD_PREFILL_QUEUE_TIMEOUT,
-    },
-    worker::{
-        acquire_prefill, endpoint::Endpoint, PdPairIndex, PdWire, PrefillAcquireError,
-        PrefillAdmission, PrefillAdmissionRejection, PrefillLoadGuard, PrefillSelectionContext,
-        RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -96,45 +120,156 @@ use crate::{
 /// [`PDRouter::handle_server_selection_error`].
 type PdPair = (Arc<dyn Worker>, Arc<dyn Worker>);
 
-/// The load one admitted PD request holds. The Prefill guard is released
-/// when the Prefill phase ends; the Decode guard rides on the response body.
+/// Response extension: the side that failed the attempt by itself. Its
+/// worker answered an error status before the side's first byte, or the
+/// call to it failed below HTTP, or its body was cut after a successful
+/// response head. The attempt is recorded on that side's worker alone
+/// ([`PDRouter::record_attempt_outcomes`]), and a worker's own 500 is settled
+/// on the request's ledger ([`PDRouter::settle_attempt`]).
+#[derive(Clone, Copy, Debug)]
+struct OwnFailure(PdSide);
+
+/// The side that failed the attempt by itself, when the answer names one.
+fn own_failure(response: &Response) -> Option<PdSide> {
+    response
+        .extensions()
+        .get::<OwnFailure>()
+        .map(|&OwnFailure(side)| side)
+}
+
+/// The status recorded for a side's call that failed below HTTP, on the
+/// route that sends both sides at once. It is the gateway's 504 for the
+/// request's own timeout, else the 502. The side's end is told with it.
+fn below_http_status(e: &reqwest::Error) -> StatusCode {
+    if is_request_timeout(e) {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
+    }
+}
+
+/// The load one admitted PD request holds, each side's ahead of its send.
+/// The Prefill load is said sent where a dispatch shape hands the prefill's
+/// request to its client ([`PrefillAhead::sent`]), and released when the
+/// Prefill phase ends. A request refused on the way drops it unsent: the
+/// worker is counted no more, and Grand Central hears a release. The
+/// Decode guard rides on the response body, from the decode's send on
+/// ([`DecodeAhead::sent`]).
 struct PdLoadGuards {
-    prefill: PrefillLoadGuard,
-    decode: WorkerLoadGuard,
+    prefill: PrefillAhead,
+    decode: DecodeAhead,
+}
+
+/// A pair's decode from its selection to its send: the placement's answer
+/// for the decode, and that answer's load guard made ahead of the send
+/// ([`Placed::ahead`]). The decode worker is counted from the selection on,
+/// under the key this route always counted it under.
+///
+/// Each dispatch shape sends the decode's request in one place, and says so
+/// there ([`Self::sent`]): the guard a response keeps comes out of that call
+/// alone. Where Grand Central placed the pair, it hears the decode's
+/// dispatch at that call and the decode's end where that guard is dropped. A
+/// decode that is never sent (its prefill failed, the request was refused on
+/// the way) is dropped whole: its worker is counted no more, and the engine
+/// hears its side of the pair released.
+struct DecodeAhead {
+    guard: WorkerLoadGuard,
+    answer: Placed,
+}
+
+impl DecodeAhead {
+    /// The decode `answer` names, counted from now under `key`.
+    fn new(answer: Placed, key: Option<&str>) -> Self {
+        Self {
+            guard: answer.ahead(key),
+            answer,
+        }
+    }
+
+    /// The decode worker, for what a dispatch builds ahead of the send.
+    fn worker(&self) -> &dyn Worker {
+        self.answer.worker().as_ref()
+    }
+
+    /// Whether a dispatch owes this decode an ask behind its prefill's
+    /// answer ([`Placed::owed_behind_prefill`]): an attempt hands its
+    /// dispatch the ask ([`Self::again`]) for such a decode alone.
+    fn owed_behind_prefill(&self) -> bool {
+        self.answer.owed_behind_prefill()
+    }
+
+    /// This decode asked again behind its prefill's answer, by the attempt's
+    /// `ask`. Where the answer names another decode, the request goes to
+    /// that one: its answer and the guard that counts it take the first's
+    /// place here, so the send that follows is that decode's. Everywhere
+    /// else the first decode stands as it was.
+    fn again(self, ask: &DecodeAsk<'_>) -> Self {
+        let (moved, guard) = ask(&self.answer, self.guard);
+        Self {
+            guard,
+            answer: moved.unwrap_or(self.answer),
+        }
+    }
+
+    /// The decode's request goes out now: the worker it goes to, and the load
+    /// guard that holds the worker's count to the request's end.
+    fn sent(self) -> (Arc<dyn Worker>, WorkerLoadGuard) {
+        let guard = self.answer.sent(self.guard);
+        (self.answer.into_guarded_worker(), guard)
+    }
+}
+
+/// A pair's decode asked again behind its prefill's answer
+/// ([`placement::decode_again`]), as an attempt states it for the dispatch
+/// that sends the two sides one behind the other: the attempt holds what
+/// the placement reads of the request. In go the decode's answer and its
+/// guard made ahead of the send; out come the guard to keep, and the decode
+/// the request goes to now where that is another worker.
+type DecodeAsk<'a> =
+    dyn Fn(&Placed, WorkerLoadGuard) -> (Option<Placed>, WorkerLoadGuard) + Sync + 'a;
+
+/// Whether the attempt of a pair sent prefill first hands its dispatch the
+/// ask for `decode` ([`DecodeAsk`]): the decode is owed it behind its
+/// prefill's answer ([`DecodeAhead::owed_behind_prefill`]), and the pair's
+/// connector is not MoRI-IO, whose prefill was told of its decode. A decode
+/// the classic policies picked is owed none: its attempt builds no ask.
+fn asks_decode_again(mode: &KvConnectorMode, decode: &DecodeAhead) -> bool {
+    *mode != KvConnectorMode::MoriIo && decode.owed_behind_prefill()
 }
 
 /// What every dispatch body sets up before its first side goes out: the two
-/// serialized sides and the two load guards taken apart, the request headers
-/// with the trace context injected (every side is sent under them), and the
-/// prefill engine's runtime label the PD metrics are recorded under.
-struct PdSetup {
+/// serialized sides and the two loads taken apart (each still ahead of its
+/// side's send), the request headers as every side is sent them (the
+/// caller's, lent while tracing is off; a copy carrying the trace context
+/// while it is on), and the prefill engine's runtime label the PD metrics are
+/// recorded under.
+struct PdSetup<'a> {
     prefill_body: Bytes,
     decode_body: Bytes,
-    prefill_guard: PrefillLoadGuard,
-    decode_guard: WorkerLoadGuard,
-    headers_with_trace: HeaderMap,
+    prefill_ahead: PrefillAhead,
+    decode: DecodeAhead,
+    headers_with_trace: Cow<'a, HeaderMap>,
     runtime: &'static str,
 }
 
-impl PdSetup {
+impl<'a> PdSetup<'a> {
     fn new(
-        headers: Option<&HeaderMap>,
+        headers: Option<&'a HeaderMap>,
         side_bodies: (Bytes, Bytes),
         guards: PdLoadGuards,
         prefill: &dyn Worker,
     ) -> Self {
         let (prefill_body, decode_body) = side_bodies;
         let PdLoadGuards {
-            prefill: prefill_guard,
-            decode: decode_guard,
+            prefill: prefill_ahead,
+            decode,
         } = guards;
-        let mut headers_with_trace = headers.cloned().unwrap_or_default();
-        inject_trace_context_http(&mut headers_with_trace);
+        let headers_with_trace = with_trace_context_http(headers);
         Self {
             prefill_body,
             decode_body,
-            prefill_guard,
-            decode_guard,
+            prefill_ahead,
+            decode,
             headers_with_trace,
             runtime: prefill.metadata().spec.runtime_type.as_str(),
         }
@@ -145,9 +280,19 @@ impl PdSetup {
 enum PdSelectionFailure {
     /// Every worker on one role is vetoed: a ready-made, already-counted 503.
     Shed(Response),
+    /// The policy spec in force binds no pair plan for the model: the
+    /// placement's ready-made 501.
+    NoPlanBound(Response),
+    /// Grand Central refused the pair's decision: the placement's
+    /// ready-made 500.
+    DecisionFailed(Response),
     /// The pre-existing string: no workers configured, all unhealthy or
     /// circuit-broken, or the policy declined.
     Unavailable(String),
+    /// [`Self::Unavailable`]'s string for a role, and a reason for its line:
+    /// the word Grand Central shed the pair under. The pair route's line
+    /// names it, and the deep probe's answer drops it.
+    ShedUnder(String, String),
     /// Both roles are up, but no prefill shares a KV transfer protocol with
     /// any decode (#2483).
     Incompatible(String),
@@ -177,6 +322,8 @@ pub struct PDRouter {
     pub policy_registry: Arc<PolicyRegistry>,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
+    /// Cap on buffered worker response bodies, mirroring the ingress limit.
+    max_payload_size: usize,
     prefill_admission: Option<Arc<PrefillAdmission>>,
     /// Round-robin over the data-parallel ranks of MoRI-IO pairs.
     moriio_dp_turn: AtomicUsize,
@@ -198,8 +345,9 @@ impl std::fmt::Debug for PDRouter {
 }
 
 /// Who records the prefill side's outcome for an attempt: the attempt, from
-/// the response status, or the drain task once the prefill body is known
-/// (the early-commit path, where the response is the decode's).
+/// the response status, or whoever consumed the prefill body under a
+/// response that is the decode's: the drain task (the early-commit path), or
+/// the unary read of a body that was cut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrefillOutcome {
     FromStatus,
@@ -232,7 +380,7 @@ trait PdRoute: GenerationRequest {
 
     /// The (text, tokens) the policies route on, read only when one asks.
     fn routing_inputs(&self) -> (Option<String>, Option<Vec<u32>>) {
-        (Some(self.extract_text_for_routing()), None)
+        (Some(self.routing_text()), None)
     }
 }
 
@@ -363,7 +511,7 @@ impl PDRouter {
             .cloned();
 
         if let Some(worker) = first_worker {
-            Self::proxy_to_worker(&worker, endpoint, headers).await
+            Self::proxy_to_worker(&worker, endpoint, headers, self.max_payload_size).await
         } else {
             error::service_unavailable("no_prefill_servers", "No prefill servers available")
         }
@@ -373,75 +521,74 @@ impl PDRouter {
         worker: &Arc<dyn Worker>,
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
+        max_payload_size: usize,
     ) -> Response {
-        let url = format!("{}/{endpoint}", worker.url());
+        let url = format!("{}/{endpoint}", worker.base_url());
         let mut request_builder = worker.http_client().get(&url);
 
-        // A public route outside the auth middleware: the caller's headers go
-        // as they are and nothing is added (a configured worker key here would
-        // authenticate an anonymous caller as the worker).
+        // A public route outside the auth middleware: the allow-listed caller
+        // headers go as they are and nothing is added (a configured worker key
+        // here would authenticate an anonymous caller as the worker). The rest
+        // stays behind, the caller's `accept-encoding` among them: the worker
+        // reads the client factory's `identity`.
         if let Some(headers) = headers {
             for (name, value) in headers {
-                request_builder = request_builder.header(name, value);
+                if header_utils::should_forward_request_header(&name) {
+                    request_builder = request_builder.header(name, value);
+                }
             }
         }
 
         match send_with_stale_conn_retry(request_builder).await {
-            Ok(res) if res.status().is_success() => {
+            Ok(res) => {
+                let status = res.status();
                 let response_headers = header_utils::preserve_response_headers(res.headers());
 
-                match res.bytes().await {
+                match read_body_capped(res.bytes_stream(), max_payload_size).await {
                     Ok(body) => {
                         let mut response = Response::new(Body::from(body));
-                        *response.status_mut() = StatusCode::OK;
+                        *response.status_mut() = status;
                         *response.headers_mut() = response_headers;
                         response
                     }
-                    Err(e) => {
-                        error!("Failed to read response body: {}", e);
-                        error::internal_error(
+                    Err(BodyReadError::TooLarge) => {
+                        worker_body_too_large(max_payload_size, worker.url())
+                    }
+                    // The request's own timeout running out mid-body ends the
+                    // request as it does on every other body read of these
+                    // routers (504 under its code), never as the worker's
+                    // transport failing.
+                    Err(BodyReadError::Transport(e)) if is_request_timeout(&e) => {
+                        error!(
+                            worker = Endpoint::redacted_str(worker.url()),
+                            "Response body read timed out: {}",
+                            cause(&e)
+                        );
+                        request_timeout_response(format!(
+                            "Failed to read response body: {}",
+                            cause(&e)
+                        ))
+                    }
+                    Err(BodyReadError::Transport(e)) => {
+                        error!(
+                            worker = Endpoint::redacted_str(worker.url()),
+                            "Failed to read response body: {}",
+                            cause(&e)
+                        );
+                        error::bad_gateway(
                             "read_response_body_failed",
                             format!("Failed to read response body: {}", cause(&e)),
                         )
                     }
                 }
             }
-            Ok(res) => {
-                let status = res.status();
-                // Use the status code to determine which error function to use
-                match status {
-                    StatusCode::BAD_REQUEST => error::bad_request(
-                        "server_bad_request",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    StatusCode::NOT_FOUND => error::not_found(
-                        "server_not_found",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    StatusCode::INTERNAL_SERVER_ERROR => error::internal_error(
-                        "server_internal_error",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    StatusCode::SERVICE_UNAVAILABLE => error::service_unavailable(
-                        "server_unavailable",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    StatusCode::BAD_GATEWAY => error::bad_gateway(
-                        "server_bad_gateway",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                    _ => error::internal_error(
-                        "server_error",
-                        format!("Server returned status: {}", res.status()),
-                    ),
-                }
-            }
             Err(e) => {
-                error!("Failed to proxy request server: {}", e);
-                error::internal_error(
-                    "proxy_request_failed",
-                    format!("Failed to proxy request: {}", cause(&e)),
-                )
+                error!(
+                    worker = Endpoint::redacted_str(worker.url()),
+                    "Failed to proxy request server: {}",
+                    cause(&e)
+                );
+                convert_reqwest_error(e)
             }
         }
     }
@@ -450,12 +597,13 @@ impl PDRouter {
         clippy::unused_async,
         reason = "async for API consistency with other router constructors"
     )]
-    pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+    pub async fn new(ctx: &Arc<AppContext>) -> Result<Self, String> {
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
+            max_payload_size: ctx.router_config.max_payload_size,
             prefill_admission: ctx.prefill_admission.clone(),
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: ctx.rate_limit_manager.clone(),
@@ -478,6 +626,10 @@ impl PDRouter {
             // counter; re-describing it as a circuit-breaker/health failure is
             // exactly the misdiagnosis this path used to hand operators.
             PdSelectionFailure::Shed(shed) => shed,
+            // Its line is written by [`Self::report_refusal`] too.
+            PdSelectionFailure::NoPlanBound(refusal) => refusal,
+            // The engine's own line says why it refused the decision.
+            PdSelectionFailure::DecisionFailed(refusal) => refusal,
             PdSelectionFailure::Incompatible(error) => {
                 error!("Failed to select PD pair error={}", error);
                 error::service_unavailable("no_compatible_pd_pair", error)
@@ -492,19 +644,33 @@ impl PDRouter {
                 // [`Self::report_refusal`], once and rate-limited, not here.
                 placement::no_available_workers(format!("No available servers: {error}"))
             }
+            // The same answer for the client, and the line names the word.
+            PdSelectionFailure::ShedUnder(error, reason) => {
+                placement::no_available_workers_because(
+                    format!("No available servers: {error}"),
+                    reason,
+                )
+            }
         }
     }
 
     /// The line and marker of a refusal this router answers on its own (the
-    /// `no_available_workers` 503 of a role that is down): one WARN per
-    /// refusal, rate-limited, with both roles' state, through
+    /// `no_available_workers` 503 of a role that is down, the
+    /// `no_policy_plan_for_model` 501 of a request no plan binds): one WARN
+    /// per refusal, rate-limited, with both roles' state, through
     /// [`placement::report_refusal`]; the access log then keeps quiet about
-    /// it. Every other response passes through unchanged.
-    fn report_refusal(&self, model_id: &str, refusal: Response) -> Response {
+    /// it. Every other response passes through unchanged. `function` is the
+    /// site that answers the refusal, as the line names it.
+    fn report_refusal(
+        &self,
+        function: &'static str,
+        model_id: &str,
+        refusal: Response,
+    ) -> Response {
         placement::report_refusal(
             &self.worker_registry,
             RefusalSite {
-                function: "PDRouter::execute_dual_dispatch_attempt",
+                function,
                 mode: "PrefillDecode",
                 pools: &[
                     ("prefill", RoutingPool::HttpPrefill),
@@ -531,8 +697,9 @@ impl PDRouter {
 
     /// The bootstrap rendezvous for one request, generated once so both sides
     /// carry the same rooms: one value per prompt for a batch, scalars
-    /// otherwise. With a selected prefill DP rank on a worker of `dp_size > 1`,
-    /// every room is congruent to that rank; otherwise the rooms are free.
+    /// otherwise. With a selected prefill DP rank on a worker whose `dp_size`
+    /// is above 1 and below `i64::MAX`, every room is congruent to that rank;
+    /// otherwise the rooms are free.
     fn bootstrap_fields(
         prefill_worker: &dyn Worker,
         batch_size: Option<usize>,
@@ -540,11 +707,18 @@ impl PDRouter {
     ) -> serde_json::Result<BootstrapFields> {
         let host = prefill_worker.bootstrap_host();
         let port = prefill_worker.bootstrap_port();
+        // At or above the room's range the ranked draw's range,
+        // `0..i64::MAX - dp_size`, would be empty.
         let room_rank = match (prefill_rank, prefill_worker.dp_size()) {
-            (Some(rank), Some(dp_size)) if dp_size > 1 => usize::try_from(rank)
-                .ok()
-                .filter(|&rank| rank < dp_size)
-                .map(|rank| (rank, dp_size)),
+            (Some(rank), Some(dp_size))
+                if dp_size > 1
+                    && i64::try_from(dp_size).is_ok_and(|dp_size| dp_size < i64::MAX) =>
+            {
+                usize::try_from(rank)
+                    .ok()
+                    .filter(|&rank| rank < dp_size)
+                    .map(|rank| (rank, dp_size))
+            }
             _ => None,
         };
         let room = || match room_rank {
@@ -574,10 +748,10 @@ impl PDRouter {
         body.insert(Self::BOOTSTRAP_ROOM_KEY, fields.room);
     }
 
-    fn inject_dp_rank(
-        body: &mut RawBody<'_>,
+    fn inject_dp_rank<'a>(
+        body: &mut RawBody<'a>,
         rank: isize,
-        rank_key: &str,
+        rank_key: &'a str,
     ) -> serde_json::Result<()> {
         body.insert(rank_key, to_raw_value(&rank)?);
         Ok(())
@@ -641,7 +815,7 @@ impl PDRouter {
     /// reserves its estimate once, before any dispatch, and the one answer
     /// the dispatch paths converge on resolves the reservation once
     /// (`tenant_rate_limit`), as the regular HTTP router's typed route does.
-    async fn execute_dual_dispatch<T: TenantCharge + Serialize>(
+    async fn execute_dual_dispatch<T: TenantCharge + Serialize + GenerationRequest>(
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: Option<&TenantRequestMeta>,
@@ -700,13 +874,20 @@ impl PDRouter {
             ReleasePoint::from_retry_config(retry_config),
         );
 
+        // What the request's attempts tell the worker pool: a retry selects
+        // around a worker whose answer was definitive (`attempt_ledger`).
+        let ledger = AttemptLedger::default();
+        // The engines of the pairs the request's failed attempts were sent
+        // to: a retry steps off them (`PlacementInputs::tried`).
+        let tried = parking_lot::Mutex::new(Vec::new());
+
         let response = if let Some(denied) = denial {
             denied
         } else if lease.release_point() == ReleasePoint::AfterDispatch {
             // Retries disabled: one dispatch; the lease frees the parsed
             // request as soon as its serialized sides exist.
             let res = self
-                .execute_dual_dispatch_attempt(0, headers, &lease, context)
+                .execute_dual_dispatch_attempt(0, headers, &lease, context, &ledger, &tried)
                 .await;
             // Mirror the retry executor's exhaustion accounting for a
             // retryable response that gets no retry.
@@ -718,15 +899,17 @@ impl PDRouter {
         } else {
             // The lease keeps the request alive for replay until the retry
             // window closes (first non-retryable response).
-            let lease = &lease;
+            let (lease, ledger, tried) = (&lease, &ledger, &tried);
             RetryExecutor::execute_response_with_retry(
                 retry_config,
                 {
                     move |attempt: u32| {
                         let context = context.clone();
                         async move {
-                            self.execute_dual_dispatch_attempt(attempt, headers, lease, context)
-                                .await
+                            self.execute_dual_dispatch_attempt(
+                                attempt, headers, lease, context, ledger, tried,
+                            )
+                            .await
                         }
                     }
                 },
@@ -752,8 +935,9 @@ impl PDRouter {
         };
 
         // The reservation resolves on the one answer both dispatch paths
-        // converge on. A buffered answer is the decode side's body, held
-        // whole already (read without a bound), so the re-read is unbounded.
+        // converge on. A buffered answer is held whole already (each body
+        // kept for it read under the payload limit, the logprob merge
+        // joining the two), so the re-read takes no bound of its own.
         let response = tenant_rate_limit::resolve(
             reservation.as_ref(),
             route,
@@ -795,12 +979,17 @@ impl PDRouter {
 
     /// One PD dispatch attempt: select the pair, lease-serialize the
     /// per-side bodies, dispatch, and record per-attempt worker outcomes.
-    async fn execute_dual_dispatch_attempt<T: Serialize>(
+    /// A retry selects around the workers the request's `ledger` closed the
+    /// retry window on, and the attempt's answer is settled on that ledger
+    /// ([`Self::settle_attempt`]).
+    async fn execute_dual_dispatch_attempt<T: Serialize + GenerationRequest>(
         &self,
         attempt: u32,
         headers: Option<&HeaderMap>,
         lease: &RequestLease<T>,
         context: PDRequestContext<'_>,
+        ledger: &AttemptLedger,
+        tried: &parking_lot::Mutex<Vec<String>>,
     ) -> Response {
         // Admission may queue the request, so the selection inputs are copied
         // out of the lease's synchronous view first.
@@ -813,26 +1002,57 @@ impl PDRouter {
             )
         });
         let sticky_key = self.policy_registry.sticky_key(headers, rid_key.as_deref());
+        // A retry never goes back to a worker whose answer was definitive
+        // for this request. The selection may wait for admission, so the
+        // filter is built here, as the gRPC selection stage builds its own,
+        // and not through `AttemptLedger::with_candidate_filter`. A first
+        // attempt asks nothing of each candidate.
+        let admits = |worker: &dyn Worker| ledger.admits(worker);
+        let candidate_filter: Option<CandidateFilter<'_>> =
+            if attempt == 0 { None } else { Some(&admits) };
+        // The dispatch takes the context; the settle reads the model after it.
+        let model_id = context.model_id;
+        // Copied out: the selection may wait for admission. The ask behind a
+        // prefill's answer states the same list again.
+        let tried_before = tried.lock().clone();
         let selected = self
             .select_pd_pair_with_admission(
-                context.model_id,
+                model_id,
                 PlacementInputs {
                     text: text.as_deref(),
                     tokens: tokens.as_deref(),
                     headers: context.headers.as_ref(),
                     rid_key: rid_key.as_deref(),
+                    // The attempt holds the key the route derived of the
+                    // body's id and no copy of the id, so the id it states
+                    // is that key. A key that still ends in a turn or retry
+                    // suffix keys one level coarser than under the classic
+                    // override.
+                    rid: rid_key.as_deref(),
                     cache_namespace,
-                    candidate_filter: None,
-                    tried: &[],
+                    candidate_filter,
+                    tried: &tried_before,
                 },
                 sticky_key,
+                // The body's output limit, for Grand Central alone. The
+                // selection may wait for admission, so what rides with it
+                // is the lease's reference: the body is read where the
+                // engine decides and nowhere else.
+                move || {
+                    lease.with_view(|view| {
+                        placement::Stated::of_limit(view.request.max_output_tokens())
+                    })
+                },
             )
             .await;
         let ((prefill, decode), guards) = match selected {
             Ok(admitted) => admitted,
             Err(e) => {
-                return self
-                    .report_refusal(context.model_id, Self::handle_server_selection_error(*e));
+                return self.report_refusal(
+                    "PDRouter::execute_dual_dispatch_attempt",
+                    context.model_id,
+                    Self::handle_server_selection_error(*e),
+                );
             }
         };
 
@@ -993,7 +1213,7 @@ impl PDRouter {
             lease.release_dispatch();
 
             if let (true, Some((prefill_endpoint, _))) = (concurrent_write, &moriio_endpoints) {
-                return self
+                let response = self
                     .execute_moriio_concurrent_write(
                         headers,
                         (prefill_body, decode_body),
@@ -1002,16 +1222,68 @@ impl PDRouter {
                         prefill_endpoint,
                         context,
                         Arc::clone(&prefill),
-                        Arc::clone(&decode),
                         guards,
+                        ledger,
                     )
                     .await;
+                let response = self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+                Self::join_tried(tried, [&prefill, &decode], &response);
+                return response;
             }
+
+            // The prefill goes first: behind its answer the pair's decode is
+            // asked again, with what the selection read of the request and
+            // its rule for a retry, over the pair index as it stands then.
+            // The request goes to the decode that answer names. A MoRI-IO
+            // prefill was told of its decode (that engine's sizes, the rank
+            // both sides go to, and the side channel a WRITE prefill pushes
+            // to), so that pair's decode is not asked.
+            //
+            // Both sides stand as built for the decode the selection named,
+            // which is no MoRI-IO engine where the decode is asked. A MoRI-IO
+            // decode takes the transfer its prefill was told of, and this
+            // prefill was told of none. So the ask is held to a decode that
+            // is no such engine, beside the retry's rule.
+            //
+            // The ask and its rule are built where the decode is asked again
+            // and nowhere else ([`asks_decode_again`]): the attempt of a
+            // pair the classic policies picked makes that test, builds
+            // neither and hands its dispatch no ask.
+            let moved_to = parking_lot::Mutex::new(None);
+            let (keeps_the_shape, ask);
+            let again: Option<&DecodeAsk<'_>> = if asks_decode_again(&mode, &guards.decode) {
+                keeps_the_shape = |worker: &dyn Worker| {
+                    !is_moriio_worker(worker)
+                        && candidate_filter.is_none_or(|accepts| accepts(worker))
+                };
+                ask = |first: &Placed, ahead: WorkerLoadGuard| {
+                    let inputs = PlacementInputs {
+                        text: text.as_deref(),
+                        tokens: tokens.as_deref(),
+                        headers,
+                        rid_key: rid_key.as_deref(),
+                        // The derived key again, as the selection stated it.
+                        rid: rid_key.as_deref(),
+                        cache_namespace,
+                        candidate_filter: Some(&keeps_the_shape),
+                        tried: &tried_before,
+                    };
+                    let pairs = || self.pd_pairs(model_id);
+                    let (moved, guard) = self.decode_again(model_id, &pairs, inputs, first, ahead);
+                    if let Some(moved) = &moved {
+                        *moved_to.lock() = Some(Arc::clone(moved.worker()));
+                    }
+                    (moved, guard)
+                };
+                Some(&ask)
+            } else {
+                None
+            };
 
             // Outcome accounting happens per-side inside the sequential path:
             // a prefill-only failure must not feed the decode worker's
             // circuit breaker (the decode side was never contacted).
-            return self
+            let response = self
                 .execute_sequential_dispatch_internal(
                     headers,
                     (prefill_body, decode_body),
@@ -1020,10 +1292,17 @@ impl PDRouter {
                     dp_rank,
                     context,
                     Arc::clone(&prefill),
-                    Arc::clone(&decode),
                     guards,
+                    ledger,
+                    again,
                 )
                 .await;
+            // The attempt is settled on the decode the request went to.
+            let moved_to = moved_to.into_inner();
+            let decode = moved_to.as_ref().unwrap_or(&decode);
+            let response = self.settle_attempt(ledger, model_id, [&prefill, decode], response);
+            Self::join_tried(tried, [&prefill, decode], &response);
+            return response;
         }
 
         let sides =
@@ -1122,40 +1401,80 @@ impl PDRouter {
                 (prefill_body, decode_body),
                 context,
                 Arc::clone(&prefill),
-                Arc::clone(&decode),
                 guards,
                 &mut prefill_outcome,
+                ledger,
             )
             .await;
         Self::record_attempt_outcomes(
+            ledger,
             prefill.as_ref(),
             decode.as_ref(),
             response.status(),
             prefill_outcome,
             head_success_recorded(&response),
+            own_failure(&response),
         );
+        let response = self.settle_attempt(ledger, model_id, [&prefill, &decode], response);
+        Self::join_tried(tried, [&prefill, &decode], &response);
         response
     }
 
-    /// Record an attempt's outcome on both sides. On the early-commit path the
+    /// The engines of a pair whose answer a retry may replace join the
+    /// engines the request tried, which the selection reads: the engine of
+    /// the side the request's ledger closed, else both.
+    fn join_tried(
+        tried: &parking_lot::Mutex<Vec<String>>,
+        [prefill, decode]: [&Arc<dyn Worker>; 2],
+        response: &Response,
+    ) {
+        if !is_retryable_response(response) {
+            return;
+        }
+        let named = failed_side_type(response);
+        let mut tried = tried.lock();
+        let mut join = |worker: &Arc<dyn Worker>| {
+            if !tried.iter().any(|engine| engine == worker.base_url()) {
+                tried.push(worker.base_url().to_string());
+            }
+        };
+        if named != Some(WorkerType::Decode) {
+            join(prefill);
+        }
+        if named != Some(WorkerType::Prefill) {
+            join(decode);
+        }
+    }
+
+    /// Record an attempt's outcome on both sides, or on one. A status one
+    /// side failed with by itself (`failed_side`, see [`OwnFailure`]) is
+    /// that worker's alone, as the sequential path records it: charged to
+    /// its partner too, one failing decode worker would open the breaker of
+    /// the healthy prefill worker beside it. On the early-commit path the
     /// drain records the prefill's once its body is known: the attempt's
     /// status is the decode's there, and recording it on the prefill would
-    /// reset the failures the drain counts. A streamed decode head's success
-    /// was recorded before its relay task was spawned
-    /// (`create_streaming_response`), so it is not recorded again.
+    /// reset the failures the drain counts. A streamed decode head's sample
+    /// is its relay's to take, at the head or at the stream's end
+    /// (`create_streaming_response`), so it is not recorded here. A failure
+    /// goes through the request's `ledger`, which charges a worker once a
+    /// request however many of its attempts failed there.
     fn record_attempt_outcomes(
+        ledger: &AttemptLedger,
         prefill: &dyn Worker,
         decode: &dyn Worker,
         status: StatusCode,
         prefill_outcome: PrefillOutcome,
         decode_head_recorded: bool,
+        failed_side: Option<PdSide>,
     ) {
-        let attempt_records_prefill = prefill_outcome == PrefillOutcome::FromStatus;
+        let attempt_records_prefill =
+            prefill_outcome == PrefillOutcome::FromStatus && failed_side != Some(PdSide::Decode);
+        let attempt_records_decode = failed_side != Some(PdSide::Prefill);
         if attempt_records_prefill {
-            prefill.record_outcome(status.as_u16());
+            ledger.record_outcome(prefill, status.as_u16());
         }
-        if !(decode_head_recorded && status.is_success()) {
-            decode.record_outcome(status.as_u16());
+        if attempt_records_decode && !(decode_head_recorded && status.is_success()) {
+            ledger.record_outcome(decode, status.as_u16());
         }
 
         // Record worker errors for server errors (5xx)
@@ -1168,11 +1487,13 @@ impl PDRouter {
                     error_type,
                 );
             }
-            Metrics::record_worker_error(
-                metrics_labels::WORKER_DECODE,
-                metrics_labels::CONNECTION_HTTP,
-                error_type,
-            );
+            if attempt_records_decode {
+                Metrics::record_worker_error(
+                    metrics_labels::WORKER_DECODE,
+                    metrics_labels::CONNECTION_HTTP,
+                    error_type,
+                );
+            }
         }
     }
 
@@ -1185,13 +1506,25 @@ impl PDRouter {
     /// stream: nothing of the response is out, and a client reads an error
     /// status's body as the envelope, not as events. An error body that
     /// cannot be read says so in the detail.
-    async fn side_refused(side: PdSide, response: reqwest::Response) -> Response {
+    ///
+    /// The answer is marked as the worker's own and as the side's own
+    /// failure ([`OwnFailure`]). Its 500 is definitive for the payload and
+    /// is settled on the request's ledger ([`Self::settle_attempt`]). Its
+    /// other statuses are replayed as before.
+    async fn side_refused(
+        side: PdSide,
+        response: reqwest::Response,
+        max_payload_size: usize,
+    ) -> Response {
         let status = response.status();
         // Taken before the body read consumes the response.
         let retry_after = response.headers().get(RETRY_AFTER).cloned();
-        let detail = match response.bytes().await {
+        let detail = match read_body_capped(response.bytes_stream(), max_payload_size).await {
             Ok(body) => upstream_error_message(&body),
-            Err(e) => format!(
+            Err(BodyReadError::TooLarge) => {
+                format!("{status}, and its error body exceeded {max_payload_size} bytes")
+            }
+            Err(BodyReadError::Transport(e)) => format!(
                 "{status}, and its error body could not be read: {}",
                 cause(&e)
             ),
@@ -1200,16 +1533,89 @@ impl PDRouter {
         if let Some(value) = retry_after {
             answer.headers_mut().insert(RETRY_AFTER, value);
         }
+        mark_upstream_answer(&mut answer);
+        answer.extensions_mut().insert(OwnFailure(side));
         answer
     }
 
+    /// [`Self::side_refused`] for a decode worker, with the refusal logged.
+    async fn decode_refused(
+        decode: &dyn Worker,
+        response: reqwest::Response,
+        max_payload_size: usize,
+    ) -> Response {
+        error!(
+            "Decode server returned error status decode_url={} status={}",
+            decode.redacted_url(),
+            response.status()
+        );
+        Self::side_refused(PdSide::Decode, response, max_payload_size).await
+    }
+
+    /// An attempt's definitive answer on the request's ledger, settled as
+    /// the regular HTTP route and the gRPC pipeline settle theirs, over the
+    /// pairs the model's index can still form among its available workers.
+    ///
+    /// The worker that answered takes no further attempt of this request
+    /// while a pair is left without it, and the retry selects another
+    /// worker of its side. A side's status can carry its partner's part of
+    /// the handoff (a decode side that is not streamed answers after the
+    /// transfer), so when the worker that answered is the last of its side
+    /// that can pair, the retry leaves its partner instead and keeps the
+    /// worker. With no pair left either way the answer goes back to the
+    /// client as it is. Any other response passes untouched.
+    fn settle_attempt(
+        &self,
+        ledger: &AttemptLedger,
+        model_id: &str,
+        pair: [&Arc<dyn Worker>; 2],
+        mut response: Response,
+    ) -> Response {
+        // Of a side's own failures only its worker's own 500 is definitive.
+        let Some(side) = own_failure(&response).filter(|_| is_definitive_failure(&response)) else {
+            return response;
+        };
+        let [prefill, decode] = pair;
+        let (answered, partner) = match side {
+            PdSide::Prefill => (prefill, decode),
+            PdSide::Decode => (decode, prefill),
+        };
+        let pairs = self.pd_pairs(model_id);
+        let pairs_without = |gone: &Arc<dyn Worker>| {
+            let free = |worker: &Arc<dyn Worker>| {
+                worker.base_url() != gone.base_url()
+                    && worker.is_available()
+                    && ledger.admits(worker.as_ref())
+            };
+            pairs
+                .prefill
+                .iter()
+                .zip(&pairs.partners)
+                .any(|(candidate, partners)| free(candidate) && partners.iter().any(&free))
+        };
+        let left = [answered, partner]
+            .into_iter()
+            .find(|&worker| pairs_without(worker));
+        mark_failed_side(&mut response, left.unwrap_or(answered).as_ref());
+        // With no pair left the ledger is given no pool to seek an
+        // alternative in, and the answer stands.
+        let pool = left.map(|_| pairs.prefill_pool.iter().chain(pairs.decode_pool.iter()));
+        ledger.settle(&mut response, pair, pool.into_iter().flatten());
+        response
+    }
+
     /// The decode side's response head, once the prefill side is done with:
-    /// the side's outcome recorded (a streamed head's success is the relay's
-    /// to record, before it spawns its task, see `create_streaming_response`;
-    /// the other outcomes here, before the body is forwarded), an error
-    /// status answered, the PD TTFT taken from the dispatch to this head
-    /// (the prefill wait is part of what the client experiences), and the
-    /// body forwarded.
+    /// the side's outcome recorded (a streamed head's sample is the relay's
+    /// to take, at the head or at the stream's end, see
+    /// `create_streaming_response`;
+    /// a non-streamed success is recorded after its body is read), an error
+    /// status answered, the PD TTFT taken from the dispatch to this head (the
+    /// prefill wait is part of what the client experiences), and the body
+    /// forwarded.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the sequential decode handoff carries its request ledger"
+    )]
     async fn forward_decode_head(
         &self,
         decode_response: reqwest::Response,
@@ -1218,19 +1624,20 @@ impl PDRouter {
         decode_guard: WorkerLoadGuard,
         runtime: &'static str,
         dispatch_start: Instant,
+        ledger: &AttemptLedger,
     ) -> Response {
         events::RequestReceivedEvent {}.emit();
         let status = decode_response.status();
-        if !(context.is_stream && status.is_success()) {
-            Self::record_sequential_side(decode.as_ref(), metrics_labels::WORKER_DECODE, status);
-        }
         if !status.is_success() {
-            error!(
-                "Decode server returned error status decode_url={} status={}",
-                decode.redacted_url(),
-                status
+            Self::record_sequential_side(
+                ledger,
+                decode.as_ref(),
+                metrics_labels::WORKER_DECODE,
+                status,
             );
-            return Self::side_refused(PdSide::Decode, decode_response).await;
+            RequestEnd::of(&decode_guard).report(status.as_u16(), || true);
+            return Self::decode_refused(decode.as_ref(), decode_response, self.max_payload_size)
+                .await;
         }
         Metrics::record_pd_ttft(
             metrics_labels::BACKEND_PD,
@@ -1238,8 +1645,15 @@ impl PDRouter {
             runtime,
             dispatch_start.elapsed(),
         );
-        self.forward_decode_body(decode_response, status, context, decode, decode_guard, None)
-            .await
+        self.forward_decode_body(
+            decode_response,
+            context,
+            decode,
+            decode_guard,
+            None,
+            Some(ledger),
+        )
+        .await
     }
 
     /// A side the request's own timeout cut (see `retry::is_request_timeout`):
@@ -1247,6 +1661,7 @@ impl PDRouter {
     /// side's worker as the timeout, answered as the gateway's 504, which the
     /// retry layer does not replay on another pair.
     fn side_timed_out(
+        ledger: &AttemptLedger,
         worker: &dyn Worker,
         role: &'static str,
         what: &str,
@@ -1257,7 +1672,7 @@ impl PDRouter {
             "PD {what} timed out: {}",
             cause(e)
         );
-        Self::record_sequential_side(worker, role, StatusCode::GATEWAY_TIMEOUT);
+        Self::record_sequential_side(ledger, worker, role, StatusCode::GATEWAY_TIMEOUT);
         request_timeout_response(format!("{what} timed out: {}", cause(e)))
     }
 
@@ -1269,6 +1684,7 @@ impl PDRouter {
     /// the shared vocabulary (see `pd_failure`) with the transport's reason
     /// and its causes. `what` names the call in the log and the timeout.
     fn side_failed_below_http(
+        ledger: &AttemptLedger,
         side: PdSide,
         phase: SidePhase,
         what: &str,
@@ -1276,7 +1692,7 @@ impl PDRouter {
         e: &reqwest::Error,
     ) -> Response {
         if is_request_timeout(e) {
-            return Self::side_timed_out(worker, side.name(), what, e);
+            return Self::side_timed_out(ledger, worker, side.name(), what, e);
         }
         error!(
             worker = Endpoint::redacted_str(worker.url()),
@@ -1284,13 +1700,18 @@ impl PDRouter {
             "PD {what} failed below HTTP: {}",
             cause(e)
         );
-        Self::record_sequential_side(worker, side.name(), StatusCode::BAD_GATEWAY);
+        Self::record_sequential_side(ledger, worker, side.name(), StatusCode::BAD_GATEWAY);
         side.answer(phase, StatusCode::BAD_GATEWAY, cause(e))
     }
 
     /// A prefill side whose call failed below HTTP before its first byte.
-    fn prefill_transport_failed(prefill: &dyn Worker, e: &reqwest::Error) -> Response {
+    fn prefill_transport_failed(
+        ledger: &AttemptLedger,
+        prefill: &dyn Worker,
+        e: &reqwest::Error,
+    ) -> Response {
         Self::side_failed_below_http(
+            ledger,
             PdSide::Prefill,
             SidePhase::Start,
             "Prefill request",
@@ -1301,8 +1722,13 @@ impl PDRouter {
 
     /// A prefill side whose answer could not be read to its end: its stream
     /// failed after it began.
-    fn prefill_read_failed(prefill: &dyn Worker, e: &reqwest::Error) -> Response {
+    fn prefill_read_failed(
+        ledger: &AttemptLedger,
+        prefill: &dyn Worker,
+        e: &reqwest::Error,
+    ) -> Response {
         Self::side_failed_below_http(
+            ledger,
             PdSide::Prefill,
             SidePhase::Stream,
             "Prefill response",
@@ -1311,15 +1737,25 @@ impl PDRouter {
         )
     }
 
-    /// A decode side whose call failed below HTTP before its first byte.
-    fn decode_transport_failed(decode: &dyn Worker, e: &reqwest::Error) -> Response {
-        Self::side_failed_below_http(
+    /// A decode side whose call failed below HTTP before its first byte. The
+    /// decode's end is told through `guard`, its own, with the status the
+    /// route answers and records, as no answer of its worker's.
+    fn decode_transport_failed(
+        ledger: &AttemptLedger,
+        decode: &dyn Worker,
+        guard: &WorkerLoadGuard,
+        e: &reqwest::Error,
+    ) -> Response {
+        let refusal = Self::side_failed_below_http(
+            ledger,
             PdSide::Decode,
             SidePhase::Start,
             "Decode request",
             decode,
             e,
-        )
+        );
+        RequestEnd::of(guard).report(refusal.status().as_u16(), || false);
+        refusal
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
@@ -1333,19 +1769,19 @@ impl PDRouter {
         side_bodies: (Bytes, Bytes),
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
         prefill_outcome: &mut PrefillOutcome,
+        ledger: &AttemptLedger,
     ) -> Response {
         let PdSetup {
             prefill_body,
             decode_body,
-            prefill_guard,
-            decode_guard,
+            prefill_ahead,
+            decode,
             headers_with_trace,
             runtime,
         } = PdSetup::new(headers, side_bodies, guards, prefill.as_ref());
-        let headers = Some(&headers_with_trace);
+        let headers = Some(&*headers_with_trace);
 
         // Build both requests
         let prefill_request = self.build_post_with_headers(
@@ -1353,21 +1789,21 @@ impl PDRouter {
             context.route,
             prefill_body,
             headers,
-            false,
+            None,
         );
         let decode_request = self.build_post_with_headers(
-            decode.as_ref(),
+            decode.worker(),
             context.route,
             decode_body,
             headers,
-            false,
+            None,
         );
 
         // Send both requests concurrently and wait for both
         // Note: Using borrowed references avoids heap allocation
         events::RequestPDSentEvent {
             prefill_url: prefill.redacted_url(),
-            decode_url: decode.redacted_url(),
+            decode_url: decode.worker().redacted_url(),
         }
         .emit();
 
@@ -1387,12 +1823,24 @@ impl PDRouter {
             Draining(tokio_util::task::AbortOnDropHandle<()>),
         }
         let dispatch_start = Instant::now();
+        // The prefill goes out with the join below, in a future that owns
+        // its load: the prefill's send is said here.
+        let prefill_guard = prefill_ahead.sent();
         let prefill_fut = async {
             let resp = send_with_stale_conn_retry(prefill_request)
                 .await
-                .map_err(|e| DispatchError::Transport(PdSide::Prefill, e))?;
+                .map_err(|e| {
+                    // The prefill's guard stands in this future alone: its
+                    // failed call is told here, with the status the attempt
+                    // records for it.
+                    prefill_guard
+                        .end()
+                        .report(below_http_status(&e).as_u16(), || false);
+                    DispatchError::Transport(PdSide::Prefill, e)
+                })?;
             if context.is_stream && !context.return_logprob && resp.status().is_success() {
                 let prefill = Arc::clone(&prefill);
+                let charges = ledger.charges().clone();
                 let model_id = context.model_id.to_string();
                 // The drain owns both the permit and the outcome. It may finish
                 // before Decode sends headers; neither waits for the other.
@@ -1402,17 +1850,31 @@ impl PDRouter {
                     reason = "drains a prefill body concurrently with Decode; aborted before client commitment and detached after it"
                 )]
                 let drain = tokio::spawn(async move {
-                    let _prefill_guard = prefill_guard;
+                    // The worker's own success status, as the read whole
+                    // keeps it, or the 502 of a body cut before its end.
+                    let mut drained = resp.status();
                     let mut chunks = resp.bytes_stream();
-                    let mut drained = StatusCode::OK;
                     while let Some(chunk) = chunks.next().await {
                         if let Err(e) = chunk {
-                            warn!("Error consuming prefill response: {e}");
+                            warn!(
+                                worker = Endpoint::redacted_str(prefill.url()),
+                                "Error consuming prefill response: {}",
+                                cause(&e)
+                            );
                             drained = StatusCode::BAD_GATEWAY;
                             break;
                         }
                     }
-                    prefill.record_outcome(drained.as_u16());
+                    // Through the request's charges: retried attempts whose
+                    // drains all fail charge the worker once.
+                    charges.record_outcome(prefill.as_ref(), drained.as_u16());
+                    // The drain owns the prefill's guard to its end, and
+                    // tells the prefill's end through it. It tells the
+                    // status it charges: the worker's own where the body
+                    // was read to its end.
+                    prefill_guard
+                        .end()
+                        .report(drained.as_u16(), || drained.is_success());
                     if drained.is_server_error() {
                         Metrics::record_worker_error(
                             metrics_labels::WORKER_PREFILL,
@@ -1436,6 +1898,32 @@ impl PDRouter {
             let result = self
                 .process_prefill_response(resp, prefill.url(), context.return_logprob)
                 .await;
+            if let Ok((consumed, _)) = &result {
+                if consumed.is_server_error() {
+                    // The answer is the decode's: the cut is recorded here, as
+                    // the drain records it on a streamed request, while the
+                    // admission slot is still held.
+                    *prefill_outcome = PrefillOutcome::Drained;
+                    Self::record_sequential_side(
+                        ledger,
+                        prefill.as_ref(),
+                        metrics_labels::WORKER_PREFILL,
+                        *consumed,
+                    );
+                }
+            }
+            // The prefill is told its own answer where its guard is let go,
+            // ahead of the decode's: the status its body left on it, or its
+            // refusal's. No handle goes on to the attempt's account, which
+            // would hold this side's end for the decode's whole answer.
+            match &result {
+                Ok((consumed, _)) => prefill_guard
+                    .end()
+                    .report(consumed.as_u16(), || consumed.is_success()),
+                Err(refusal) => prefill_guard
+                    .end()
+                    .report(refusal.status().as_u16(), || worker_answered(refusal)),
+            }
             drop(prefill_guard);
             let (_, body) = result.map_err(DispatchError::Prefill)?;
             Metrics::record_pd_prefill_duration(
@@ -1455,6 +1943,8 @@ impl PDRouter {
             }
             Ok((dispatch_start.elapsed(), resp))
         };
+        // Both sides go out here: the decode's send is said.
+        let (decode, decode_guard) = decode.sent();
         let pd_result = tokio::try_join!(prefill_fut, decode_fut);
 
         events::RequestReceivedEvent {}.emit();
@@ -1462,30 +1952,47 @@ impl PDRouter {
         let (prefill_body, (decode_head_elapsed, decode_response)) = match pd_result {
             Ok(pair) => pair,
             Err(DispatchError::Transport(side, e)) => {
+                let worker = match side {
+                    PdSide::Prefill => &prefill,
+                    PdSide::Decode => &decode,
+                };
+                // The decode's guard stands here. Its own failed call is told
+                // through it, and so is the request's own timeout whichever
+                // side's call it cut, as the attempt records it. A prefill
+                // told its failed call where it failed.
+                if side == PdSide::Decode || is_request_timeout(&e) {
+                    RequestEnd::of(&decode_guard).report(below_http_status(&e).as_u16(), || false);
+                }
                 // The request's own timeout on either side is the request's
-                // end (see `retry::request_timeout_response`); the caller
-                // records the 504 on both workers as it records every status.
+                // end (see `retry::request_timeout_response`). It names no
+                // side, so the caller records the 504 on both workers.
                 if is_request_timeout(&e) {
-                    error!("PD request timed out, both sides aborted: {e}");
+                    error!(
+                        worker = Endpoint::redacted_str(worker.url()),
+                        worker_type = side.name(),
+                        "PD request timed out, both sides aborted: {}",
+                        cause(&e)
+                    );
                     return request_timeout_response(format!("Transport error: {}", cause(&e)));
                 }
                 error!(
+                    worker = Endpoint::redacted_str(worker.url()),
                     worker_type = side.name(),
-                    "PD {} request failed below HTTP, both sides aborted: {e}",
-                    side.name()
+                    "PD {} request failed below HTTP, both sides aborted: {}",
+                    side.name(),
+                    cause(&e)
                 );
-                // Don't record_outcome here — the caller (execute_dual_dispatch)
-                // records outcomes from the response status after we return.
-                return side.answer(SidePhase::Start, StatusCode::BAD_GATEWAY, cause(&e));
+                // Not recorded here: the caller records the response status
+                // after we return, on this side's worker alone.
+                let mut answer = side.answer(SidePhase::Start, StatusCode::BAD_GATEWAY, cause(&e));
+                answer.extensions_mut().insert(OwnFailure(side));
+                return answer;
             }
             Err(DispatchError::Prefill(response)) => return response,
             Err(DispatchError::Decode(response)) => {
-                error!(
-                    "Decode server returned error status decode_url={} status={}",
-                    decode.redacted_url(),
-                    response.status()
-                );
-                return Self::side_refused(PdSide::Decode, response).await;
+                RequestEnd::of(&decode_guard).report(response.status().as_u16(), || true);
+                return Self::decode_refused(decode.as_ref(), response, self.max_payload_size)
+                    .await;
             }
         };
 
@@ -1515,11 +2022,11 @@ impl PDRouter {
         };
         self.forward_decode_body(
             decode_response,
-            status,
             &context,
             decode,
             decode_guard,
             prefill_body,
+            None,
         )
         .await
     }
@@ -1582,9 +2089,9 @@ impl PDRouter {
         if prefill_endpoint.transfer != decode_endpoint.transfer {
             return Err(misconfigured(format!(
                 "prefill {} runs {:?} but decode {} runs {:?}",
-                prefill.url(),
+                prefill.redacted_url(),
                 prefill_endpoint.transfer,
-                decode.url(),
+                decode.redacted_url(),
                 decode_endpoint.transfer
             )));
         }
@@ -1667,6 +2174,11 @@ impl PDRouter {
     /// vLLM PD over HTTP: send the tagged prefill side, wait for it, harvest
     /// (or synthesize) the KV handoff params, then dispatch the decode side
     /// carrying them. Mirrors the gRPC pipeline's `execute_sequential_pd`.
+    ///
+    /// `again` asks the pair's decode again once the prefill has answered
+    /// ([`DecodeAsk`]): the decode side goes to the decode that answer names.
+    /// `None` where the decode the selection named stands whatever happens
+    /// meanwhile.
     #[expect(
         clippy::too_many_arguments,
         reason = "mirrors execute_dual_dispatch_internal's dispatch surface"
@@ -1680,18 +2192,19 @@ impl PDRouter {
         dp_rank: Option<usize>,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
+        ledger: &AttemptLedger,
+        again: Option<&DecodeAsk<'_>>,
     ) -> Response {
         let PdSetup {
             prefill_body,
             decode_body,
-            prefill_guard,
-            decode_guard,
+            prefill_ahead,
+            decode,
             headers_with_trace,
             runtime,
         } = PdSetup::new(headers, side_bodies, guards, prefill.as_ref());
-        let headers = Some(&headers_with_trace);
+        let headers = Some(&*headers_with_trace);
 
         let decode_side = match RawBody::parse(&decode_body) {
             Ok(body) => body,
@@ -1707,47 +2220,42 @@ impl PDRouter {
         let harvested = if relay {
             events::RequestPDSentEvent {
                 prefill_url: prefill.redacted_url(),
-                decode_url: decode.redacted_url(),
+                decode_url: decode.worker().redacted_url(),
             }
             .emit();
 
-            let prefill_request = Self::pin_dp_rank(
-                self.build_post_with_headers(
-                    prefill.as_ref(),
-                    context.route,
-                    prefill_body,
-                    headers,
-                    false,
-                ),
-                dp_rank,
-            );
-            let prefill_response = match send_with_stale_conn_retry(prefill_request).await {
-                Ok(response) => response,
-                Err(e) => return Self::prefill_transport_failed(prefill.as_ref(), &e),
-            };
-            let prefill_status = prefill_response.status();
-            if !prefill_status.is_success() {
-                error!(
-                    "Prefill server returned error status prefill_url={} status={}",
-                    prefill.redacted_url(),
-                    prefill_status
-                );
-                Self::record_sequential_side(
-                    prefill.as_ref(),
-                    metrics_labels::WORKER_PREFILL,
-                    prefill_status,
-                );
-                return Self::side_refused(PdSide::Prefill, prefill_response).await;
-            }
-            let prefill_bytes = match prefill_response.bytes().await {
-                Ok(bytes) => bytes,
-                Err(e) => return Self::prefill_read_failed(prefill.as_ref(), &e),
-            };
-            Self::record_sequential_side(
+            // Each side's request names the rank its connector holds the
+            // pair to and, where the connector names none, the rank of the
+            // side's own worker object: an engine registered rank by rank is
+            // sent the rank of the row that was picked.
+            let prefill_request = self.build_post_with_headers(
                 prefill.as_ref(),
-                metrics_labels::WORKER_PREFILL,
-                prefill_status,
+                context.route,
+                prefill_body,
+                headers,
+                dp_rank.or_else(|| prefill.dp_rank()),
             );
+            // The prefill goes out here: its send is said.
+            let prefill_guard = prefill_ahead.sent();
+            let prefill_bytes = match Self::prefill_side_bytes(
+                ledger,
+                prefill.as_ref(),
+                prefill_request,
+                self.max_payload_size,
+            )
+            .await
+            {
+                Ok(bytes) => bytes,
+                Err(refusal) => {
+                    // The prefill is told its refusal here, where its load
+                    // stands: the status the client is answered with, the
+                    // worker's own where the worker answered.
+                    prefill_guard
+                        .end()
+                        .report(refusal.status().as_u16(), || worker_answered(&refusal));
+                    return refusal;
+                }
+            };
             Metrics::record_pd_prefill_duration(
                 metrics_labels::BACKEND_PD,
                 context.model_id,
@@ -1757,15 +2265,23 @@ impl PDRouter {
 
             // Harvest the handoff params the prefill engine returned (NIXL and
             // opportunistic passthrough; Mooncake returns nothing and is minted).
-            Self::harvest_kv_transfer_params(&prefill_bytes)
+            let harvested = Self::harvest_kv_transfer_params(&prefill_bytes);
+            // The Prefill phase is over: the prefill is told its good answer
+            // through its load, and the load is released. The read keeps the
+            // body and no status, so the answer is told as the worker's 200.
+            prefill_guard.end().report(StatusCode::OK.as_u16(), || true);
+            drop(prefill_guard);
+            harvested
         } else {
             debug!(
                 "vLLM PD over HTTP: n>1 fan-out cannot consume a KV handoff; \
                  dispatching to decode only"
             );
+            // No prefill goes out: its load is let go as it was acquired,
+            // unsent, and Grand Central hears the prefill's side released.
+            drop(prefill_ahead);
             None
         };
-        drop(prefill_guard);
         if mode == KvConnectorMode::MoriIo {
             let checked = match (&harvested, transfer_id.as_deref()) {
                 (Some(handoff), Some(id)) => validate_moriio_handoff(handoff, id, dp_rank),
@@ -1796,7 +2312,14 @@ impl PDRouter {
                 let id = transfer_id.as_deref().unwrap_or_default();
                 RawValue::from_string(mooncake_decode_params(id, engine_id, host, *port)).ok()
             }
-            (KvConnectorMode::Mooncake { .. }, _) => {
+            // No engine id to mint under. A fan-out to a discovered pair is not
+            // this case: it falls through, and the debug line above names it.
+            (
+                KvConnectorMode::Mooncake {
+                    engine_id: None, ..
+                },
+                _,
+            ) => {
                 // Legacy typed host/port injection is a sidecar-proto shape
                 // with no HTTP equivalent; decode recomputes the prompt.
                 warn!(
@@ -1837,19 +2360,30 @@ impl PDRouter {
             None => decode_body,
         };
 
-        let decode_request = Self::pin_dp_rank(
-            self.build_post_with_headers(
-                decode.as_ref(),
-                context.route,
-                decode_body,
-                headers,
-                false,
-            ),
-            dp_rank,
+        // The prefill has answered: the pair's decode is asked again, and the
+        // decode side is built for the decode that answer names. A fan-out
+        // sent no prefill, so nothing has changed that an ask would read.
+        let decode = match again {
+            Some(ask) if relay => decode.again(ask),
+            _ => decode,
+        };
+        // The decode's rank is read here, behind the ask: a decode that
+        // moved is sent the rank of the row it moved to.
+        let decode_request = self.build_post_with_headers(
+            decode.worker(),
+            context.route,
+            decode_body,
+            headers,
+            dp_rank.or_else(|| decode.worker().dp_rank()),
         );
+        // The decode side goes out here, behind its prefill's answer: its
+        // send is said.
+        let (decode, decode_guard) = decode.sent();
         let decode_response = match send_with_stale_conn_retry(decode_request).await {
             Ok(response) => response,
-            Err(e) => return Self::decode_transport_failed(decode.as_ref(), &e),
+            Err(e) => {
+                return Self::decode_transport_failed(ledger, decode.as_ref(), &decode_guard, &e);
+            }
         };
 
         self.forward_decode_head(
@@ -1859,6 +2393,7 @@ impl PDRouter {
             decode_guard,
             runtime,
             dispatch_start,
+            ledger,
         )
         .await
     }
@@ -1884,77 +2419,50 @@ impl PDRouter {
         prefill_endpoint: &MoriIoEndpoint,
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
-        decode: Arc<dyn Worker>,
         guards: PdLoadGuards,
+        ledger: &AttemptLedger,
     ) -> Response {
         let PdSetup {
             prefill_body,
             decode_body,
-            prefill_guard,
-            decode_guard,
+            prefill_ahead,
+            decode,
             headers_with_trace,
             runtime,
         } = PdSetup::new(headers, side_bodies, guards, prefill.as_ref());
-        let headers = Some(&headers_with_trace);
+        let headers = Some(&*headers_with_trace);
         Metrics::record_pd_kv_connector_mode(KvConnectorMode::MoriIo.metrics_label());
         events::RequestPDSentEvent {
             prefill_url: prefill.redacted_url(),
-            decode_url: decode.redacted_url(),
+            decode_url: decode.worker().redacted_url(),
         }
         .emit();
 
         let dispatch_start = Instant::now();
-        let prefill_request = Self::pin_dp_rank(
-            self.build_post_with_headers(
-                prefill.as_ref(),
-                context.route,
-                prefill_body,
-                headers,
-                false,
-            ),
+        let prefill_request = self.build_post_with_headers(
+            prefill.as_ref(),
+            context.route,
+            prefill_body,
+            headers,
             dp_rank,
         );
-        let decode_request = Self::pin_dp_rank(
-            self.build_post_with_headers(
-                decode.as_ref(),
-                context.route,
-                decode_body,
-                headers,
-                false,
-            ),
+        let decode_request = self.build_post_with_headers(
+            decode.worker(),
+            context.route,
+            decode_body,
+            headers,
             dp_rank,
         );
-        let prefill_side = async {
-            let response = match send_with_stale_conn_retry(prefill_request).await {
-                Ok(response) => response,
-                Err(e) => return Err(Self::prefill_transport_failed(prefill.as_ref(), &e)),
-            };
-            let status = response.status();
-            if !status.is_success() {
-                error!(
-                    "Prefill server returned error status prefill_url={} status={}",
-                    prefill.redacted_url(),
-                    status
-                );
-                Self::record_sequential_side(
-                    prefill.as_ref(),
-                    metrics_labels::WORKER_PREFILL,
-                    status,
-                );
-                return Err(Self::side_refused(PdSide::Prefill, response).await);
-            }
-            match response.bytes().await {
-                Ok(bytes) => {
-                    Self::record_sequential_side(
-                        prefill.as_ref(),
-                        metrics_labels::WORKER_PREFILL,
-                        status,
-                    );
-                    Ok(bytes)
-                }
-                Err(e) => Err(Self::prefill_read_failed(prefill.as_ref(), &e)),
-            }
-        };
+        // Both sides go out here, one beside the other: each side's send is
+        // said.
+        let prefill_guard = prefill_ahead.sent();
+        let prefill_side = Self::prefill_side_bytes(
+            ledger,
+            prefill.as_ref(),
+            prefill_request,
+            self.max_payload_size,
+        );
+        let (decode, decode_guard) = decode.sent();
         let decode_side = send_with_stale_conn_retry(decode_request);
         tokio::pin!(decode_side);
 
@@ -1970,7 +2478,14 @@ impl PDRouter {
                             decode_head = Some(response);
                         }
                         Ok(response) => break Err(response),
-                        Err(e) => return Self::decode_transport_failed(decode.as_ref(), &e),
+                        Err(e) => {
+                            return Self::decode_transport_failed(
+                                ledger,
+                                decode.as_ref(),
+                                &decode_guard,
+                                &e,
+                            );
+                        }
                     },
                 }
             }
@@ -1980,10 +2495,19 @@ impl PDRouter {
             // A decode engine that refused the request takes no push.
             Err(refused) => refused,
             Ok(prefill_outcome) => {
+                // The prefill finished: it is told its own answer here,
+                // where its load stands, as the shape that sends one side
+                // behind the other tells it.
                 let prefill_bytes = match prefill_outcome {
                     Ok(bytes) => bytes,
-                    Err(response) => return response,
+                    Err(response) => {
+                        prefill_guard
+                            .end()
+                            .report(response.status().as_u16(), || worker_answered(&response));
+                        return response;
+                    }
                 };
+                prefill_guard.end().report(StatusCode::OK.as_u16(), || true);
                 drop(prefill_guard);
                 Metrics::record_pd_prefill_duration(
                     metrics_labels::BACKEND_PD,
@@ -2017,7 +2541,14 @@ impl PDRouter {
                     Some(response) => response,
                     None => match decode_side.await {
                         Ok(response) => response,
-                        Err(e) => return Self::decode_transport_failed(decode.as_ref(), &e),
+                        Err(e) => {
+                            return Self::decode_transport_failed(
+                                ledger,
+                                decode.as_ref(),
+                                &decode_guard,
+                                &e,
+                            );
+                        }
                     },
                 }
             }
@@ -2029,14 +2560,66 @@ impl PDRouter {
             decode_guard,
             runtime,
             dispatch_start,
+            ledger,
         )
         .await
     }
 
+    /// The prefill side of a sequential or concurrent-write dispatch: sent,
+    /// refused on an error status, read whole and recorded on its worker. The
+    /// error is the response the client is answered with.
+    async fn prefill_side_bytes(
+        ledger: &AttemptLedger,
+        prefill: &dyn Worker,
+        request: reqwest::RequestBuilder,
+        max_payload_size: usize,
+    ) -> Result<Bytes, Response> {
+        let response = match send_with_stale_conn_retry(request).await {
+            Ok(response) => response,
+            Err(e) => return Err(Self::prefill_transport_failed(ledger, prefill, &e)),
+        };
+        let status = response.status();
+        if !status.is_success() {
+            error!(
+                "Prefill server returned error status prefill_url={} status={}",
+                prefill.redacted_url(),
+                status
+            );
+            Self::record_sequential_side(ledger, prefill, metrics_labels::WORKER_PREFILL, status);
+            return Err(Self::side_refused(PdSide::Prefill, response, max_payload_size).await);
+        }
+        match read_body_capped(response.bytes_stream(), max_payload_size).await {
+            Ok(bytes) => {
+                Self::record_sequential_side(
+                    ledger,
+                    prefill,
+                    metrics_labels::WORKER_PREFILL,
+                    status,
+                );
+                Ok(bytes)
+            }
+            Err(BodyReadError::TooLarge) => {
+                Self::record_sequential_side(
+                    ledger,
+                    prefill,
+                    metrics_labels::WORKER_PREFILL,
+                    StatusCode::BAD_GATEWAY,
+                );
+                Err(worker_body_too_large(max_payload_size, prefill.url()))
+            }
+            Err(BodyReadError::Transport(e)) => Err(Self::prefill_read_failed(ledger, prefill, &e)),
+        }
+    }
+
     /// Per-side outcome accounting for the sequential path: a side that was
     /// never contacted must not feed the other worker's circuit breaker.
-    fn record_sequential_side(worker: &dyn Worker, role: &'static str, status: StatusCode) {
-        worker.record_outcome(status.as_u16());
+    fn record_sequential_side(
+        ledger: &AttemptLedger,
+        worker: &dyn Worker,
+        role: &'static str,
+        status: StatusCode,
+    ) {
+        ledger.record_outcome(worker, status.as_u16());
         if status.is_server_error() {
             Metrics::record_worker_error(
                 role,
@@ -2049,15 +2632,18 @@ impl PDRouter {
     /// Forward a successful decode response to the client, streaming or not,
     /// merging prefill logprobs when requested. Shared by the parallel and
     /// sequential PD dispatch paths.
+    /// `outcome_ledger` records an unstreamed answer's status on the decode
+    /// worker here when the caller does not record the attempt itself.
     async fn forward_decode_body(
         &self,
         decode_response: reqwest::Response,
-        status: StatusCode,
         context: &PDRequestContext<'_>,
         decode: Arc<dyn Worker>,
         decode_guard: WorkerLoadGuard,
         prefill_body: Option<Bytes>,
+        outcome_ledger: Option<&AttemptLedger>,
     ) -> Response {
+        let status = decode_response.status();
         if context.is_stream {
             // Streaming response
             let prefill_logprobs = if context.return_logprob {
@@ -2087,6 +2673,7 @@ impl PDRouter {
             let mut response = if context.return_logprob {
                 self.process_non_streaming_response(
                     decode_response,
+                    decode.as_ref(),
                     status,
                     context.return_logprob,
                     prefill_body,
@@ -2097,20 +2684,40 @@ impl PDRouter {
                 let response_headers =
                     header_utils::preserve_response_headers(decode_response.headers());
 
-                match decode_response.bytes().await {
+                match read_body_capped(decode_response.bytes_stream(), self.max_payload_size).await
+                {
                     Ok(decode_body) => {
                         let mut response = Response::new(Body::from(decode_body));
                         *response.status_mut() = status;
                         *response.headers_mut() = response_headers;
                         response
                     }
-                    Err(e) if is_request_timeout(&e) => {
-                        error!("Decode response timed out: {e}");
+                    Err(BodyReadError::TooLarge) => {
+                        let mut answer = worker_body_too_large(self.max_payload_size, decode.url());
+                        answer.extensions_mut().insert(OwnFailure(PdSide::Decode));
+                        answer
+                    }
+                    Err(BodyReadError::Transport(e)) if is_request_timeout(&e) => {
+                        error!(
+                            worker = Endpoint::redacted_str(decode.url()),
+                            "Decode response timed out: {}",
+                            cause(&e)
+                        );
                         request_timeout_response(format!("Failed to read response: {}", cause(&e)))
                     }
-                    Err(e) => {
-                        error!("Failed to read decode response: {}", e);
-                        PdSide::Decode.answer(SidePhase::Stream, StatusCode::BAD_GATEWAY, cause(&e))
+                    Err(BodyReadError::Transport(e)) => {
+                        error!(
+                            worker = Endpoint::redacted_str(decode.url()),
+                            "Failed to read decode response: {}",
+                            cause(&e)
+                        );
+                        let mut answer = PdSide::Decode.answer(
+                            SidePhase::Stream,
+                            StatusCode::BAD_GATEWAY,
+                            cause(&e),
+                        );
+                        answer.extensions_mut().insert(OwnFailure(PdSide::Decode));
+                        answer
                     }
                 }
             };
@@ -2118,6 +2725,21 @@ impl PDRouter {
             // The decode worker is the one that produced the body the client
             // sees, on both the merged-logprob and passthrough paths.
             header_utils::insert_routed_worker_id(response.headers_mut(), decode.redacted_url());
+            // The decode's answer read whole is told here for every shape,
+            // through its guard, with the status the route records on its
+            // worker. A status of 500 and over is the route's own, made of
+            // a body it gave up. A body over the limit is the worker's
+            // answer still, and one whose read failed is not.
+            RequestEnd::of(&decode_guard)
+                .report(response.status().as_u16(), || worker_answered(&response));
+            if let Some(ledger) = outcome_ledger {
+                Self::record_sequential_side(
+                    ledger,
+                    decode.as_ref(),
+                    metrics_labels::WORKER_DECODE,
+                    response.status(),
+                );
+            }
             response
         }
     }
@@ -2135,7 +2757,7 @@ impl PDRouter {
         body: CountMessageTokensRequest,
         policies_need_text: bool,
     ) -> (Option<String>, CountMessageTokensRequest) {
-        let text = policies_need_text.then(|| body.extract_text_for_routing());
+        let text = policies_need_text.then(|| body.routing_text());
         (text, body)
     }
 
@@ -2155,48 +2777,86 @@ impl PDRouter {
     }
 
     /// Select a PD pair and take its load. With Prefill admission enabled
-    /// the selection runs at the head of the admission queue.
+    /// the selection runs at the head of the admission queue. `stated`
+    /// states what Grand Central alone reads of the request
+    /// ([`placement::Stated`]): the pair placement makes that call where
+    /// the engine decides and nowhere else. The call rides with the
+    /// selection while it waits, for a pair the classic policies pick too:
+    /// that is what a classic pair selection pays for it.
     async fn select_pd_pair_with_admission(
         &self,
         model_id: &str,
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
+        stated: impl Fn() -> placement::Stated + Send + Sync,
     ) -> Result<(PdPair, PdLoadGuards), Box<PdSelectionFailure>> {
-        let ((prefill, decode), prefill_guard) = acquire_prefill(
+        let ((prefill, decode), prefill_ahead) = acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
-            |(prefill, _): &PdPair| prefill,
-            |capacity| self.select_pd_pair(model_id, inputs, capacity),
+            |(prefill, _): &(Placed, Placed)| prefill,
+            |capacity| self.select_pd_pair(model_id, inputs, capacity, &stated),
+            // The prefill's worker goes on behind its load, and what its
+            // answer owes its send goes with that load.
+            |(prefill, decode)| {
+                let (prefill, unsent) = prefill.unsent();
+                ((prefill, decode), unsent)
+            },
         )
         .await
         .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
+        // Each side's load is held ahead of its send: a dispatch shape says
+        // the send where that side goes out, and what a side's answer owes
+        // its send stays with its load until then.
+        let pair = (prefill, Arc::clone(decode.worker()));
         let guards = PdLoadGuards {
-            prefill: prefill_guard,
-            decode: WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key),
+            prefill: prefill_ahead,
+            decode: DecodeAhead::new(decode, sticky_key),
         };
-        Ok(((prefill, decode), guards))
+        Ok((pair, guards))
     }
 
-    fn select_pd_pair(
+    /// A pair's decode asked again behind its prefill's answer: this route's
+    /// one call of the placement's ask ([`placement::decode_again`]), over
+    /// this router's registries, with no wire pinned and no test around it.
+    /// `pairs` reads the pair index again. It is handed as a call, so that
+    /// a pair the classic policies picked, which has nothing to ask, reads
+    /// nothing: the placement makes the call for an answer of Grand
+    /// Central alone. This route claims no room at a decode's admission
+    /// gate, and says so.
+    fn decode_again(
         &self,
         model_id: &str,
+        pairs: placement::PairsAgain<'_>,
         inputs: PlacementInputs<'_>,
-        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
-    ) -> Result<PdPair, Box<PairFailure>> {
-        debug!("Selecting PD pair: model_id={:?}", model_id);
+        first: &Placed,
+        ahead: WorkerLoadGuard,
+    ) -> (Option<Placed>, WorkerLoadGuard) {
+        placement::decode_again(
+            &self.worker_registry,
+            &self.policy_registry,
+            model_id,
+            pairs,
+            None,
+            inputs,
+            first,
+            ahead,
+            false,
+        )
+    }
 
-        // Shared HTTP-transport projections: this router proxies plain HTTP
-        // to the selected worker's URL, so a gRPC or ZMQ worker must never
-        // be selectable. Both pools derive from ONE snapshot's pair index:
-        // separate lookups could straddle a concurrent membership change and
-        // pair workers that never coexisted.
+    /// The pair index `model_id` routes within. Shared HTTP-transport
+    /// projections: this router proxies plain HTTP to the selected worker's
+    /// URL, so a gRPC or ZMQ worker must never be selectable. Both pools
+    /// derive from ONE snapshot's pair index: separate lookups could straddle
+    /// a concurrent membership change and pair workers that never coexisted.
+    fn pd_pairs(&self, model_id: &str) -> Arc<PdPairIndex> {
         let is_unknown_model = model_id == UNKNOWN_MODEL_ID;
         let mode = self.policy_registry.pd_pairing_mode();
         let by_model = self
             .worker_registry
             .model_routing_snapshot(model_id)
             .map(|snapshot| snapshot.pd_pairs(PdWire::Http, mode));
-        let pairs = match by_model {
+        match by_model {
             // A named model routes within its own entry. The wildcard's
             // literal "unknown" entry wins while it can pair at all; when it
             // cannot (a pool empty, or no compatible pair) both pools widen
@@ -2208,18 +2868,28 @@ impl PDRouter {
                 .worker_registry
                 .get_routing_snapshot(UNKNOWN_MODEL_ID)
                 .pd_pairs(PdWire::Http, mode),
-            _ => Arc::new(PdPairIndex::empty()),
-        };
+            _ => Arc::new(PdPairIndex::empty(PdWire::Http)),
+        }
+    }
 
+    fn select_pd_pair(
+        &self,
+        model_id: &str,
+        inputs: PlacementInputs<'_>,
+        prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+        stated: impl FnOnce() -> placement::Stated,
+    ) -> Result<(Placed, Placed), Box<PairFailure>> {
+        debug!("Selecting PD pair: model_id={:?}", model_id);
+        let pairs = self.pd_pairs(model_id);
         let pair = placement::select_pair(
             &self.worker_registry,
             &self.policy_registry,
             model_id,
             &pairs,
             None,
-            false,
             prefill_capacity,
             inputs,
+            stated,
         )?;
 
         Ok((pair.prefill, pair.decode))
@@ -2233,17 +2903,34 @@ impl PDRouter {
             WorkerRole::Decode => "decode",
             WorkerRole::Single => "worker",
         };
+        let unavailable =
+            || format!("No available {role} workers (all circuits open or unhealthy)");
         match failure.verdict {
             PlacementFailure::AllOverloaded(shed) => PdSelectionFailure::Shed(shed),
+            PlacementFailure::NoPlanBound(refusal) => PdSelectionFailure::NoPlanBound(refusal),
+            PlacementFailure::DecisionFailed(refusal) => {
+                PdSelectionFailure::DecisionFailed(refusal)
+            }
             PlacementFailure::NoCandidates => PdSelectionFailure::Unavailable(format!(
                 "No {role} workers available. Please check if {role} servers are configured and healthy."
             )),
-            PlacementFailure::Unavailable => PdSelectionFailure::Unavailable(format!(
-                "No available {role} workers (all circuits open or unhealthy)"
-            )),
-            PlacementFailure::PolicyDeclined(policy) => PdSelectionFailure::Unavailable(
-                format!("Policy {policy} failed to select a {role} worker"),
-            ),
+            PlacementFailure::Unavailable => PdSelectionFailure::Unavailable(unavailable()),
+            // The role's sentence stays the client's, and the line names
+            // the engine's word, with the side the answer is for.
+            PlacementFailure::ShedUnder(name) => {
+                let side = (failure.role != WorkerRole::Single).then_some(role);
+                PdSelectionFailure::ShedUnder(unavailable(), placement::shed_under(name, side))
+            }
+            // Under Grand Central the name is the engine's, and a decline
+            // that names no side is the pair's whole.
+            PlacementFailure::PolicyDeclined(policy) => {
+                PdSelectionFailure::Unavailable(match failure.role {
+                    WorkerRole::Single => format!("Policy {policy} failed to select a pair"),
+                    WorkerRole::Prefill | WorkerRole::Decode => {
+                        format!("Policy {policy} failed to select a {role} worker")
+                    }
+                })
+            }
             // Admission turns this verdict into a wait before it gets here.
             PlacementFailure::PrefillAtCapacity => PdSelectionFailure::Unavailable(format!(
                 "No {role} workers below their Prefill admission limit"
@@ -2286,43 +2973,25 @@ impl PDRouter {
             .and_then(|headers| headers.get(CONTENT_TYPE))
             .and_then(|value| value.to_str().ok())
         {
-            Some(content_type) => content_type.starts_with("text/event-stream"),
+            Some(content_type) => names_event_stream(content_type),
             None => status.is_success(),
         };
         let mut response_headers = headers.unwrap_or_default();
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
 
-        // Each decode chunk is read for the `[DONE]` sentinel, which ends the
-        // relay, and re-encoded with the prefill log-probabilities when the
-        // request asked for them; the sentinel is anchored at a line start
-        // when the previous chunk ended with an end of line.
-        let mut encoder = SseEncoder::new();
-        let mut at_line_start = true;
-        let per_chunk: Box<dyn FnMut(Bytes) -> ChunkStep + Send> = Box::new(move |chunk: Bytes| {
-            let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
-            if let Some(&last) = chunk.last() {
-                at_line_start = last == b'\n' || last == b'\r';
-            }
-            let bytes = if return_logprob && prefill_logprobs.is_some() {
-                Self::merge_streaming_logprobs(prefill_logprobs.as_ref(), &chunk, &mut encoder)
-                    .unwrap_or(chunk)
-            } else {
-                chunk
-            };
-            ChunkStep {
-                bytes,
-                last: is_done,
-            }
-        });
+        let hook = Self::decode_chunk_hook(prefill_logprobs, return_logprob);
         relay_streaming_body(
             stream,
             Relay {
                 status,
                 upstream_sse,
                 source,
+                // The relay tells the decode's end through the handle of
+                // its guard, asked here ahead of the guard's move.
+                end: RequestEnd::of(&decode_guard),
                 guard: decode_guard,
                 headers: response_headers,
-                mode: ChunkMode::Hook(per_chunk),
+                mode: ChunkMode::Hook(hook),
             },
         )
     }
@@ -2344,24 +3013,37 @@ impl PDRouter {
     async fn process_non_streaming_response(
         &self,
         res: reqwest::Response,
+        decode: &dyn Worker,
         status: StatusCode,
         return_logprob: bool,
         prefill_body: Option<Bytes>,
     ) -> Response {
-        let response = res.bytes().await;
+        let response = read_body_capped(res.bytes_stream(), self.max_payload_size).await;
         let decode_body = match response {
             Ok(decode_body) => decode_body,
-            Err(e) if is_request_timeout(&e) => {
-                error!("Decode response timed out: {e}");
+            Err(BodyReadError::TooLarge) => {
+                let mut answer = worker_body_too_large(self.max_payload_size, decode.url());
+                answer.extensions_mut().insert(OwnFailure(PdSide::Decode));
+                return answer;
+            }
+            Err(BodyReadError::Transport(e)) if is_request_timeout(&e) => {
+                error!(
+                    worker = Endpoint::redacted_str(decode.url()),
+                    "Decode response timed out: {}",
+                    cause(&e)
+                );
                 return request_timeout_response(format!("Failed to read response: {}", cause(&e)));
             }
-            Err(e) => {
-                error!("Failed to read decode response: {}", e);
-                return PdSide::Decode.answer(
-                    SidePhase::Stream,
-                    StatusCode::BAD_GATEWAY,
-                    cause(&e),
+            Err(BodyReadError::Transport(e)) => {
+                error!(
+                    worker = Endpoint::redacted_str(decode.url()),
+                    "Failed to read decode response: {}",
+                    cause(&e)
                 );
+                let mut answer =
+                    PdSide::Decode.answer(SidePhase::Stream, StatusCode::BAD_GATEWAY, cause(&e));
+                answer.extensions_mut().insert(OwnFailure(PdSide::Decode));
+                return answer;
             }
         };
 
@@ -2413,36 +3095,92 @@ impl PDRouter {
                 Endpoint::redacted_str(prefill_url),
                 prefill_status
             );
-            return Err(Self::side_refused(PdSide::Prefill, prefill_response).await);
+            return Err(Self::side_refused(
+                PdSide::Prefill,
+                prefill_response,
+                self.max_payload_size,
+            )
+            .await);
         }
 
+        // What the body leaves on the prefill worker: its status, or the 502
+        // of a body that was cut while it was only consumed.
+        let mut consumed = prefill_status;
         // Read prefill body if needed for logprob merging
         let prefill_body = if return_logprob {
-            match prefill_response.bytes().await {
+            match read_body_capped(prefill_response.bytes_stream(), self.max_payload_size).await {
                 Ok(body) => Some(body),
-                Err(e) => {
-                    warn!("Failed to read prefill response body for logprobs: {}", e);
+                // This body is the prefill side's part of the answer: over
+                // the limit it is the 502, as the handoff read answers it.
+                Err(BodyReadError::TooLarge) => {
+                    let mut answer = worker_body_too_large(self.max_payload_size, prefill_url);
+                    answer.extensions_mut().insert(OwnFailure(PdSide::Prefill));
+                    return Err(answer);
+                }
+                // The request's own timeout is not the worker cutting its body:
+                // the request goes on to the decode read.
+                Err(BodyReadError::Transport(e)) if is_request_timeout(&e) => {
+                    warn!(
+                        worker = Endpoint::redacted_str(prefill_url),
+                        "Failed to read prefill response body for logprobs: {}",
+                        cause(&e)
+                    );
                     None
+                }
+                // Cut short it is that side's failure too, under the code
+                // the handoff read answers a cut body with.
+                Err(BodyReadError::Transport(e)) => {
+                    error!(
+                        worker = Endpoint::redacted_str(prefill_url),
+                        "Failed to read prefill response body for logprobs: {}",
+                        cause(&e)
+                    );
+                    let mut answer = PdSide::Prefill.answer(
+                        SidePhase::Stream,
+                        StatusCode::BAD_GATEWAY,
+                        cause(&e),
+                    );
+                    answer.extensions_mut().insert(OwnFailure(PdSide::Prefill));
+                    return Err(answer);
                 }
             }
         } else {
-            // For non-logprob requests, just consume the response without storing
+            // For non-logprob requests, consume the response chunk by chunk
+            // without storing it.
             debug!("Consuming prefill response body (non-logprob request)");
-            match prefill_response.bytes().await {
-                Ok(_) => debug!("Prefill response consumed successfully"),
-                Err(e) => warn!("Error consuming prefill response: {}", e),
+            let mut chunks = prefill_response.bytes_stream();
+            loop {
+                match chunks.next().await {
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => {
+                        warn!(
+                            worker = Endpoint::redacted_str(prefill_url),
+                            "Error consuming prefill response: {}",
+                            cause(&e)
+                        );
+                        consumed = StatusCode::BAD_GATEWAY;
+                        break;
+                    }
+                    None => {
+                        debug!("Prefill response consumed successfully");
+                        break;
+                    }
+                }
             }
             None
         };
 
-        Ok((prefill_status, prefill_body))
+        Ok((consumed, prefill_body))
     }
 
     /// One side's POST: the body, the allow-listed caller headers, and the
     /// credential with the precedence every other upstream call has (the
     /// caller's `Authorization`, else the worker's configured key), so a worker
     /// behind a key-protected gateway, whose caller key ends at the
-    /// middleware, still carries the key the worker requires.
+    /// middleware, still carries the key the worker requires; and the
+    /// data-parallel rank the side goes to, where its caller names one (the
+    /// rank a MoRI-IO pair is pinned to, or the side's own worker object's),
+    /// set after the forwarded headers.
     #[expect(
         clippy::unused_self,
         reason = "method on PDRouter for consistent API; may use self.api_key in future"
@@ -2453,29 +3191,20 @@ impl PDRouter {
         route: &'static str,
         body: Bytes,
         headers: Option<&HeaderMap>,
-        connection_close: bool,
+        dp_rank: Option<usize>,
     ) -> reqwest::RequestBuilder {
         let endpoint_url = worker.endpoint_url(route);
         // Every side built here is sent; counted per side, on its worker.
-        Metrics::record_worker_request(worker.url(), worker.model_id());
-        let mut request = attach_sized_body(
+        WorkerMetrics::record_worker_request(worker);
+        let request = attach_sized_body(
             worker
                 .http_client()
                 .post(endpoint_url)
                 .header(CONTENT_TYPE, HeaderValue::from_static("application/json")),
             body,
         );
-        if connection_close {
-            request = request.header("Connection", "close");
-        }
-        header_utils::apply_forwarded_request_headers(request, headers, worker.api_key())
-    }
-
-    /// Route a MoRI-IO side to the data-parallel rank both sides are pinned to.
-    fn pin_dp_rank(
-        request: reqwest::RequestBuilder,
-        dp_rank: Option<usize>,
-    ) -> reqwest::RequestBuilder {
+        let request =
+            header_utils::apply_forwarded_request_headers(request, headers, worker.api_key());
         match dp_rank {
             Some(rank) => request.header(DATA_PARALLEL_RANK_HEADER, rank.to_string()),
             None => request,
@@ -2600,6 +3329,128 @@ impl PDRouter {
     }
 }
 
+impl PDRouter {
+    /// The decode side's reading of its stream. With the prefill's
+    /// log-probabilities to merge, each decode chunk is split into its frames
+    /// (a frame cut across chunks waits for its delimiter) and every data
+    /// frame is re-encoded with them merged in; without them, or when the
+    /// request did not ask for log-probabilities, each chunk is read for the
+    /// `[DONE]` sentinel alone, anchored at a line start when the previous
+    /// chunk ended with an end of line. Either reading ends the relay at the
+    /// sentinel.
+    fn decode_chunk_hook(
+        prefill_logprobs: Option<Value>,
+        return_logprob: bool,
+    ) -> Box<dyn ChunkHook> {
+        match prefill_logprobs.filter(|_| return_logprob) {
+            Some(prefill_logprobs) => Box::new(LogprobMerge::new(prefill_logprobs)),
+            None => {
+                let mut at_line_start = true;
+                Box::new(move |chunk: Bytes| {
+                    let is_done = Self::chunk_contains_done_event(&chunk, at_line_start);
+                    if let Some(&last) = chunk.last() {
+                        at_line_start = last == b'\n' || last == b'\r';
+                    }
+                    ChunkStep {
+                        bytes: chunk,
+                        last: is_done,
+                    }
+                })
+            }
+        }
+    }
+}
+
+/// The decode side's reading of its stream when the request asked for
+/// log-probabilities: each chunk split into frames, every data frame
+/// re-encoded with the prefill's log-probabilities merged in, a frame cut
+/// across chunks held until its delimiter arrives, and the relay ended at the
+/// `[DONE]` sentinel. A frame that is not one data event passes as it came,
+/// and so does a frame past the re-chunker's bound, with the rest of it.
+struct LogprobMerge {
+    prefill_logprobs: Value,
+    encoder: SseEncoder,
+    /// The bytes after the last frame delimiter: a frame still arriving.
+    partial: Vec<u8>,
+    /// The rest of a frame past the bound is still arriving: it passes as it
+    /// came, and a sentinel in it counts only after a line break of its own.
+    overflowed: bool,
+}
+
+impl LogprobMerge {
+    fn new(prefill_logprobs: Value) -> Self {
+        Self {
+            prefill_logprobs,
+            encoder: SseEncoder::new(),
+            partial: Vec::new(),
+            overflowed: false,
+        }
+    }
+}
+
+impl ChunkHook for LogprobMerge {
+    fn step(&mut self, chunk: Bytes) -> ChunkStep {
+        let mut out = Vec::with_capacity(chunk.len());
+        // A delimiter is up to four bytes long and may straddle the boundary.
+        let mut from = self.partial.len().saturating_sub(3);
+        self.partial.extend_from_slice(&chunk);
+        let mut start = 0;
+        let mut last = false;
+        while let Some((end, delimiter)) = find_frame_end(&self.partial[start..], from) {
+            let frame_end = start + end + delimiter;
+            let frame = &self.partial[start..frame_end];
+            start = frame_end;
+            from = 0;
+            if self.overflowed {
+                // The rest of a frame past the bound continues a line already
+                // begun: it passes as it came, and a sentinel in it counts
+                // only after a line break of its own.
+                self.overflowed = false;
+                out.extend_from_slice(frame);
+                if PDRouter::chunk_contains_done_event(frame, false) {
+                    last = true;
+                    break;
+                }
+                continue;
+            }
+            if PDRouter::chunk_contains_done_event(frame, true) {
+                out.extend_from_slice(frame);
+                last = true;
+                break;
+            }
+            match PDRouter::merge_streaming_logprobs(
+                Some(&self.prefill_logprobs),
+                frame,
+                &mut self.encoder,
+            ) {
+                Ok(merged) => out.extend_from_slice(&merged),
+                Err(()) => out.extend_from_slice(frame),
+            }
+        }
+        if last {
+            // The sentinel ends the relay: nothing after it is read.
+            self.partial.clear();
+        } else {
+            self.partial.drain(..start);
+            if self.partial.len() > MAX_FRAME_BYTES {
+                // Past the bound a frame is no longer waited for: it passes as
+                // it came, and so will its rest.
+                out.append(&mut self.partial);
+                self.overflowed = true;
+            }
+        }
+        ChunkStep {
+            bytes: Bytes::from(out),
+            last,
+        }
+    }
+
+    /// A last frame cut short of its delimiter goes out as it came.
+    fn finish(&mut self) -> Bytes {
+        Bytes::from(std::mem::take(&mut self.partial))
+    }
+}
+
 #[async_trait]
 impl RouterTrait for PDRouter {
     fn as_any(&self) -> &dyn std::any::Any {
@@ -2610,37 +3461,44 @@ impl RouterTrait for PDRouter {
         // Note: This endpoint actually causes the model to generate tokens, so we only test one pair
 
         // Select a random worker pair using the policy
-        let (prefill, decode) =
-            match self.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None) {
-                Ok(pair) => pair,
-                // A deep probe that generates gets the same answer routing does:
-                // an all-vetoed fleet fails the probe, exactly as an all-circuit-
-                // broken one already did.
-                Err(failure) => match Self::pair_failure(*failure) {
-                    PdSelectionFailure::Shed(shed) => return shed,
-                    PdSelectionFailure::Incompatible(e) => {
-                        return error::service_unavailable("no_compatible_pd_pair", e);
-                    }
-                    PdSelectionFailure::Unavailable(e) => {
-                        return error::service_unavailable(
-                            "no_healthy_worker_pair",
-                            format!("No healthy worker pair available: {e}"),
-                        );
-                    }
-                    // The probe does not go through admission.
-                    rejection @ (PdSelectionFailure::QueueFull
-                    | PdSelectionFailure::QueueTimeout) => {
-                        return Self::handle_server_selection_error(rejection);
-                    }
-                },
-            };
+        let (prefill, decode) = match self.select_pd_pair(
+            UNKNOWN_MODEL_ID,
+            PlacementInputs::default(),
+            None,
+            placement::Stated::nothing,
+        ) {
+            Ok(pair) => pair,
+            // A deep probe that generates gets the same answer routing does:
+            // an all-vetoed fleet fails the probe, exactly as an all-circuit-
+            // broken one already did.
+            Err(failure) => match Self::pair_failure(*failure) {
+                PdSelectionFailure::Shed(refusal)
+                | PdSelectionFailure::NoPlanBound(refusal)
+                | PdSelectionFailure::DecisionFailed(refusal) => {
+                    return refusal;
+                }
+                PdSelectionFailure::Incompatible(e) => {
+                    return error::service_unavailable("no_compatible_pd_pair", e);
+                }
+                PdSelectionFailure::Unavailable(e) | PdSelectionFailure::ShedUnder(e, _) => {
+                    return error::service_unavailable(
+                        "no_healthy_worker_pair",
+                        format!("No healthy worker pair available: {e}"),
+                    );
+                }
+                // The probe does not go through admission.
+                rejection @ (PdSelectionFailure::QueueFull | PdSelectionFailure::QueueTimeout) => {
+                    return Self::handle_server_selection_error(rejection);
+                }
+            },
+        };
 
-        let prefill_url = format!("{}/health_generate", prefill.url());
+        let prefill_url = prefill.endpoint_url("/health_generate");
         let (prefill_result, decode_result) = tokio::join!(
             prefill.http_client().get(&prefill_url).send(),
             decode
                 .http_client()
-                .get(format!("{}/health_generate", decode.url()))
+                .get(decode.endpoint_url("/health_generate"))
                 .send()
         );
 
@@ -2657,12 +3515,19 @@ impl RouterTrait for PDRouter {
             Ok(res) => {
                 errors.push(format!(
                     "Prefill {} returned status {}",
-                    prefill.url(),
+                    prefill.redacted_url(),
                     res.status()
                 ));
             }
+            // The client's error names the request's address, its query
+            // kept: the answer carries its cause without the address, and
+            // the masked address beside it names the side.
             Err(e) => {
-                errors.push(format!("Prefill {} error: {}", prefill.url(), e));
+                errors.push(format!(
+                    "Prefill {} error: {}",
+                    prefill.redacted_url(),
+                    cause(&e)
+                ));
             }
         }
 
@@ -2676,12 +3541,16 @@ impl RouterTrait for PDRouter {
             Ok(res) => {
                 errors.push(format!(
                     "Decode {} returned status {}",
-                    decode.url(),
+                    decode.redacted_url(),
                     res.status()
                 ));
             }
             Err(e) => {
-                errors.push(format!("Decode {} error: {}", decode.url(), e));
+                errors.push(format!(
+                    "Decode {} error: {}",
+                    decode.redacted_url(),
+                    cause(&e)
+                ));
             }
         }
 
@@ -2690,8 +3559,8 @@ impl RouterTrait for PDRouter {
                 StatusCode::OK,
                 format!(
                     "Health generate passed on selected pair: prefill={}, decode={}",
-                    prefill.url(),
-                    decode.url()
+                    prefill.redacted_url(),
+                    decode.redacted_url()
                 ),
             )
                 .into_response()
@@ -2732,13 +3601,13 @@ impl RouterTrait for PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ChatCompletionRequest,
+        body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Response {
         self.route_pd(
             headers,
             Some(tenant_meta),
-            super::chat_for_upstream(body),
+            super::chat_for_upstream(Arc::unwrap_or_clone(body)),
             model_id,
         )
         .await
@@ -2748,14 +3617,19 @@ impl RouterTrait for PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: CreateMessageRequest,
+        body: Arc<CreateMessageRequest>,
         model_id: &str,
     ) -> Response {
         if let Some(refused) = super::refuse_max_tokens_zero(body.max_tokens) {
             return refused;
         }
-        self.route_pd(headers, Some(tenant_meta), body, model_id)
-            .await
+        self.route_pd(
+            headers,
+            Some(tenant_meta),
+            Arc::unwrap_or_clone(body),
+            model_id,
+        )
+        .await
     }
 
     async fn route_messages_count_tokens(
@@ -2772,30 +3646,66 @@ impl RouterTrait for PDRouter {
         // The request is never borrowed here: a borrowed local keeps its slot
         // in the task across the awaits that follow, a second copy of the
         // request per count. It is moved out for its routing text, moved back,
-        // and serialized once a worker is selected and admitted.
-        let (request_text, body) =
-            Self::count_tokens_routing_text(body, self.policies_need_request_text());
-        let Some(worker) = placement::select_single(
-            &self.worker_registry,
-            &self.policy_registry,
-            model_id,
-            RoutingPool::HttpPrefill,
-            None,
-            PlacementInputs {
-                text: request_text.as_deref(),
-                tokens: None,
-                headers,
-                rid_key: None,
-                cache_namespace: None,
-                candidate_filter: None,
-                tried: &[],
-            },
-        ) else {
-            return error::service_unavailable(
-                "no_prefill_servers",
-                "No available prefill servers to count tokens",
-            );
+        // and serialized once a worker is selected and admitted. The routing
+        // text, when a policy reads any, is owned by the selection's block and
+        // dropped at its end, before the first await: neither its slot nor
+        // its buffer rides in the task across the round trip.
+        let (placed, body) = {
+            let (request_text, body) =
+                Self::count_tokens_routing_text(body, self.policies_need_request_text());
+            let placed = match placement::select_single(
+                &self.worker_registry,
+                &self.policy_registry,
+                model_id,
+                RoutingPool::HttpPrefill,
+                None,
+                PlacementInputs {
+                    text: request_text.as_deref(),
+                    tokens: None,
+                    headers,
+                    rid_key: None,
+                    rid: None,
+                    cache_namespace: None,
+                    candidate_filter: None,
+                    tried: &[],
+                },
+                placement::Stated::nothing,
+            ) {
+                Ok(placed) => placed,
+                Err(miss) => {
+                    // A miss that says nothing keeps the answer below and
+                    // reads no pool for it, as the gateway's own selection
+                    // never did. The engine's word is judged with no shed,
+                    // since the count judges no pool's load: a prefill pool
+                    // nobody is in keeps the answer below too.
+                    let judged = (miss != SingleMiss::UNSAID).then(|| {
+                        let prefills = placement::candidates(
+                            &self.worker_registry,
+                            model_id,
+                            RoutingPool::HttpPrefill,
+                            None,
+                        );
+                        placement::miss_failure(miss, prefills.as_slice(), model_id, false)
+                    });
+                    return match judged {
+                        Some(
+                            PlacementFailure::NoPlanBound(refusal)
+                            | PlacementFailure::DecisionFailed(refusal),
+                        ) => self.report_refusal(
+                            "PDRouter::route_messages_count_tokens",
+                            model_id,
+                            refusal,
+                        ),
+                        _ => error::service_unavailable(
+                            "no_prefill_servers",
+                            "No available prefill servers to count tokens",
+                        ),
+                    };
+                }
+            };
+            (placed, body)
         };
+        let worker = placed.worker();
 
         if let Some(response) = overload::shed_if_worker_overloaded(
             worker.as_ref(),
@@ -2808,10 +3718,9 @@ impl RouterTrait for PDRouter {
             Ok(bytes) => bytes,
             Err(e) => return Self::handle_serialization_error(e),
         };
-        let _load_guard = WorkerLoadGuard::with_key(
-            worker.clone(),
-            self.policy_registry.sticky_header_key(headers),
-        );
+        // This route keeps its answer to its end and tells the request's
+        // outcome through it, beside each record on the worker.
+        let _load_guard = placed.guard_keeping_end(self.policy_registry.sticky_header_key(headers));
         let request = header_utils::apply_forwarded_request_headers(
             attach_sized_body(
                 worker
@@ -2823,7 +3732,7 @@ impl RouterTrait for PDRouter {
             headers,
             worker.api_key(),
         );
-        Metrics::record_worker_request(worker.url(), worker.model_id());
+        WorkerMetrics::record_worker_request(worker.as_ref());
         let res = match send_with_stale_conn_retry(request).await {
             Ok(res) => res,
             Err(e) if is_request_timeout(&e) => {
@@ -2836,6 +3745,7 @@ impl RouterTrait for PDRouter {
                     cause(&e)
                 );
                 worker.record_outcome(StatusCode::GATEWAY_TIMEOUT.as_u16());
+                placed.ended(StatusCode::GATEWAY_TIMEOUT.as_u16(), || false);
                 return request_timeout_response(format!("count-tokens timed out: {}", cause(&e)));
             }
             Err(e) => {
@@ -2848,6 +3758,7 @@ impl RouterTrait for PDRouter {
                     cause(&e)
                 );
                 worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
+                placed.ended(StatusCode::BAD_GATEWAY.as_u16(), || false);
                 return error::bad_gateway(
                     "prefill_count_tokens_failed",
                     format!("Prefill server error: {}", cause(&e)),
@@ -2857,15 +3768,22 @@ impl RouterTrait for PDRouter {
         let status = res.status();
         let mut response_headers = header_utils::preserve_response_headers(res.headers());
         header_utils::insert_routed_worker_id(&mut response_headers, worker.redacted_url());
-        match res.bytes().await {
+        match read_body_capped(res.bytes_stream(), self.max_payload_size).await {
             Ok(bytes) => {
                 worker.record_outcome(status.as_u16());
+                placed.ended(status.as_u16(), || true);
                 let mut response = Response::new(Body::from(bytes));
                 *response.status_mut() = status;
                 *response.headers_mut() = response_headers;
                 response
             }
-            Err(e) if is_request_timeout(&e) => {
+            Err(BodyReadError::TooLarge) => {
+                worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
+                // The worker answered, and the route refused what it gave.
+                placed.ended(StatusCode::BAD_GATEWAY.as_u16(), || true);
+                worker_body_too_large(self.max_payload_size, worker.url())
+            }
+            Err(BodyReadError::Transport(e)) if is_request_timeout(&e) => {
                 error!(
                     worker = Endpoint::redacted_str(worker.url()),
                     endpoint = "/v1/messages/count_tokens",
@@ -2873,9 +3791,10 @@ impl RouterTrait for PDRouter {
                     cause(&e)
                 );
                 worker.record_outcome(StatusCode::GATEWAY_TIMEOUT.as_u16());
+                placed.ended(StatusCode::GATEWAY_TIMEOUT.as_u16(), || false);
                 request_timeout_response(format!("count-tokens timed out: {}", cause(&e)))
             }
-            Err(e) => {
+            Err(BodyReadError::Transport(e)) => {
                 error!(
                     worker = Endpoint::redacted_str(worker.url()),
                     endpoint = "/v1/messages/count_tokens",
@@ -2883,6 +3802,7 @@ impl RouterTrait for PDRouter {
                     cause(&e)
                 );
                 worker.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
+                placed.ended(StatusCode::BAD_GATEWAY.as_u16(), || false);
                 error::bad_gateway(
                     "prefill_count_tokens_failed",
                     format!("Failed to read prefill response: {}", cause(&e)),
@@ -2895,9 +3815,12 @@ impl RouterTrait for PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ResponsesRequest,
+        mut body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
+        if let Err(response) = lower_responses_request_for_local_backend(&mut body) {
+            return response;
+        }
         self.route_pd(headers, Some(tenant_meta), body, model_id)
             .await
     }
@@ -2920,7 +3843,20 @@ impl RouterTrait for PDRouter {
         body: RerankRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, None, body, model_id).await
+        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
+        let response_spec = RerankResponseSpec::from(&body);
+        let response = self.route_pd(headers, None, body, model_id).await;
+        if response.status().is_success() {
+            Router::build_rerank_response(
+                response_spec,
+                canonical_model.as_deref(),
+                response,
+                self.max_payload_size,
+            )
+            .await
+        } else {
+            response
+        }
     }
 
     fn router_type(&self) -> &'static str {
@@ -2946,9 +3882,13 @@ fn upstream_error_message(body: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::header::AUTHORIZATION;
+    use axum::http::header::{AUTHORIZATION, CONTENT_LENGTH};
     use openai_protocol::model_card::ModelCard;
     use serde_json::json;
+    use smg_worker::{
+        health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        test_support::RefusedAddress,
+    };
     use tokio::sync::{mpsc, oneshot};
     use tokio_stream::wrappers::ReceiverStream;
 
@@ -2957,18 +3897,27 @@ mod tests {
         config::{types::PdPairingMode, PolicyConfig},
         middleware::{test_support::json_of, ReportedRefusal},
         observability::logging::test_support::{test_subscriber, RefusalLineCounter},
-        routers::common::sse::SSE_CHANNEL_BUFFER,
-        tenant::TenantKey,
-        worker::{
-            circuit_breaker::CircuitState, test_support::RefusedAddress, BasicWorkerBuilder,
-            WorkerType,
+        routers::{
+            common::{
+                placement::tests::{
+                    engine_on, hearing_engine_on, hearing_pair_sides_on, hearing_pairs_on, Heard,
+                    Refusing,
+                },
+                prefill_admission::PrefillLoadGuard,
+                sse::SSE_CHANNEL_BUFFER,
+            },
+            grpc::backend_client::BasicWorkerBuilder,
+            http::test_support,
         },
+        server::http_client_builder,
+        tenant::TenantKey,
     };
 
     /// A call that never reached its worker, with the worker's URL on the
     /// error as reqwest attaches it.
     async fn call_refused_by(addr: std::net::SocketAddr) -> reqwest::Error {
-        crate::server::http_client_builder()
+        http_client_builder()
+            .no_proxy()
             .build()
             .unwrap()
             .get(format!("http://{addr}/generate"))
@@ -2996,8 +3945,10 @@ mod tests {
             error.url().is_some(),
             "reqwest attaches the URL to the error"
         );
+        let ledger = AttemptLedger::default();
 
         let response = PDRouter::side_failed_below_http(
+            &ledger,
             PdSide::Prefill,
             SidePhase::Start,
             "prefill request",
@@ -3025,7 +3976,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let worker = BasicWorkerBuilder::new(format!("http://{addr}")).build();
-        let error = crate::server::http_client_builder()
+        let error = http_client_builder()
             .timeout(std::time::Duration::from_millis(100))
             .build()
             .unwrap()
@@ -3035,8 +3986,10 @@ mod tests {
             .unwrap_err();
         drop(listener);
         assert!(is_request_timeout(&error));
+        let ledger = AttemptLedger::default();
 
         let response = PDRouter::side_failed_below_http(
+            &ledger,
             PdSide::Decode,
             SidePhase::Start,
             "decode request",
@@ -3051,6 +4004,48 @@ mod tests {
         );
         assert!(!message.contains(&addr.to_string()), "{message}");
         assert!(!message.contains("for url"), "{message}");
+    }
+
+    /// A route keys a chat request on its routing text: two requests of one
+    /// text and two images part at the image's place, as they do in a
+    /// backend's prefix cache; one image keeps one key, a request of text
+    /// alone reads the text of before, and the tenant's charge counts the
+    /// words of the prompt alone. The marker and its digest have their own
+    /// cases in the protocol crate.
+    #[test]
+    fn a_chat_request_routes_on_a_marker_at_the_place_of_each_part_that_is_no_text() {
+        let chat = |parts: Value| -> ChatCompletionRequest {
+            serde_json::from_value(json!({
+                "model": "m", "messages": [{"role": "user", "content": parts}]
+            }))
+            .unwrap()
+        };
+        let routed = |parts: Value| chat(parts).routing_inputs().0.unwrap();
+        let text = json!({"type": "text", "text": "what does it show"});
+        let image = |url: &str| json!({"type": "image_url", "image_url": {"url": url}});
+        let around = |part: Value| json!([text, part, text]);
+
+        assert_eq!(
+            routed(json!([text, text])),
+            "what does it show what does it show"
+        );
+        let first = routed(around(image("https://example.com/a.png")));
+        let other = routed(around(image("https://example.com/b.png")));
+        assert_eq!(first, routed(around(image("https://example.com/a.png"))));
+        // The text in front is shared, the digests part the keys at the
+        // image's place and the text behind follows the marker.
+        assert_eq!(first[..18], other[..18]);
+        assert_ne!(first[18..34], other[18..34]);
+        assert!(first.starts_with("what does it show ") && first.ends_with(" what does it show"));
+        // The route hands the marker on whole: the digest's 16 digits
+        // sixteen times, 256 characters.
+        assert_eq!(first.len(), 18 + 256 + 18);
+        assert_eq!(first[18..274], first[18..34].repeat(16));
+
+        let with_image = chat(around(image("https://example.com/a.png")));
+        let words = chat(json!([text, text])).estimated_input_tokens(None);
+        assert_eq!(with_image.estimated_input_tokens(Some(&first)), words);
+        assert_eq!(with_image.estimated_input_tokens(None), words);
     }
 
     #[test]
@@ -3144,7 +4139,7 @@ mod tests {
     /// hang, not a budget, since a loaded machine can take seconds.
     const ROUND_TRIP_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
 
-    fn create_test_pd_router() -> PDRouter {
+    pub(super) fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
 
@@ -3153,6 +4148,7 @@ mod tests {
             policy_registry,
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
+            max_payload_size: 536_870_912,
             prefill_admission: None,
             moriio_dp_turn: AtomicUsize::new(0),
             rate_limit_manager: None,
@@ -3303,6 +4299,224 @@ mod tests {
         }
     }
 
+    /// The rest of a frame past the bound continues a line already begun: a
+    /// sentinel at its start is text of that line, not an event, and the
+    /// frames after the rest are read as before.
+    #[test]
+    fn the_rest_of_a_frame_past_the_bound_is_not_read_as_a_fresh_frame() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let comment = Bytes::from(format!(": {}", "x".repeat(MAX_FRAME_BYTES)));
+        let flushed = merge.step(comment.clone());
+        assert_eq!(
+            flushed.bytes, comment,
+            "past the bound it passes as it came"
+        );
+        assert!(!flushed.last);
+        let rest = Bytes::from_static(b"data: [DONE]\n\n");
+        let step = merge.step(rest.clone());
+        assert_eq!(step.bytes, rest, "the rest passes as it came");
+        assert!(!step.last, "the rest of a line is not the sentinel");
+        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}\n\n";
+        let merged = merge.step(Bytes::from(frame));
+        assert!(!merged.last);
+        let body = std::str::from_utf8(&merged.bytes).unwrap();
+        let event: Value =
+            serde_json::from_str(body.trim_end().strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            event["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 2, null]]),
+            "the frame after the rest is merged: {body}"
+        );
+        let done = merge.step(Bytes::from_static(b"data: [DONE]\n\n"));
+        assert!(
+            done.last,
+            "the sentinel on a line of its own ends the relay"
+        );
+        assert!(merge.finish().is_empty(), "nothing held past the sentinel");
+    }
+
+    /// A sentinel after the rest's own line break is an event: it ends the
+    /// relay as before.
+    #[test]
+    fn a_sentinel_after_the_rest_of_a_frame_past_the_bound_ends_the_relay() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let comment = Bytes::from(format!(": {}", "x".repeat(MAX_FRAME_BYTES)));
+        assert!(!merge.step(comment).last);
+        let rest = Bytes::from_static(b"tail\ndata: [DONE]\n\n");
+        let step = merge.step(rest.clone());
+        assert_eq!(
+            step.bytes, rest,
+            "the rest and the sentinel pass as they came"
+        );
+        assert!(
+            step.last,
+            "the sentinel after the rest's line break ends the relay"
+        );
+        assert!(merge.finish().is_empty(), "nothing held past the sentinel");
+    }
+
+    /// Two frames in one chunk: each is merged. Before the split, the chunk
+    /// failed to parse as one frame and passed unmerged.
+    #[test]
+    fn two_decode_frames_in_one_chunk_are_each_merged() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let frame = |id: u32| {
+            format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{id}\"}}}}],\"meta_info\":{{\"input_token_logprobs\":[[-0.5,{id},null]]}}}}\n\n"
+            )
+        };
+        let step = merge.step(Bytes::from(format!("{}{}", frame(2), frame(3))));
+        assert!(!step.last);
+        let body = std::str::from_utf8(&step.bytes).unwrap();
+        let events: Vec<Value> = body
+            .split("\n\n")
+            .filter(|event| !event.is_empty())
+            .map(|event| serde_json::from_str(event.strip_prefix("data: ").unwrap()).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2, "{body}");
+        assert_eq!(
+            events[0]["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 2, null]]),
+            "{body}"
+        );
+        assert_eq!(
+            events[1]["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 3, null]]),
+            "{body}"
+        );
+    }
+
+    /// A frame cut across two chunks waits for its delimiter and is merged
+    /// whole; the sentinel in the same chunk ends the relay.
+    #[test]
+    fn a_decode_frame_split_across_chunks_is_merged_whole() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}\n\n";
+        let (head, tail) = frame.split_at(40);
+        let first = merge.step(Bytes::from(head.to_owned()));
+        assert!(first.bytes.is_empty() && !first.last, "{:?}", first.bytes);
+        let second = merge.step(Bytes::from(format!("{tail}data: [DONE]\n\n")));
+        assert!(second.last);
+        let body = std::str::from_utf8(&second.bytes).unwrap();
+        let (merged, done) = body.split_once("\n\n").expect("two frames: {body}");
+        let merged: Value = serde_json::from_str(merged.strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            merged["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 2, null]]),
+            "{body}"
+        );
+        assert_eq!(done, "data: [DONE]\n\n");
+        assert!(merge.finish().is_empty(), "nothing held past the sentinel");
+    }
+
+    /// A last frame cut short of its delimiter leaves at the end as it came.
+    #[test]
+    fn a_decode_frame_cut_short_at_the_end_leaves_as_it_came() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let step = merge.step(Bytes::from_static(b"data: {\"choices\":[{\"delta"));
+        assert!(step.bytes.is_empty() && !step.last);
+        assert_eq!(
+            merge.finish(),
+            Bytes::from_static(b"data: {\"choices\":[{\"delta")
+        );
+        assert!(merge.finish().is_empty(), "the tail leaves once");
+    }
+
+    /// The prefill's log-probabilities stay out of a stream the request did
+    /// not ask them for: the sentinel reading relays each chunk byte for byte
+    /// and ends at `[DONE]`; asked for, the same frame comes back merged.
+    #[test]
+    fn a_request_without_logprobs_keeps_the_sentinel_reading() {
+        let prefill = json!([[-0.1, 1, null]]);
+        let frame = Bytes::from_static(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}\n\n",
+        );
+        let mut plain = PDRouter::decode_chunk_hook(Some(prefill.clone()), false);
+        let step = plain.step(frame.clone());
+        assert_eq!(step.bytes, frame, "relayed as it came");
+        assert!(!step.last);
+        assert!(plain.step(Bytes::from_static(b"data: [DONE]\n\n")).last);
+        let mut merging = PDRouter::decode_chunk_hook(Some(prefill), true);
+        let step = merging.step(frame);
+        let body = std::str::from_utf8(&step.bytes).unwrap();
+        let merged: Value =
+            serde_json::from_str(body.trim_end().strip_prefix("data: ").unwrap()).unwrap();
+        assert_eq!(
+            merged["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 2, null]]),
+            "{body}"
+        );
+    }
+
+    /// A frame delimiter cut across two chunks (`\n\n` and `\r\r` after
+    /// their first byte, `\r\n\r\n` after any of its first three bytes): the
+    /// look-back over the held bytes finds it on the second chunk and the
+    /// frame is merged whole. The cut after the third byte needs all three
+    /// held bytes, so a shorter look-back is red here.
+    #[test]
+    fn a_delimiter_cut_across_chunks_completes_its_frame_on_the_second() {
+        let body = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}";
+        for (delimiter, cut) in [
+            ("\n\n", 1),
+            ("\r\r", 1),
+            ("\r\n\r\n", 1),
+            ("\r\n\r\n", 2),
+            ("\r\n\r\n", 3),
+        ] {
+            let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+            let (head, tail) = delimiter.split_at(cut);
+            let first = merge.step(Bytes::from(format!("{body}{head}")));
+            assert!(
+                first.bytes.is_empty() && !first.last,
+                "{delimiter:?}: {:?}",
+                first.bytes
+            );
+            let second = merge.step(Bytes::from(tail.to_owned()));
+            assert!(!second.last, "{delimiter:?}");
+            let out = std::str::from_utf8(&second.bytes).unwrap();
+            let (event, rest) = out.split_once("\n\n").expect("one frame");
+            let merged: Value =
+                serde_json::from_str(event.strip_prefix("data: ").unwrap()).unwrap();
+            assert_eq!(
+                merged["meta_info"]["input_token_logprobs"],
+                json!([[-0.1, 1, null], [-0.5, 2, null]]),
+                "{delimiter:?}: {out}"
+            );
+            assert!(rest.is_empty(), "{delimiter:?}: {out}");
+            assert!(merge.finish().is_empty(), "{delimiter:?}: nothing held");
+        }
+    }
+
+    /// A partial past the re-chunker's bound is no longer waited for: the
+    /// held bytes leave as they came on the chunk that crosses the bound,
+    /// and the frame's rest follows unmerged.
+    #[test]
+    fn a_partial_past_the_bound_passes_as_it_came() {
+        let mut merge = LogprobMerge::new(json!([[-0.1, 1, null]]));
+        let head = Bytes::from(format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}",
+            "x".repeat(MAX_FRAME_BYTES / 2)
+        ));
+        let first = merge.step(head.clone());
+        assert!(
+            first.bytes.is_empty() && !first.last,
+            "held under the bound"
+        );
+        let more = Bytes::from("y".repeat(MAX_FRAME_BYTES / 2 + 1));
+        let second = merge.step(more.clone());
+        assert!(!second.last);
+        assert_eq!(second.bytes.len(), head.len() + more.len());
+        assert_eq!(&second.bytes[..head.len()], &head[..]);
+        assert_eq!(&second.bytes[head.len()..], &more[..]);
+        let rest = Bytes::from_static(b"\"}}]}\n\n");
+        assert_eq!(
+            merge.step(rest.clone()).bytes,
+            rest,
+            "the rest passes unmerged"
+        );
+        assert!(merge.finish().is_empty(), "nothing held past the bound");
+    }
+
     #[test]
     fn test_merge_streaming_logprobs_sentinel_exact_match() {
         let mut encoder = SseEncoder::new();
@@ -3333,7 +4547,7 @@ mod tests {
                 "/generate",
                 Bytes::from(r#"{"text":"hello"}"#),
                 None,
-                false,
+                None,
             )
             .build()
             .expect("request should build");
@@ -3363,7 +4577,7 @@ mod tests {
                     "/generate",
                     Bytes::from(r#"{"text":"hello"}"#),
                     headers,
-                    false,
+                    None,
                 )
                 .build()
                 .expect("request should build")
@@ -3438,7 +4652,8 @@ mod tests {
                 .build(),
         );
 
-        let anonymous = PDRouter::proxy_to_worker(&worker, "get_server_info", None).await;
+        let anonymous =
+            PDRouter::proxy_to_worker(&worker, "get_server_info", None, usize::MAX).await;
         assert_eq!(anonymous.status(), StatusCode::OK);
         let own = PDRouter::proxy_to_worker(
             &worker,
@@ -3447,12 +4662,170 @@ mod tests {
                 "authorization".to_string(),
                 "Bearer callers-own-key".to_string(),
             )]),
+            usize::MAX,
         )
         .await;
         assert_eq!(own.status(), StatusCode::OK);
         assert_eq!(
             *seen.lock().unwrap(),
             vec![None, Some("Bearer callers-own-key".to_string())]
+        );
+    }
+
+    /// The public GET forwards the caller's allow-listed headers only: the
+    /// caller's `accept-encoding` is not among them, so the worker reads the
+    /// client factory's `identity`; a cookie does not cross; `authorization`
+    /// does.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn a_public_get_forwards_only_the_allow_listed_caller_headers() {
+        type Seen = (Option<String>, Option<String>, Option<String>);
+        let seen: Arc<std::sync::Mutex<Vec<Seen>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = Arc::clone(&seen);
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
+            let log = Arc::clone(&log);
+            async move {
+                let header = |name: &str| {
+                    req.headers()
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string)
+                };
+                log.lock().unwrap().push((
+                    header("authorization"),
+                    header("accept-encoding"),
+                    header("cookie"),
+                ));
+                ([(CONTENT_TYPE, "application/json")], "{}")
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("http://{addr}"))
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+
+        let response = PDRouter::proxy_to_worker(
+            &worker,
+            "get_model_info",
+            Some(vec![
+                (
+                    "authorization".to_string(),
+                    "Bearer callers-own-key".to_string(),
+                ),
+                ("accept-encoding".to_string(), "gzip, deflate".to_string()),
+                ("cookie".to_string(), "session=1".to_string()),
+            ]),
+            usize::MAX,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![(
+                Some("Bearer callers-own-key".to_string()),
+                Some("identity".to_string()),
+                None
+            )]
+        );
+    }
+
+    /// A worker's refusal goes back as the worker sent it (its status, its
+    /// body, its `Retry-After`), as the regular router's proxied GET relays
+    /// it, not as an error object of the gateway's own.
+    #[tokio::test]
+    async fn a_proxied_get_relays_the_workers_refusal() {
+        let app = axum::Router::new().fallback(axum::routing::any(|| async {
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(RETRY_AFTER, "7")],
+                r#"{"error":"busy"}"#,
+            )
+        }));
+        let worker = ready_prefill_worker(spawn_stub(app).await);
+
+        let response =
+            PDRouter::proxy_to_worker(&worker, "get_server_info", None, usize::MAX).await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(response.headers()[RETRY_AFTER], "7");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], br#"{"error":"busy"}"#);
+    }
+
+    /// A worker that closes the connection after its head, before the body
+    /// it announced, failed below HTTP: the proxied GET answers a bad gateway
+    /// under the read's code, as the typed routes' buffered reads do, not a
+    /// 500 of the gateway's own.
+    #[tokio::test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn a_worker_that_closes_mid_body_is_proxied_as_a_bad_gateway() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 1000\r\n\r\n{\"partial\":")
+                    .await;
+                let _ = sock.shutdown().await;
+            }
+        });
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("http://{addr}"))
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+
+        let response =
+            PDRouter::proxy_to_worker(&worker, "get_server_info", None, usize::MAX).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = json_of(response).await;
+        assert_eq!(body["error"]["code"], "read_response_body_failed", "{body}");
+    }
+
+    /// A worker whose answer's head arrives and whose body does not end within
+    /// the request's own timeout ends the proxied GET as every other body read
+    /// of these routers does: the 504 of the request's timeout, not the bad
+    /// gateway of a cut transport.
+    #[tokio::test]
+    async fn a_worker_body_the_request_timeout_cuts_is_proxied_as_the_timeout() {
+        let url = spawn_stalled_body_stub().await;
+        let client = Arc::new(
+            http_client_builder()
+                .timeout(std::time::Duration::from_secs(1))
+                .build()
+                .unwrap(),
+        );
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Prefill)
+                .http_client(client)
+                .build(),
+        );
+
+        let response =
+            PDRouter::proxy_to_worker(&worker, "get_server_info", None, usize::MAX).await;
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "call_upstream_timeout"
         );
     }
 
@@ -3477,7 +4850,12 @@ mod tests {
             .worker_registry
             .register_or_replace(Arc::from(decode_worker));
 
-        let result = router.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None);
+        let result = router.select_pd_pair(
+            UNKNOWN_MODEL_ID,
+            PlacementInputs::default(),
+            None,
+            placement::Stated::nothing,
+        );
 
         assert!(result.is_ok());
         let (prefill, _decode) = result.unwrap();
@@ -3502,13 +4880,23 @@ mod tests {
         }
 
         let (prefill, decode) = router
-            .select_pd_pair("GLM-5.2-Coding", PlacementInputs::default(), None)
+            .select_pd_pair(
+                "GLM-5.2-Coding",
+                PlacementInputs::default(),
+                None,
+                placement::Stated::nothing,
+            )
             .expect("alias should select a PD pair");
         assert_eq!(prefill.url(), "http://prefill");
         assert_eq!(decode.url(), "http://decode");
 
         assert!(router
-            .select_pd_pair("GLM-5.2-Unknown", PlacementInputs::default(), None)
+            .select_pd_pair(
+                "GLM-5.2-Unknown",
+                PlacementInputs::default(),
+                None,
+                placement::Stated::nothing,
+            )
             .is_err());
     }
 
@@ -3516,7 +4904,12 @@ mod tests {
     async fn test_empty_worker_lists() {
         let router = create_test_pd_router();
 
-        let result = router.select_pd_pair(UNKNOWN_MODEL_ID, PlacementInputs::default(), None);
+        let result = router.select_pd_pair(
+            UNKNOWN_MODEL_ID,
+            PlacementInputs::default(),
+            None,
+            placement::Stated::nothing,
+        );
 
         assert!(result.is_err());
         // No workers at all is the pre-existing unavailable string, not a shed:
@@ -3526,6 +4919,10 @@ mod tests {
                 assert!(error.contains("No prefill workers available"));
             }
             PdSelectionFailure::Shed(_) => panic!("an empty fleet is not an overload shed"),
+            PdSelectionFailure::NoPlanBound(_) => panic!("a classic gateway runs no policy spec"),
+            PdSelectionFailure::DecisionFailed(_) | PdSelectionFailure::ShedUnder(..) => {
+                panic!("a classic gateway has no engine to refuse or to shed")
+            }
             PdSelectionFailure::Incompatible(_) => {
                 panic!("an empty fleet has no pairing to be incompatible about")
             }
@@ -3535,13 +4932,38 @@ mod tests {
         }
     }
 
+    /// A declined policy's sentence names the role it declined for. Under
+    /// Grand Central a decline may name no side: the sentence then says the
+    /// pair.
+    #[test]
+    fn a_decline_that_names_no_side_says_the_pair() {
+        let sentence = |role| {
+            let failure = PairFailure {
+                role,
+                verdict: PlacementFailure::PolicyDeclined("a-stage"),
+            };
+            let PdSelectionFailure::Unavailable(sentence) = PDRouter::pair_failure(failure) else {
+                panic!("a declined policy is answered as unavailable");
+            };
+            sentence
+        };
+        assert_eq!(
+            sentence(WorkerRole::Single),
+            "Policy a-stage failed to select a pair"
+        );
+        assert_eq!(
+            sentence(WorkerRole::Decode),
+            "Policy a-stage failed to select a decode worker"
+        );
+    }
+
     /// Loopback stub answering `{}` on any path, recording each request's
     /// path and JSON body.
     #[expect(
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn spawn_recording_stub(
+    pub(super) async fn spawn_recording_stub(
         reply: &'static str,
     ) -> (String, Arc<std::sync::Mutex<Vec<(String, Value)>>>) {
         let seen: Arc<std::sync::Mutex<Vec<(String, Value)>>> =
@@ -3567,6 +4989,21 @@ mod tests {
         (format!("http://{addr}"), seen)
     }
 
+    /// A Prefill admission refusal (the queue full, or a queued request that
+    /// waited out its admission timeout) is this process's own backpressure:
+    /// the retry layer does not replay it on another pair, where a plain
+    /// retryable answer is replayed, a worker's 503 and its own 429 under
+    /// another code alike: the error code decides, not the status.
+    #[test]
+    fn a_prefill_admission_refusal_is_not_retried() {
+        assert!(!PDRouter::should_retry_pd_response(&prefill_queue_full()));
+        assert!(!PDRouter::should_retry_pd_response(&prefill_queue_timeout()));
+        let worker_refusal = error::service_unavailable("worker_unavailable", "a worker is down");
+        assert!(PDRouter::should_retry_pd_response(&worker_refusal));
+        let worker_busy = error::too_many_requests("worker_busy", "a worker is saturated");
+        assert!(PDRouter::should_retry_pd_response(&worker_busy));
+    }
+
     /// A side that does not answer within the request's timeout ends the
     /// request, on the concurrent dispatch shape and on the sequential one:
     /// one attempt on the pair, the 504 `call_upstream_timeout` to the client
@@ -3589,7 +5026,7 @@ mod tests {
                 ..Default::default()
             };
             let client = Arc::new(
-                crate::server::http_client_builder()
+                http_client_builder()
                     .timeout(std::time::Duration::from_secs(1))
                     .build()
                     .unwrap(),
@@ -3602,7 +5039,7 @@ mod tests {
                     .worker_type(worker_type)
                     .runtime_type(runtime)
                     .http_client(Arc::clone(&client))
-                    .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    .circuit_breaker_config(CircuitBreakerConfig {
                         failure_threshold: 1,
                         success_threshold: 1,
                         timeout_duration: std::time::Duration::from_secs(60),
@@ -3619,11 +5056,9 @@ mod tests {
             }))
             .expect("valid chat request");
 
-            let started = Instant::now();
             let response = router
-                .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
                 .await;
-            let elapsed = started.elapsed();
 
             assert_eq!(
                 response.status(),
@@ -3640,10 +5075,6 @@ mod tests {
                 prefill_arrivals.lock().unwrap().len(),
                 1,
                 "{runtime:?}: one attempt on the pair"
-            );
-            assert!(
-                elapsed < std::time::Duration::from_millis(1900),
-                "{runtime:?}: one timeout, not retries x timeout: {elapsed:?}"
             );
             // The concurrent shape sent the decode side once with the prefill;
             // the sequential shape never reached it.
@@ -3693,7 +5124,7 @@ mod tests {
             ..Default::default()
         };
         let client = Arc::new(
-            crate::server::http_client_builder()
+            http_client_builder()
                 .timeout(std::time::Duration::from_secs(1))
                 .build()
                 .unwrap(),
@@ -3718,7 +5149,7 @@ mod tests {
         .expect("valid chat request");
 
         let response = router
-            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
             .await;
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
@@ -3732,6 +5163,320 @@ mod tests {
             1,
             "one attempt on the pair, no replay"
         );
+    }
+
+    /// The request end of a caller whose server ends the wait by the clock
+    /// (`past_the_request_end`): a minute, longer than a busy test binary
+    /// holds a thread, so the end is never met in real time.
+    const HELD_REQUEST_END: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// Moves the caller's clock past `HELD_REQUEST_END`, by hand and at once
+    /// (a current-thread runtime): a request timeout up to that end fires
+    /// where the server stands, in every run, and no real second is waited.
+    async fn past_the_request_end() {
+        struct Resumed;
+        impl Drop for Resumed {
+            fn drop(&mut self) {
+                tokio::time::resume();
+            }
+        }
+        tokio::time::pause();
+        let _resumed = Resumed;
+        tokio::time::advance(HELD_REQUEST_END + std::time::Duration::from_secs(1)).await;
+    }
+
+    /// A server whose answer's head and first bytes leave at once and whose
+    /// body then breaks off, on every path and method: a worker that dies
+    /// mid-answer. The cut comes past a request end of up to
+    /// `HELD_REQUEST_END` on the caller's clock (`past_the_request_end`): a
+    /// caller that reads the cut against such a request timeout reads the
+    /// timeout in every run, not only where a busy test binary holds its
+    /// thread. It needs a current-thread runtime whose clock runs: on a
+    /// multi-thread runtime, or with the clock paused already
+    /// (`start_paused = true`), `tokio::time::pause` panics in the server's
+    /// connection task and the caller is told nothing of it.
+    pub(super) async fn spawn_cut_body_stub() -> String {
+        let app = axum::Router::new().fallback(axum::routing::any(|| async {
+            let head = futures_util::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(
+                b"{\"partial\":",
+            ))]);
+            let cut = futures_util::stream::once(async {
+                // The head and the first bytes are read before the cut.
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                past_the_request_end().await;
+                Err::<Bytes, std::io::Error>(std::io::Error::other("the engine went away"))
+            });
+            (
+                [(CONTENT_TYPE, "application/json")],
+                Body::from_stream(head.chain(cut)),
+            )
+        }));
+        spawn_stub(app).await
+    }
+
+    /// Every line this router writes about a call that failed below HTTP
+    /// names its worker by the masked address and gives the HTTP client's
+    /// reason without the client's URL. The client ends its error text with
+    /// the URL it called, query included, after a failed send and a failed
+    /// body read alike, so each row registers its failing worker with a
+    /// token in the address's query and reads the row's line: three for the
+    /// proxied GET, two for the parallel dispatch, four for the decode body
+    /// (cut and timed out, with and without logprobs) and two for the
+    /// prefill body.
+    /// Every row is read to its end, so one run names every line that is
+    /// written another way. (The line about a prefill body drained in the
+    /// background is written from a detached task, outside this capture.)
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_failed_calls_line_names_the_worker_masked_without_the_clients_url() {
+        use PdSide::{Decode, Prefill};
+
+        // What a row's failing server does: nothing listens at its address;
+        // it takes the request and answers nothing in the request's time; its
+        // head and first bytes leave and the body breaks off, or never ends.
+        #[derive(Clone, Copy, Debug)]
+        enum Server {
+            Unreachable,
+            Silent,
+            Cut,
+            Stalled,
+        }
+        use Server::{Cut, Silent, Stalled, Unreachable};
+
+        // The call a row makes: the proxied GET, or one unstreamed chat with
+        // the failing server on a side, with logprobs asked or not.
+        #[derive(Clone, Copy, Debug)]
+        enum Call {
+            ProxiedGet,
+            Chat(PdSide, bool),
+        }
+        use Call::{Chat, ProxiedGet};
+
+        const BAD_GATEWAY: StatusCode = StatusCode::BAD_GATEWAY;
+        const GATEWAY_TIMEOUT: StatusCode = StatusCode::GATEWAY_TIMEOUT;
+
+        // A row that owes a timeout does not wait for it: its server moves
+        // the clock past the request's end where the row owes the timeout.
+        // This one takes the request and never answers.
+        async fn spawn_silent_stub() -> String {
+            let app = axum::Router::new().fallback(axum::routing::any(|| async {
+                past_the_request_end().await;
+                std::future::pending::<StatusCode>().await
+            }));
+            spawn_stub(app).await
+        }
+        // This one's head and first bytes leave at once and its body never
+        // ends. The clock moves once the caller had 64 turns of the test's
+        // one thread to read them: turns, not time, which a held thread
+        // cannot reorder. The count rests on the loopback handing the head
+        // over within those turns (each one poll of the driver, no wait):
+        // were it handed over later, the timeout would be read at the send
+        // and the row would miss its line.
+        async fn spawn_stalled_stub() -> String {
+            let app = axum::Router::new().fallback(axum::routing::any(|| async {
+                let head = futures_util::stream::iter([Ok::<_, std::io::Error>(
+                    Bytes::from_static(b"{\"partial\":"),
+                )]);
+                let stall = futures_util::stream::once(async {
+                    for _ in 0..64 {
+                        tokio::task::yield_now().await;
+                    }
+                    past_the_request_end().await;
+                    std::future::pending::<Result<Bytes, std::io::Error>>().await
+                });
+                (
+                    [(CONTENT_TYPE, "application/json")],
+                    Body::from_stream(head.chain(stall)),
+                )
+            }));
+            spawn_stub(app).await
+        }
+
+        // (the line's words, the call, the failing server, the answer)
+        let rows = [
+            (
+                "Failed to proxy request server",
+                ProxiedGet,
+                Unreachable,
+                BAD_GATEWAY,
+            ),
+            ("Failed to read response body", ProxiedGet, Cut, BAD_GATEWAY),
+            (
+                "Response body read timed out",
+                ProxiedGet,
+                Stalled,
+                GATEWAY_TIMEOUT,
+            ),
+            (
+                "PD request timed out, both sides aborted",
+                Chat(Prefill, false),
+                Silent,
+                GATEWAY_TIMEOUT,
+            ),
+            (
+                "request failed below HTTP, both sides aborted",
+                Chat(Decode, false),
+                Unreachable,
+                BAD_GATEWAY,
+            ),
+            (
+                "Failed to read decode response",
+                Chat(Decode, false),
+                Cut,
+                BAD_GATEWAY,
+            ),
+            (
+                "Failed to read decode response",
+                Chat(Decode, true),
+                Cut,
+                BAD_GATEWAY,
+            ),
+            (
+                "Decode response timed out",
+                Chat(Decode, false),
+                Stalled,
+                GATEWAY_TIMEOUT,
+            ),
+            (
+                "Decode response timed out",
+                Chat(Decode, true),
+                Stalled,
+                GATEWAY_TIMEOUT,
+            ),
+            (
+                "Error consuming prefill response",
+                Chat(Prefill, false),
+                Cut,
+                StatusCode::OK,
+            ),
+            (
+                "Failed to read prefill response body for logprobs",
+                Chat(Prefill, true),
+                Cut,
+                BAD_GATEWAY,
+            ),
+        ];
+
+        // No row waits out a real timeout. A busy test binary holds a thread
+        // for longer than a second (its log capture is one lock), and a cut,
+        // a refused connect, a healthy side's answer or a stalled side's head
+        // read behind the hold was read as the request's timeout. Every
+        // worker has a request end, as a registered worker's client has: a
+        // worker that owes a timeout has it a minute away, where its server
+        // meets it by the clock; every other worker has it ten times as far,
+        // past the clock step of any row.
+        let timed = Arc::new(
+            http_client_builder()
+                .timeout(HELD_REQUEST_END)
+                .build()
+                .unwrap(),
+        );
+        let far = Arc::new(
+            http_client_builder()
+                .timeout(HELD_REQUEST_END * 10)
+                .build()
+                .unwrap(),
+        );
+        let worker_at = |url: String,
+                         worker_type: WorkerType,
+                         client: &Arc<reqwest::Client>|
+         -> Arc<dyn Worker> {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Sglang)
+                .http_client(Arc::clone(client))
+                .build();
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            Arc::new(worker)
+        };
+
+        let mut wrong = Vec::new();
+        let mut lines_wanted = Vec::new();
+        for (what, call, server, status) in rows {
+            let client = match server {
+                Silent | Stalled => &timed,
+                Unreachable | Cut => &far,
+            };
+            let (url, _refused) = match server {
+                Unreachable => {
+                    let refused = RefusedAddress::reserve();
+                    (refused.http_url(), Some(refused))
+                }
+                Silent => (spawn_silent_stub().await, None),
+                Cut => (spawn_cut_body_stub().await, None),
+                Stalled => (spawn_stalled_stub().await, None),
+            };
+            let registered = format!("{url}?token=s3cret");
+            let answered = match call {
+                ProxiedGet => {
+                    let worker = worker_at(registered, WorkerType::Prefill, client);
+                    PDRouter::proxy_to_worker(&worker, "get_server_info", None, usize::MAX)
+                        .await
+                        .status()
+                }
+                Chat(side, logprobs) => {
+                    let healthy = healthy_stub(Shape::Parallel, side.partner()).await;
+                    let (prefill_url, decode_url) = match side {
+                        Prefill => (registered, healthy),
+                        Decode => (healthy, registered),
+                    };
+                    let router = single_attempt_router();
+                    for (url, worker_type, failing) in [
+                        (prefill_url, WorkerType::Prefill, matches!(side, Prefill)),
+                        (decode_url, WorkerType::Decode, matches!(side, Decode)),
+                    ] {
+                        let client = if failing { client } else { &far };
+                        let worker = worker_at(url, worker_type, client);
+                        router.worker_registry.register_or_replace(worker);
+                    }
+                    let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+                    let request = serde_json::from_value(json!({
+                        "model": "m",
+                        "logprobs": logprobs,
+                        "messages": [{"role": "user", "content": "hi"}],
+                    }))
+                    .expect("valid chat request");
+                    router
+                        .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+                        .await
+                        .status()
+                }
+            };
+            if answered != status {
+                wrong.push(format!(
+                    "{what:?} ({call:?} on {server:?}): answered {answered}, not {status}"
+                ));
+            }
+            // The masked address of these workers is the address without its query.
+            lines_wanted.push((what, url));
+        }
+
+        logs_assert(|lines: &[&str]| {
+            let mut wrong = wrong.clone();
+            for (what, masked) in &lines_wanted {
+                let named: Vec<_> = lines
+                    .iter()
+                    .filter(|line| line.contains(*what) && line.contains(masked.as_str()))
+                    .collect();
+                if named.is_empty() {
+                    wrong.push(format!("{what:?}: no such line names {masked}"));
+                } else if let Some(line) = named.iter().find(|line| line.contains("s3cret")) {
+                    wrong.push(format!(
+                        "{what:?}: the line carries the client's URL: {line}"
+                    ));
+                }
+            }
+            if wrong.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} findings over {} rows:\n{}",
+                    wrong.len(),
+                    lines_wanted.len(),
+                    wrong.join("\n")
+                ))
+            }
+        });
     }
 
     #[tokio::test]
@@ -3763,7 +5508,7 @@ mod tests {
         }))
         .expect("valid messages request");
         let response = router
-            .route_messages(None, &tenant, messages, UNKNOWN_MODEL_ID)
+            .route_messages(None, &tenant, Arc::new(messages), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -3796,6 +5541,173 @@ mod tests {
         }
     }
 
+    /// The pair shapes a rerank answer by the regular router's builder: a
+    /// client reads the same rerank object from either router, not the decode
+    /// worker's body as it came.
+    #[tokio::test]
+    async fn rerank_behind_the_pair_answers_the_gateways_rerank_object() {
+        let list =
+            r#"[{"score":0.25,"document":"a","index":0},{"score":0.75,"document":"b","index":1}]"#;
+        let (prefill_url, _) = spawn_recording_stub(list).await;
+        let (decode_url, _) = spawn_recording_stub(list).await;
+        let router = create_test_pd_router();
+        register_pd_pair(&router, prefill_url, decode_url.clone());
+
+        let rerank: RerankRequest = serde_json::from_value(json!({
+            "model": "m",
+            "query": "q",
+            "documents": ["a", "b"],
+            "top_k": 1,
+            "return_documents": false,
+            "rid": "my-rid",
+        }))
+        .expect("valid rerank request");
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let response = router
+            .route_rerank(None, &tenant, rerank, UNKNOWN_MODEL_ID)
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["x-smg-routed-worker-id"], decode_url);
+        let answer = json_of(response).await;
+        assert_eq!(answer["object"], "rerank");
+        assert_eq!(answer["id"], "my-rid");
+        assert_eq!(answer["results"], json!([{"score": 0.75, "index": 1}]));
+    }
+
+    #[tokio::test]
+    async fn a_side_answer_above_the_payload_limit_reads_502() {
+        use crate::routers::common::attempt_ledger::WORKER_BODY_TOO_LARGE;
+
+        const OVER: &str =
+            r#"{"object":"response","output":"one side's answer above the payload limit"}"#;
+        // The limit fits one side's answer, not the other's. The prefill
+        // answer is part of the client's only when logprobs are asked.
+        let mut read = Vec::new();
+        for (prefill, decode, logprobs, stream) in [
+            ("{}", OVER, false, false),
+            ("{}", OVER, true, false),
+            (OVER, "{}", true, false),
+            (OVER, "{}", true, true),
+        ] {
+            let (prefill_url, _) = spawn_recording_stub(prefill).await;
+            let (decode_url, _) = spawn_recording_stub(decode).await;
+            let router = PDRouter {
+                max_payload_size: 64,
+                ..single_attempt_router()
+            };
+            // A breaker that opens on the first failure shows which worker
+            // the 502 is charged to.
+            let pair = [
+                fragile_worker(prefill_url, WorkerType::Prefill),
+                fragile_worker(decode_url, WorkerType::Decode),
+            ];
+            for worker in &pair {
+                router
+                    .worker_registry
+                    .register_or_replace(Arc::clone(worker));
+            }
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": logprobs,
+                "stream": stream,
+            }))
+            .expect("valid chat request");
+            let response = router
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+                .await;
+            read.push((
+                response.status(),
+                error_code(&response).map(str::to_owned),
+                pair.map(|worker| !worker.circuit_breaker_can_execute()),
+            ));
+        }
+
+        let code = Some(WORKER_BODY_TOO_LARGE.to_owned());
+        let refused = |charged: [bool; 2]| (StatusCode::BAD_GATEWAY, code.clone(), charged);
+        // Charged, prefill then decode: the side above the limit, alone.
+        assert_eq!(
+            read,
+            [[false, true], [false, true], [true, false], [true, false]].map(refused)
+        );
+    }
+
+    /// A prefill body cut after its 2xx head is the prefill worker's failure,
+    /// and the decode worker beside it is not charged. With logprobs asked
+    /// that body is part of the answer and the request reads the side's 502.
+    /// Without them the client keeps the decode answer, and the cut stands on
+    /// the prefill worker beside the decode's success.
+    #[tokio::test]
+    async fn a_cut_prefill_body_is_charged_to_the_prefill_worker() {
+        let client = Arc::new(
+            http_client_builder()
+                .timeout(std::time::Duration::from_secs(1))
+                .build()
+                .unwrap(),
+        );
+        let mut read = Vec::new();
+        for logprobs in [true, false] {
+            let prefill_url = faulty_stub(Fault::CutAfterHead).await.0;
+            let decode_url = healthy_stub(Shape::Parallel, PdSide::Decode).await;
+            let router = single_attempt_router();
+            let pair = [
+                (prefill_url, WorkerType::Prefill),
+                (decode_url, WorkerType::Decode),
+            ]
+            .map(|(url, worker_type)| {
+                let worker = Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(worker_type)
+                        .http_client(Arc::clone(&client))
+                        .build(),
+                );
+                worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+                router
+                    .worker_registry
+                    .register_or_replace(Arc::clone(&worker) as Arc<dyn Worker>);
+                worker
+            });
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": logprobs,
+            }))
+            .expect("valid chat request");
+
+            let response = router
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+                .await;
+
+            // The failures and the successes each worker's breaker counted.
+            let counted = pair.map(|worker| {
+                let stats = worker.circuit_breaker.load().stats();
+                (stats.total_failures, stats.total_successes)
+            });
+            read.push((
+                response.status(),
+                error_code(&response).map(str::to_owned),
+                counted,
+            ));
+        }
+
+        // Prefill then decode: the cut is the prefill worker's alone.
+        assert_eq!(
+            read,
+            [
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Some("prefill_stream_error".to_owned()),
+                    [(1, 0), (0, 0)]
+                ),
+                (StatusCode::OK, None, [(1, 0), (0, 1)]),
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn both_sides_forward_client_numbers_exactly() {
         let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
@@ -3820,7 +5732,7 @@ mod tests {
         }))
         .expect("valid chat request");
         let response = router
-            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -3910,7 +5822,7 @@ mod tests {
                 BasicWorkerBuilder::new(format!("http://{}", listener.local_addr().unwrap()))
                     .worker_type(WorkerType::Prefill)
                     .api_key("worker-key".to_string())
-                    .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    .circuit_breaker_config(CircuitBreakerConfig {
                         failure_threshold: 1,
                         ..Default::default()
                     })
@@ -3991,7 +5903,7 @@ mod tests {
         for head_sent in [false, true] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = Arc::new(
-                crate::server::http_client_builder()
+                http_client_builder()
                     .timeout(std::time::Duration::from_millis(100))
                     .build()
                     .unwrap(),
@@ -4002,7 +5914,7 @@ mod tests {
                 BasicWorkerBuilder::new(format!("http://{}", listener.local_addr().unwrap()))
                     .worker_type(WorkerType::Prefill)
                     .http_client(client)
-                    .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                    .circuit_breaker_config(CircuitBreakerConfig {
                         failure_threshold: 1,
                         ..Default::default()
                     })
@@ -4144,6 +6056,220 @@ mod tests {
             .is_empty());
     }
 
+    /// What the token count answers by the engine's word, on a prefill pool
+    /// whose one worker is open: the count is decided as a single request.
+    /// A model that the policy spec in force binds no single-request plan
+    /// for is the 501 `no_policy_plan_for_model`. A decision the engine
+    /// refuses is the 500 `grand_central_decision_failed`. Neither carries
+    /// a retry hint. Each read the count's own 503 `no_prefill_servers`
+    /// before. A filter of the spec that keeps nobody keeps
+    /// that 503, and so does a prefill pool nobody is in, under each spec.
+    /// The gateway's own selection has no like case for the first two: it
+    /// reads no spec, and it has no engine to refuse. Its own miss reads
+    /// the 503
+    /// (`messages_count_tokens_uses_one_prefill_worker_and_no_bootstrap`).
+    #[tokio::test]
+    async fn a_token_count_is_answered_by_the_engines_word() {
+        let answered = |refusing: Refusing, prefills: usize| async move {
+            let router = create_test_pd_router();
+            for at in 0..prefills {
+                // Nothing listens there: the count is refused ahead of any
+                // send.
+                let url = format!("http://127.0.0.1:{}", 9700 + at);
+                let worker = create_test_worker(url, WorkerType::Prefill, true);
+                router
+                    .worker_registry
+                    .register_or_replace(Arc::from(worker));
+            }
+            refusing.single_on(&router.policy_registry);
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+            let body: CountMessageTokensRequest =
+                serde_json::from_value(body).expect("valid count_tokens request");
+            let response = router
+                .route_messages_count_tokens(None, &tenant, body, UNKNOWN_MODEL_ID)
+                .await;
+            let code = error::extract_error_code_from_response(&response).to_string();
+            let hint = response.headers().contains_key(RETRY_AFTER);
+            (response.status(), code, hint)
+        };
+        let refused = |status: StatusCode, code: &str| (status, code.to_string(), false);
+
+        assert_eq!(
+            answered(Refusing::Unbound, 1).await,
+            refused(StatusCode::NOT_IMPLEMENTED, "no_policy_plan_for_model")
+        );
+        assert_eq!(
+            answered(Refusing::Faulted, 1).await,
+            refused(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "grand_central_decision_failed"
+            )
+        );
+        let unavailable = refused(StatusCode::SERVICE_UNAVAILABLE, "no_prefill_servers");
+        assert_eq!(answered(Refusing::Nobody, 1).await, unavailable);
+        for refusing in [Refusing::Unbound, Refusing::Faulted, Refusing::Nobody] {
+            assert_eq!(answered(refusing, 0).await, unavailable, "{refusing:?}");
+        }
+    }
+
+    /// A token count's refusal is the count's own. Both changed answers
+    /// name the model the count was routed under. The 501's line is written
+    /// under the count's function: under the pair route's it pointed an
+    /// operator at the dual dispatch, which a count never reaches. The 500
+    /// is no refusal the router reports, so it writes no such line.
+    #[tokio::test]
+    async fn a_token_counts_refusal_names_its_own_model_and_function() {
+        /// The `function` of each refusal line this thread writes: the
+        /// events that name one.
+        struct RefusalFunctions(Arc<std::sync::Mutex<Vec<String>>>);
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RefusalFunctions {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Function(String);
+                impl tracing::field::Visit for Function {
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "function" {
+                            value.clone_into(&mut self.0);
+                        }
+                    }
+
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                }
+                if event.metadata().fields().field("function").is_some() {
+                    let mut function = Function(String::new());
+                    event.record(&mut function);
+                    self.0.lock().unwrap().push(function.0);
+                }
+            }
+        }
+
+        // A model of the case's own: its refusal lines share no allowance
+        // with another case's.
+        const COUNTED: &str = "a-counted-model";
+        let functions = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _subscriber = test_subscriber(RefusalFunctions(Arc::clone(&functions)));
+        let answered = |refusing: Refusing| async move {
+            let router = create_test_pd_router();
+            // Nothing listens there: the count is refused ahead of any send.
+            let worker = BasicWorkerBuilder::new("http://127.0.0.1:9710")
+                .worker_type(WorkerType::Prefill)
+                .model(ModelCard::new(COUNTED))
+                .build();
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register(Arc::new(worker)).unwrap();
+            refusing.single_on(&router.policy_registry);
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let body = json!({"model": COUNTED, "messages": [{"role": "user", "content": "hi"}]});
+            let body: CountMessageTokensRequest =
+                serde_json::from_value(body).expect("valid count_tokens request");
+            let response = router
+                .route_messages_count_tokens(None, &tenant, body, COUNTED)
+                .await;
+            error_message(response).await
+        };
+
+        assert_eq!(
+            answered(Refusing::Unbound).await,
+            format!("the policy spec in force binds no single-request plan for model '{COUNTED}'")
+        );
+        assert_eq!(
+            answered(Refusing::Faulted).await,
+            format!("Grand Central made no decision for model '{COUNTED}'. The fault is the gateway's own.")
+        );
+        assert_eq!(
+            *functions.lock().unwrap(),
+            ["PDRouter::route_messages_count_tokens"]
+        );
+    }
+
+    /// The count route asks the pair's text question, and its request is
+    /// decided as a single one over the prefill pool: by the model's main
+    /// policy under the classic policies, by the binding of single requests
+    /// under Grand Central. Beside a cache-aware main policy with
+    /// round-robin sides the two sides read no text. So neither kind builds
+    /// the count's text, and both place it on the same worker, the one that
+    /// holds less.
+    #[tokio::test]
+    async fn a_count_beside_quiet_sides_is_placed_with_no_text_under_either_kind() {
+        use smg_grand_central::document::AppliedSpec;
+
+        use crate::{
+            config::types::{RouterConfig, RoutingMode},
+            policies::Side,
+        };
+
+        let settings = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                prefill_policy: Some(PolicyConfig::RoundRobin),
+                decode_policy: Some(PolicyConfig::RoundRobin),
+            },
+            policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096),
+            ..Default::default()
+        };
+        let classic = PolicyRegistry::new(settings.policy.clone());
+        let engine = PolicyRegistry::for_engine(
+            settings.policy.clone(),
+            settings.routing_key_override.clone(),
+        );
+        let document = settings.policy_document().expect("the settings' document");
+        engine_on(
+            &engine,
+            AppliedSpec::validate(&document).expect("a valid document"),
+        );
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let body = || -> CountMessageTokensRequest {
+            serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "count me"}],
+            }))
+            .expect("valid count_tokens request")
+        };
+        for (kind, policies) in [("classic", classic), ("engine", engine)] {
+            // The router factory names each side's policy at the start.
+            for side in [Side::Prefill, Side::Decode] {
+                policies.set_side_policy(side, &PolicyConfig::RoundRobin);
+            }
+            let router = PDRouter {
+                policy_registry: Arc::new(policies),
+                ..create_test_pd_router()
+            };
+            let reads = router.policies_need_request_text();
+            let (text, _) = PDRouter::count_tokens_routing_text(body(), reads);
+            assert!(text.is_none(), "{kind}: the two sides read no text");
+
+            let (busy_url, busy_seen) = spawn_recording_stub(r#"{"input_tokens":42}"#).await;
+            let (idle_url, idle_seen) = spawn_recording_stub(r#"{"input_tokens":42}"#).await;
+            let busy: Arc<dyn Worker> =
+                Arc::from(create_test_worker(busy_url, WorkerType::Prefill, true));
+            let idle: Arc<dyn Worker> =
+                Arc::from(create_test_worker(idle_url, WorkerType::Prefill, true));
+            for _ in 0..3 {
+                busy.increment_load();
+            }
+            for worker in [busy, idle] {
+                router.worker_registry.register_or_replace(worker);
+            }
+            let response = router
+                .route_messages_count_tokens(None, &tenant, body(), UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{kind}");
+            let arrived = [&busy_seen, &idle_seen].map(|seen| {
+                seen.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .len()
+            });
+            assert_eq!(arrived, [0, 1], "{kind}: the worker that holds less");
+        }
+    }
+
     /// The prefill/decode relay renders no prompt either: `max_tokens: 0` is
     /// refused with the 400 naming the field before any side is dispatched, and
     /// neither worker sees the request; a positive `max_tokens` takes both sides.
@@ -4172,7 +6298,7 @@ mod tests {
         };
 
         let response = router
-            .route_messages(None, &tenant, request(0), UNKNOWN_MODEL_ID)
+            .route_messages(None, &tenant, Arc::new(request(0)), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
@@ -4187,7 +6313,7 @@ mod tests {
         }
 
         let response = router
-            .route_messages(None, &tenant, request(16), UNKNOWN_MODEL_ID)
+            .route_messages(None, &tenant, Arc::new(request(16)), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
         for seen in [&prefill_seen, &decode_seen] {
@@ -4204,7 +6330,7 @@ mod tests {
         clippy::disallowed_methods,
         reason = "test stub server lives for the duration of the test process"
     )]
-    async fn spawn_stub(app: axum::Router) -> String {
+    pub(super) async fn spawn_stub(app: axum::Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -4222,6 +6348,87 @@ mod tests {
                 .worker_registry
                 .register_or_replace(Arc::from(create_test_worker(url, worker_type, true)));
         }
+    }
+
+    /// The health-generate probe names the pair it tried with each address
+    /// masked, whether a side answers, answers an error or refuses the
+    /// connection: a worker registered with a password and a token in its
+    /// query is named by its scheme, host and port, and a refused
+    /// connection's entry carries the transport's reason without the
+    /// request's address. The route is public. The stubs answer every path:
+    /// the probe's route joins such an address after its query.
+    #[tokio::test]
+    async fn health_generate_names_the_pair_it_tried_with_masked_addresses() {
+        async fn probe(prefill: &str, decode: &str) -> (StatusCode, String) {
+            let with_secrets = |url: &str| {
+                let with_password = url.replacen("http://", "http://user:s3cret@", 1);
+                format!("{with_password}/?token=s3cret")
+            };
+            let router = create_test_pd_router();
+            register_pd_pair(&router, with_secrets(prefill), with_secrets(decode));
+            let request = Request::builder().body(Body::empty()).unwrap();
+            let response = tokio::time::timeout(ROUND_TRIP_GUARD, router.health_generate(request))
+                .await
+                .expect("the probe answers");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        }
+        let answering = |status: StatusCode| {
+            spawn_stub(axum::Router::new().fallback(move || async move { status }))
+        };
+        let (healthy_prefill, healthy_decode) = (
+            answering(StatusCode::OK).await,
+            answering(StatusCode::OK).await,
+        );
+        let (failing_prefill, failing_decode) = (
+            answering(StatusCode::INTERNAL_SERVER_ERROR).await,
+            answering(StatusCode::INTERNAL_SERVER_ERROR).await,
+        );
+        let (refused_prefill, refused_decode) =
+            (RefusedAddress::reserve(), RefusedAddress::reserve());
+        let (refused_prefill, refused_decode) =
+            (refused_prefill.http_url(), refused_decode.http_url());
+
+        let mut carrying = Vec::new();
+        for (prefill, decode, wanted) in [
+            (&healthy_prefill, &healthy_decode, StatusCode::OK),
+            (
+                &failing_prefill,
+                &refused_decode,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                &refused_prefill,
+                &failing_decode,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let (status, body) = probe(prefill, decode).await;
+            assert_eq!(status, wanted, "{body}");
+            if body.contains("s3cret") {
+                carrying.push(body);
+                continue;
+            }
+            for side in [prefill, decode] {
+                let masked = side.replacen("http://", "http://***@", 1);
+                assert!(body.contains(&masked), "{masked} is not named in: {body}");
+            }
+            // The side that refused the connection is answered with the
+            // transport's reason after the client's own words.
+            if wanted == StatusCode::SERVICE_UNAVAILABLE {
+                assert!(
+                    body.contains(" error: error sending request: "),
+                    "the refused side is answered without its reason: {body}"
+                );
+            }
+        }
+        assert!(
+            carrying.is_empty(),
+            "bodies of the probe that carry the secret: {carrying:#?}"
+        );
     }
 
     fn streaming_chat() -> ChatCompletionRequest {
@@ -4268,7 +6475,7 @@ mod tests {
     /// breaker with a threshold above one.
     #[test]
     fn a_drained_prefill_outcome_is_not_overwritten_by_the_attempt_status() {
-        let breaker = crate::worker::CircuitBreakerConfig {
+        let breaker = CircuitBreakerConfig {
             failure_threshold: 2,
             ..Default::default()
         };
@@ -4290,11 +6497,13 @@ mod tests {
                 // What the drain records when the prefill body fails.
                 prefill.record_outcome(StatusCode::BAD_GATEWAY.as_u16());
                 PDRouter::record_attempt_outcomes(
+                    &AttemptLedger::default(),
                     prefill.as_ref(),
                     decode.as_ref(),
                     StatusCode::OK,
                     outcome,
                     false,
+                    None,
                 );
             }
             assert_eq!(!prefill.circuit_breaker_can_execute(), trips, "{outcome:?}");
@@ -4365,7 +6574,7 @@ mod tests {
 
         let response = tokio::time::timeout(
             guard,
-            router.route_messages(None, &tenant, request, UNKNOWN_MODEL_ID),
+            router.route_messages(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID),
         )
         .await
         .expect("the client stream must not wait for the prefill body");
@@ -4453,7 +6662,7 @@ mod tests {
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(spawn_stub(prefill).await)
                 .worker_type(WorkerType::Prefill)
-                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                .circuit_breaker_config(CircuitBreakerConfig {
                     failure_threshold: 1,
                     ..Default::default()
                 })
@@ -4471,7 +6680,7 @@ mod tests {
 
         let response = tokio::time::timeout(
             ROUND_TRIP_GUARD,
-            router.route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID),
+            router.route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID),
         )
         .await
         .expect("the client stream must not wait for the prefill body");
@@ -4521,7 +6730,7 @@ mod tests {
         let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
         let response = router
-            .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID)
             .await;
 
         // A prefill 5xx stays a status the retry layer and the client can act
@@ -4562,7 +6771,7 @@ mod tests {
                 let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
 
                 let response = router
-                    .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+                    .route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID)
                     .await;
                 assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             });
@@ -4617,7 +6826,7 @@ mod tests {
         }))
         .expect("valid chat request");
         let response = router
-            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -4655,6 +6864,130 @@ mod tests {
         assert_eq!(body.get("bootstrap_room"), None, "no bootstrap on vLLM PD");
     }
 
+    /// Every request a Mooncake pair's two sides are sent for `chat`, the
+    /// prefill side's first. The prefill engine's id was discovered
+    /// (`engine_id`) or was not, and its server answers with handoff params
+    /// of its own, which neither Mooncake form relays.
+    async fn mooncake_pair_sees(engine_id: Option<&str>, chat: Value) -> [Vec<(String, Value)>; 2] {
+        let (prefill_url, prefill_seen) =
+            spawn_recording_stub(r#"{"kv_transfer_params":{"remote_engine_id":"its-own"}}"#).await;
+        let (decode_url, decode_seen) =
+            spawn_recording_stub(r#"{"object":"chat.completion"}"#).await;
+        let mut prefill = BasicWorkerBuilder::new(prefill_url)
+            .worker_type(WorkerType::Prefill)
+            .runtime_type(RuntimeType::Vllm)
+            .kv_connector("MooncakeConnector")
+            .bootstrap_port(Some(9123));
+        if let Some(engine_id) = engine_id {
+            prefill = prefill.kv_engine_id(engine_id);
+        }
+        let decode = BasicWorkerBuilder::new(decode_url)
+            .worker_type(WorkerType::Decode)
+            .runtime_type(RuntimeType::Vllm);
+        let router = create_test_pd_router();
+        for worker in [prefill.build(), decode.build()] {
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register_or_replace(Arc::new(worker));
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let chat: ChatCompletionRequest = serde_json::from_value(chat).expect("valid chat request");
+        let response = router
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        [taken(&prefill_seen), taken(&decode_seen)]
+    }
+
+    /// What a Mooncake pair's two sides are sent for one chat request of one
+    /// choice, the prefill body first.
+    async fn sent_to_a_mooncake_pair(engine_id: Option<&str>) -> [Value; 2] {
+        let chat = json!({
+            "model": "m",
+            "max_tokens": 50,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let [prefill, decode] = mooncake_pair_sees(engine_id, chat).await;
+        [(prefill, "prefill"), (decode, "decode")].map(|(mut requests, side)| {
+            assert_eq!(requests.len(), 1, "exactly one {side} request");
+            let (path, body) = requests.remove(0);
+            assert_eq!(path, "/v1/chat/completions", "{side}");
+            body
+        })
+    }
+
+    /// A Mooncake pair whose prefill engine's id was discovered: one minted
+    /// transfer id goes to both sides. The prefill side pins its blocks
+    /// under it; the decode side pulls them by it from the prefill engine's
+    /// bootstrap address.
+    #[tokio::test]
+    async fn vllm_pd_mooncake_mints_one_transfer_id_for_both_sides() {
+        let [prefill, decode] = sent_to_a_mooncake_pair(Some("eng0")).await;
+        let transfer_id = prefill
+            .pointer("/kv_transfer_params/transfer_id")
+            .and_then(Value::as_str)
+            .expect("a transfer id on the prefill side");
+        assert!(transfer_id.starts_with("xfer-"), "{transfer_id}");
+        assert_eq!(
+            prefill.get("kv_transfer_params"),
+            Some(&json!({
+                "do_remote_decode": true,
+                "do_remote_prefill": false,
+                "transfer_id": transfer_id,
+            }))
+        );
+        assert_eq!(
+            decode.get("kv_transfer_params"),
+            Some(&json!({
+                "do_remote_decode": false,
+                "do_remote_prefill": true,
+                "transfer_id": transfer_id,
+                "remote_engine_id": "eng0",
+                "remote_bootstrap_addr": "http://127.0.0.1:9123",
+            }))
+        );
+    }
+
+    /// A Mooncake pair whose prefill engine's id was not discovered: nothing
+    /// is minted, neither side carries handoff params, and the gateway warns
+    /// that the decode side recomputes the prompt.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn vllm_pd_mooncake_without_an_engine_id_sends_no_handoff_params() {
+        let [prefill, decode] = sent_to_a_mooncake_pair(None).await;
+        assert_eq!(prefill.get("kv_transfer_params"), None);
+        assert_eq!(decode.get("kv_transfer_params"), None);
+        assert!(logs_contain(
+            "Mooncake without a discovered kv_engine_id cannot be minted for"
+        ));
+    }
+
+    /// A fan-out request skips the prefill side, so nothing is minted for it
+    /// whatever the pair. Only a pair whose engine id was not discovered is
+    /// warned about: the other pair's id is there.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn vllm_pd_mooncake_fanout_warns_only_without_an_engine_id() {
+        // The discovered pair goes first: a test's log only grows.
+        for (engine_id, warned) in [(Some("eng0"), false), (None, true)] {
+            let chat = json!({
+                "model": "m",
+                "n": 2,
+                "max_tokens": 50,
+                "messages": [{"role": "user", "content": "hi"}],
+            });
+            let [prefill, decode] = mooncake_pair_sees(engine_id, chat).await;
+            assert!(prefill.is_empty(), "{engine_id:?}: no prefill side");
+            assert_eq!(decode.len(), 1, "{engine_id:?}: one decode request");
+            assert_eq!(decode[0].1.get("kv_transfer_params"), None, "{engine_id:?}");
+            assert_eq!(
+                logs_contain("Mooncake without a discovered kv_engine_id cannot be minted for"),
+                warned,
+                "{engine_id:?}: the warning that names a missing engine id"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn vllm_pd_fanout_skips_the_prefill_side() {
         let (prefill_url, prefill_seen) = spawn_recording_stub("{}").await;
@@ -4675,7 +7008,7 @@ mod tests {
         }))
         .expect("valid chat request");
         let response = router
-            .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
             .await;
         assert_eq!(response.status(), StatusCode::OK);
 
@@ -4854,7 +7187,7 @@ mod tests {
             "/v1/chat/completions" => {
                 let request = serde_json::from_value(body).expect("valid chat request");
                 router
-                    .route_chat(headers, &tenant, request, UNKNOWN_MODEL_ID)
+                    .route_chat(headers, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
                     .await
             }
             "/v1/completions" => {
@@ -5414,6 +7747,36 @@ mod tests {
         assert!(taken(&decode_seen).is_empty());
     }
 
+    /// A pair refused for running two transfer modes is named in the warning
+    /// by masked addresses.
+    #[test]
+    #[tracing_test::traced_test]
+    fn a_pair_refused_for_its_transfer_modes_is_named_masked() {
+        let worker = |url: &str, worker_type, mode: &str| {
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("MoRIIOConnector")
+                .label("moriio_mode", mode)
+                .build()
+        };
+        let prefill = worker(
+            "http://user:s3cret@10.0.0.1:8100",
+            WorkerType::Prefill,
+            "read",
+        );
+        let decode = worker(
+            "http://user:s3cret@10.0.0.2:8200",
+            WorkerType::Decode,
+            "write",
+        );
+        assert!(PDRouter::moriio_pair(&prefill, &decode).is_err());
+        assert!(logs_contain(
+            "prefill http://***@10.0.0.1:8100 runs Read but decode http://***@10.0.0.2:8200 runs Write"
+        ));
+        assert!(!logs_contain("s3cret"));
+    }
+
     #[test]
     fn moriio_pair_needs_one_mode_and_a_write_target_the_prefill_reaches() {
         let worker = |url: &str, worker_type, mode: &str| {
@@ -5470,11 +7833,11 @@ mod tests {
         );
     }
 
-    type Arrivals = Arc<std::sync::Mutex<Vec<Value>>>;
+    pub(super) type Arrivals = Arc<std::sync::Mutex<Vec<Value>>>;
 
     /// A stub that records each request body, then answers `reply` with
     /// `status` after `delay`.
-    async fn spawn_delayed_stub(
+    pub(super) async fn spawn_delayed_stub(
         status: StatusCode,
         reply: Value,
         delay: std::time::Duration,
@@ -5744,6 +8107,27 @@ mod tests {
         assert_eq!(completion.get("max_tokens"), Some(&Value::from(1)));
     }
 
+    /// A routed pair's request body carries the bootstrap host a client
+    /// dials: for a prefill side with no rank whose address is a token
+    /// before a host of digits, that host and never the token. One prompt
+    /// and a batch of two.
+    #[test]
+    fn a_pairs_request_body_carries_the_bootstrap_host_a_client_dials() {
+        let prefill = BasicWorkerBuilder::new("http://s3cret-token@2130706433")
+            .worker_type(WorkerType::Prefill)
+            .bootstrap_port(Some(8998))
+            .build();
+        let bytes = br#"{"text":"hi"}"#.to_vec();
+        for batch in [None, Some(2)] {
+            let mut body = RawBody::parse(&bytes).unwrap();
+            let fields = PDRouter::bootstrap_fields(&prefill, batch, None).unwrap();
+            PDRouter::inject_bootstrap(&mut body, fields);
+            let sent = String::from_utf8(body.to_bytes(None).unwrap().to_vec()).unwrap();
+            assert!(sent.contains("127.0.0.1"), "{sent}");
+            assert!(!sent.contains("s3cret"), "{sent}");
+        }
+    }
+
     #[test]
     fn bootstrap_rooms_follow_the_prefill_rank_only_on_a_multi_rank_worker() {
         let worker = |dp: Option<(usize, usize)>| {
@@ -5788,6 +8172,33 @@ mod tests {
             assert!(free.iter().all(in_range));
             let residues: std::collections::HashSet<u64> = free.iter().map(|r| r % 4).collect();
             assert!(residues.len() > 1, "{rank:?}: {residues:?}");
+        }
+    }
+
+    /// A prefill worker whose DP size is at or above the room's range gets a
+    /// free room, like a worker of one rank: the ranked draw would have no
+    /// range to draw from.
+    #[test]
+    fn a_dp_size_the_room_cannot_carry_gets_a_free_room() {
+        let rooms = |size: usize| -> Vec<u64> {
+            let worker = BasicWorkerBuilder::new("http://prefill:8000")
+                .worker_type(WorkerType::Prefill)
+                .dp_config(1, size)
+                .build();
+            let fields = PDRouter::bootstrap_fields(&worker, Some(64), Some(1)).unwrap();
+            serde_json::from_str(fields.room.get()).unwrap()
+        };
+        // The ranked draw's range is `0..i64::MAX - size`: `edge` is the last
+        // size it is not empty for (one room, the rank itself), and from
+        // `edge + 1` on the worker takes the free room.
+        let edge = usize::try_from(i64::MAX - 1).unwrap();
+        assert!(rooms(edge).iter().all(|&room| room == 1));
+        for size in [edge + 1, usize::MAX] {
+            let free: std::collections::HashSet<u64> = rooms(size).into_iter().collect();
+            assert!(
+                free.len() > 1 && free.iter().all(|&room| room <= i64::MAX as u64),
+                "{size}: {free:?}"
+            );
         }
     }
 
@@ -5886,7 +8297,7 @@ mod tests {
         }))
         .expect("valid messages request");
         let response = router
-            .route_messages(None, &tenant, messages, UNKNOWN_MODEL_ID)
+            .route_messages(None, &tenant, Arc::new(messages), UNKNOWN_MODEL_ID)
             .await;
         // The endpoint reaches PD selection (and fails on the empty fleet)
         // instead of falling through to the trait's 501 default.
@@ -5918,8 +8329,8 @@ mod tests {
             true,
         ));
 
-        let _prefill_guard = WorkerLoadGuard::new(prefill_worker.clone(), None);
-        let _decode_guard = WorkerLoadGuard::new(decode_worker.clone(), None);
+        let _prefill_guard = WorkerLoadGuard::with_key(prefill_worker.clone(), None);
+        let _decode_guard = WorkerLoadGuard::with_key(decode_worker.clone(), None);
 
         assert_eq!(prefill_worker.load(), 1);
         assert_eq!(decode_worker.load(), 1);
@@ -5943,8 +8354,12 @@ mod tests {
             .body(r#"{"error":"boom \"quoted\""}"#)
             .unwrap();
 
-        let response =
-            PDRouter::side_refused(PdSide::Decode, reqwest::Response::from(upstream)).await;
+        let response = PDRouter::side_refused(
+            PdSide::Decode,
+            reqwest::Response::from(upstream),
+            usize::MAX,
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(error_code(&response), Some("decode_worker_failed_to_start"));
@@ -5979,8 +8394,12 @@ mod tests {
             .body(r#"{"error":"busy"}"#)
             .unwrap();
 
-        let response =
-            PDRouter::side_refused(PdSide::Prefill, reqwest::Response::from(upstream)).await;
+        let response = PDRouter::side_refused(
+            PdSide::Prefill,
+            reqwest::Response::from(upstream),
+            usize::MAX,
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(
@@ -6124,6 +8543,7 @@ mod tests {
                         UNKNOWN_MODEL_ID,
                         PlacementInputs::default(),
                         None,
+                        placement::Stated::nothing,
                     )
                     .await
                     .unwrap();
@@ -6136,14 +8556,15 @@ mod tests {
                     headers: None,
                 };
                 let mut outcome = PrefillOutcome::FromStatus;
+                let ledger = AttemptLedger::default();
                 let dispatch = router.execute_dual_dispatch_internal(
                     None,
                     (Bytes::from_static(b"{}"), Bytes::from_static(b"{}")),
                     context,
                     Arc::clone(&prefill),
-                    Arc::clone(&decode),
                     guards,
                     &mut outcome,
+                    &ledger,
                 );
                 tokio::pin!(dispatch);
 
@@ -6151,6 +8572,7 @@ mod tests {
                     UNKNOWN_MODEL_ID,
                     PlacementInputs::default(),
                     None,
+                    placement::Stated::nothing,
                 );
                 tokio::pin!(next);
                 tokio::select! {
@@ -6210,11 +8632,12 @@ mod tests {
                 })
                 .await;
                 let router = admission_test_router(prefill_url, decode_url);
-                let ((prefill, decode), guards) = router
+                let ((prefill, _), guards) = router
                     .select_pd_pair_with_admission(
                         UNKNOWN_MODEL_ID,
                         PlacementInputs::default(),
                         None,
+                        placement::Stated::nothing,
                     )
                     .await
                     .unwrap();
@@ -6232,9 +8655,9 @@ mod tests {
                             headers: None,
                         },
                         prefill,
-                        decode,
                         guards,
                         &mut outcome,
+                        &AttemptLedger::default(),
                     )
                     .await;
                 assert_eq!(response.status(), StatusCode::OK);
@@ -6301,6 +8724,7 @@ mod tests {
                         UNKNOWN_MODEL_ID,
                         PlacementInputs::default(),
                         None,
+                        placement::Stated::nothing,
                     )
                     .await
                     .unwrap();
@@ -6314,14 +8738,15 @@ mod tests {
                 };
                 {
                     let mut outcome = PrefillOutcome::FromStatus;
+                    let ledger = AttemptLedger::default();
                     let dispatch = router.execute_dual_dispatch_internal(
                         None,
                         (Bytes::from_static(b"{}"), Bytes::from_static(b"{}")),
                         context,
                         Arc::clone(&prefill),
-                        Arc::clone(&decode),
                         guards,
                         &mut outcome,
+                        &ledger,
                     );
                     tokio::pin!(dispatch);
                     if failure == "cancel" {
@@ -6354,8 +8779,8 @@ mod tests {
 
     /// A breaker that opens on two failures, whose timeout is over at once
     /// and which closes again after `successes` successes.
-    fn breaker_closing_after(successes: u32) -> crate::worker::CircuitBreakerConfig {
-        crate::worker::CircuitBreakerConfig {
+    fn breaker_closing_after(successes: u32) -> CircuitBreakerConfig {
+        CircuitBreakerConfig {
             failure_threshold: 2,
             success_threshold: successes,
             timeout_duration: std::time::Duration::ZERO,
@@ -6371,7 +8796,7 @@ mod tests {
         builder: BasicWorkerBuilder,
         successes: u32,
     ) -> Arc<dyn Worker> {
-        use crate::worker::circuit_breaker::CircuitState;
+        use smg_worker::health::circuit_breaker::CircuitState;
 
         let worker: Arc<dyn Worker> = Arc::new(
             builder
@@ -6402,8 +8827,8 @@ mod tests {
         worker
     }
 
-    /// The successful head of a decode stream is recorded on the decode
-    /// worker before the relay task is spawned, so a body the worker cuts
+    /// On a breaker that is not closed, a decode stream's successful head is
+    /// recorded before the relay task is spawned, so a body the worker cuts
     /// right behind the head is sampled after the head's success and stands.
     /// Read on a current-thread runtime, where the relay cannot run before
     /// the body is polled: the half-open breaker is closed by the head as
@@ -6412,7 +8837,7 @@ mod tests {
     /// standing failure.
     #[tokio::test]
     async fn a_decode_heads_success_is_recorded_before_the_relay_can_sample_a_cut() {
-        use crate::worker::circuit_breaker::CircuitState;
+        use smg_worker::health::circuit_breaker::CircuitState;
 
         let router = create_test_pd_router();
         let decode = half_open_decode_worker();
@@ -6453,7 +8878,7 @@ mod tests {
                 Arc::clone(&decode),
             ),
             None,
-            WorkerLoadGuard::new(Arc::clone(&decode), None),
+            WorkerLoadGuard::with_key(Arc::clone(&decode), None),
         );
 
         // The head is out and the relay has not run: the success is recorded.
@@ -6489,7 +8914,7 @@ mod tests {
     /// breaker.
     #[test]
     fn the_attempt_skips_a_decode_head_the_relay_recorded() {
-        use crate::worker::circuit_breaker::CircuitState;
+        use smg_worker::health::circuit_breaker::CircuitState;
 
         let prefill: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://prefill:8000")
@@ -6498,21 +8923,25 @@ mod tests {
         );
         let recorded = half_open_decode_worker();
         PDRouter::record_attempt_outcomes(
+            &AttemptLedger::default(),
             prefill.as_ref(),
             recorded.as_ref(),
             StatusCode::OK,
             PrefillOutcome::FromStatus,
             true,
+            None,
         );
         assert_eq!(recorded.circuit_breaker_state(), CircuitState::HalfOpen);
 
         let unrecorded = half_open_decode_worker();
         PDRouter::record_attempt_outcomes(
+            &AttemptLedger::default(),
             prefill.as_ref(),
             unrecorded.as_ref(),
             StatusCode::OK,
             PrefillOutcome::FromStatus,
             false,
+            None,
         );
         assert_eq!(unrecorded.circuit_breaker_state(), CircuitState::Closed);
     }
@@ -6526,7 +8955,7 @@ mod tests {
     #[tokio::test]
     async fn a_streamed_decode_heads_success_is_recorded_once_on_the_parallel_and_sequential_paths()
     {
-        use crate::worker::circuit_breaker::CircuitState;
+        use smg_worker::health::circuit_breaker::CircuitState;
 
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
@@ -6635,7 +9064,7 @@ mod tests {
     /// the cut, every time.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_cut_right_behind_the_decode_head_is_sampled_after_the_heads_success() {
-        use crate::worker::circuit_breaker::CircuitState;
+        use smg_worker::health::circuit_breaker::CircuitState;
 
         const ROUNDS: usize = 40;
         let decode_url = spawn_abrupt_cut_stub("/v1/chat/completions", CHAT_SSE_CHUNKS[0]).await;
@@ -6703,9 +9132,9 @@ mod tests {
 
         {
             let prefill_guard = PrefillLoadGuard::Unbounded {
-                _guard: WorkerLoadGuard::new(prefill_ref.clone(), None),
+                _guard: WorkerLoadGuard::with_key(prefill_ref.clone(), None),
             };
-            let decode_guard = WorkerLoadGuard::new(decode_ref.clone(), None);
+            let decode_guard = WorkerLoadGuard::with_key(decode_ref.clone(), None);
 
             assert_eq!(prefill_ref.load(), 1);
             assert_eq!(decode_ref.load(), 1);
@@ -6802,7 +9231,7 @@ mod tests {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new(url)
                 .worker_type(worker_type)
-                .circuit_breaker_config(crate::worker::CircuitBreakerConfig {
+                .circuit_breaker_config(CircuitBreakerConfig {
                     failure_threshold: 1,
                     ..Default::default()
                 })
@@ -6834,8 +9263,153 @@ mod tests {
     async fn stream_chat_through(router: &PDRouter) -> Response {
         let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
         router
-            .route_chat(None, &tenant, streaming_chat(), UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID)
             .await
+    }
+
+    /// The PD router's own streaming path takes the relay's rule: a decode
+    /// worker that declared its length and went away mid-body reaches the
+    /// client without the decode worker's `Content-Length`, with the frames
+    /// that arrived, the typed error event and `[DONE]`.
+    #[tokio::test]
+    async fn a_cut_sized_decode_stream_ends_with_its_error_event_and_no_length() {
+        const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n\
+                            data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        let first = BODY.find("\n\n").unwrap() + 2;
+        let prefill = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async { ([(CONTENT_TYPE, "text/event-stream")], DECODE_SSE) }),
+        );
+        let router = create_test_pd_router();
+        register_pd_pair(
+            &router,
+            spawn_stub(prefill).await,
+            test_support::spawn_sized_sse_worker_cut_after(BODY, first).await,
+        );
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        let response = tokio::time::timeout(
+            ROUND_TRIP_GUARD,
+            router.route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID),
+        )
+        .await
+        .expect("the client stream starts on the decode head");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response.headers().contains_key(CONTENT_LENGTH),
+            "a cut decode stream's length is not the decode worker's"
+        );
+        let bytes = tokio::time::timeout(
+            ROUND_TRIP_GUARD,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the body ends after the error event")
+        .expect("response body");
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 3, "{body}");
+        assert_eq!(events[0], BODY[..first].trim_end());
+        let error: Value = serde_json::from_str(events[1].strip_prefix("data: ").unwrap())
+            .expect("the error event is a frame of its own");
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(events[2], "data: [DONE]");
+    }
+
+    /// The decode side's answer is an event stream however the worker spells
+    /// the type (a media type's name is case-insensitive, RFC 9110, section
+    /// 8.3.1): the relay may change its length, so a sized
+    /// `Text/Event-Stream` answer reaches the client without the decode
+    /// worker's `Content-Length` too.
+    #[tokio::test]
+    async fn a_decode_stream_is_an_event_stream_however_the_worker_spells_its_type() {
+        const BODY: &str =
+            "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\ndata: [DONE]\n\n";
+        for content_type in ["text/event-stream", "Text/Event-Stream"] {
+            let prefill = axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(|| async { axum::Json(json!({})) }),
+            );
+            let decode = axum::Router::new().route(
+                "/v1/chat/completions",
+                axum::routing::post(move || async move { ([(CONTENT_TYPE, content_type)], BODY) }),
+            );
+            let router = create_test_pd_router();
+            register_pd_pair(&router, spawn_stub(prefill).await, spawn_stub(decode).await);
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+            let response = tokio::time::timeout(
+                ROUND_TRIP_GUARD,
+                router.route_chat(None, &tenant, Arc::new(streaming_chat()), UNKNOWN_MODEL_ID),
+            )
+            .await
+            .expect("the client stream starts once the prefill answered");
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            assert!(
+                !response.headers().contains_key(CONTENT_LENGTH),
+                "{content_type}: the decode worker's length is not the relay's"
+            );
+        }
+    }
+
+    /// With logprobs asked for, the relay re-encodes each frame with the
+    /// prefill's logprobs merged in, so a sized decode answer grows past its
+    /// declared length: the client gets the merged frame and no length.
+    #[tokio::test]
+    async fn a_sized_decode_stream_with_merged_logprobs_carries_no_length() {
+        const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}],\
+                            \"meta_info\":{\"input_token_logprobs\":[[-0.5,2,null]]}}\n\n";
+        let prefill = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(|| async {
+                axum::Json(json!({"meta_info": {"input_token_logprobs": [[-0.1, 1, null]]}}))
+            }),
+        );
+        let router = create_test_pd_router();
+        // The one frame is sent whole and the body closes cleanly, so the
+        // only growth is the merge's.
+        register_pd_pair(
+            &router,
+            spawn_stub(prefill).await,
+            test_support::spawn_sized_sse_worker_cut_after(BODY, BODY.len()).await,
+        );
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let mut request = streaming_chat();
+        request.logprobs = true;
+
+        let response = tokio::time::timeout(
+            ROUND_TRIP_GUARD,
+            router.route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID),
+        )
+        .await
+        .expect("the client stream starts once the prefill answered");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response.headers().contains_key(CONTENT_LENGTH),
+            "a merged stream's length is not the decode worker's"
+        );
+        let bytes = tokio::time::timeout(
+            ROUND_TRIP_GUARD,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the body ends at the upstream's clean close")
+        .expect("response body");
+        assert!(
+            bytes.len() > BODY.len(),
+            "the merged frames grew past the declared length"
+        );
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 1, "{body}");
+        let frame: Value = serde_json::from_str(events[0].strip_prefix("data: ").unwrap())
+            .expect("the merged frame is one data event");
+        assert_eq!(
+            frame["meta_info"]["input_token_logprobs"],
+            json!([[-0.1, 1, null], [-0.5, 2, null]]),
+            "{body}"
+        );
     }
 
     /// The events of an SSE body, blank-line separated.
@@ -6965,7 +9539,7 @@ mod tests {
         .unwrap();
 
         let response = router
-            .route_messages(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .route_messages(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
             .await;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -7097,14 +9671,17 @@ mod tests {
     /// A healthy server for `side` on `shape`: what its partner's failure is
     /// measured next to.
     async fn healthy_stub(shape: Shape, side: PdSide) -> String {
+        spawn_recording_stub(healthy_answer(shape, side)).await.0
+    }
+
+    /// What a healthy server for `side` on `shape` answers.
+    fn healthy_answer(shape: Shape, side: PdSide) -> &'static str {
         match (shape, side) {
-            (Shape::Sequential, PdSide::Prefill) => spawn_recording_stub(
-                r#"{"kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#,
-            )
-            .await
-            .0,
-            (Shape::Parallel, PdSide::Prefill) => spawn_recording_stub("{}").await.0,
-            (_, PdSide::Decode) => spawn_recording_stub(r#"{"choices":[]}"#).await.0,
+            (Shape::Sequential, PdSide::Prefill) => {
+                r#"{"kv_transfer_params":{"remote_engine_id":"eng0","remote_block_ids":[1,2]}}"#
+            }
+            (Shape::Parallel, PdSide::Prefill) => "{}",
+            (_, PdSide::Decode) => r#"{"choices":[]}"#,
         }
     }
 
@@ -7149,7 +9726,7 @@ mod tests {
         }))
         .expect("valid chat request");
         router
-            .route_chat(None, &tenant, request, UNKNOWN_MODEL_ID)
+            .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
             .await
     }
 
@@ -7319,6 +9896,2264 @@ mod tests {
         );
     }
 
+    /// The three shapes a pair's two sides go out in. Each has its own line
+    /// where the decode side is sent.
+    #[derive(Clone, Copy, Debug)]
+    enum Sends {
+        BothAtOnce,
+        PrefillFirst,
+        ConcurrentWrite,
+    }
+
+    /// A router of one attempt over one healthy pair that is sent in `shape`,
+    /// with Grand Central placing its pairs, and what that engine's decode
+    /// stage hears (`hearing_pairs_on`).
+    async fn heard_pair_router(shape: Sends) -> (PDRouter, Heard) {
+        let router = single_attempt_router();
+        let heard = hearing_pairs_on(&router.policy_registry, false);
+        match shape {
+            Sends::BothAtOnce => register_pd_pair(
+                &router,
+                healthy_stub(Shape::Parallel, PdSide::Prefill).await,
+                healthy_stub(Shape::Parallel, PdSide::Decode).await,
+            ),
+            Sends::PrefillFirst => {
+                let prefill = healthy_stub(Shape::Sequential, PdSide::Prefill).await;
+                let decode = healthy_stub(Shape::Sequential, PdSide::Decode).await;
+                for worker in sequential_pair(prefill, decode) {
+                    router.worker_registry.register_or_replace(worker);
+                }
+            }
+            Sends::ConcurrentWrite => {
+                let (prefill, _) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+                let decode = healthy_stub(Shape::Sequential, PdSide::Decode).await;
+                register_moriio_pair_with(
+                    &router,
+                    (prefill, Some("write")),
+                    (decode, "write"),
+                    &[CONCURRENT_WRITE],
+                );
+            }
+        }
+        (router, heard)
+    }
+
+    /// Every word Grand Central hears of one unstreamed chat request it
+    /// placed on a healthy pair that is sent in `shape`, once the answer's
+    /// body is read to its end.
+    async fn heard_of_a_served_pair(shape: Sends) -> Vec<String> {
+        let (router, heard) = heard_pair_router(shape).await;
+        let response = chat_through(&router, false).await;
+        assert_eq!(response.status(), StatusCode::OK, "{shape:?}");
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let heard = heard.lock().expect("the stage heard");
+        heard.clone()
+    }
+
+    /// Both sides at once: the engine hears the prefill's dispatch and the
+    /// decode's where the two requests go out, then each side's end where
+    /// its guard is dropped, the prefill's at its answer and the decode's
+    /// behind the answer's body, each with that side's own good answer.
+    /// Nothing is released.
+    #[tokio::test]
+    async fn the_engine_hears_both_sides_of_a_pair_sent_at_once() {
+        assert_eq!(
+            heard_of_a_served_pair(Sends::BothAtOnce).await,
+            [
+                "issued",
+                "issued",
+                "dispatched Prefill",
+                "dispatched Decode",
+                "completed Ok 200",
+                "completed Ok 200",
+            ]
+        );
+    }
+
+    /// The prefill first: the engine hears the decode's dispatch where the
+    /// decode's request goes out, behind the prefill's answer, and not at the
+    /// selection, where the decode's guard is made. The prefill's guard is
+    /// dropped at its answer, ahead of that send. This document picks the
+    /// decode with its prefill, so the engine refuses the ask behind the
+    /// prefill's answer as a decode that was not left to choose: the first
+    /// decode goes out, and nothing more is heard of the ask.
+    #[tokio::test]
+    async fn the_engine_hears_the_decode_of_a_pair_sent_behind_its_prefill() {
+        assert_eq!(
+            heard_of_a_served_pair(Sends::PrefillFirst).await,
+            [
+                "issued",
+                "issued",
+                "dispatched Prefill",
+                "completed Ok 200",
+                "dispatched Decode",
+                "completed Ok 200",
+            ]
+        );
+    }
+
+    /// A MoRI-IO pair written concurrently: the engine hears the decode's
+    /// dispatch where the decode's request goes out beside its prefill's,
+    /// then the two ends as the both-at-once shape tells them.
+    #[tokio::test]
+    async fn the_engine_hears_both_sides_of_a_pair_written_concurrently() {
+        assert_eq!(
+            heard_of_a_served_pair(Sends::ConcurrentWrite).await,
+            [
+                "issued",
+                "issued",
+                "dispatched Prefill",
+                "dispatched Decode",
+                "completed Ok 200",
+                "completed Ok 200",
+            ]
+        );
+    }
+
+    /// What the stage heard of each side's end, sorted: a completion or a
+    /// release, as a stage that names sides says it
+    /// (`hearing_pair_sides_on`). The two guards of an attempt drop in an
+    /// order the cases do not hold.
+    fn ends_heard(heard: &Heard) -> Vec<String> {
+        let heard = heard.lock().expect("the stage heard");
+        let ends = heard
+            .iter()
+            .filter(|word| word.starts_with("completed") || word.starts_with("released"));
+        let mut ends: Vec<String> = ends.cloned().collect();
+        ends.sort();
+        ends
+    }
+
+    /// [`ends_heard`] once the stage heard `count` ends: a drain and a relay
+    /// tell their side's end from a task of their own.
+    async fn ends_heard_at(heard: &Heard, count: usize) -> Vec<String> {
+        for _ in 0..2_000 {
+            if ends_heard(heard).len() >= count {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        ends_heard(heard)
+    }
+
+    /// A ready worker for `side` of a pair that is sent in `shape`, whose
+    /// calls time out after `timeout` where one is given.
+    fn pair_worker(
+        shape: Shape,
+        side: PdSide,
+        url: String,
+        timeout: Option<std::time::Duration>,
+    ) -> Arc<dyn Worker> {
+        let worker_type = match side {
+            PdSide::Prefill => WorkerType::Prefill,
+            PdSide::Decode => WorkerType::Decode,
+        };
+        let mut worker = BasicWorkerBuilder::new(url).worker_type(worker_type);
+        if let Shape::Sequential = shape {
+            worker = worker.runtime_type(RuntimeType::Vllm);
+            if side == PdSide::Prefill {
+                worker = worker.kv_connector("NixlConnector");
+            }
+        }
+        if let Some(timeout) = timeout {
+            let client = http_client_builder().timeout(timeout).build().unwrap();
+            worker = worker.http_client(Arc::new(client));
+        }
+        let worker: Arc<dyn Worker> = Arc::new(worker.build());
+        worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        worker
+    }
+
+    /// A streamed pair tells both ends from tasks of their own. The
+    /// prefill's drain tells through the guard it owns. The decode's relay
+    /// tells through the handle the route asked of the decode's guard,
+    /// behind the body's last byte. A decode stream cut behind its good
+    /// head is told as a failed connection, as the relay accounts it, and
+    /// leaves the prefill its own answer.
+    #[tokio::test]
+    async fn the_engine_hears_both_ends_of_a_streamed_pair() {
+        for (cut, decode_end) in [
+            (false, "completed Decode Ok 200"),
+            (true, "completed Decode ConnectFailed 502"),
+        ] {
+            let decode_url = spawn_cut_stub(
+                "/v1/chat/completions",
+                "text/event-stream",
+                CHAT_SSE_CHUNKS,
+                cut,
+            )
+            .await;
+            let router = single_attempt_router();
+            let heard = hearing_pair_sides_on(&router.policy_registry);
+            register_fragile_pair(&router, decode_url).await;
+
+            let response = stream_chat_through(&router).await;
+            assert_eq!(response.status(), StatusCode::OK, "cut={cut}");
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                ends_heard_at(&heard, 2).await,
+                [decode_end, "completed Prefill Ok 200"],
+                "cut={cut}"
+            );
+        }
+    }
+
+    /// Each side of a pair is told its own answer where its route records
+    /// that side, row by row on both dispatch shapes. It is told the status
+    /// its worker answered, as the worker's own. Or it is told the status
+    /// the route made of its failed call, as no answer of the worker's. A
+    /// side the gateway dropped is told by nobody: a decode that was never
+    /// sent is released, and the partner of a side that failed first ends
+    /// with no status. Where both sides go out at once and the decode
+    /// fails, the prefill's server never answers, so the prefill is in
+    /// flight when it is dropped.
+    #[tokio::test]
+    async fn the_engine_hears_each_sides_own_answer_where_a_side_fails() {
+        use Fault::{CutAfterHead, Refuses, Unreachable};
+        use PdSide::{Decode, Prefill};
+        use Shape::{Parallel, Sequential};
+        const UNAVAILABLE: Fault = Refuses(StatusCode::SERVICE_UNAVAILABLE);
+        const BUSY: Fault = Refuses(StatusCode::TOO_MANY_REQUESTS);
+        const NEVER_SENT: &str = "released Decode Abandoned";
+        const DROPPED: &str = "Cancelled";
+        const GOOD: &str = "Ok 200";
+        const NO_CONNECTION: &str = "ConnectFailed 502";
+        const SERVER: &str = "ServerError 503";
+        const CLIENT: &str = "ClientError 429";
+
+        // (shape, failing side, its fault, streamed request, the decode's
+        // end, the prefill's end). An end is a completion's class, with its
+        // status where one was told, or the release of a decode never sent.
+        let rows = [
+            // One behind the other: a prefill's failure ends the request
+            // ahead of the decode's send.
+            (
+                Sequential,
+                Prefill,
+                Unreachable,
+                false,
+                NEVER_SENT,
+                NO_CONNECTION,
+            ),
+            (Sequential, Prefill, UNAVAILABLE, false, NEVER_SENT, SERVER),
+            (Sequential, Prefill, BUSY, false, NEVER_SENT, CLIENT),
+            (
+                Sequential,
+                Prefill,
+                CutAfterHead,
+                false,
+                NEVER_SENT,
+                NO_CONNECTION,
+            ),
+            // A decode fails behind a prefill that was told its good answer.
+            (Sequential, Decode, Unreachable, false, NO_CONNECTION, GOOD),
+            (Sequential, Decode, UNAVAILABLE, false, SERVER, GOOD),
+            (Sequential, Decode, UNAVAILABLE, true, SERVER, GOOD),
+            (Sequential, Decode, CutAfterHead, false, NO_CONNECTION, GOOD),
+            // Both at once: the decode was sent, and is dropped where its
+            // prefill fails first.
+            (
+                Parallel,
+                Prefill,
+                Unreachable,
+                false,
+                DROPPED,
+                NO_CONNECTION,
+            ),
+            (Parallel, Prefill, UNAVAILABLE, false, DROPPED, SERVER),
+            (Parallel, Prefill, BUSY, false, DROPPED, CLIENT),
+            // A prefill body that breaks off while it is only consumed does
+            // not end the request: the decode's answer is the client's.
+            (Parallel, Prefill, CutAfterHead, false, GOOD, NO_CONNECTION),
+            // Both at once, and the decode fails while its prefill is in
+            // flight: the prefill is dropped.
+            (Parallel, Decode, Unreachable, false, NO_CONNECTION, DROPPED),
+            (Parallel, Decode, UNAVAILABLE, false, SERVER, DROPPED),
+            (Parallel, Decode, UNAVAILABLE, true, SERVER, DROPPED),
+        ];
+        let total = rows.len();
+        let mut mismatches = Vec::new();
+        for (shape, side, fault, streamed, decode_end, prefill_end) in rows {
+            let (failing, _refusing) = faulty_stub(fault).await;
+            let healthy = match (shape, side) {
+                (Parallel, Decode) => spawn_held_stub("{}").await.url,
+                _ => healthy_stub(shape, side.partner()).await,
+            };
+            let (prefill_url, decode_url) = match side {
+                Prefill => (failing, healthy),
+                Decode => (healthy, failing),
+            };
+            let router = single_attempt_router();
+            let heard = hearing_pair_sides_on(&router.policy_registry);
+            register_fleet(&router, shape, &prefill_url, &[decode_url.as_str()]);
+
+            let response = chat_through(&router, streamed).await;
+            let status = response.status();
+            drop(response);
+            let said = |side: &str, end: &str| match end {
+                NEVER_SENT => NEVER_SENT.to_owned(),
+                end => format!("completed {side} {end}"),
+            };
+            let mut ends = [said("Decode", decode_end), said("Prefill", prefill_end)];
+            ends.sort_unstable();
+            let got = ends_heard(&heard);
+            if got != ends {
+                mismatches.push(format!(
+                    "{shape:?} {side:?} {fault:?} streamed={streamed}: answered {status}, heard {got:?}, expected {ends:?}"
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "{} of {total} rows tell another end:\n{}",
+            mismatches.len(),
+            mismatches.join("\n")
+        );
+    }
+
+    /// A prefill that answers a success other than 200 is told by what its
+    /// route's read keeps of it. Sent at once with its decode, the read
+    /// answers the worker's own status, and so does the drain of a streamed
+    /// pair: the prefill is told it. Sent ahead of its decode, the read
+    /// keeps the body and no status, and the prefill's good answer is told
+    /// as status 200. The class is `Ok` on each, and the decode is told its
+    /// own 200.
+    #[tokio::test]
+    async fn the_engine_hears_a_prefills_other_success_by_what_its_read_keeps() {
+        for (shape, streamed, prefill_end) in [
+            (Shape::Parallel, false, "completed Prefill Ok 202"),
+            (Shape::Parallel, true, "completed Prefill Ok 202"),
+            (Shape::Sequential, false, "completed Prefill Ok 200"),
+        ] {
+            let answer = serde_json::from_str(healthy_answer(shape, PdSide::Prefill))
+                .expect("a healthy answer is JSON");
+            let (prefill_url, _) =
+                spawn_delayed_stub(StatusCode::ACCEPTED, answer, std::time::Duration::ZERO).await;
+            let decode_url = if streamed {
+                let (path, kind) = ("/v1/chat/completions", "text/event-stream");
+                spawn_cut_stub(path, kind, CHAT_SSE_CHUNKS, false).await
+            } else {
+                healthy_stub(shape, PdSide::Decode).await
+            };
+            let router = single_attempt_router();
+            let heard = hearing_pair_sides_on(&router.policy_registry);
+            register_fleet(&router, shape, &prefill_url, &[decode_url.as_str()]);
+
+            let response = chat_through(&router, streamed).await;
+            assert_eq!(response.status(), StatusCode::OK, "{shape:?} {streamed}");
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            // A drain and a relay tell their side's end from a task of
+            // their own.
+            assert_eq!(
+                ends_heard_at(&heard, 2).await,
+                ["completed Decode Ok 200", prefill_end],
+                "{shape:?} {streamed}"
+            );
+        }
+    }
+
+    /// Both sides at once, and the decode fails behind a prefill that had
+    /// answered. The engine hears the prefill's own good answer, told where
+    /// its guard was let go, and then the decode's refusal. The breaker's
+    /// record differs: the attempt is the decode's own failure, recorded on
+    /// the decode alone, so nothing is recorded on the prefill.
+    #[tokio::test]
+    async fn the_engine_hears_a_prefills_own_answer_ahead_of_its_decodes_failure() {
+        let decode_stub = spawn_held_stub_answering(
+            StatusCode::SERVICE_UNAVAILABLE,
+            |_| json!({"error": {"message": REFUSAL}}),
+        )
+        .await;
+        let router = single_attempt_router();
+        let heard = hearing_pair_sides_on(&router.policy_registry);
+        let (prefill, decode) = register_fragile_pair(&router, decode_stub.url.clone()).await;
+
+        let prefill_ends = async {
+            decode_stub.reached.notified().await;
+            assert_eq!(ends_heard_at(&heard, 1).await, ["completed Prefill Ok 200"]);
+            decode_stub.answers.notify_one();
+        };
+        let (response, ()) = served_beside(chat_through(&router, false), prefill_ends).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(response);
+
+        assert_eq!(
+            ends_heard(&heard),
+            [
+                "completed Decode ServerError 503",
+                "completed Prefill Ok 200"
+            ]
+        );
+        assert!(!decode.circuit_breaker_can_execute());
+        assert!(prefill.circuit_breaker_can_execute());
+    }
+
+    /// The request's own timeout on a pair. One behind the other, the side
+    /// whose call met it is told the timeout. A prefill that had answered
+    /// was told its answer, and a decode that was never sent is released.
+    /// Both at once, the engine hears the timeout on the decode always, as
+    /// the attempt records it. On the prefill it hears the timeout where
+    /// the prefill's own call met it, and the prefill's own answer where it
+    /// had answered. It hears nothing where the prefill was still in
+    /// flight. The breaker's record differs in those last two: the
+    /// attempt's 504 is recorded on both workers.
+    #[tokio::test]
+    async fn the_engine_hears_the_requests_own_timeout_by_what_each_side_had_done() {
+        use std::time::Duration;
+
+        use Shape::{Parallel, Sequential};
+        const SHORT: Option<Duration> = Some(Duration::from_millis(300));
+        // Long enough for the other side's answer to come first on a loaded
+        // machine.
+        const AMPLE: Option<Duration> = Some(Duration::from_secs(3));
+        const SILENT: Duration = Duration::from_secs(30);
+        const AT_ONCE: (Duration, Option<Duration>) = (Duration::ZERO, None);
+        const TIMED_OUT: &str = "completed Decode Timeout 504";
+
+        // (shape, the prefill's delay and timeout, the decode's delay and
+        // timeout, the decode's end, the prefill's end)
+        let rows = [
+            (
+                Sequential,
+                (SILENT, SHORT),
+                AT_ONCE,
+                "released Decode Abandoned",
+                "completed Prefill Timeout 504",
+            ),
+            (
+                Sequential,
+                AT_ONCE,
+                (SILENT, SHORT),
+                TIMED_OUT,
+                "completed Prefill Ok 200",
+            ),
+            // The prefill had answered when the decode's call timed out.
+            (
+                Parallel,
+                AT_ONCE,
+                (SILENT, AMPLE),
+                TIMED_OUT,
+                "completed Prefill Ok 200",
+            ),
+            // The prefill was still in flight.
+            (
+                Parallel,
+                (SILENT, None),
+                (SILENT, SHORT),
+                TIMED_OUT,
+                "completed Prefill Cancelled",
+            ),
+            // The prefill's own call met the timeout.
+            (
+                Parallel,
+                (SILENT, SHORT),
+                AT_ONCE,
+                TIMED_OUT,
+                "completed Prefill Timeout 504",
+            ),
+        ];
+        for (shape, prefill, decode, decode_end, prefill_end) in rows {
+            let case = format!("{shape:?}: {decode_end}, {prefill_end}");
+            let router = single_attempt_router();
+            let heard = hearing_pair_sides_on(&router.policy_registry);
+            for ((delay, timeout), side) in [(prefill, PdSide::Prefill), (decode, PdSide::Decode)] {
+                let reply =
+                    serde_json::from_str(healthy_answer(shape, side)).expect("a JSON reply");
+                let (url, _arrivals) = spawn_delayed_stub(StatusCode::OK, reply, delay).await;
+                let worker = pair_worker(shape, side, url, timeout);
+                router.worker_registry.register_or_replace(worker);
+            }
+
+            let response = chat_through(&router, false).await;
+            assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT, "{case}");
+            drop(response);
+            let mut ends = [decode_end, prefill_end];
+            ends.sort_unstable();
+            assert_eq!(ends_heard(&heard), ends, "{case}");
+        }
+    }
+
+    /// A side's body over the payload limit is told as the server's error
+    /// on that side: the worker answered, and the route refused what it
+    /// gave. One behind the other the prefill's handoff is over
+    /// the limit and the decode is never sent. Both at once the decode's
+    /// body is over it behind a good prefill. Or the prefill's body is,
+    /// which the route reads whole where the request asks for logprobs, and
+    /// the decode is dropped.
+    #[tokio::test]
+    async fn the_engine_hears_a_body_over_the_limit_as_the_servers_error() {
+        const OVER: &str =
+            r#"{"object":"response","output":"one side's answer above the payload limit"}"#;
+        const NEVER_SENT: &str = "released Decode Abandoned";
+        const DECODE_REFUSED: &str = "completed Decode ServerError 502";
+        const PREFILL_REFUSED: &str = "completed Prefill ServerError 502";
+        // (shape, the prefill's answer, the decode's answer, logprobs, the
+        // decode's end, the prefill's end)
+        let rows = [
+            (
+                Shape::Sequential,
+                healthy_answer(Shape::Sequential, PdSide::Prefill),
+                "{}",
+                false,
+                NEVER_SENT,
+                PREFILL_REFUSED,
+            ),
+            (
+                Shape::Parallel,
+                "{}",
+                OVER,
+                false,
+                DECODE_REFUSED,
+                "completed Prefill Ok 200",
+            ),
+            (
+                Shape::Parallel,
+                "{}",
+                OVER,
+                true,
+                DECODE_REFUSED,
+                "completed Prefill Ok 200",
+            ),
+            (
+                Shape::Parallel,
+                OVER,
+                "{}",
+                true,
+                "completed Decode Cancelled",
+                PREFILL_REFUSED,
+            ),
+        ];
+        for (shape, prefill, decode, logprobs, decode_end, prefill_end) in rows {
+            let case = format!("{shape:?} logprobs={logprobs}: {decode_end}, {prefill_end}");
+            let router = PDRouter {
+                max_payload_size: 64,
+                ..single_attempt_router()
+            };
+            let heard = hearing_pair_sides_on(&router.policy_registry);
+            for (reply, side) in [(prefill, PdSide::Prefill), (decode, PdSide::Decode)] {
+                let (url, _seen) = spawn_recording_stub(reply).await;
+                let worker = pair_worker(shape, side, url, None);
+                router.worker_registry.register_or_replace(worker);
+            }
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+                "logprobs": logprobs,
+            }))
+            .expect("valid chat request");
+
+            let response = router
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+                .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{case}");
+            drop(response);
+            let mut ends = [decode_end, prefill_end];
+            ends.sort_unstable();
+            assert_eq!(ends_heard(&heard), ends, "{case}");
+        }
+    }
+
+    /// The route reads a prefill's body whole where the request asks for
+    /// logprobs. One that its worker cuts short is told as a failed
+    /// connection: the refusal is the route's own, and no answer of the
+    /// worker's stands. The decode is dropped.
+    #[tokio::test]
+    async fn the_engine_hears_a_prefill_body_cut_while_read_whole_as_a_failed_connection() {
+        let (prefill_url, _refusing) = faulty_stub(Fault::CutAfterHead).await;
+        let decode_url = healthy_stub(Shape::Parallel, PdSide::Decode).await;
+        let router = single_attempt_router();
+        let heard = hearing_pair_sides_on(&router.policy_registry);
+        for (url, side) in [(prefill_url, PdSide::Prefill), (decode_url, PdSide::Decode)] {
+            let worker = pair_worker(Shape::Parallel, side, url, None);
+            router.worker_registry.register_or_replace(worker);
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "logprobs": true,
+        }))
+        .expect("valid chat request");
+
+        let response = router
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        drop(response);
+        assert_eq!(
+            ends_heard(&heard),
+            [
+                "completed Decode Cancelled",
+                "completed Prefill ConnectFailed 502"
+            ]
+        );
+    }
+
+    /// The drain's twin of the case above: a streamed pair's prefill body
+    /// that breaks off under its drain is told as a failed connection, no
+    /// answer of the worker's. The decode's stream is the client's and ends
+    /// well.
+    #[tokio::test]
+    async fn the_engine_hears_a_prefill_body_cut_under_its_drain_as_a_failed_connection() {
+        let (prefill_url, _refusing) = faulty_stub(Fault::CutAfterHead).await;
+        let decode_url = spawn_cut_stub(
+            "/v1/chat/completions",
+            "text/event-stream",
+            CHAT_SSE_CHUNKS,
+            false,
+        )
+        .await;
+        let router = single_attempt_router();
+        let heard = hearing_pair_sides_on(&router.policy_registry);
+        register_fleet(
+            &router,
+            Shape::Parallel,
+            &prefill_url,
+            &[decode_url.as_str()],
+        );
+
+        let response = stream_chat_through(&router).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            ends_heard_at(&heard, 2).await,
+            [
+                "completed Decode Ok 200",
+                "completed Prefill ConnectFailed 502"
+            ]
+        );
+    }
+
+    /// A fan-out of more than one answer sends no prefill. The route lets
+    /// the prefill's guard go unsent and tells its end nothing, and the
+    /// decode is told its own answer.
+    #[tokio::test]
+    async fn the_engine_hears_no_answer_of_a_prefill_a_fan_out_never_sends() {
+        let (prefill_url, prefill_seen) =
+            spawn_recording_stub(healthy_answer(Shape::Sequential, PdSide::Prefill)).await;
+        let decode_url = healthy_stub(Shape::Sequential, PdSide::Decode).await;
+        let router = single_attempt_router();
+        let heard = hearing_pair_sides_on(&router.policy_registry);
+        register_fleet(
+            &router,
+            Shape::Sequential,
+            &prefill_url,
+            &[decode_url.as_str()],
+        );
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let request = serde_json::from_value(json!({
+            "model": "m",
+            "n": 2,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+
+        let response = router
+            .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+
+        assert!(taken(&prefill_seen).is_empty(), "no prefill is sent");
+        let ends = ends_heard(&heard);
+        assert_eq!(ends.len(), 2, "{ends:?}");
+        assert_eq!(ends[0], "completed Decode Ok 200");
+        // The prefill's end, whatever its word, states no status.
+        let stated = ends[1].ends_with(|last: char| last.is_ascii_digit());
+        assert!(ends[1].contains("Prefill") && !stated, "{ends:?}");
+    }
+
+    /// A MoRI-IO pair written concurrently tells the side that answered and
+    /// leaves the side it dropped to nobody. The rows: a decode that
+    /// refuses, or whose call fails, while its prefill is in flight, and a
+    /// prefill that does either while its decode is.
+    #[tokio::test]
+    async fn the_engine_hears_the_side_that_answered_of_a_pair_written_concurrently() {
+        use Fault::{Refuses, Unreachable};
+        const UNAVAILABLE: Fault = Refuses(StatusCode::SERVICE_UNAVAILABLE);
+        // (the side that fails, its fault, the decode's end, the prefill's
+        // end)
+        let rows = [
+            (
+                PdSide::Decode,
+                UNAVAILABLE,
+                "completed Decode ServerError 503",
+                "completed Prefill Cancelled",
+            ),
+            (
+                PdSide::Decode,
+                Unreachable,
+                "completed Decode ConnectFailed 502",
+                "completed Prefill Cancelled",
+            ),
+            (
+                PdSide::Prefill,
+                UNAVAILABLE,
+                "completed Decode Cancelled",
+                "completed Prefill ServerError 503",
+            ),
+            // The route's own answer for a call that failed is no answer
+            // of the worker's.
+            (
+                PdSide::Prefill,
+                Unreachable,
+                "completed Decode Cancelled",
+                "completed Prefill ConnectFailed 502",
+            ),
+        ];
+        for (fails, fault, decode_end, prefill_end) in rows {
+            let case = format!("{fails:?} {fault:?}");
+            let (failing, _refusing) = faulty_stub(fault).await;
+            // Never let to answer: in flight where its partner fails.
+            let held = spawn_held_stub("{}").await;
+            let (prefill_url, decode_url) = match fails {
+                PdSide::Prefill => (failing, held.url.clone()),
+                PdSide::Decode => (held.url.clone(), failing),
+            };
+            let router = single_attempt_router();
+            let heard = hearing_pair_sides_on(&router.policy_registry);
+            register_moriio_pair_with(
+                &router,
+                (prefill_url, Some("write")),
+                (decode_url, "write"),
+                &[CONCURRENT_WRITE],
+            );
+
+            let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
+            assert!(!response.status().is_success(), "{case}");
+            drop(response);
+            assert_eq!(ends_heard(&heard), [decode_end, prefill_end], "{case}");
+        }
+    }
+
+    /// A MoRI-IO pair written concurrently whose decode's call fails behind
+    /// a prefill that had answered. The engine hears the prefill's own good
+    /// answer, told where its load was let go, and then the decode's failed
+    /// connection, as the route answers it.
+    #[tokio::test]
+    async fn the_engine_hears_a_concurrent_writes_prefill_ahead_of_its_decodes_failed_call() {
+        let (prefill, _) = spawn_moriio_prefill_stub(StubHandoff::Minted).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decode = format!("http://{}", listener.local_addr().unwrap());
+        let router = single_attempt_router();
+        let heard = hearing_pair_sides_on(&router.policy_registry);
+        register_moriio_pair_with(
+            &router,
+            (prefill, Some("write")),
+            (decode, "write"),
+            &[CONCURRENT_WRITE],
+        );
+
+        let decode_hangs_up = async {
+            // The decode's call is taken and left without an answer.
+            let held = listener.accept().await.unwrap();
+            assert_eq!(ends_heard_at(&heard, 1).await, ["completed Prefill Ok 200"]);
+            drop(held);
+            // The route sends the call once more: it is hung up on too.
+            drop(listener.accept().await.unwrap());
+        };
+        let no_fields = json!({});
+        let call = moriio_call(&router, "/v1/chat/completions", None, &no_fields);
+        let (response, ()) = served_beside(call, decode_hangs_up).await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        drop(response);
+
+        assert_eq!(
+            ends_heard(&heard),
+            [
+                "completed Decode ConnectFailed 502",
+                "completed Prefill Ok 200"
+            ]
+        );
+    }
+
+    /// The last word the engine hears of one count request. The router
+    /// makes one attempt on its one prefill worker at `url`, under a payload
+    /// `limit` and the call's own `timeout` where one is given.
+    async fn count_heard(
+        url: String,
+        limit: Option<usize>,
+        timeout: Option<std::time::Duration>,
+    ) -> Option<String> {
+        let mut router = single_attempt_router();
+        if let Some(limit) = limit {
+            router.max_payload_size = limit;
+        }
+        let heard = hearing_engine_on(&router.policy_registry);
+        let worker = pair_worker(Shape::Parallel, PdSide::Prefill, url, timeout);
+        router.worker_registry.register_or_replace(worker);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let body = serde_json::from_value(json!({"model": "m", "messages": []})).unwrap();
+
+        let response = router
+            .route_messages_count_tokens(None, &tenant, body, UNKNOWN_MODEL_ID)
+            .await;
+        drop(response);
+        let heard = heard.lock().expect("the stage heard");
+        heard.last().cloned()
+    }
+
+    /// The count route places one prefill worker and keeps its answer to
+    /// its end. The engine hears the count's outcome beside each record on
+    /// the worker. It hears the worker's own status where it answered, and
+    /// a failed connection where its call failed below HTTP. It hears the
+    /// server's error where its answer was over the payload limit.
+    ///
+    /// It hears the request's own timeout where the call met it, ahead of
+    /// the answer's head or in its body. It hears a failed connection where
+    /// the body broke off.
+    #[tokio::test]
+    async fn the_engine_hears_a_count_requests_outcome() {
+        use std::time::Duration;
+
+        const SHORT: Option<Duration> = Some(Duration::from_millis(300));
+        const TIMED_OUT: &str = "completed Timeout 504";
+
+        // (the worker's fault, a payload limit under its answer, the end)
+        let rows = [
+            (None, None, "completed Ok 200"),
+            (
+                Some(Fault::Refuses(StatusCode::SERVICE_UNAVAILABLE)),
+                None,
+                "completed ServerError 503",
+            ),
+            (
+                Some(Fault::Unreachable),
+                None,
+                "completed ConnectFailed 502",
+            ),
+            (None, Some(8), "completed ServerError 502"),
+        ];
+        for (fault, limit, end) in rows {
+            let (url, _refusing) = match fault {
+                None => (spawn_recording_stub(r#"{"input_tokens":3}"#).await.0, None),
+                Some(fault) => faulty_stub(fault).await,
+            };
+            let heard = count_heard(url, limit, None).await;
+            assert_eq!(heard.as_deref(), Some(end), "{fault:?} {limit:?}");
+        }
+
+        // (what the worker's server does, the call's own timeout, the end)
+        // A loaded machine may meet the timeout ahead of the stalled body's
+        // head: the word is the same.
+        let (silent, _) =
+            spawn_delayed_stub(StatusCode::OK, json!({}), Duration::from_secs(30)).await;
+        let rows = [
+            ("sends no head", silent, SHORT, TIMED_OUT),
+            (
+                "stalls in its body",
+                spawn_stalled_body_stub().await,
+                SHORT,
+                TIMED_OUT,
+            ),
+            (
+                "breaks its body off",
+                spawn_cut_body_stub().await,
+                None,
+                "completed ConnectFailed 502",
+            ),
+        ];
+        for (serves, url, timeout, end) in rows {
+            let heard = count_heard(url, None, timeout).await;
+            assert_eq!(heard.as_deref(), Some(end), "{serves}");
+        }
+    }
+
+    /// A decode that is never sent is no dispatch: where the prefill refuses
+    /// a pair that is sent prefill first, the engine hears the prefill's
+    /// dispatch and its end with the refusal's status, and the decode's side
+    /// released. The decode worker was counted from the selection, and is
+    /// counted no more.
+    #[tokio::test]
+    async fn the_engine_hears_a_decode_that_is_never_sent_as_released() {
+        let router = single_attempt_router();
+        let heard = hearing_pairs_on(&router.policy_registry, false);
+        let (prefill, _) = faulty_stub(Fault::Refuses(StatusCode::SERVICE_UNAVAILABLE)).await;
+        let decode = healthy_stub(Shape::Sequential, PdSide::Decode).await;
+        let [_, decode] = sequential_pair(prefill, decode).map(|worker| {
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(&worker));
+            worker
+        });
+
+        let response = chat_through(&router, false).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        drop(response);
+
+        let mut heard = heard.lock().expect("the stage heard").clone();
+        heard.sort();
+        assert_eq!(
+            heard,
+            [
+                "completed ServerError 503",
+                "dispatched Prefill",
+                "issued",
+                "issued",
+                "released Abandoned",
+            ]
+        );
+        assert_eq!(decode.load(), 0);
+    }
+
+    /// Under a document that picks a pair's decode behind its prefill, the
+    /// prefill-first dispatch asks the decode again once the prefill has
+    /// answered. With one decode the answer names it again, and it stands:
+    /// the engine books the decode at the ask and tells the prefill's end,
+    /// which it held back for that booking, and it hears the decode's
+    /// dispatch where the decode's request goes out.
+    #[tokio::test]
+    async fn a_decode_asked_again_behind_its_prefill_stands_where_it_is_named_again() {
+        let router = single_attempt_router();
+        let heard = hearing_pairs_on(&router.policy_registry, true);
+        let prefill = healthy_stub(Shape::Sequential, PdSide::Prefill).await;
+        let decode = healthy_stub(Shape::Sequential, PdSide::Decode).await;
+        for worker in sequential_pair(prefill, decode) {
+            router.worker_registry.register_or_replace(worker);
+        }
+
+        let response = chat_through(&router, false).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            [
+                "issued",
+                "dispatched Prefill",
+                "issued",
+                "completed Ok 200",
+                "dispatched Decode",
+                "completed Ok 200",
+            ]
+        );
+    }
+
+    /// A pair the classic policies picked has nothing to ask behind its
+    /// prefill's answer: the route's one call answers the guard it was
+    /// handed, which counts the decode as before, and never makes the call
+    /// that reads the pair index again.
+    #[test]
+    fn a_classic_pair_reads_no_pair_index_behind_its_prefill() {
+        let router = create_test_pd_router();
+        let [_, decode] = sequential_pair("http://p:1".to_owned(), "http://d:1".to_owned());
+        let first = Placed::from(Arc::clone(&decode));
+        let ahead = first.ahead(None);
+
+        let (moved, guard) = router.decode_again(
+            UNKNOWN_MODEL_ID,
+            &|| panic!("a classic pair reads the pair index again"),
+            PlacementInputs::default(),
+            &first,
+            ahead,
+        );
+        assert!(moved.is_none(), "a classic pair's decode stands");
+        assert!(guard.counts(&decode));
+        assert_eq!(decode.load(), 1);
+        drop(first.sent(guard));
+        assert_eq!(decode.load(), 0);
+    }
+
+    /// A server that says when a request reached it and answers when the
+    /// case lets it, with how many requests reached it.
+    struct HeldStub {
+        url: String,
+        hits: Arc<AtomicUsize>,
+        reached: Arc<tokio::sync::Notify>,
+        answers: Arc<tokio::sync::Notify>,
+    }
+
+    /// A [`HeldStub`] that answers `reply` as JSON on every path.
+    async fn spawn_held_stub(reply: &'static str) -> HeldStub {
+        let reply: Value = serde_json::from_str(reply).expect("a JSON reply");
+        spawn_held_stub_with(move |_| reply.clone()).await
+    }
+
+    /// A [`HeldStub`] that answers, on every path, what `reply` makes of the
+    /// JSON body it was sent.
+    async fn spawn_held_stub_with(
+        reply: impl Fn(&Value) -> Value + Clone + Send + Sync + 'static,
+    ) -> HeldStub {
+        spawn_held_stub_answering(StatusCode::OK, reply).await
+    }
+
+    /// [`spawn_held_stub_with`] under `status`.
+    async fn spawn_held_stub_answering(
+        status: StatusCode,
+        reply: impl Fn(&Value) -> Value + Clone + Send + Sync + 'static,
+    ) -> HeldStub {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let answers = Arc::new(tokio::sync::Notify::new());
+        let held = (
+            Arc::clone(&hits),
+            Arc::clone(&reached),
+            Arc::clone(&answers),
+        );
+        let app = axum::Router::new().fallback(axum::routing::any(move |req: Request| {
+            let (hits, reached, answers) = held.clone();
+            let reply = reply.clone();
+            async move {
+                let bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
+                    .await
+                    .unwrap_or_default();
+                let sent: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+                hits.fetch_add(1, Ordering::SeqCst);
+                reached.notify_one();
+                answers.notified().await;
+                (status, axum::Json(reply(&sent)))
+            }
+        }));
+        HeldStub {
+            url: spawn_stub(app).await,
+            hits,
+            reached,
+            answers,
+        }
+    }
+
+    /// `served` driven beside `meanwhile`, the steps a case takes while its
+    /// request is in flight, with what those steps answer. An answer that
+    /// comes before the steps end fails the case: its steps would wait for
+    /// ever on a server the request never reached.
+    async fn served_beside<T>(
+        served: impl std::future::Future<Output = Response>,
+        meanwhile: impl std::future::Future<Output = T>,
+    ) -> (Response, T) {
+        tokio::pin!(served, meanwhile);
+        let stepped = tokio::select! {
+            biased;
+            stepped = &mut meanwhile => stepped,
+            response = &mut served => {
+                panic!("answered {} before the case's steps ended", response.status())
+            }
+        };
+        (served.await, stepped)
+    }
+
+    /// The request moves where the answer names another decode. Here the
+    /// decode the selection named stops being ready while the prefill runs:
+    /// the ask behind the prefill's answer names the other decode, which is
+    /// sent the request and counted for it, and the first is sent nothing
+    /// and is counted no more. The engine hears one decode's dispatch and
+    /// end, and no release.
+    #[tokio::test]
+    async fn a_decode_that_stops_being_ready_behind_its_prefill_hands_the_request_on() {
+        let prefill_stub =
+            spawn_held_stub(healthy_answer(Shape::Sequential, PdSide::Prefill)).await;
+        let first_stub = spawn_held_stub(r#"{"choices":[]}"#).await;
+        let second_stub = spawn_held_stub(r#"{"choices":[]}"#).await;
+
+        let router = single_attempt_router();
+        let heard = hearing_pairs_on(&router.policy_registry, true);
+        let [prefill, first] = sequential_pair(prefill_stub.url.clone(), first_stub.url.clone());
+        let second: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(second_stub.url.clone())
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Vllm)
+                .build(),
+        );
+        second.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        for worker in [&prefill, &first, &second] {
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(worker));
+        }
+
+        let leaves = async {
+            prefill_stub.reached.notified().await;
+            // The decode the selection named is the one counted from then on.
+            let (named, other) = if first.load() == 1 {
+                (&first, &second)
+            } else {
+                (&second, &first)
+            };
+            assert_eq!((named.load(), other.load()), (1, 0));
+            named.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+            prefill_stub.answers.notify_one();
+
+            tokio::select! {
+                () = first_stub.reached.notified() => {}
+                () = second_stub.reached.notified() => {}
+            }
+            assert_eq!(
+                (named.load(), other.load()),
+                (0, 1),
+                "the request is counted on the decode it went to"
+            );
+            first_stub.answers.notify_one();
+            second_stub.answers.notify_one();
+            (named, other)
+        };
+        let (response, (named, other)) = served_beside(chat_through(&router, false), leaves).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!((named.load(), other.load()), (0, 0));
+
+        let sent_to = |worker: &Arc<dyn Worker>| {
+            let stub = if worker.url() == first.url() {
+                &first_stub
+            } else {
+                &second_stub
+            };
+            stub.hits.load(Ordering::SeqCst)
+        };
+        assert_eq!((sent_to(named), sent_to(other)), (0, 1));
+        assert_eq!(
+            *heard.lock().expect("the stage heard"),
+            [
+                "issued",
+                "dispatched Prefill",
+                "issued",
+                "completed Ok 200",
+                "dispatched Decode",
+                "completed Ok 200",
+            ]
+        );
+    }
+
+    /// A MoRI-IO pair's decode is not asked again behind its prefill: that
+    /// prefill was told of its decode, so the request goes to the decode the
+    /// selection named, whatever became of it while the prefill ran. Here
+    /// that decode stops being ready meanwhile, under a document that picks
+    /// a pair's decode behind its prefill. It is sent the request all the
+    /// same and stays counted for it; the other decode is sent nothing and
+    /// is never counted. The engine hears the body's output limit at the
+    /// pair's one decision, each side's dispatch and end, the decode booked
+    /// at its send, and no release. Both transfer modes of a pair sent
+    /// prefill first.
+    #[tokio::test]
+    async fn a_moriio_pairs_decode_is_not_asked_again_behind_its_prefill() {
+        for transfer in ["read", "write"] {
+            let prefill_stub = spawn_held_stub_with(|sent| {
+                let minted = sent.pointer("/kv_transfer_params/transfer_id");
+                json!({"kv_transfer_params": stub_handoff(minted.unwrap_or(&Value::Null))})
+            })
+            .await;
+            let first_stub = spawn_held_stub(r#"{"choices":[]}"#).await;
+            let second_stub = spawn_held_stub(r#"{"choices":[]}"#).await;
+
+            let router = single_attempt_router();
+            let heard = hearing_pairs_on(&router.policy_registry, true);
+            for decode in [&first_stub, &second_stub] {
+                register_moriio_pair_with(
+                    &router,
+                    (prefill_stub.url.clone(), Some(transfer)),
+                    (decode.url.clone(), transfer),
+                    &[],
+                );
+            }
+            let [first, second] = [&first_stub, &second_stub].map(|stub| {
+                let worker = router.worker_registry.get_by_url(&stub.url);
+                worker.expect("a registered decode")
+            });
+
+            let meanwhile = async {
+                prefill_stub.reached.notified().await;
+                // The decode the selection named is the one counted from then on.
+                let (named, other) = if first.load() == 1 {
+                    (&first, &second)
+                } else {
+                    (&second, &first)
+                };
+                assert_eq!((named.load(), other.load()), (1, 0), "{transfer}");
+                named.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+                prefill_stub.answers.notify_one();
+
+                tokio::select! {
+                    () = first_stub.reached.notified() => {}
+                    () = second_stub.reached.notified() => {}
+                }
+                assert_eq!(
+                    (named.load(), other.load()),
+                    (1, 0),
+                    "{transfer}: the request stays counted on the decode the selection named"
+                );
+                first_stub.answers.notify_one();
+                second_stub.answers.notify_one();
+                (named, other)
+            };
+            let no_extra = json!({});
+            let served = moriio_call(&router, "/v1/chat/completions", None, &no_extra);
+            let (response, (named, other)) = served_beside(served, meanwhile).await;
+            assert_eq!(response.status(), StatusCode::OK, "{transfer}");
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!((named.load(), other.load()), (0, 0), "{transfer}");
+
+            let sent_to = |worker: &Arc<dyn Worker>| {
+                let stub = if worker.url() == first.url() {
+                    &first_stub
+                } else {
+                    &second_stub
+                };
+                stub.hits.load(Ordering::SeqCst)
+            };
+            assert_eq!((sent_to(named), sent_to(other)), (1, 0), "{transfer}");
+            assert_eq!(
+                *heard.lock().expect("the stage heard"),
+                [
+                    "limit 50",
+                    "issued",
+                    "dispatched Prefill",
+                    "issued",
+                    "dispatched Decode",
+                    "completed Ok 200",
+                    "completed Ok 200",
+                ],
+                "{transfer}"
+            );
+        }
+    }
+
+    /// A decode of `router`'s fleet behind the prefill at `prefill_url` that
+    /// answers every request its own 500, with what arrives at its server.
+    async fn refusing_decode(router: &PDRouter, prefill_url: &str) -> (Arc<dyn Worker>, Arrivals) {
+        let (url, arrivals) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+        register_fleet(router, Shape::Sequential, prefill_url, &[url.as_str()]);
+        let worker = router.worker_registry.get_by_url(&url);
+        (worker.expect("a registered decode"), arrivals)
+    }
+
+    /// A failed attempt is settled on the decode its request went to. Here
+    /// the decode the selection named stops being ready while the prefill
+    /// runs, and the decode the ask names answers its own 500. That decode
+    /// is the one the request leaves: no other pair is left, so the client
+    /// reads its 500 after one attempt. Settled on the decode the selection
+    /// named, the request would be sent to the decode that failed it once
+    /// more.
+    #[tokio::test]
+    async fn a_moved_decodes_own_500_is_settled_on_the_decode_that_answered() {
+        let prefill_stub =
+            spawn_held_stub(healthy_answer(Shape::Sequential, PdSide::Prefill)).await;
+        let router = quick_retry_router();
+        let _heard = hearing_pairs_on(&router.policy_registry, true);
+        let (first, first_arrivals) = refusing_decode(&router, &prefill_stub.url).await;
+        let (second, second_arrivals) = refusing_decode(&router, &prefill_stub.url).await;
+
+        let first_named = std::cell::Cell::new(false);
+        let meanwhile = async {
+            prefill_stub.reached.notified().await;
+            first_named.set(first.load() == 1);
+            let named = if first_named.get() { &first } else { &second };
+            named.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+            // Every prefill request is let go from here on, a retry's too.
+            loop {
+                prefill_stub.answers.notify_one();
+                prefill_stub.reached.notified().await;
+            }
+        };
+        let response = tokio::select! {
+            response = chat_through(&router, false) => response,
+            () = meanwhile => panic!("the case's steps never end"),
+        };
+
+        let arrived = |arrivals: &Arrivals| arrivals.lock().unwrap().len();
+        let (named, moved_to) = if first_named.get() {
+            (arrived(&first_arrivals), arrived(&second_arrivals))
+        } else {
+            (arrived(&second_arrivals), arrived(&first_arrivals))
+        };
+        assert_eq!(
+            (
+                response.status(),
+                prefill_stub.hits.load(Ordering::SeqCst),
+                named,
+                moved_to
+            ),
+            (StatusCode::INTERNAL_SERVER_ERROR, 1, 0, 1),
+            "the answer, the prefill's requests, the requests at the decode the selection named \
+             and at the decode the request moved to"
+        );
+    }
+
+    /// A retry's decode is asked again under the retry's own rule: a worker
+    /// that answered the request its own 500 takes no further attempt of
+    /// it, behind the prefill as at the selection. Here the first attempt's
+    /// decode answers its own 500, and the decode the retry names stops
+    /// being ready while the retry's prefill runs. The ask finds nobody it
+    /// may name, so the retry's decode stands and is sent the request.
+    #[tokio::test]
+    async fn a_retrys_decode_is_asked_again_under_the_retrys_rule() {
+        let prefill_stub =
+            spawn_held_stub(healthy_answer(Shape::Sequential, PdSide::Prefill)).await;
+        let router = quick_retry_router();
+        let _heard = hearing_pairs_on(&router.policy_registry, true);
+        let (first, first_arrivals) = refusing_decode(&router, &prefill_stub.url).await;
+        let (second, second_arrivals) = refusing_decode(&router, &prefill_stub.url).await;
+
+        let first_retried = std::cell::Cell::new(false);
+        let meanwhile = async {
+            // The first attempt goes to the decode its own ask names, either
+            // of the two.
+            prefill_stub.reached.notified().await;
+            prefill_stub.answers.notify_one();
+            // The retry names the other decode, the one counted now, which
+            // stops being ready while the retry's prefill runs.
+            prefill_stub.reached.notified().await;
+            first_retried.set(first.load() == 1);
+            let (answered, retried) = if first_retried.get() {
+                (&second, &first)
+            } else {
+                (&first, &second)
+            };
+            assert_eq!((answered.load(), retried.load()), (0, 1));
+            retried.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+            loop {
+                prefill_stub.answers.notify_one();
+                prefill_stub.reached.notified().await;
+            }
+        };
+        let response = tokio::select! {
+            response = chat_through(&router, false) => response,
+            () = meanwhile => panic!("the case's steps never end"),
+        };
+
+        let arrived = |arrivals: &Arrivals| arrivals.lock().unwrap().len();
+        let (answered, retried) = if first_retried.get() {
+            (arrived(&second_arrivals), arrived(&first_arrivals))
+        } else {
+            (arrived(&first_arrivals), arrived(&second_arrivals))
+        };
+        assert_eq!(
+            (
+                response.status(),
+                prefill_stub.hits.load(Ordering::SeqCst),
+                answered,
+                retried
+            ),
+            (StatusCode::INTERNAL_SERVER_ERROR, 2, 1, 1),
+            "the answer, the prefill's requests, the requests at the decode that answered the \
+             first attempt and at the decode the retry named"
+        );
+    }
+
+    /// A decode policy with a favourite: the worker at that address whenever
+    /// it is among the candidates, as a policy that holds a session or a
+    /// cached prefix picks one worker for one request at every attempt.
+    #[derive(Debug)]
+    struct Favours(String);
+
+    impl crate::policies::LoadBalancingPolicy for Favours {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &crate::policies::SelectWorkerInfo,
+        ) -> Option<usize> {
+            workers
+                .iter()
+                .position(|worker| worker.url() == self.0)
+                .or_else(|| (!workers.is_empty()).then_some(0))
+        }
+
+        fn name(&self) -> &'static str {
+            "favours"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// The default retry allowance with no real back-off between attempts.
+    fn quick_retry_router() -> PDRouter {
+        PDRouter {
+            retry_config: RetryConfig {
+                initial_backoff_ms: 1,
+                max_backoff_ms: 1,
+                ..Default::default()
+            },
+            ..create_test_pd_router()
+        }
+    }
+
+    /// A server that answers `status` with an error body before its side's
+    /// first byte, and what arrived at it.
+    async fn refusing_stub(status: StatusCode) -> (String, Arrivals) {
+        spawn_delayed_stub(
+            status,
+            json!({"error": {"message": REFUSAL}}),
+            std::time::Duration::ZERO,
+        )
+        .await
+    }
+
+    /// One prefill worker of `shape` and the decode workers behind it.
+    fn register_fleet(router: &PDRouter, shape: Shape, prefill_url: &str, decode_urls: &[&str]) {
+        for decode_url in decode_urls {
+            let (prefill_url, decode_url) = (prefill_url.to_string(), (*decode_url).to_string());
+            match shape {
+                Shape::Sequential => {
+                    for worker in sequential_pair(prefill_url, decode_url) {
+                        router.worker_registry.register_or_replace(worker);
+                    }
+                }
+                Shape::Parallel => register_pd_pair(router, prefill_url, decode_url),
+            }
+        }
+    }
+
+    /// A pair request keyed by its body's request id alone reaches the
+    /// engine with its key. Under the document the settings make of
+    /// `consistent_hashing` sides with the sticky override on, both turns of
+    /// a conversation go to one decode engine, and sixteen conversations do
+    /// not all go to one.
+    #[tokio::test]
+    async fn a_pair_request_keyed_by_its_bodys_id_reaches_the_engine_with_its_key() {
+        use smg_grand_central::document::AppliedSpec;
+
+        use crate::config::types::{RouterConfig, RoutingKeyOverrideConfig, RoutingMode};
+
+        let settings = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                prefill_policy: None,
+                decode_policy: None,
+            },
+            policy: PolicyConfig::ConsistentHashing,
+            routing_key_override: RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let policies = PolicyRegistry::for_engine(
+            settings.policy.clone(),
+            settings.routing_key_override.clone(),
+        );
+        let document = settings.policy_document().expect("the settings' document");
+        engine_on(
+            &policies,
+            AppliedSpec::validate(&document).expect("a valid document"),
+        );
+        let router = PDRouter {
+            policy_registry: Arc::new(policies),
+            ..create_test_pd_router()
+        };
+        let prefill_url = healthy_stub(Shape::Sequential, PdSide::Prefill).await;
+        let mut decodes = Vec::new();
+        for _ in 0..4 {
+            let answer = healthy_answer(Shape::Sequential, PdSide::Decode);
+            decodes.push(spawn_recording_stub(answer).await);
+        }
+        let decode_urls: Vec<&str> = decodes.iter().map(|(url, _)| url.as_str()).collect();
+        register_fleet(&router, Shape::Sequential, &prefill_url, &decode_urls);
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+        // One entry a request: the decode servers it arrived at.
+        let mut reached: Vec<Vec<usize>> = Vec::new();
+        for conversation in 0..16 {
+            for turn in 1..=2 {
+                let request = serde_json::from_value(json!({
+                    "model": "m",
+                    "rid": format!("conv-{conversation}_t{turn}"),
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .expect("valid chat request");
+                let response = router
+                    .route_chat(None, &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                reached.push(
+                    decodes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (_, seen))| {
+                            !std::mem::take(&mut *seen.lock().unwrap()).is_empty()
+                        })
+                        .map(|(at, _)| at)
+                        .collect(),
+                );
+            }
+        }
+
+        let apart: Vec<&[Vec<usize>]> = reached
+            .chunks(2)
+            .filter(
+                |turns| !matches!(turns, [first, second] if first.len() == 1 && first == second),
+            )
+            .collect();
+        assert!(
+            apart.is_empty(),
+            "the turns of a conversation went apart: {apart:?}"
+        );
+        let mut engines = reached.concat();
+        engines.sort_unstable();
+        engines.dedup();
+        assert!(
+            engines.len() > 1,
+            "sixteen conversations went to one decode: {engines:?}"
+        );
+    }
+
+    /// A pair goes through the engine under the sticky override's rule.
+    /// Under the document the settings make of round-robin sides with the
+    /// override on, every turn of a conversation reaches the prefill engine
+    /// and the decode engine its first turn reached. A conversation is keyed
+    /// by its routing key header where it carries one, ahead of its body's
+    /// id, and by that id where it carries none. The requests are sent a
+    /// turn at a time, ten conversations to a turn: under round robin alone
+    /// a conversation's three turns would reach three engines of a side.
+    #[tokio::test]
+    async fn a_pairs_conversation_keeps_its_two_engines_under_the_overrides_rule() {
+        conversations_keep_their_engines(PolicyConfig::RoundRobin).await;
+    }
+
+    /// Beside a prefill under `consistent_hashing` the override's rule
+    /// names the decode side alone. Every turn of a conversation still
+    /// reaches one prefill engine, by the ring over its key, and the decode
+    /// engine its first turn reached, by its pin.
+    #[tokio::test]
+    async fn a_pairs_conversation_keeps_its_engines_beside_a_hash_prefill() {
+        conversations_keep_their_engines(PolicyConfig::ConsistentHashing).await;
+    }
+
+    /// Ten conversations of three turns through the pair route. The
+    /// document is the one the settings make of the `prefill` policy beside
+    /// a round-robin decode with the override on. The turns of each
+    /// conversation reach one engine a side.
+    async fn conversations_keep_their_engines(prefill: PolicyConfig) {
+        use smg_grand_central::document::AppliedSpec;
+
+        use crate::config::types::{RouterConfig, RoutingKeyOverrideConfig, RoutingMode};
+
+        // Ten conversations of three turns. The first five carry their key
+        // in the header beside an id of the turn's own, and the others in
+        // the lineage of their id alone.
+        const CONVERSATIONS: usize = 10;
+
+        // A side under round robin spreads the conversations by its turns.
+        // A ring spreads them by its hash of addresses a run draws.
+        let by_turns = matches!(prefill, PolicyConfig::RoundRobin);
+        let settings = RouterConfig {
+            mode: RoutingMode::PrefillDecode {
+                prefill_urls: Vec::new(),
+                decode_urls: Vec::new(),
+                prefill_policy: Some(prefill),
+                decode_policy: Some(PolicyConfig::RoundRobin),
+            },
+            policy: PolicyConfig::RoundRobin,
+            routing_key_override: RoutingKeyOverrideConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let policies = PolicyRegistry::for_engine(
+            settings.policy.clone(),
+            settings.routing_key_override.clone(),
+        );
+        let document = settings.policy_document().expect("the settings' document");
+        engine_on(
+            &policies,
+            AppliedSpec::validate(&document).expect("a valid document"),
+        );
+        let router = PDRouter {
+            policy_registry: Arc::new(policies),
+            ..create_test_pd_router()
+        };
+        // Three engines a side, each with what arrived at it. A decode
+        // names no transport, so every prefill pairs with every decode.
+        let (mut prefills, mut decodes) = (Vec::new(), Vec::new());
+        for _ in 0..3 {
+            let prefill = healthy_answer(Shape::Sequential, PdSide::Prefill);
+            let decode = healthy_answer(Shape::Sequential, PdSide::Decode);
+            let prefill = spawn_recording_stub(prefill).await;
+            let decode = spawn_recording_stub(decode).await;
+            for worker in sequential_pair(prefill.0.clone(), decode.0.clone()) {
+                router.worker_registry.register_or_replace(worker);
+            }
+            prefills.push(prefill);
+            decodes.push(decode);
+        }
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        // The engines of a side a request arrived at, by their places.
+        let reached = |side: &[(String, Seen)]| -> Vec<usize> {
+            side.iter()
+                .enumerate()
+                .filter(|(_, (_, seen))| !std::mem::take(&mut *seen.lock().unwrap()).is_empty())
+                .map(|(at, _)| at)
+                .collect()
+        };
+
+        // What each conversation's turns reached: the prefill engines and
+        // the decode engines of a turn.
+        let mut turns_of: Vec<Vec<(Vec<usize>, Vec<usize>)>> = vec![Vec::new(); CONVERSATIONS];
+        for turn in 1..=3 {
+            for (conversation, turns) in turns_of.iter_mut().enumerate() {
+                let by_header = conversation < CONVERSATIONS / 2;
+                let rid = if by_header {
+                    format!("request-{conversation}-{turn}")
+                } else {
+                    format!("conv-{conversation}_t{turn}")
+                };
+                let mut headers = HeaderMap::new();
+                if by_header {
+                    let key = format!("conv-{conversation}");
+                    let key = HeaderValue::from_str(&key).expect("the key's text");
+                    headers.insert("x-smg-routing-key", key);
+                }
+                let request = serde_json::from_value(json!({
+                    "model": "m",
+                    "rid": rid,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }))
+                .expect("valid chat request");
+                let response = router
+                    .route_chat(Some(&headers), &tenant, Arc::new(request), UNKNOWN_MODEL_ID)
+                    .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                turns.push((reached(&prefills), reached(&decodes)));
+            }
+        }
+
+        // Each conversation's one prefill and its one decode.
+        let mut kept = Vec::new();
+        for turns in &turns_of {
+            let first = turns.first().expect("a conversation's first turn");
+            assert!(
+                turns.iter().all(|turn| turn == first),
+                "the turns of a conversation went apart: {turns:?}"
+            );
+            assert_eq!(
+                (first.0.len(), first.1.len()),
+                (1, 1),
+                "a turn reaches one engine a side: {first:?}"
+            );
+            kept.push((first.0[0], first.1[0]));
+        }
+        let engines = |side: fn(&(usize, usize)) -> usize| {
+            let mut engines: Vec<usize> = kept.iter().map(side).collect();
+            engines.sort_unstable();
+            engines.dedup();
+            engines.len()
+        };
+        assert!(
+            (!by_turns || engines(|pair| pair.0) > 1) && engines(|pair| pair.1) > 1,
+            "ten conversations went to one engine of a side: {kept:?}"
+        );
+    }
+
+    /// A decode worker's own 500, answered before the side's first byte, is
+    /// its answer for the payload: a replay on it costs the same work for
+    /// the same answer. With no other decode worker available the request
+    /// makes one attempt and the client reads the worker's 500, as on the
+    /// regular HTTP route and the gRPC prefill-decode route. A status that
+    /// says "not served now" (503) is replayed for every attempt the retry
+    /// config allows. Both dispatch shapes.
+    #[tokio::test]
+    async fn a_lone_decode_workers_own_500_goes_back_after_one_attempt() {
+        let mut mismatches = Vec::new();
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            for (status, replayed) in [
+                (StatusCode::INTERNAL_SERVER_ERROR, false),
+                (StatusCode::SERVICE_UNAVAILABLE, true),
+            ] {
+                let prefill_url = healthy_stub(shape, PdSide::Prefill).await;
+                let (decode_url, arrivals) = refusing_stub(status).await;
+                let router = quick_retry_router();
+                register_fleet(&router, shape, &prefill_url, &[decode_url.as_str()]);
+
+                let response = chat_through(&router, false).await;
+
+                let attempts = arrivals.lock().unwrap().len();
+                let expected = if replayed {
+                    router.retry_config.max_retries as usize
+                } else {
+                    1
+                };
+                if response.status() != status || attempts != expected {
+                    mismatches.push(format!(
+                        "{shape:?}: {} after {attempts} attempts on the refusing decode worker, \
+                         expected {status} after {expected}",
+                        response.status()
+                    ));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// With another decode worker available the retry leaves the decode
+    /// worker that answered its own 500, even under a policy that picks
+    /// that worker whenever it is a candidate: one attempt on it, then the
+    /// free worker's answer. Placed as a first attempt, a retry would go
+    /// back to the refusing worker every time. Both dispatch shapes.
+    #[tokio::test]
+    async fn the_retry_leaves_a_decode_worker_that_answered_its_own_500() {
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            let prefill_url = healthy_stub(shape, PdSide::Prefill).await;
+            let (refusing_url, refused) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+            let (free_url, served) = spawn_recording_stub(r#"{"choices":[]}"#).await;
+            let router = quick_retry_router();
+            register_fleet(
+                &router,
+                shape,
+                &prefill_url,
+                &[refusing_url.as_str(), free_url.as_str()],
+            );
+            router
+                .policy_registry
+                .set_decode_policy(Arc::new(Favours(refusing_url)));
+
+            let response = chat_through(&router, false).await;
+
+            assert_eq!(
+                (
+                    response.status(),
+                    refused.lock().unwrap().len(),
+                    served.lock().unwrap().len()
+                ),
+                (StatusCode::OK, 1, 1),
+                "{shape:?}: the answer, the attempts on the refusing decode worker, the \
+                 requests the free one served"
+            );
+        }
+    }
+
+    /// A decode worker's 503 is replayed, and the retry leaves the worker
+    /// that gave it while another decode worker is available, even under a
+    /// policy that picks that worker whenever it is a candidate: one attempt
+    /// on it, then the free worker's answer. Both dispatch shapes.
+    #[tokio::test]
+    async fn the_retry_leaves_a_decode_worker_that_answered_503() {
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            let prefill_url = healthy_stub(shape, PdSide::Prefill).await;
+            let (refusing_url, refused) = refusing_stub(StatusCode::SERVICE_UNAVAILABLE).await;
+            let (free_url, served) = spawn_recording_stub(r#"{"choices":[]}"#).await;
+            let router = quick_retry_router();
+            register_fleet(
+                &router,
+                shape,
+                &prefill_url,
+                &[refusing_url.as_str(), free_url.as_str()],
+            );
+            router
+                .policy_registry
+                .set_decode_policy(Arc::new(Favours(refusing_url)));
+
+            let response = chat_through(&router, false).await;
+
+            assert_eq!(
+                (
+                    response.status(),
+                    refused.lock().unwrap().len(),
+                    served.lock().unwrap().len()
+                ),
+                (StatusCode::OK, 1, 1),
+                "{shape:?}: the answer, the attempts on the refusing decode worker, the \
+                 requests the free one served"
+            );
+        }
+    }
+
+    /// The prefill side's twin of the lone decode worker: a prefill worker's
+    /// own 500, answered before the side's first byte, is its answer for
+    /// the payload. With no other pair to take the request it makes one
+    /// attempt and the client reads the worker's 500. A 503 is replayed for
+    /// every attempt the retry config allows. Both dispatch shapes.
+    #[tokio::test]
+    async fn a_lone_prefill_workers_own_500_goes_back_after_one_attempt() {
+        let mut mismatches = Vec::new();
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            for (status, replayed) in [
+                (StatusCode::INTERNAL_SERVER_ERROR, false),
+                (StatusCode::SERVICE_UNAVAILABLE, true),
+            ] {
+                let (prefill_url, arrivals) = refusing_stub(status).await;
+                let decode_url = healthy_stub(shape, PdSide::Decode).await;
+                let router = quick_retry_router();
+                register_fleet(&router, shape, &prefill_url, &[decode_url.as_str()]);
+
+                let response = chat_through(&router, false).await;
+
+                let attempts = arrivals.lock().unwrap().len();
+                let expected = if replayed {
+                    router.retry_config.max_retries as usize
+                } else {
+                    1
+                };
+                if response.status() != status || attempts != expected {
+                    mismatches.push(format!(
+                        "{shape:?}: {} after {attempts} attempts on the refusing prefill worker, \
+                         expected {status} after {expected}",
+                        response.status()
+                    ));
+                }
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// With another prefill worker available the retry leaves the prefill
+    /// worker that answered its own 500, even under a policy that picks
+    /// that worker whenever it is a candidate: one attempt on it, then the
+    /// answer through the free worker. Both dispatch shapes.
+    #[tokio::test]
+    async fn the_retry_leaves_a_prefill_worker_that_answered_its_own_500() {
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            let (refusing_url, refused) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+            let (free_url, served) =
+                spawn_recording_stub(healthy_answer(shape, PdSide::Prefill)).await;
+            let decode_url = healthy_stub(shape, PdSide::Decode).await;
+            let router = quick_retry_router();
+            for prefill_url in [&refusing_url, &free_url] {
+                register_fleet(&router, shape, prefill_url, &[decode_url.as_str()]);
+            }
+            router
+                .policy_registry
+                .set_prefill_policy(Arc::new(Favours(refusing_url)));
+
+            let response = chat_through(&router, false).await;
+
+            assert_eq!(
+                (
+                    response.status(),
+                    refused.lock().unwrap().len(),
+                    served.lock().unwrap().len()
+                ),
+                (StatusCode::OK, 1, 1),
+                "{shape:?}: the answer, the attempts on the refusing prefill worker, the \
+                 requests the free one served"
+            );
+        }
+    }
+
+    /// The last prefill worker that can pair is not left on its own 500
+    /// while another decode worker can take the request with it: the retry
+    /// leaves the decode partner and keeps the prefill worker, as it does
+    /// on the other side, even under a policy that picks that decode worker
+    /// whenever it is a candidate. One attempt with each decode worker, then
+    /// the prefill worker's 500 goes back. Both dispatch shapes.
+    #[tokio::test]
+    async fn the_retry_leaves_the_partner_of_the_last_prefill_worker_that_can_pair() {
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            let (prefill_url, refused) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+            let first_url = healthy_stub(shape, PdSide::Decode).await;
+            let second_url = healthy_stub(shape, PdSide::Decode).await;
+            let router = quick_retry_router();
+            register_fleet(
+                &router,
+                shape,
+                &prefill_url,
+                &[first_url.as_str(), second_url.as_str()],
+            );
+            router
+                .policy_registry
+                .set_decode_policy(Arc::new(Favours(first_url)));
+
+            let response = chat_through(&router, false).await;
+
+            assert_eq!(
+                (response.status(), refused.lock().unwrap().len()),
+                (StatusCode::INTERNAL_SERVER_ERROR, 2),
+                "{shape:?}: the answer, the attempts on the refusing prefill worker"
+            );
+        }
+    }
+
+    /// A decode side's status can carry its prefill partner's part of the
+    /// handoff, so the last decode worker that can pair is not left on its
+    /// own 500 while another prefill worker can take the request: the retry
+    /// leaves the prefill partner and keeps the decode worker, even under a
+    /// policy that picks that prefill worker whenever it is a candidate.
+    /// One attempt a prefill worker, then the decode worker's 500 goes
+    /// back. Both dispatch shapes.
+    #[tokio::test]
+    async fn the_retry_leaves_the_partner_of_the_last_decode_worker_that_can_pair() {
+        for shape in [Shape::Sequential, Shape::Parallel] {
+            let answer = healthy_answer(shape, PdSide::Prefill);
+            let (first_url, first) = spawn_recording_stub(answer).await;
+            let (second_url, second) = spawn_recording_stub(answer).await;
+            let (decode_url, refused) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+            let router = quick_retry_router();
+            for prefill_url in [&first_url, &second_url] {
+                register_fleet(&router, shape, prefill_url, &[decode_url.as_str()]);
+            }
+            router
+                .policy_registry
+                .set_prefill_policy(Arc::new(Favours(first_url)));
+
+            let response = chat_through(&router, false).await;
+
+            assert_eq!(
+                (response.status(), refused.lock().unwrap().len()),
+                (StatusCode::INTERNAL_SERVER_ERROR, 2),
+                "{shape:?}: the answer, the attempts on the refusing decode worker"
+            );
+            // The sequential shape's prefill side runs first, so its servers
+            // count every attempt that chose them.
+            if matches!(shape, Shape::Sequential) {
+                assert_eq!(
+                    (first.lock().unwrap().len(), second.lock().unwrap().len()),
+                    (1, 1),
+                    "the requests each prefill worker took"
+                );
+            }
+        }
+    }
+
+    /// The alternative to a decode worker that answered its own 500 is a
+    /// decode worker an available prefill worker can hand off to. A decode
+    /// worker whose only compatible prefill worker is down is none: the
+    /// client reads the worker's 500 after one attempt, where a retry would
+    /// find no pair and answer the placement's refusal in its place.
+    #[tokio::test]
+    async fn a_decode_worker_no_prefill_worker_can_hand_off_to_is_no_alternative() {
+        let prefill_url = healthy_stub(Shape::Sequential, PdSide::Prefill).await;
+        let (decode_url, refused) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let (unpaired_url, unpaired) = spawn_recording_stub(r#"{"choices":[]}"#).await;
+        let router = quick_retry_router();
+        let register = |url: &str, worker_type: WorkerType, connector: &str, ready: bool| {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector(connector)
+                .build();
+            if ready {
+                worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            }
+            router.worker_registry.register_or_replace(Arc::new(worker));
+        };
+        register(&prefill_url, WorkerType::Prefill, "NixlConnector", true);
+        register(&decode_url, WorkerType::Decode, "NixlConnector", true);
+        // A second pair on another transfer protocol, its prefill worker not
+        // ready: its decode worker is available and cannot be paired.
+        register(
+            "http://127.0.0.1:9",
+            WorkerType::Prefill,
+            "MoRIIOConnector",
+            false,
+        );
+        register(&unpaired_url, WorkerType::Decode, "MoRIIOConnector", true);
+
+        let response = chat_through(&router, false).await;
+
+        assert_eq!(
+            (
+                response.status(),
+                refused.lock().unwrap().len(),
+                unpaired.lock().unwrap().len()
+            ),
+            (StatusCode::INTERNAL_SERVER_ERROR, 1, 0),
+            "the answer, the attempts on the decode worker that answered, the requests the \
+             unpaired decode worker took"
+        );
+    }
+
+    /// The concurrent-write dispatch settles a decode worker's own 500 as
+    /// the other two shapes do: a lone pair makes one attempt and the
+    /// client reads the worker's 500.
+    #[tokio::test]
+    async fn a_concurrent_write_pairs_decode_500_goes_back_after_one_attempt() {
+        let computing = std::time::Duration::from_secs(30);
+        let (prefill_url, _) = spawn_delayed_stub(StatusCode::OK, json!({}), computing).await;
+        let (decode_url, refused) = refusing_stub(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let router = quick_retry_router();
+        register_moriio_pair_with(
+            &router,
+            (prefill_url, Some("write")),
+            (decode_url, "write"),
+            &[CONCURRENT_WRITE],
+        );
+
+        let response = moriio_call(&router, "/v1/chat/completions", None, &json!({})).await;
+
+        assert_eq!(
+            (response.status(), refused.lock().unwrap().len()),
+            (StatusCode::INTERNAL_SERVER_ERROR, 1),
+            "the answer, the attempts on the refusing decode worker"
+        );
+    }
+
+    /// On the parallel dispatch a status one side fails with by itself is
+    /// recorded on that side's worker alone, as the sequential path and the
+    /// gRPC prefill-decode route record it: its own error status, or a call
+    /// to it that failed below HTTP, including a successful response whose
+    /// body was cut. Every worker's breaker opens on its first failure here,
+    /// so a charge to either side shows: the failing side's is open after one
+    /// request and its partner's is closed.
+    /// Charged with its partner's failure, a healthy worker leaves the
+    /// rotation with the failing one.
+    #[tokio::test]
+    async fn a_sides_own_failure_is_charged_to_its_worker_alone() {
+        use Fault::{CutAfterHead, Refuses, Unreachable};
+        use PdSide::{Decode, Prefill};
+
+        let rows = [
+            (Decode, Refuses(StatusCode::INTERNAL_SERVER_ERROR)),
+            (Decode, Unreachable),
+            (Decode, CutAfterHead),
+            (Prefill, Refuses(StatusCode::INTERNAL_SERVER_ERROR)),
+            (Prefill, Unreachable),
+        ];
+        let mut mismatches = Vec::new();
+        for (side, fault) in rows {
+            let (failing_url, _refusing) = faulty_stub(fault).await;
+            let healthy_url = healthy_stub(Shape::Parallel, side.partner()).await;
+            let failing = fragile_worker(
+                failing_url,
+                match side {
+                    Prefill => WorkerType::Prefill,
+                    Decode => WorkerType::Decode,
+                },
+            );
+            let partner = fragile_worker(
+                healthy_url,
+                match side {
+                    Prefill => WorkerType::Decode,
+                    Decode => WorkerType::Prefill,
+                },
+            );
+            let router = single_attempt_router();
+            for worker in [&failing, &partner] {
+                router
+                    .worker_registry
+                    .register_or_replace(Arc::clone(worker));
+            }
+
+            let response = chat_through(&router, false).await;
+
+            let charged = (
+                !failing.circuit_breaker_can_execute(),
+                !partner.circuit_breaker_can_execute(),
+            );
+            if response.status().is_success() || charged != (true, false) {
+                mismatches.push(format!(
+                    "{side:?} {fault:?}: {}, the failing side's breaker open: {}, its partner's breaker open: {}",
+                    response.status(),
+                    charged.0,
+                    charged.1
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "a side's own failure is not its worker's alone:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    /// A non-streamed decode body cut on the sequential path is the decode
+    /// worker's failure, not the successful response head recorded earlier.
+    #[tokio::test]
+    async fn a_sequential_decode_cut_is_charged_to_the_decode_worker() {
+        let (decode_url, _refusing) = faulty_stub(Fault::CutAfterHead).await;
+        let prefill_url = healthy_stub(Shape::Sequential, PdSide::Prefill).await;
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("NixlConnector")
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(decode_url)
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Vllm)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let router = single_attempt_router();
+        for worker in [&prefill, &decode] {
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(worker));
+        }
+
+        let response = chat_through(&router, false).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            prefill.circuit_breaker_can_execute(),
+            "the decode's cut is charged to the prefill worker"
+        );
+        assert!(!decode.circuit_breaker_can_execute());
+    }
+
+    /// Retrying one request after its sequential decode body is cut charges
+    /// that request to the decode worker once, not once per attempt.
+    #[tokio::test]
+    async fn retried_sequential_decode_cuts_charge_one_breaker_failure() {
+        let (decode_url, _refusing) = faulty_stub(Fault::CutAfterHead).await;
+        let (prefill_url, attempts) =
+            spawn_recording_stub(healthy_answer(Shape::Sequential, PdSide::Prefill)).await;
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill)
+                .runtime_type(RuntimeType::Vllm)
+                .kv_connector("NixlConnector")
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(decode_url)
+                .worker_type(WorkerType::Decode)
+                .runtime_type(RuntimeType::Vllm)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let router = PDRouter {
+            retry_config: RetryConfig {
+                max_retries: 2,
+                initial_backoff_ms: 1,
+                max_backoff_ms: 1,
+                ..Default::default()
+            },
+            ..create_test_pd_router()
+        };
+        for worker in [&prefill, &decode] {
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router
+                .worker_registry
+                .register_or_replace(Arc::clone(worker));
+        }
+
+        let response = chat_through(&router, false).await;
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            attempts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            2
+        );
+        assert!(
+            decode.circuit_breaker_can_execute(),
+            "one request's retried decode cuts opened the breaker"
+        );
+    }
+
+    /// The parallel dispatch's twin: a decode worker's 503 is replayed for
+    /// every attempt the retry config allows, and the request charges that
+    /// worker once.
+    #[tokio::test]
+    async fn retried_parallel_decode_refusals_charge_one_breaker_failure() {
+        let prefill_url = healthy_stub(Shape::Parallel, PdSide::Prefill).await;
+        let (decode_url, attempts) = refusing_stub(StatusCode::SERVICE_UNAVAILABLE).await;
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(decode_url)
+                .worker_type(WorkerType::Decode)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        decode.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        let router = quick_retry_router();
+        let prefill = create_test_worker(prefill_url, WorkerType::Prefill, true);
+        for worker in [Arc::from(prefill), Arc::clone(&decode)] {
+            router.worker_registry.register_or_replace(worker);
+        }
+
+        let response = chat_through(&router, false).await;
+
+        assert_eq!(
+            (response.status(), attempts.lock().unwrap().len()),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                router.retry_config.max_retries as usize
+            ),
+            "the answer and the attempts on the refusing decode worker"
+        );
+        assert!(
+            decode.circuit_breaker_can_execute(),
+            "one request's retried decode refusals opened the breaker"
+        );
+    }
+
+    /// The drain's twin: a streamed request's prefill body is cut on every
+    /// attempt while its decode worker refuses, and the request charges the
+    /// prefill worker once.
+    #[tokio::test]
+    async fn retried_prefill_drain_cuts_charge_one_breaker_failure() {
+        let (prefill_url, _) = faulty_stub(Fault::CutAfterHead).await;
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(WorkerType::Prefill)
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        prefill.set_status(openai_protocol::worker::WorkerStatus::Ready);
+        // The decode worker refuses once the attempt's drain has read the cut
+        // and let go of the prefill worker.
+        let drained = Arc::clone(&prefill);
+        let refusals = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&refusals);
+        let decode = axum::Router::new().fallback(axum::routing::any(move || {
+            let (drained, counted) = (Arc::clone(&drained), Arc::clone(&counted));
+            async move {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while drained.load() != 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("the attempt's prefill drain must release its guard");
+                counted.fetch_add(1, Ordering::SeqCst);
+                (StatusCode::SERVICE_UNAVAILABLE, REFUSAL)
+            }
+        }));
+        let router = quick_retry_router();
+        let decode = create_test_worker(spawn_stub(decode).await, WorkerType::Decode, true);
+        for worker in [Arc::clone(&prefill), Arc::from(decode)] {
+            router.worker_registry.register_or_replace(worker);
+        }
+
+        let response = chat_through(&router, true).await;
+
+        assert_eq!(
+            (response.status(), refusals.load(Ordering::SeqCst)),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                router.retry_config.max_retries as usize
+            ),
+            "the answer and the attempts on the refusing decode worker"
+        );
+        assert!(
+            prefill.circuit_breaker_can_execute(),
+            "one request's retried prefill body cuts opened the breaker"
+        );
+        // ...and the request did charge it: the next request's failure is the
+        // second one the breaker counts, and opens it.
+        AttemptLedger::default().record_outcome(prefill.as_ref(), 503);
+        assert!(
+            !prefill.circuit_breaker_can_execute(),
+            "the request's one charge reached the prefill worker's breaker"
+        );
+    }
+
     /// A request with no prefill/decode pair to take it is refused with the
     /// `no_available_workers` 503, marked as reported for the access log,
     /// and written at WARN within the per-second allowance, never at ERROR:
@@ -7344,7 +12179,7 @@ mod tests {
             }))
             .expect("valid chat request");
             let response = router
-                .route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID)
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
             assert_eq!(
@@ -7365,6 +12200,275 @@ mod tests {
             refusal_lines.load(Ordering::Relaxed) <= allowance,
             "{refusals} refusals inside one second write at most {allowance} lines"
         );
+    }
+
+    /// A pair of a model that the policy spec in force binds no pair plan
+    /// for is refused with a 501 under the cause's own code, with no retry
+    /// hint, in words that name the cause, though both its workers are
+    /// open: no worker is asked. The refusal is marked as reported and
+    /// written at WARN, never at ERROR. Judged from the pools, the client
+    /// read "No available decode workers" and was told to come back in a
+    /// second.
+    #[tokio::test]
+    async fn a_pair_the_spec_binds_no_plan_for_is_refused_501_with_no_retry_hint() {
+        let errors = Arc::new(AtomicUsize::new(0));
+        let refusal_lines = Arc::new(AtomicUsize::new(0));
+        let _subscriber = test_subscriber(RefusalLineCounter {
+            errors: Arc::clone(&errors),
+            refusal_lines: Arc::clone(&refusal_lines),
+        });
+        // Nothing listens at either address: a request that reached one
+        // would answer a failed dispatch.
+        let router = pair_router_under(
+            false,
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:10".to_string(),
+        );
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+        let response = router
+            .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            placement::NO_PLAN_BOUND_CODE
+        );
+        assert!(response.headers().get(RETRY_AFTER).is_none());
+        assert!(
+            response.extensions().get::<ReportedRefusal>().is_some(),
+            "the refusal is marked as reported, so the access log keeps quiet"
+        );
+        assert_eq!(errors.load(Ordering::Relaxed), 0);
+        assert_eq!(refusal_lines.load(Ordering::Relaxed), 1);
+        // The client's words name the model the request was routed under.
+        assert_eq!(
+            error_message(response).await,
+            format!("the policy spec in force binds no pair plan for model '{UNKNOWN_MODEL_ID}'")
+        );
+    }
+
+    /// A pair router whose engine runs a stock document, over one registered
+    /// pair at the two addresses. Where `pair_plan`, the stock pair of two
+    /// rotations, which binds a pair plan for every model. Else the stock
+    /// rotation, which binds single requests alone: no pair plan for any
+    /// model.
+    fn pair_router_under(pair_plan: bool, prefill_url: String, decode_url: String) -> PDRouter {
+        use smg_grand_central::document::{AppliedSpec, PolicySpec};
+
+        use crate::config::types::RoutingKeyOverrideConfig;
+
+        let document = if pair_plan {
+            PolicySpec::pair_presets("round_robin", "round_robin")
+        } else {
+            PolicySpec::preset("round_robin")
+        };
+        let document = document.expect("a stock document");
+        let policies = PolicyRegistry::for_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        engine_on(
+            &policies,
+            AppliedSpec::validate(&document).expect("a valid document"),
+        );
+        let router = PDRouter {
+            policy_registry: Arc::new(policies),
+            ..create_test_pd_router()
+        };
+        register_pd_pair(&router, prefill_url, decode_url);
+        router
+    }
+
+    /// A pair no plan binds is counted as a verdict on the configuration,
+    /// as a pair no transfer protocol joins is: by its status for the type,
+    /// and under the reason of a fleet that cannot serve the request as it
+    /// is configured. No worker was asked, and the gateway's own processing
+    /// did not fail: counted by its status alone, the reason read
+    /// `internal`.
+    #[test]
+    fn a_pair_no_plan_binds_is_counted_as_a_configuration_verdict() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let router = pair_router_under(
+            false,
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:10".to_string(),
+        );
+        let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .expect("valid chat request");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let response = metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(router.route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID))
+        });
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains("router_type=\"http\"")
+                    && line.contains("backend_type=\"pd\"")
+            })
+            .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"backend_error\""), "{line}");
+        assert!(line.contains("reason=\"no_capable_worker\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// The deep probe gets the answer routing gives. Under a spec that
+    /// binds a pair plan for every model it reads a healthy pair as
+    /// healthy, as it did. Under one that binds no pair plan for the name
+    /// the probe asks under, it reads the unbound plan's 501: judged from
+    /// the pools, it read `no_healthy_worker_pair` on a fleet with nobody
+    /// down.
+    #[tokio::test]
+    async fn the_deep_probe_reads_an_unbound_plan_as_routing_does() {
+        async fn probe(pair_plan: bool) -> Response {
+            let answering =
+                || spawn_stub(axum::Router::new().fallback(|| async { StatusCode::OK }));
+            let router = pair_router_under(pair_plan, answering().await, answering().await);
+            let request = Request::builder().body(Body::empty()).unwrap();
+            tokio::time::timeout(ROUND_TRIP_GUARD, router.health_generate(request))
+                .await
+                .expect("the probe answers")
+        }
+        let healthy = probe(true).await;
+        assert_eq!(healthy.status(), StatusCode::OK);
+        let refused = probe(false).await;
+        assert_eq!(refused.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            placement::NO_PLAN_BOUND_CODE
+        );
+    }
+
+    /// A pair router whose engine answers a pair as `refusing` says, over one
+    /// registered pair whose workers stand open. Nothing listens at either
+    /// address: a request that reached one would answer a failed dispatch.
+    fn pair_router_refusing(refusing: Refusing) -> PDRouter {
+        use crate::config::types::RoutingKeyOverrideConfig;
+
+        let policies = PolicyRegistry::for_engine(
+            PolicyConfig::RoundRobin,
+            RoutingKeyOverrideConfig::default(),
+        );
+        refusing.pair_on(&policies);
+        let router = PDRouter {
+            policy_registry: Arc::new(policies),
+            ..create_test_pd_router()
+        };
+        register_pd_pair(
+            &router,
+            "http://127.0.0.1:9".to_string(),
+            "http://127.0.0.1:10".to_string(),
+        );
+        router
+    }
+
+    /// What the pair route answers a pair by the engine's word, though both
+    /// its workers are open: no worker is asked. A pair's decision the
+    /// engine refuses is the 500 `grand_central_decision_failed`, with no
+    /// retry hint, and the route does not replay it. Judged from the pools,
+    /// the client read "No available decode workers" and was told to come
+    /// back in a second. A filter that keeps no prefill reads as the
+    /// prefill's role unavailable, in the role's own sentence, and the
+    /// refusal's line names the filter and the side the answer is for: the
+    /// decode's where the placement answers for the decodes. The gateway's
+    /// own pair selection has no like case for the first: it has no engine
+    /// to refuse. For the second it names a policy that picked nobody
+    /// (`pair_pass`, in `model_gateway/src/routers/common/placement.rs`),
+    /// and no stage: it has none.
+    #[tokio::test]
+    async fn the_pair_route_answers_a_pair_by_the_engines_word() {
+        let answered = |refusing: Refusing| async move {
+            let router = pair_router_refusing(refusing);
+            let tenant = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "hi"}],
+            }))
+            .expect("valid chat request");
+            router
+                .route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID)
+                .await
+        };
+
+        let faulted = answered(Refusing::Faulted).await;
+        assert_eq!(faulted.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error::extract_error_code_from_response(&faulted),
+            placement::DECISION_FAILED_CODE
+        );
+        assert!(faulted.headers().get(RETRY_AFTER).is_none());
+        assert!(!is_retryable_response(&faulted));
+
+        let nobody = answered(Refusing::Nobody).await;
+        assert_eq!(nobody.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&nobody),
+            placement::NO_AVAILABLE_WORKERS_CODE
+        );
+        assert_eq!(
+            placement::refusal_reason(&nobody),
+            Some("Grand Central shed the pair under nobody, answered for its prefill side")
+        );
+        assert_eq!(
+            error_message(nobody).await,
+            "No available servers: No available prefill workers (all circuits open or \
+             unhealthy)"
+        );
+
+        // The side is the one the answer is for: under the same word the
+        // line says the decode's where the placement answers for the decodes.
+        let for_decodes = PairFailure {
+            role: WorkerRole::Decode,
+            verdict: PlacementFailure::ShedUnder("nobody"),
+        };
+        let PdSelectionFailure::ShedUnder(sentence, reason) = PDRouter::pair_failure(for_decodes)
+        else {
+            panic!("a shed under the engine's word is answered as one");
+        };
+        assert_eq!(
+            sentence,
+            "No available decode workers (all circuits open or unhealthy)"
+        );
+        assert_eq!(
+            reason,
+            "Grand Central shed the pair under nobody, answered for its decode side"
+        );
+    }
+
+    /// The deep probe gets the answer routing gives for a decision the
+    /// engine refuses too: the 500 `grand_central_decision_failed`, with no
+    /// retry hint, and no worker is asked. Judged from the pools, the probe
+    /// read the 503 `no_healthy_worker_pair` on a fleet with nobody down.
+    #[tokio::test]
+    async fn the_deep_probe_reads_a_refused_decision_as_routing_does() {
+        let router = pair_router_refusing(Refusing::Faulted);
+        let request = Request::builder().body(Body::empty()).unwrap();
+        let refused = tokio::time::timeout(ROUND_TRIP_GUARD, router.health_generate(request))
+            .await
+            .expect("the probe answers");
+        assert_eq!(refused.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error::extract_error_code_from_response(&refused),
+            placement::DECISION_FAILED_CODE
+        );
+        assert!(refused.headers().get(RETRY_AFTER).is_none());
     }
 
     /// A refusal this router answers on its own (no prefill/decode pair to
@@ -7388,7 +12492,7 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let response = metrics::with_local_recorder(&recorder, || {
-            runtime.block_on(router.route_chat(None, &tenant, chat, UNKNOWN_MODEL_ID))
+            runtime.block_on(router.route_chat(None, &tenant, Arc::new(chat), UNKNOWN_MODEL_ID))
         });
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
@@ -7427,10 +12531,10 @@ mod tests {
                 .build(),
         );
         let guards = PdLoadGuards {
-            prefill: PrefillLoadGuard::Unbounded {
-                _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
-            },
-            decode: WorkerLoadGuard::new(Arc::clone(&decode), None),
+            prefill: PrefillAhead::classic(PrefillLoadGuard::Unbounded {
+                _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), None),
+            }),
+            decode: DecodeAhead::new(Placed::from(Arc::clone(&decode)), None),
         };
         assert_eq!((prefill.load(), decode.load()), (1, 1));
         let mut headers = HeaderMap::new();
@@ -7459,4 +12563,6 @@ mod tests {
         drop(setup);
         assert_eq!((prefill.load(), decode.load()), (0, 0));
     }
+
+    mod grand_central;
 }

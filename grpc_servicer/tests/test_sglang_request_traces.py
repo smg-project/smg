@@ -66,6 +66,8 @@ class FakeTimeStats:
 @pytest.fixture
 def sglang_tracing(monkeypatch):
     """The SGLang pieces `RequestTraces` imports, as stand-ins."""
+    # Keep preloaded modern engine types out of this legacy-layout fixture.
+    monkeypatch.setitem(sys.modules, "sglang.srt.disaggregation.mode", None)
     monkeypatch.setattr(FakeTimeStats, "created", [])
     monkeypatch.setattr(FakeTimeStats, "tracing_on", True)
     switch = {"enabled": True}
@@ -77,7 +79,12 @@ def sglang_tracing(monkeypatch):
     _install(
         monkeypatch, "sglang.srt.observability.req_time_stats", APIServerReqTimeStats=FakeTimeStats
     )
-    _install(monkeypatch, "sglang.srt.disaggregation.utils", DisaggregationMode=lambda mode: mode)
+    _install(
+        monkeypatch,
+        "sglang.srt.disaggregation.utils",
+        DisaggregationMode=lambda mode: mode,
+        FAKE_BOOTSTRAP_HOST="2.2.2.2",
+    )
     _install(
         monkeypatch,
         "sglang.srt.runtime_context",

@@ -192,10 +192,9 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
 
 /// `GetLoads`: the per-rank load piggybacked on engine output, in the gRPC
 /// response shape the Python servicer derives from the scheduler's load
-/// replies (pages in use become tokens, running is total minus waiting), with
-/// the servicer's own bookkeeping ([`crate::load_tracker`]) for the queued
-/// token-work, the prefill and generation throughput and the hit rate this
-/// wire's load tail does not carry, each rank's own.
+/// replies, including resident and pending uncached tokens when reported.
+/// The servicer estimates queued work only when the engine omits it, and
+/// supplies the throughput and hit rate from its own bookkeeping.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsResponse, Status> {
     let client = state.shared.engine()?;
     if state.encode_role.is_some() {
@@ -220,7 +219,7 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
         capacity.max_total_num_tokens,
         ranks,
         dp_rank,
-        |load, figures| reported_entry(state, load, figures, &capacity),
+        |load, figures| reported_entry(state, load, figures, &capacity, client),
         |dp_rank| unreported_entry(state, dp_rank, &capacity),
     );
     let aggregate = ts::AggregateMetrics {
@@ -257,20 +256,19 @@ pub(super) fn rank_load(state: &State, dp_rank: Option<i32>) -> Option<ts::Sched
         capacity.max_total_num_tokens,
         state.shared.rank_count(state.model.data_parallel_size),
         dp_rank,
-        |load, figures| reported_entry(state, load, figures, &capacity),
+        |load, figures| reported_entry(state, load, figures, &capacity, client),
         |rank| unreported_entry(state, rank, &capacity),
     )
 }
 
-/// A reported rank's entry: the snapshot's figures with, from this
-/// servicer's own bookkeeping ([`crate::load_tracker`]), the queued
-/// token-work, prefill/generation throughput and hit rate this wire's load
-/// tail does not carry, the rank's own.
+/// Engine-reported queued work takes precedence over the servicer's
+/// estimate, including a reported zero.
 fn reported_entry(
     state: &State,
     load: &SchedulerLoadSnapshot,
     figures: &RankFigures,
     capacity: &Capacity,
+    client: &ZmqEngineClient,
 ) -> ts::SchedulerLoad {
     let estimate = state
         .shared
@@ -289,7 +287,14 @@ fn reported_entry(
         // The direct TokenSpeed wire reports active pages, excluding
         // retained cache (unlike the Python legacy GetLoad projection).
         active_token_usage: Some(figures.usage),
-        num_waiting_uncached_tokens: estimate.queued_token_work,
+        num_resident_tokens: load.num_resident_tokens,
+        // The shared snapshot maps absence to zero; read the wire's presence here.
+        num_waiting_uncached_tokens: client
+            .engine_load(load.dp_rank as u32)
+            .and_then(|load| load.num_waiting_uncached_tokens)
+            .map_or(estimate.queued_token_work, |tokens| {
+                i32::try_from(tokens).unwrap_or(i32::MAX)
+            }),
         gen_throughput: estimate.gen_throughput,
         prefill_throughput: estimate.prefill_throughput,
         cache_hit_rate: estimate.cache_hit_rate,

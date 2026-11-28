@@ -4,7 +4,7 @@ Exercises router → gRPC → MLX worker. Backend-scoped (separate from
 `chat_completions/`) because the fixtures need a macOS runner and a
 different model than the sglang/vllm/trtllm parameterization.
 
-Run: `E2E_RUNTIME=mlx pytest e2e_test/mlx/test_mlx_backend.py -v`
+Run: `E2E_RUNTIME=mlx E2E_ENGINE=mlx pytest e2e_test/mlx/test_mlx_backend.py -v`
 """
 
 from __future__ import annotations

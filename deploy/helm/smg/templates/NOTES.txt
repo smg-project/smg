@@ -5,6 +5,20 @@ Router:
   Metrics:  http://{{ $fullname }}-router:{{ .Values.router.metrics.port }}/metrics
   Policy:   {{ .Values.router.policy }}
 
+{{- if (.Values.grandCentral).enabled }}
+
+Grand Central:
+  gRPC:     {{ $fullname }}-grand-central:{{ .Values.grandCentral.ports.gateway }}
+  Metrics:  http://{{ $fullname }}-grand-central:{{ .Values.grandCentral.ports.admin }}/metrics
+{{- if include "smg.grandCentralElection" . }}
+{{- if not (include "smg.grandCentralReplicationAsTold" .) }}
+  Standby:  follows no leader and takes over with no worker and no load: grandCentral.identityAsTold does not name replication (the chart's README, Standby)
+{{- else if include "smg.grandCentralServesTls" . }}
+  Standby:  follows no leader and takes over with no worker and no load: the controller's listeners serve TLS, and a standby's dial has no credential yet (the chart's README, Standby)
+{{- end }}
+{{- end }}
+{{- end }}
+
 {{- if .Values.router.ingress.enabled }}
 
 Ingress:

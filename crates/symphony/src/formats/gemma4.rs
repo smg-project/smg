@@ -156,7 +156,7 @@ mod tests {
         assert_eq!(names, ["play", "play"]);
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::ToolCallEnd { index: 1, source } if source.text == "<tool_call|>"
+            Event::ToolCallEnd { index: 1, source, .. } if source.text == "<tool_call|>"
         )));
         assert!(malformed(&events).is_empty());
     }

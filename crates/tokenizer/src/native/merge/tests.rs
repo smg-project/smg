@@ -1,7 +1,7 @@
 use std::collections::{hash_map::Entry, HashSet};
 
 use rustc_hash::FxHashMap;
-use tiktoken_rs::CoreBPE;
+use tiktoken_rs::{byte_pair_split, CoreBPE};
 use tokenizers::{
     models::{
         bpe::{Merges, Vocab, BPE},
@@ -15,6 +15,7 @@ use super::{
     super::bytes_char, ByteTokens, Merge, MergeTable, BUCKET, HOT_SIDE, PAIR_FILTER_BITS_PER_MERGE,
     SHORT_PIECE_SMALL, SHORT_PIECE_SYMBOLS, SHORT_PIECE_TINY,
 };
+use crate::word_cache::LateBoundModel;
 
 /// The byte-level alphabet as the first 256 entries of a vocabulary.
 fn alphabet_vocab() -> (Vocab, [char; 256]) {
@@ -499,6 +500,47 @@ fn a_rank_set_the_table_cannot_stand_in_for_declines() {
     );
 }
 
+/// `from_ranks` proves a token from two halves unless a pair across the cut
+/// merges first; each declined set below fails one comparison of that proof.
+#[test]
+fn a_token_is_declined_when_a_pair_across_its_halves_merges_first() {
+    // Merges in rank order from 256; the last one forms the token in question.
+    for (merges, taken) in [
+        // `bc` merges before the left half `ab` forms.
+        ([("b", "c"), ("a", "b"), ("c", "d"), ("ab", "cd")], false),
+        // `bc` merges before the right half `cd` forms.
+        ([("b", "c"), ("c", "d"), ("a", "b"), ("ab", "cd")], false),
+        // A tie: `ab` + `ab` across the cut ranks with the right half's
+        // `abab`, and the leftmost of a tie merges first.
+        (
+            [("a", "b"), ("ab", "ab"), ("abab", "c"), ("ab", "ababc")],
+            false,
+        ),
+        // `bc` ranks over both halves: nothing crosses the cut first.
+        ([("a", "b"), ("c", "d"), ("b", "c"), ("ab", "cd")], true),
+        // A tie of the halves' own steps: the walk meets `ab` + `ab`, and the
+        // right one formed last, so the pair before it is `ab` + `a` (`aba`,
+        // which ranks under it), not `b` + `ab`.
+        ([("ab", "a"), ("a", "b"), ("ab", "b"), ("ab", "abb")], false),
+    ] {
+        let ranks = ranks_of(&merges, false);
+        assert_eq!(
+            MergeTable::from_ranks(&ranks)
+                .err()
+                .map(|declined| declined.to_string()),
+            (!taken).then(|| "token 259 is not the merge of its bytes".to_string()),
+            "{merges:?}"
+        );
+        // The plain merge of the token's bytes says the same.
+        let token = format!("{}{}", merges[3].0, merges[3].1);
+        assert_eq!(
+            byte_pair_split(token.as_bytes(), &ranks) == [token.as_bytes()],
+            taken,
+            "{merges:?}"
+        );
+    }
+}
+
 #[test]
 fn the_leftmost_of_a_repeated_pair_merges_first() {
     // (a, a) is the only merge: "aaa" is [aa, a], never [a, aa].
@@ -900,9 +942,10 @@ fn two_byte_characters_on_one_id_merge_as_the_model_does() {
 }
 
 /// The table is the hot grid (`HOT_SIDE` x `HOT_SIDE` words) and its
-/// entries: a power of two of buckets, one cache line of four sixteen-byte
-/// entries each, at a load of one half or less, the pair filter, and the
-/// pre-formed character analysis counted apart.
+/// entries: exactly the buckets its merges need at a load of one half, one
+/// cache line of four sixteen-byte entries per two merges (two buckets at the
+/// least), the pair filter, and the pre-formed character analysis counted
+/// apart.
 #[test]
 fn the_tables_bytes_are_the_grid_the_filter_and_its_buckets_at_half_load_or_less() {
     let bpe = model_with(&merges(), false);
@@ -916,13 +959,13 @@ fn the_tables_bytes_are_the_grid_the_filter_and_its_buckets_at_half_load_or_less
     );
     let analysis = table.preformed.bytes();
     let entries = (table.bytes() - size_of::<MergeTable>() - grid - filter - analysis) / 16;
-    assert!(entries.is_power_of_two(), "{entries} entries");
-    assert!(
-        entries >= 2 * merges,
+    assert_eq!(
+        entries,
+        4 * merges.div_ceil(2).max(2),
         "{entries} entries for {merges} merges"
     );
     assert!(
-        entries < 4 * merges + 8,
+        entries >= 2 * merges,
         "{entries} entries for {merges} merges"
     );
 }
@@ -1014,6 +1057,38 @@ fn a_lookup_walks_a_full_bucket_into_the_next_and_stops_at_the_first_empty_entry
     // An absent pair that hashes to the full bucket and passes the filter
     // (its bits set as a merge's would be) is none: the walk crosses the
     // full bucket and ends at the next bucket's first empty entry.
+    let &(a, b) = rest.first().expect("a pair left over");
+    let (word, bits) = table.pair_filter_slot(MergeTable::pair_key(a, b));
+    table.pair_filter[word] |= bits;
+    assert!(table.pair_filter_admits(a, b));
+    assert_eq!(table.merge_of(a, b), Merge::NONE);
+}
+
+/// The walk goes on at the first bucket after the last: pairs that hash to
+/// the last bucket, one more than its entries, are all found (the walk
+/// wraps for the last of them at the latest), and a pair that hashes there
+/// too and passes the filter but was never inserted is none.
+#[test]
+fn a_lookup_walking_past_the_last_bucket_goes_on_at_the_first() {
+    let bpe = model_with(&merges(), false);
+    let mut table = table_of(&bpe);
+    let last = table.buckets.len() - 1;
+    // Pairs of ids no token of the model has whose first bucket is the last.
+    let pairs: Vec<(u32, u32)> = (1_000_000..1_100_000u32)
+        .map(|a| (a, a + 1))
+        .filter(|&(a, b)| table.first_bucket(MergeTable::pair_key(a, b)) == last)
+        .collect();
+    let (inserted, rest) = pairs.split_at(BUCKET + 1);
+    for (rank, &(a, b)) in inserted.iter().enumerate() {
+        table.insert(a, b, Merge::new(rank as u32, a));
+    }
+    for (rank, &(a, b)) in inserted.iter().enumerate() {
+        assert_eq!(
+            table.merge_of(a, b),
+            Merge::new(rank as u32, a),
+            "pair {rank}"
+        );
+    }
     let &(a, b) = rest.first().expect("a pair left over");
     let (word, bits) = table.pair_filter_slot(MergeTable::pair_key(a, b));
     table.pair_filter[word] |= bits;
@@ -1428,7 +1503,7 @@ fn a_run_of_one_character_overflows_the_stack_arrays_and_a_pair_no_token_holds_i
 
 /// The model as its section reads into the loading model (the one-pass
 /// read the loader's tables take their merges and largest id from).
-fn read_of(bpe: &BPE) -> crate::word_cache::LateBoundModel {
+fn read_of(bpe: &BPE) -> LateBoundModel {
     let json =
         serde_json::to_string(&ModelWrapper::BPE(bpe.clone())).expect("the model serializes");
     serde_json::from_str(&json).expect("the loading model reads its section")
@@ -1442,7 +1517,7 @@ fn section_of(
     merges: &[(&str, &str)],
     byte_fallback: bool,
     unk_token: Option<&str>,
-) -> crate::word_cache::LateBoundModel {
+) -> LateBoundModel {
     let vocab: std::collections::BTreeMap<&str, u32> = vocab
         .iter()
         .map(|(token, &id)| (token.as_str(), id))
@@ -1510,6 +1585,62 @@ fn the_read_of_a_section_builds_the_table_the_model_builds() {
     assert_eq!(
         MergeTable::from_model(late.wrapper(), ByteTokens::Alphabet, Some(read)).err(),
         MergeTable::from_model(late.wrapper(), ByteTokens::Alphabet, None).err()
+    );
+}
+
+/// A short merge's key is a pair's merge over seven position bits in one
+/// word whose top bit says no merge, so it carries the ranks under
+/// `MAX_RANKS`. `from_model` declines a model from that many merges on, one
+/// merge before the keys run out, and its own merge stays in place.
+#[test]
+fn a_model_with_more_merges_than_the_keys_carry_is_declined() {
+    use crate::word_cache::ReadBpe;
+    let model = ModelWrapper::BPE(model_with(&[("a", "b")], false));
+    // The merges as the one-pass read hands them over, one more than the
+    // keys carry: zeroed memory, refused by its length before an entry is
+    // read.
+    let read = ReadBpe {
+        pairs: Some(vec![[0u32; 3]; super::MAX_RANKS].into_boxed_slice()),
+        max_id: None,
+        dense: false,
+        tokens: None,
+        index: None,
+    };
+    assert_eq!(
+        MergeTable::from_model(&model, ByteTokens::Alphabet, Some(&read)).err(),
+        Some(super::Declined::from(
+            "more merges than a short merge's keys carry"
+        ))
+    );
+    // The keys at the bound, as `ShortMerge::set_pair` packs them.
+    let last = SHORT_PIECE_SYMBOLS - 1;
+    let mut short = super::ShortMerge::<SHORT_PIECE_SYMBOLS>::of(
+        std::iter::repeat_n(0, SHORT_PIECE_SYMBOLS),
+        SHORT_PIECE_SYMBOLS,
+    );
+    let mut key =
+        |rank: usize, product: u32, at: usize| short.set_pair(at, Merge::new(rank as u32, product));
+    let whole = key(0, 0x8000_0001, 1);
+    assert_eq!(
+        (whole >> super::SHORT_KEY_BITS) as u32,
+        0x8000_0001,
+        "the key carries the product whole, as `merge_at` reads it back"
+    );
+    assert!(
+        key(super::MAX_RANKS - 1, u32::MAX, last) < super::NO_MERGE,
+        "the greatest key of a rank the keys carry is a merge"
+    );
+    assert!(
+        key(super::MAX_RANKS - 3, u32::MAX, last) < key(super::MAX_RANKS - 2, 0, 0),
+        "a lower rank sorts first whatever its product and its position"
+    );
+    assert!(
+        key(super::MAX_RANKS, 0, 0) >= super::NO_MERGE,
+        "one rank more would read as no merge"
+    );
+    assert!(
+        short.set_pair(0, Merge::NONE) >= super::NO_MERGE,
+        "a pair that is no merge reads so at the first position too"
     );
 }
 

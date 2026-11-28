@@ -54,7 +54,7 @@ parent is known is rehashed the worker's way (SGLang's per-page SHA-256
 chain; vLLM's ``sha256_cbor`` with the default seed) and mismatches are
 counted, never dropped, so a worker with a different algorithm, seed or page
 size shows up as a counter. The algorithms and their test vectors mirror
-``crates/engine_servicer/src/engine_hash.rs``.
+``crates/engine_servicer/src/engine_hash.rs`` and the crate's ``tests/unit/engine_hash/tests.rs``.
 """
 
 from __future__ import annotations

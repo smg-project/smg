@@ -7,7 +7,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Instant};
 
 use engine_zmq_adapter::{
     fold_tokenizer_eos_backstop, kv_transfer_rejection_params, stops::take_vllm_string_stops,
-    VllmGenerateStream, ZmqEngineClient,
+    validate_cache_salt, VllmGenerateStream, ZmqEngineClient,
 };
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
@@ -117,6 +117,32 @@ fn python_bool(value: bool) -> &'static str {
         "True"
     } else {
         "False"
+    }
+}
+
+/// Drop the stop ids this servicer derived (single-token string stops, the
+/// tokenizer's EOS backstop) that lie past the model's vocabulary. The model
+/// can never sample them, so they could never stop anything (a string stop is
+/// still matched on the decoded text), and keeping them would make the
+/// engine client's vocabulary check refuse the request over ids the caller
+/// never sent. The derivations only append, so the first `caller_stop_count`
+/// ids are the caller's own, kept for that check to judge. A `vocab_size` of
+/// 0 (unknown) keeps everything.
+fn drop_unsampleable_derived_stops(
+    req: &mut vllm::GenerateRequest,
+    caller_stop_count: usize,
+    vocab_size: u32,
+) {
+    if vocab_size == 0 {
+        return;
+    }
+    if let Some(params) = req.sampling_params.as_mut() {
+        let mut position = 0;
+        params.stop_token_ids.retain(|id| {
+            let callers = position < caller_stop_count;
+            position += 1;
+            callers || *id < vocab_size
+        });
     }
 }
 
@@ -277,7 +303,7 @@ async fn submit(
     if let Some(params) = ec_params.as_ref() {
         encoder_cache::check_consumer_handoff(&req, &state.model, params)?;
     }
-    let ec_producer_leg = ec_params.is_some() && encoder_cache::is_producer(&state.model);
+    let ec_producer_side = ec_params.is_some() && encoder_cache::is_producer(&state.model);
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before anything slow: an `Abort` landing while the media is
     // processed must find the entry, and a duplicate id is refused up front.
@@ -295,6 +321,12 @@ async fn submit(
                     notice.disarm();
                 }
             })?;
+    // Refuse a bad salt before the media stage fetches anything, and after
+    // the registry, which keeps a live id from getting a notice. The adapter
+    // checks the salt again for its direct-ZMQ lane.
+    if let Some(salt) = req.cache_salt.as_deref() {
+        validate_cache_salt(salt).map_err(Status::invalid_argument)?;
+    }
     // Worker-side media: the request's references become engine features
     // and its prompt the expanded one, before the frontend duties below.
     let (processed_media, media_identity) = match process_media_refs(state, &mut req).await? {
@@ -304,7 +336,7 @@ async fn submit(
     // An encoder's request with router-preprocessed batches gets its identity
     // from the batches themselves (the media stage saw no reference).
     let media_identity = media_identity.or_else(|| {
-        ec_producer_leg
+        ec_producer_side
             .then(|| encoder_cache::producer_identity(&req, &state.model))
             .flatten()
             .map(Arc::new)
@@ -320,6 +352,10 @@ async fn submit(
     // stop ids) and come back as this servicer's own obligation; the
     // tokenizer's EOS set backstops a config without ids.
     let tokenizer = state.tokenizer();
+    let caller_stop_count = req
+        .sampling_params
+        .as_ref()
+        .map_or(0, |params| params.stop_token_ids.len());
     let stops = req
         .sampling_params
         .as_mut()
@@ -327,6 +363,7 @@ async fn submit(
         .unwrap_or_default();
     client.adopt_tokenizer_eos(tokenizer);
     fold_tokenizer_eos_backstop(&mut req, tokenizer);
+    drop_unsampleable_derived_stops(&mut req, caller_stop_count, state.model.vocab_size);
     let decoder = stop_decoder(state.tokenizer(), &stops, skip_special_tokens)?;
 
     // Admission ends here: the add is on the wire before `submit_with_aux`
@@ -404,7 +441,7 @@ async fn submit(
                 load,
                 VllmShape {
                     media_identity: media_identity.clone(),
-                    ec_producer_leg,
+                    ec_producer_side,
                 },
             ),
             decoder,
@@ -425,7 +462,7 @@ async fn submit(
 struct VllmShape {
     media_identity: Option<Arc<vllm::MediaIdentity>>,
     /// Whether this is the encoder side of an encoder-cache handoff.
-    ec_producer_leg: bool,
+    ec_producer_side: bool,
 }
 
 impl Shape for VllmShape {
@@ -452,10 +489,14 @@ impl Shape for VllmShape {
 
     fn completed(&self, state: &State, complete: &vllm::GenerateComplete) -> Result<(), Status> {
         match self.media_identity.as_deref() {
-            Some(identity) if self.ec_producer_leg => {
+            Some(identity) if self.ec_producer_side => {
                 encoder_cache::check_producer_handles(&state.model, identity, complete)
             }
             _ => Ok(()),
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/vllm/generate/tests.rs"]
+mod tests;

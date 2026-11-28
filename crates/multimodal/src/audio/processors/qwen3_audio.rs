@@ -48,7 +48,10 @@ impl Default for Qwen3AudioParams {
 }
 
 impl Qwen3AudioParams {
-    pub fn from_configs(model_config: &Value, preprocessor_config: &PreProcessorConfig) -> Self {
+    pub(crate) fn from_configs(
+        model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+    ) -> Self {
         let mut params = Self::default();
 
         if let Some(value) = preprocessor_config.get_extra::<usize>("sampling_rate") {
@@ -142,7 +145,7 @@ impl Qwen3AudioProcessor {
         Self::with_params(Qwen3AudioParams::default())
     }
 
-    pub fn with_params(params: Qwen3AudioParams) -> Self {
+    pub(crate) fn with_params(params: Qwen3AudioParams) -> Self {
         Self {
             params,
             frontend: OnceLock::new(),
@@ -160,17 +163,13 @@ impl Qwen3AudioProcessor {
         &self.params
     }
 
-    /// The log-mel features of a batch of decoded clips. The clips are borrowed: a clip at the
-    /// frontend's sample rate is copied once, into the batch's padded buffer, and only a clip at
-    /// another rate is resampled into a buffer of its own first.
+    /// The log-mel features of a batch of decoded clips.
     pub fn preprocess_decoded_clips(
         &self,
         clips: &[&DecodedAudio],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         self.validate_params()?;
-        if clips.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(clips)?;
 
         let mut waveforms: Vec<Cow<'_, [f32]>> = Vec::with_capacity(clips.len());
         for (clip_index, clip) in clips.iter().enumerate() {
@@ -184,7 +183,7 @@ impl Qwen3AudioProcessor {
                     "decoded audio contains no samples".to_string(),
                 ));
             }
-            if clip.samples.iter().any(|sample| !sample.is_finite()) {
+            if !all_samples_finite(&clip.samples) {
                 return Err(TransformError::ShapeError(
                     "decoded audio contains a non-finite sample".to_string(),
                 ));
@@ -241,17 +240,26 @@ impl Qwen3AudioProcessor {
         }
 
         let batch_size = waveforms.len();
+        u32::try_from(max_frames).map_err(|_| {
+            TransformError::ShapeError("Qwen3 audio frame count exceeds u32".to_string())
+        })?;
         let clip_values = self.params.n_mels.checked_mul(max_frames).ok_or_else(|| {
             TransformError::ShapeError("Qwen3 audio feature size overflow".to_string())
         })?;
         let feature_values = batch_size.checked_mul(clip_values).ok_or_else(|| {
             TransformError::ShapeError("Qwen3 audio feature size overflow".to_string())
         })?;
+        let mut all_features = Vec::new();
+        all_features
+            .try_reserve_exact(feature_values)
+            .map_err(|e| {
+                TransformError::ShapeError(format!("failed to allocate Qwen3 audio features: {e}"))
+            })?;
+        all_features.resize(feature_values, 0.0);
         let frontend = self
             .frontend
             .get_or_init(|| Arc::new(MelFrontend::build(&self.params)));
-        let mut scratch = MelScratch::new(frontend, &self.params, max_samples);
-        let mut all_features = vec![0.0_f32; feature_values];
+        let mut scratch = MelScratch::new(frontend, &self.params);
         let mut attention_mask = Vec::with_capacity(batch_size * max_frames);
         let mut feature_lengths = Vec::with_capacity(batch_size);
         let mut token_counts = Vec::with_capacity(batch_size);
@@ -266,7 +274,7 @@ impl Qwen3AudioProcessor {
                 &self.params,
                 &mut scratch,
                 features,
-            )?;
+            );
 
             attention_mask.extend((0..max_frames).map(|frame| i64::from(frame < feature_length)));
             feature_lengths.push(feature_length as i64);
@@ -339,6 +347,14 @@ impl Qwen3AudioProcessor {
                 "Qwen3 audio max_samples must be positive".to_string(),
             ));
         }
+        if self.params.n_fft > MAX_N_FFT
+            || self.params.n_mels > MAX_N_MELS
+            || self.params.n_window.checked_mul(2).is_none()
+        {
+            return Err(TransformError::ShapeError(
+                "Qwen3 audio parameter exceeds supported bounds".to_string(),
+            ));
+        }
         Ok(())
     }
 }
@@ -351,6 +367,19 @@ impl AudioPreProcessor for Qwen3AudioProcessor {
         let decoded: Vec<&DecodedAudio> = clips.iter().map(|clip| clip.decoded()).collect();
         self.preprocess_decoded_clips(&decoded)
     }
+}
+
+const MAX_N_FFT: usize = 1 << 16;
+const MAX_N_MELS: usize = 1 << 12;
+
+#[cfg_attr(
+    target_arch = "x86_64",
+    multiversion::multiversion(targets("x86_64+avx2"))
+)]
+fn all_samples_finite(samples: &[f32]) -> bool {
+    samples
+        .chunks(256)
+        .all(|chunk| chunk.iter().fold(true, |ok, s| ok & s.is_finite()))
 }
 
 fn qwen_audio_cnn_output_length(mut input_length: usize) -> usize {
@@ -370,9 +399,12 @@ fn qwen3_audio_output_length(input_length: usize, n_window: usize) -> usize {
         + qwen_audio_cnn_output_length(remainder)
 }
 
-/// The frames of a clip run through the FFT so many at a time: the chunk's complex frames stay
-/// in cache (32 frames of 400 bins are 100 KiB) and one FFT call covers them all.
-const FRAMES_PER_CHUNK: usize = 32;
+/// Sized so default `power` and `power_cols` fit together inside 32 KiB L1d.
+const FRAMES_PER_CHUNK: usize = 16;
+
+#[derive(Clone, Copy)]
+#[repr(align(64))]
+struct ChunkFrames([f32; FRAMES_PER_CHUNK]);
 
 /// What the log-mel frontend needs beside the samples, built once per configuration: the window,
 /// the filter bank with the bin band each filter's weight lies in, and the FFT plan.
@@ -395,23 +427,21 @@ impl fmt::Debug for MelFrontend {
     }
 }
 
-/// The buffers one batch reuses for every clip: the padded waveform, a chunk of complex frames,
-/// the FFT's own scratch and the chunk's power spectra.
 struct MelScratch {
-    padded: Vec<f32>,
     frames: Vec<Complex32>,
     fft_scratch: Vec<Complex32>,
     power: Vec<f32>,
+    power_cols: Vec<ChunkFrames>,
 }
 
 impl MelScratch {
-    fn new(frontend: &MelFrontend, params: &Qwen3AudioParams, max_samples: usize) -> Self {
+    fn new(frontend: &MelFrontend, params: &Qwen3AudioParams) -> Self {
         let fft_bins = params.n_fft / 2 + 1;
         Self {
-            padded: Vec::with_capacity(max_samples + 2 * (params.n_fft / 2)),
             frames: vec![Complex32::new(0.0, 0.0); FRAMES_PER_CHUNK * params.n_fft],
             fft_scratch: vec![Complex32::new(0.0, 0.0); frontend.fft.get_inplace_scratch_len()],
             power: vec![0.0_f32; FRAMES_PER_CHUNK * fft_bins],
+            power_cols: vec![ChunkFrames([0.0; FRAMES_PER_CHUNK]); fft_bins],
         }
     }
 }
@@ -433,8 +463,8 @@ impl MelFrontend {
     /// The normalised log-mel rows of one clip into `out` (`n_mels` rows of `frame_count`
     /// values), as the frame-by-frame computation produced them: the same window, the same FFT
     /// of every frame, the same power term, the same product in the same bin order, so the
-    /// bits do not move. The clip is extended to `padded_len` (the batch's longest) with the
-    /// padding value before the centre reflection, as the reference pads a batch.
+    /// bits do not move. Centre reflection sees `samples` extended to `padded_len` with
+    /// `padding_value`, matching a padded batch in the reference.
     fn log_mel(
         &self,
         samples: &[f32],
@@ -443,121 +473,197 @@ impl MelFrontend {
         params: &Qwen3AudioParams,
         scratch: &mut MelScratch,
         out: &mut [f32],
-    ) -> Result<(), TransformError> {
+    ) {
+        debug_assert!(samples.len() <= padded_len);
+        debug_assert_eq!(out.len(), self.bands.len() * frame_count);
         let n_fft = params.n_fft;
-        let fft_bins = n_fft / 2 + 1;
-        reflect_pad_into(
-            &mut scratch.padded,
-            samples,
-            padded_len,
-            params.padding_value,
-            n_fft / 2,
-        );
 
+        let mut peak = f32::NEG_INFINITY;
         let mut frame = 0;
         while frame < frame_count {
             let count = FRAMES_PER_CHUNK.min(frame_count - frame);
-            for k in 0..count {
-                let start = (frame + k) * params.hop_length;
-                let frame_samples = scratch.padded.get(start..start + n_fft).ok_or_else(|| {
-                    TransformError::ShapeError(format!(
-                        "Qwen3 audio STFT frame {} lies outside padded waveform",
-                        frame + k
-                    ))
-                })?;
-                let buffer = &mut scratch.frames[k * n_fft..(k + 1) * n_fft];
-                for (slot, (&sample, &weight)) in buffer
-                    .iter_mut()
-                    .zip(frame_samples.iter().zip(&self.window))
-                {
-                    *slot = Complex32::new(sample * weight, 0.0);
-                }
-            }
+            window_chunk(
+                samples,
+                padded_len,
+                params.padding_value,
+                params.hop_length,
+                &self.window,
+                frame,
+                &mut scratch.frames[..count * n_fft],
+            );
             self.fft.process_with_scratch(
                 &mut scratch.frames[..count * n_fft],
                 &mut scratch.fft_scratch,
             );
 
-            // The power term of each bin once per frame; `mul_add`, as the product reads it,
-            // not `re * re + im * im`, which rounds twice and differs on real spectra (the
-            // sibling frontends hoist the unfused form; this one must not copy it).
-            for k in 0..count {
-                let spectrum = &scratch.frames[k * n_fft..k * n_fft + fft_bins];
-                let power = &mut scratch.power[k * fft_bins..(k + 1) * fft_bins];
-                for (value, bin) in power.iter_mut().zip(spectrum) {
-                    *value = bin.re.mul_add(bin.re, bin.im * bin.im);
-                }
-            }
-
-            // The mel product over each filter's band: a zero weight adds nothing to a finite
-            // power, so the band's sum is the full row's sum, bit for bit. Where a power
-            // overflowed, a zero weight times infinity is NaN and the full row keeps it.
-            for k in 0..count {
-                let power = &scratch.power[k * fft_bins..(k + 1) * fft_bins];
-                let finite = power.iter().all(|value| value.is_finite());
-                for mel in 0..params.n_mels {
-                    let (first, last) = if finite {
-                        self.bands[mel]
-                    } else {
-                        (0, fft_bins)
-                    };
-                    let weights = &self.filters[mel * fft_bins + first..mel * fft_bins + last];
-                    let mut value = 0.0_f32;
-                    for (weight, power) in weights.iter().zip(&power[first..last]) {
-                        value = weight.mul_add(*power, value);
-                    }
-                    out[mel * frame_count + frame + k] = value.max(1e-10).log10();
-                }
-            }
+            let chunk_peak = power_and_mel_rows(
+                &scratch.frames[..count * n_fft],
+                (&mut scratch.power, &mut scratch.power_cols),
+                &self.filters,
+                &self.bands,
+                n_fft,
+                (frame, frame_count),
+                out,
+            );
+            peak = peak.max(chunk_peak);
             frame += count;
         }
 
-        let peak = out.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let floor = peak - 8.0;
-        for value in out.iter_mut() {
-            *value = (value.max(floor) + 4.0) / 4.0;
-        }
-        Ok(())
+        clamp_and_scale(out, peak - 8.0);
     }
 }
 
-/// `out` becomes `samples` extended to `len` with `padding_value`, then reflected `padding`
-/// samples at both ends (numpy's `reflect` mode, which the reference's centred STFT uses). The
-/// buffer's capacity is kept across clips.
-fn reflect_pad_into(
-    out: &mut Vec<f32>,
+#[cfg_attr(
+    target_arch = "x86_64",
+    multiversion::multiversion(targets("x86_64+avx2+fma"))
+)]
+fn window_chunk(
+    samples: &[f32],
+    padded_len: usize,
+    padding_value: f32,
+    hop_length: usize,
+    window: &[f32],
+    frame_start: usize,
+    frames_out: &mut [Complex32],
+) {
+    let n_fft = window.len();
+    if n_fft == 0 {
+        return;
+    }
+    let pad = n_fft / 2;
+    for (k, dst) in frames_out.chunks_exact_mut(n_fft).enumerate() {
+        let start = (frame_start + k) * hop_length;
+        if let Some(src) = start
+            .checked_sub(pad)
+            .and_then(|offset| samples.get(offset..offset.checked_add(n_fft)?))
+        {
+            for (slot, (&sample, &weight)) in dst.iter_mut().zip(src.iter().zip(window)) {
+                *slot = Complex32::new(sample * weight, 0.0);
+            }
+        } else {
+            for (idx, (slot, &weight)) in dst.iter_mut().zip(window).enumerate() {
+                let sample = reflected_sample(samples, padded_len, padding_value, pad, start + idx);
+                *slot = Complex32::new(sample * weight, 0.0);
+            }
+        }
+    }
+}
+
+#[cfg_attr(
+    target_arch = "x86_64",
+    multiversion::multiversion(targets("x86_64+avx2+fma"))
+)]
+fn power_and_mel_rows(
+    frames: &[Complex32],
+    power: (&mut [f32], &mut [ChunkFrames]),
+    filters: &[f32],
+    bands: &[(usize, usize)],
+    n_fft: usize,
+    span: (usize, usize),
+    out: &mut [f32],
+) -> f32 {
+    if n_fft == 0 {
+        return f32::NEG_INFINITY;
+    }
+    let (power_rows, power_cols) = power;
+    let (frame, frame_count) = span;
+    let count = (frames.len() / n_fft).min(FRAMES_PER_CHUNK);
+    let fft_bins = n_fft / 2 + 1;
+    debug_assert!(
+        count > 0 && power_cols.len() >= fft_bins && power_rows.len() >= count * fft_bins
+    );
+    let (Some(power_cols), Some(power_rows)) = (
+        power_cols.get_mut(..fft_bins),
+        power_rows.get_mut(..count * fft_bins),
+    ) else {
+        return f32::NEG_INFINITY;
+    };
+
+    // The power term of each bin once per frame; `mul_add`, as the product reads it,
+    // not `re * re + im * im`, which rounds twice and differs on real spectra (the
+    // sibling frontends hoist the unfused form; this one must not copy it).
+    let mut all_finite = true;
+    for (row, frame_bins) in power_rows
+        .chunks_exact_mut(fft_bins)
+        .zip(frames.chunks_exact(n_fft).take(count))
+    {
+        for (value, bin) in row.iter_mut().zip(frame_bins) {
+            let p = bin.re.mul_add(bin.re, bin.im * bin.im);
+            *value = p;
+            all_finite &= p.is_finite();
+        }
+    }
+
+    for (bin, col) in power_cols.iter_mut().enumerate() {
+        for (slot, row) in col.0[..count]
+            .iter_mut()
+            .zip(power_rows.chunks_exact(fft_bins))
+        {
+            *slot = row[bin];
+        }
+        if count < FRAMES_PER_CHUNK {
+            col.0[count..].fill(0.0);
+        }
+    }
+
+    let mut peaks = [f32::NEG_INFINITY; FRAMES_PER_CHUNK];
+    for (mel, &band) in bands.iter().enumerate() {
+        // Full-row fallback keeps `0.0 * inf = NaN` without changing finite lanes.
+        let (first, last) = if all_finite { band } else { (0, fft_bins) };
+        let (Some(weights), Some(cols), Some(dst)) = (
+            filters.get(mel * fft_bins + first..mel * fft_bins + last),
+            power_cols.get(first..last),
+            out.get_mut(mel * frame_count + frame..mel * frame_count + frame + count),
+        ) else {
+            continue;
+        };
+        let mut acc = [0.0_f32; FRAMES_PER_CHUNK];
+        for (&weight, col) in weights.iter().zip(cols) {
+            for (sum, &p) in acc.iter_mut().zip(&col.0) {
+                *sum = weight.mul_add(p, *sum);
+            }
+        }
+        for (slot, &value) in dst.iter_mut().zip(&acc) {
+            *slot = value.max(1e-10).log10();
+        }
+        for (peak, &logged) in peaks[..count].iter_mut().zip(&*dst) {
+            *peak = peak.max(logged);
+        }
+    }
+    peaks[..count]
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max)
+}
+
+#[cfg_attr(
+    target_arch = "x86_64",
+    multiversion::multiversion(targets("x86_64+avx2"))
+)]
+fn clamp_and_scale(out: &mut [f32], floor: f32) {
+    for value in out {
+        *value = (value.max(floor) + 4.0) * 0.25;
+    }
+}
+
+/// Element `offset` of `samples` extended to `len`, then `numpy` `"reflect"`-padded by `padding`.
+#[inline]
+fn reflected_sample(
     samples: &[f32],
     len: usize,
     padding_value: f32,
     padding: usize,
-) {
-    out.clear();
+    offset: usize,
+) -> f32 {
     let value_at = |index: usize| samples.get(index).copied().unwrap_or(padding_value);
-    if padding == 0 {
-        out.extend((0..len).map(value_at));
-        return;
-    }
-    if len == 1 {
-        out.resize(1 + 2 * padding, value_at(0));
-        return;
-    }
-    out.extend(
-        (-(padding as isize)..(len + padding) as isize)
-            .map(|position| value_at(reflect_index(position, len))),
-    );
-}
-
-fn reflect_index(mut index: isize, len: usize) -> usize {
-    let last = len as isize - 1;
-    while index < 0 || index > last {
-        if index < 0 {
-            index = -index;
-        }
-        if index > last {
-            index = 2 * last - index;
-        }
-    }
-    index as usize
+    let Some(last) = len.checked_sub(1).filter(|_| padding > 0) else {
+        return value_at(offset);
+    };
+    let Some(period) = last.checked_mul(2).and_then(std::num::NonZeroUsize::new) else {
+        return value_at(0);
+    };
+    let r = offset.abs_diff(padding) % period;
+    value_at(if r > last { period.get() - r } else { r })
 }
 
 #[cfg(test)]
@@ -774,17 +880,23 @@ mod tests {
 
     #[test]
     fn reflect_padding_matches_numpy_convention() {
-        let mut out = Vec::new();
-        reflect_pad_into(&mut out, &[1.0, 2.0, 3.0], 3, 0.0, 2);
-        assert_eq!(out, vec![3.0, 2.0, 1.0, 2.0, 3.0, 2.0, 1.0]);
-        reflect_pad_into(&mut out, &[2.0], 1, 0.0, 2);
-        assert_eq!(out, vec![2.0; 5]);
+        let pad = |s: &[f32], len, p| -> Vec<f32> {
+            (0..len + 2 * p)
+                .map(|i| reflected_sample(s, len, 0.0, p, i))
+                .collect()
+        };
+        assert_eq!(
+            pad(&[1.0, 2.0, 3.0], 3, 2),
+            [3.0, 2.0, 1.0, 2.0, 3.0, 2.0, 1.0]
+        );
+        assert_eq!(pad(&[2.0], 1, 2), [2.0; 5]);
         // A clip shorter than the batch's longest is extended with the padding value first, so
         // the reflection at its end mirrors the padding.
-        reflect_pad_into(&mut out, &[1.0, 2.0], 4, 0.0, 2);
-        assert_eq!(out, vec![0.0, 2.0, 1.0, 2.0, 0.0, 0.0, 0.0, 2.0]);
-        reflect_pad_into(&mut out, &[1.0, 2.0], 3, 0.0, 0);
-        assert_eq!(out, vec![1.0, 2.0, 0.0]);
+        assert_eq!(
+            pad(&[1.0, 2.0], 4, 2),
+            [0.0, 2.0, 1.0, 2.0, 0.0, 0.0, 0.0, 2.0]
+        );
+        assert_eq!(pad(&[1.0, 2.0], 3, 0), [1.0, 2.0, 0.0]);
     }
 
     /// The frontend as it computed before the frames were batched: the padded waveform copied,
@@ -796,22 +908,18 @@ mod tests {
         frame_count: usize,
         params: &Qwen3AudioParams,
     ) -> Vec<f32> {
-        fn reflect_pad(samples: &[f32], padding: usize) -> Vec<f32> {
-            if padding == 0 {
-                return samples.to_vec();
-            }
-            if samples.len() == 1 {
-                return vec![samples[0]; samples.len() + 2 * padding];
-            }
-            let mut padded = Vec::with_capacity(samples.len() + 2 * padding);
-            for position in -(padding as isize)..(samples.len() + padding) as isize {
-                padded.push(samples[reflect_index(position, samples.len())]);
-            }
-            padded
-        }
         let mut waveform = samples.to_vec();
         waveform.resize(padded_len, params.padding_value);
-        let padded = reflect_pad(&waveform, params.n_fft / 2);
+        let pad = params.n_fft / 2;
+        let padded: Vec<f32> = (-(pad as isize)..(padded_len + pad) as isize)
+            .map(|mut i| {
+                let last = padded_len as isize - 1;
+                while last > 0 && (i < 0 || i > last) {
+                    i = if i < 0 { -i } else { 2 * last - i };
+                }
+                waveform[if last == 0 { 0 } else { i as usize }]
+            })
+            .collect();
         let fft_bins = params.n_fft / 2 + 1;
         let window = hann_window(params.n_fft);
         let mel_filters = mel_basis(params.sample_rate, params.n_fft, params.n_mels);
@@ -845,9 +953,6 @@ mod tests {
         output
     }
 
-    /// Deterministic waveforms over the paths a numerical change would move: a tone, noise,
-    /// silence, an impulse, a loud square wave, a very quiet tone, and lengths on both sides of
-    /// a chunk boundary (31, 32, 33 frames), a single frame and a part frame.
     fn waveform_corpus() -> Vec<(String, Vec<f32>)> {
         let mut state = 0x243f_6a88_u32;
         let mut noise = move || {
@@ -889,7 +994,7 @@ mod tests {
                     .collect(),
             ),
         ];
-        for frames in [1, 31, 32, 33, 65] {
+        for frames in [1, 15, 16, 17, 31, 32, 33, 65] {
             let count = frames * 160 + 7;
             corpus.push((
                 format!("{frames}_frames"),
@@ -989,12 +1094,59 @@ mod tests {
         );
         assert_same_bits("overflow", &log_mel_of(&processor, &overflowing), &expected);
 
+        let mut mixed: Vec<f32> = (0..4_000).map(|i| (i as f32 * 0.03).sin() * 0.25).collect();
+        mixed[800..960].copy_from_slice(&overflowing[..160]);
+        let mixed_expected = frame_by_frame_reference(&mixed, mixed.len(), frames, &params);
+        assert_same_bits(
+            "mixed_chunk",
+            &log_mel_of(&processor, &mixed),
+            &mixed_expected,
+        );
+
         // And an ordinary clip takes the band product throughout.
         let (_, ordinary) = waveform_corpus().swap_remove(1);
         assert!(
             !a_power_term_overflows(&ordinary, &params),
             "an ordinary clip should take the band product"
         );
+    }
+
+    #[test]
+    fn non_default_geometries_and_reflection_edges_keep_their_bits() {
+        for (n_fft, hop_length, n_mels, padding_value, len) in [
+            (320, 80, 64, 0.0, 2_573),
+            (257, 64, 48, -0.125, 1_900),
+            (400, 160, 128, 0.25, 160),
+            (400, 160, 128, -0.5, 300),
+            (8, 1, 4, 0.0, 1),
+            (1, 1, 4, 0.0, 19),
+        ] {
+            let params = Qwen3AudioParams {
+                n_mels,
+                n_fft,
+                hop_length,
+                padding_value,
+                ..Qwen3AudioParams::default()
+            };
+            let samples: Vec<f32> = (0..len).map(|i| (i as f32 * 0.07).cos() * 0.4).collect();
+            let actual = log_mel_of(&Qwen3AudioProcessor::with_params(params.clone()), &samples);
+            let expected = frame_by_frame_reference(&samples, len, len / hop_length, &params);
+            assert_same_bits(&format!("{n_fft}/{hop_length}/{len}"), &actual, &expected);
+        }
+        for (n_fft, n_mels, n_window) in [
+            (MAX_N_FFT + 1, 128, 50),
+            (400, MAX_N_MELS + 1, 50),
+            (400, 128, usize::MAX),
+        ] {
+            let bad = Qwen3AudioParams {
+                n_mels,
+                n_fft,
+                n_window,
+                ..Qwen3AudioParams::default()
+            };
+            let err = Qwen3AudioProcessor::with_params(bad).preprocess_decoded(decoded(320));
+            assert!(err.is_err());
+        }
     }
 
     /// One band per filter describes the filter only while its weight is contiguous. It is,

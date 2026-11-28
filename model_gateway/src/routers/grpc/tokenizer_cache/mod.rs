@@ -9,6 +9,8 @@ pub mod hub_fetch;
 
 use std::{fs, path::PathBuf};
 
+use crate::server::blocking_http_client;
+
 /// Names a directory that holds the DeepSeek-V4.1 tokenizer files; set,
 /// nothing is fetched.
 pub const DEEPSEEK_V41_MODEL_DIR_ENV: &str = "DEEPSEEK_V41_MODEL_DIR";
@@ -102,7 +104,7 @@ impl CheckpointTokenizer {
         let dir = PathBuf::from(self.cache_dir);
         fs::create_dir_all(&dir)
             .unwrap_or_else(|error| panic!("cannot create {}: {error}", dir.display()));
-        let client = crate::server::blocking_http_client();
+        let client = blocking_http_client();
         for &(file, min_bytes) in self.files {
             let path = dir.join(file);
             if path.is_file() {

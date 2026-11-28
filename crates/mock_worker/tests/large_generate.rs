@@ -34,7 +34,7 @@ fn million_token_request() -> ts::GenerateRequest {
 /// servicers do, and answers the stream through to its `Complete`.
 #[tokio::test]
 async fn a_million_token_generate_round_trips_by_default() {
-    let client = start(Config::default()).await;
+    let client = start(Config::default()).await.expect("the worker starts");
 
     let mut stream = client
         .generate(million_token_request())
@@ -63,7 +63,8 @@ async fn a_configured_limit_refuses_a_larger_message() {
         grpc_max_message_bytes: 4 << 20,
         ..Config::default()
     })
-    .await;
+    .await
+    .expect("the worker starts");
 
     let err = match client.generate(million_token_request()).await {
         Ok(_) => panic!("a message above the configured limit is refused"),

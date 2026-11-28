@@ -13,9 +13,9 @@ use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use smg::{
     app_context::AppContext,
     config::{RouterConfig, RouterConfigBuilder},
-    routers::{RouterFactory, RouterTrait},
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory, RouterTrait},
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{body::Body, server::NamedService, transport::Server};
@@ -241,20 +241,4 @@ pub fn build_grpc_router(
 ) -> Pin<Box<dyn Future<Output = Box<dyn RouterTrait>> + Send>> {
     let app_context = grpc_test_context(config, model);
     Box::pin(async move { grpc_router(&app_context.await, workers).await })
-}
-
-/// An ephemeral loopback port, bound once to learn its number and released:
-/// the port is free only at return, and another test of the binary may bind
-/// it before the caller does. Use it only where the port has to be named
-/// before something else binds it (an engine restarted on the same port, a
-/// port handed to a configuration); everywhere else bind `127.0.0.1:0` and
-/// keep the listener, as `ephemeral_listener` does.
-#[expect(clippy::expect_used, reason = "test helper")]
-pub async fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("ephemeral port address")
-        .port()
 }

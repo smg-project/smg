@@ -3,15 +3,13 @@
 use std::{cmp::Ordering, sync::Arc};
 
 use rand::RngExt;
+use smg_worker::{identity::basic::Worker, load::state::LoadReceiver};
 
 use super::{
     draw_eligible, get_healthy_worker_indices, LeastLoadPolicy, LoadBalancingPolicy,
     SelectWorkerInfo,
 };
-use crate::{
-    config::PowerOfTwoLoadMetric,
-    worker::{load_state::LoadReceiver, Worker},
-};
+use crate::config::PowerOfTwoLoadMetric;
 
 /// Power-of-two choices policy: sample two distinct healthy workers uniformly
 /// and route to the one with the lower expected wait, scored exactly like
@@ -58,16 +56,22 @@ fn fewest_of_pair<'a>(workers: &[Arc<dyn Worker>], pair: &'a [usize; 2]) -> &'a 
 }
 
 /// The candidates with the fewest router in-flight requests. Each count is read
-/// once, so concurrent dispatches cannot empty the result.
+/// once, in one pass (a lower count starts the list over, an equal one joins
+/// it), so concurrent dispatches cannot empty the result.
 fn fewest_in_flight(workers: &[Arc<dyn Worker>], candidates: &[usize]) -> Vec<usize> {
-    let loads: Vec<usize> = candidates.iter().map(|&i| workers[i].load()).collect();
-    let fewest = loads.iter().copied().min().unwrap_or(0);
-    candidates
-        .iter()
-        .zip(loads)
-        .filter(|&(_, load)| load == fewest)
-        .map(|(&i, _)| i)
-        .collect()
+    let mut fewest = usize::MAX;
+    let mut ties = Vec::new();
+    for &i in candidates {
+        let load = workers[i].load();
+        if load < fewest {
+            fewest = load;
+            ties.clear();
+        }
+        if load == fewest {
+            ties.push(i);
+        }
+    }
+    ties
 }
 
 impl LoadBalancingPolicy for PowerOfTwoPolicy {
@@ -133,6 +137,10 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             .select_min_expected_wait(workers, candidates, info, self.name())
     }
 
+    fn hears_request_complete(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &'static str {
         "power_of_two"
     }
@@ -165,12 +173,10 @@ mod tests {
     use std::collections::HashMap;
 
     use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
+    use smg_worker::load::state::{one_rank_load, one_rank_load_reqs_only, TestFeed};
 
     use super::*;
-    use crate::{
-        policies::test_support::{fed_pair, make_worker},
-        worker::load_state::{one_rank_load, one_rank_load_reqs_only, TestFeed},
-    };
+    use crate::policies::test_support::{fed_pair, make_worker};
 
     #[test]
     fn single_worker_always_selected() {
@@ -299,7 +305,7 @@ mod tests {
         // requests. b is scored as drain time (5 · p̄ / throughput ≈ 2.56s),
         // comparable to a's KV barrier (0.15 · 0.9/0.1 = 1.35s) -> pick a.
         let policy = PowerOfTwoPolicy::new();
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let a = make_worker("http://a:8000");
         let b = make_worker("http://b:8000");
         for _ in 0..5 {
@@ -414,11 +420,11 @@ mod tests {
         let info = SelectWorkerInfo::default();
 
         let expected_wait = PowerOfTwoPolicy::new();
-        TestFeed::attached_to(&expected_wait).publish(&loads);
+        TestFeed::attached_to(|rx| expected_wait.set_load_receiver(rx)).publish(&loads);
         assert_eq!(expected_wait.select_worker(&workers, &info), Some(0));
 
         let requests = PowerOfTwoPolicy::with_load_metric(PowerOfTwoLoadMetric::Requests);
-        TestFeed::attached_to(&requests).publish(&loads);
+        TestFeed::attached_to(|rx| requests.set_load_receiver(rx)).publish(&loads);
         for _ in 0..20 {
             assert_eq!(requests.select_worker(&workers, &info), Some(1));
         }
@@ -458,11 +464,11 @@ mod tests {
         let info = SelectWorkerInfo::default();
 
         let tokens_only = resident_tokens(0);
-        TestFeed::attached_to(&tokens_only).publish(&loads);
+        TestFeed::attached_to(|rx| tokens_only.set_load_receiver(rx)).publish(&loads);
         assert_eq!(tokens_only.select_worker(&workers, &info), Some(1));
 
         let with_requests = resident_tokens(100_000);
-        TestFeed::attached_to(&with_requests).publish(&loads);
+        TestFeed::attached_to(|rx| with_requests.set_load_receiver(rx)).publish(&loads);
         assert_eq!(with_requests.select_worker(&workers, &info), Some(3));
     }
 
@@ -471,7 +477,7 @@ mod tests {
         // w1's report predates resident tokens: it scores as the best peer
         // plus its live requests, never as idle.
         let policy = resident_tokens(0);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers = holding(&[2, 2]);
         let mut loads = HashMap::new();
         loads.insert("http://w0:8000".to_string(), resident(2, 500_000));
@@ -483,12 +489,22 @@ mod tests {
                 Some(0)
             );
         }
+        // So does a report that lists one rank of the two it states: its
+        // 1,000 tokens are one rank's, not the worker's count.
+        let mut one_of_two = resident(2, 1_000);
+        one_of_two.dp_rank_count = 2;
+        loads.insert("http://w1:8000".to_string(), one_of_two);
+        feed.publish(&loads);
+        assert_eq!(
+            policy.select_worker(&workers, &SelectWorkerInfo::default()),
+            Some(0)
+        );
     }
 
     #[test]
     fn least_requests_takes_the_fewest_in_flight_over_every_worker() {
         let policy = PowerOfTwoPolicy::with_load_metric(PowerOfTwoLoadMetric::LeastRequests);
-        let feed = TestFeed::attached_to(&policy);
+        let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
         let workers = holding(&[4, 5, 1, 3]);
         let mut loads = HashMap::new();
         loads.insert("http://w0:8000".to_string(), one_rank_load(0, 0.1, 100.0));

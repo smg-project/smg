@@ -4,6 +4,8 @@
 //! types and functions that `server.rs` and other call sites already
 //! reference, so this split is invisible to downstream callers.
 
+use axum::http::StatusCode;
+
 pub mod auth;
 pub mod body_limit;
 pub mod body_timeout;
@@ -24,6 +26,7 @@ pub mod token_bucket;
 pub mod wasm;
 
 #[cfg(test)]
+#[path = "../../tests/unit/middleware/test_support.rs"]
 pub(crate) mod test_support;
 
 pub use auth::{auth_middleware, deny_all_middleware, key_fingerprint, AuthConfig};
@@ -42,7 +45,7 @@ pub use messages_errors::{
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
 pub use request_start::RequestStarted;
-pub use sse_keepalive::{sse_keepalive_middleware, SseKeepAlive, SseKeepAliveLayer};
+pub use sse_keepalive::{SseKeepAlive, SseKeepAliveLayer};
 pub use storage_context::storage_context_middleware;
 pub use tenant_resolution::{
     ordinary_tenant_resolution_middleware, route_request_meta_middleware, RouteRequestMetaLayer,
@@ -59,6 +62,16 @@ pub use crate::tenant::{
 /// `Retry-After` seconds on overload sheds: sheds must signal back-off; 408
 /// reads as a client transport error and gets instant proxy retries.
 pub(crate) const SHED_RETRY_AFTER_SECS: u32 = 2;
+
+/// The admission queue's answer for a request it has no room for: its code
+/// and its status.
+pub(crate) const ADMISSION_QUEUE_FULL_CODE: &str = "admission_queue_full";
+pub(crate) const ADMISSION_QUEUE_FULL_STATUS: StatusCode = StatusCode::TOO_MANY_REQUESTS;
+
+/// The admission queue's answer for a request that outlives its wait: its
+/// code and its status.
+pub(crate) const ADMISSION_QUEUE_TIMEOUT_CODE: &str = "admission_queue_timeout";
+pub(crate) const ADMISSION_QUEUE_TIMEOUT_STATUS: StatusCode = StatusCode::SERVICE_UNAVAILABLE;
 
 /// Backward-compatible alias for the older tenant metadata name used in a few
 /// router-path tests and plumbing call sites.

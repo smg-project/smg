@@ -13,13 +13,16 @@
 //! assembler takes them away by it, not the grammar.
 //!
 //! The value follows the property's type. A string is written as it is, any text up to the
-//! parameter's close or a terminal the table leaves the call on. A number is JSON. A boolean or
-//! null is JSON or Python's word (`True`, `False`, `None`), both of which the templates write and
-//! the assembler reads. An object or a list is JSON the property's schema accepts where the
-//! template writes JSON (Qwen's `tojson`), and any text where the template writes Python's repr
-//! (Seed-OSS's `str`), which the assembler reads as the JSON it stands for ([`Spelling`]). A
-//! property without a type, or a schema without properties, takes any text. When the calls sit in a
-//! block, the block's ways in frame one or more calls, as Kimi K3's do.
+//! parameter's close, the word that opens another parameter or a terminal the table leaves the
+//! call on: a value cannot go on over the next parameter's tag. A number is JSON. A boolean or null
+//! is JSON or Python's word (`True`, `False`, `None`), both of which the templates write and the
+//! assembler reads. An object or a list is JSON the property's schema accepts where the template
+//! writes JSON (Qwen's `tojson`), and any text where the template writes Python's repr (Seed-OSS's
+//! `str`), which the assembler reads as the JSON it stands for ([`Spelling`]). A property without a
+//! type, or a schema without properties, takes any text. When the calls sit in a block, the block's
+//! ways in frame one or more calls, as Kimi K3's do.
+
+use std::sync::Arc;
 
 use openai_protocol::common::Tool;
 use serde_json::{json, Value};
@@ -83,10 +86,15 @@ struct Slot {
 }
 
 impl Values<'_> {
-    /// A value written as it is: any text up to the parameter's close or a terminal that ends the
-    /// call.
+    /// A value written as it is: any text up to the parameter's close, the word that opens another
+    /// parameter or a terminal that ends the call. The opener ends the value at its word, before
+    /// its sign: a model that runs on writes the word first, and a stop at the sign would leave the
+    /// word in the value.
     fn text(&self) -> Slot {
-        let mut excludes = vec![PARAMETER_CLOSE.to_string()];
+        let mut excludes = vec![
+            PARAMETER_CLOSE.to_string(),
+            PARAMETER_OPEN.trim_end_matches('=').to_string(),
+        ];
         excludes.extend(self.call_exits.iter().map(|exit| exit.to_string()));
         Slot {
             value: Grammar::AnyText { excludes },
@@ -117,7 +125,7 @@ impl Values<'_> {
 /// JSON the schema accepts, or one of Python's words for it.
 fn words<const N: usize>(schema: Value, python: [&str; N]) -> Grammar {
     let mut options = vec![Grammar::JsonSchema {
-        schema,
+        schema: Arc::new(schema),
         style: None,
         excludes: Vec::new(),
         whitespace: Whitespace::Free,
@@ -252,7 +260,7 @@ mod tests {
             .payload();
         let text = value!({
             "type": "any_text",
-            "excludes": ["</parameter>", "</tool_call>", "<tool_call>"],
+            "excludes": ["</parameter>", "<parameter", "</tool_call>", "<tool_call>"],
         });
         let city = value!({"type": "const_string", "value": "city"});
         let days =
@@ -270,12 +278,11 @@ mod tests {
             {"type": "const_string", "value": "c"},
             {"type": "const_string", "value": "f"},
         ]});
+        // The calls repeat, the template's newline allowed after each, once or twice.
         assert_eq!(
             payload,
-            value!({"format": {
-                "type": "triggered_tags",
-                "triggers": ["<tool_call>"],
-                "tags": [
+            value!({"format": {"type": "plus", "content": {"type": "sequence", "elements": [
+                {"type": "or", "elements": [
                     {
                         "type": "tag",
                         "begin": "<tool_call>\n<function=get_weather>\n",
@@ -297,9 +304,10 @@ mod tests {
                         )},
                         "end": "</function>\n</tool_call>",
                     },
-                ],
-                "at_least_one": true,
-            }})
+                ]},
+                {"type": "optional", "content": {"type": "const_string", "value": "\n"}},
+                {"type": "optional", "content": {"type": "const_string", "value": "\n"}},
+            ]}}})
         );
     }
 
@@ -334,7 +342,9 @@ mod tests {
         assert_eq!(weather["end"], "</function>\n</seed:tool_call>");
         let text = value!({
             "type": "any_text",
-            "excludes": ["</parameter>", "</seed:tool_call>", "<seed:tool_call>"],
+            "excludes": [
+                "</parameter>", "<parameter", "</seed:tool_call>", "<seed:tool_call>",
+            ],
         });
         let slots = weather["content"]["elements"]
             .as_array()
@@ -361,7 +371,7 @@ mod tests {
                     "t",
                     value!({"type": "object", "properties": {"nothing": {"type": "null"}}}),
                 )],
-                true,
+                false,
                 false,
             )
             .expect("a grammar")
@@ -406,6 +416,6 @@ mod tests {
             payload["format"]["elements"][1],
             value!({"type": "const_string", "value": "\n\n"})
         );
-        assert_eq!(payload["format"]["elements"][2]["type"], "triggered_tags");
+        assert_eq!(payload["format"]["elements"][2]["type"], "plus");
     }
 }

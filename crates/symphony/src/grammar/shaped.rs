@@ -34,7 +34,9 @@
 //! stop. A tag the stop ends holds no repetition, which an engine cannot end on its own: a schema
 //! without properties takes at most one parameter there. Where no call is owed and more than one
 //! may come, such a call has no tag: the free text after a tag would be the call's own, and a
-//! parameter written there would count with nothing to constrain it.
+//! parameter written there would count with nothing to constrain it. Where a call is owed and
+//! more may come, the calls are written one after another the same way, each after its lead: free
+//! text after an owed call would be read as content beside it.
 //!
 //! With the prompt's thought open, a tag that owes a call follows the free prefix every syntax's
 //! tag takes; one that owes none takes no prefix, its own free text writing the thought: an engine
@@ -60,12 +62,12 @@ use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{
-    calls,
+    calls, json,
     schema::{self, shape as typed, Definitions},
     CallMarkers, Count, Grammar, Tag, WayIn,
 };
 use crate::{
-    format::{Emits, Format, Whitespace},
+    format::{Emits, Format},
     shape::{Arguments, Atom, CallShape, End, Layout, Nested, Segment, Slot, Spellings, Words},
 };
 
@@ -115,9 +117,10 @@ pub(super) fn calls(
     if call.close.is_none() && !one && !count.at_least_one {
         return None;
     }
-    // Where the stop closes the last call, the calls are written one after another, nothing after
-    // the last; otherwise each call is a tag of its own, free text after it outside its region.
-    let in_a_row = call.close.is_none() && !one;
+    // Where the stop closes the last call, or a call is owed, the calls are written one after
+    // another, nothing after the last; otherwise each call is a tag of its own, free text after it
+    // outside its region.
+    let in_a_row = (call.close.is_none() || count.at_least_one) && !one;
     let end = match (in_a_row, one) {
         (false, true) => format!("{tail}{}", layout.after_calls),
         _ => tail.clone(),
@@ -296,12 +299,7 @@ impl<'l> Writing<'l> {
             Self::Parameters { parameters, values } => {
                 parameters.of_tool(shape, layout, values, tool, limited)
             }
-            Self::Json => Some(Grammar::JsonSchema {
-                schema: tool.function.parameters_schema().clone(),
-                style: None,
-                excludes: Vec::new(),
-                whitespace: Whitespace::Free,
-            }),
+            Self::Json => Some(json::arguments(tool)),
         }
     }
 }
@@ -524,6 +522,8 @@ fn sequence(parts: Vec<Grammar>) -> Grammar {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::json as value;
 
     use super::*;
@@ -732,17 +732,24 @@ mod tests {
             "content": lookup_parameters(json_words()),
             "end": "</c>",
         });
-        // A call at once: the lead for the tool first, then the calls.
+        // A call at once that allows more: the calls one after another, each after the lead for
+        // its tool, with what the layout writes between them, then what it writes after them.
+        let led = value!({
+            "type": "tag",
+            "begin": "@lookup\n<c n=\"lookup\">\n",
+            "content": lookup_parameters(json_words()),
+            "end": "</c>",
+        });
         assert_eq!(
             payload(&format, &[lookup()], options(true, false)),
             Some(value!({"format": {"type": "sequence", "elements": [
-                {"type": "const_string", "value": "@lookup\n"},
                 {
-                    "type": "triggered_tags",
-                    "triggers": ["<c"],
-                    "tags": [tag],
+                    "type": "tags_with_separator",
+                    "tags": [led],
+                    "separator": "\n\n",
                     "at_least_one": true,
                 },
+                {"type": "const_string", "value": "\n"},
             ]}}))
         );
         // No call owed: the lead is free text before the terminal.
@@ -790,15 +797,20 @@ mod tests {
                 }),
             ),
         ];
-        let got = payload(&format, &tools, options(true, false)).expect("a tag");
+        // One call: the lead for whichever tool is called.
+        let one = payload(&format, &tools, options(true, true)).expect("a tag");
         assert_eq!(
-            got["format"]["elements"][0],
+            one["format"]["elements"][0],
             value!({"type": "or", "elements": [
                 {"type": "const_string", "value": "@lookup\n"},
                 {"type": "const_string", "value": "@other\n"},
             ]})
         );
-        let tags = &got["format"]["elements"][1]["tags"];
+        // More than one: each call after its own lead.
+        let got = payload(&format, &tools, options(true, false)).expect("a tag");
+        let tags = &got["format"]["elements"][0]["tags"];
+        assert_eq!(tags[0]["begin"], "@lookup\n<c n=\"lookup\">\n");
+        assert_eq!(tags[1]["begin"], "@other\n<c n=\"other\">\n");
         assert_eq!(
             tags[0]["content"],
             lookup_parameters(value!({"type": "or", "elements": [
@@ -940,7 +952,7 @@ mod tests {
             options(true, false),
         )
         .expect("a tag");
-        assert_eq!(got["format"]["type"], "triggered_tags");
+        assert_eq!(got["format"]["type"], "tags_with_separator");
         let calls = &got["format"]["tags"][0]["content"]["content"]["elements"];
         assert_eq!(calls[0]["elements"][0]["value"], "@lookup\n<cf.lookup:");
         assert_eq!(calls[1]["elements"][0]["value"], "@ping\n<cf.ping:");
@@ -984,11 +996,11 @@ mod tests {
         assert_eq!(payload(&format, &[keyed(true)], options(true, false)), None);
         let got = payload(&format, &[quoted, keyed(false)], options(true, false))
             .expect("the readable tool");
-        let tags = got["format"]["elements"][1]["tags"]
+        let tags = got["format"]["elements"][0]["tags"]
             .as_array()
             .expect("tags");
         assert_eq!(tags.len(), 1);
-        assert_eq!(tags[0]["begin"], "<c n=\"keyed\">\n");
+        assert_eq!(tags[0]["begin"], "@keyed\n<c n=\"keyed\">\n");
         assert!(!tags[0]["content"].to_string().contains("a>b"));
     }
 
@@ -1248,7 +1260,7 @@ mod tests {
             value!({"content": null, "calls": [call, call]})
         );
         let answer = named
-            .answer_grammar(&value!({"type": "object"}), false)
+            .answer_grammar(&Arc::new(value!({"type": "object"})), false)
             .expect("an answer");
         assert_eq!(
             answer.payload(),

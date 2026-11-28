@@ -106,7 +106,9 @@ impl From<std::io::Error> for BridgeSetupError {
 
 impl From<reqwest::Error> for BridgeSetupError {
     fn from(err: reqwest::Error) -> Self {
-        Self::Other(err.into())
+        // The client's text ends with the request URL, its query kept, and
+        // the setup's failure line writes the text.
+        Self::Other(err.without_url().into())
     }
 }
 
@@ -619,7 +621,7 @@ impl WebRtcBridge {
                     "Client data channel opened"
                 );
                 self.client_channel = Some(id);
-                self.flush_pending_to_client();
+                self.flush_pending(Side::Client);
             }
             Event::ChannelData(data) => {
                 log_data_channel(&self.call_id, &data, "Client→Upstream");
@@ -639,8 +641,7 @@ impl WebRtcBridge {
                         call_id = self.call_id,
                         "Buffering client event (upstream channel not open)"
                     );
-                    self.pending_to_upstream
-                        .push((data.binary, data.data.to_vec()));
+                    self.pending_to_upstream.push((data.binary, data.data));
                 }
             }
             Event::ChannelClose(id) => {
@@ -689,7 +690,7 @@ impl WebRtcBridge {
                 );
                 self.upstream_channel = Some(id);
                 self.upstream_channel_ready = true;
-                self.flush_pending_to_upstream();
+                self.flush_pending(Side::Upstream);
             }
             Event::ChannelData(data) => {
                 log_data_channel(&self.call_id, &data, "Upstream→Client");
@@ -707,8 +708,7 @@ impl WebRtcBridge {
                         call_id = self.call_id,
                         "Buffering upstream event (client channel not open)"
                     );
-                    self.pending_to_client
-                        .push((data.binary, data.data.to_vec()));
+                    self.pending_to_client.push((data.binary, data.data));
                 }
             }
             Event::ChannelClose(id) => {
@@ -739,41 +739,38 @@ impl WebRtcBridge {
         }
     }
 
-    /// Send all buffered upstream events to the now-open client data channel.
-    fn flush_pending_to_client(&mut self) {
-        let Some(ch_id) = self.client_channel else {
+    /// Send the messages buffered for `target` to its now-open data channel.
+    fn flush_pending(&mut self, target: Side) {
+        let (channel, pending, rtc) = match target {
+            Side::Client => (
+                self.client_channel,
+                &mut self.pending_to_client,
+                &mut self.client_rtc,
+            ),
+            Side::Upstream => (
+                self.upstream_channel,
+                &mut self.pending_to_upstream,
+                &mut self.upstream_rtc,
+            ),
+        };
+        let Some(ch_id) = channel else {
             return;
         };
-        let pending = std::mem::take(&mut self.pending_to_client);
+        let pending = std::mem::take(pending);
         if pending.is_empty() {
             return;
         }
+        let from = Self::side_label(match target {
+            Side::Client => Side::Upstream,
+            Side::Upstream => Side::Client,
+        });
+        let to = Self::side_label(target);
         info!(
             call_id = self.call_id,
             count = pending.len(),
-            "Flushing buffered upstream events to client"
+            "Flushing buffered {from} events to {to}"
         );
-        if let Some(mut ch) = self.client_rtc.channel(ch_id) {
-            for (binary, data) in pending {
-                let _ = ch.write(binary, &data);
-            }
-        }
-    }
-
-    fn flush_pending_to_upstream(&mut self) {
-        let Some(ch_id) = self.upstream_channel else {
-            return;
-        };
-        let pending = std::mem::take(&mut self.pending_to_upstream);
-        if pending.is_empty() {
-            return;
-        }
-        info!(
-            call_id = self.call_id,
-            count = pending.len(),
-            "Flushing buffered client events to upstream"
-        );
-        if let Some(mut ch) = self.upstream_rtc.channel(ch_id) {
+        if let Some(mut ch) = rtc.channel(ch_id) {
             for (binary, data) in pending {
                 let _ = ch.write(binary, &data);
             }
@@ -1091,137 +1088,5 @@ fn parse_stun_xor_mapped_address(resp: &[u8], txn_id: &[u8]) -> Option<SocketAdd
 }
 
 #[cfg(test)]
-mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr};
-
-    use super::*;
-
-    const TXN: [u8; 12] = [
-        0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,
-    ];
-
-    /// A STUN Binding Success Response carrying `addr` in XOR-MAPPED-ADDRESS,
-    /// encoded as RFC 5389 section 15.2 says.
-    fn binding_success(addr: SocketAddr) -> Vec<u8> {
-        let cookie = 0x2112_A442u32.to_be_bytes();
-        let mut attr = vec![0u8, if addr.is_ipv4() { 0x01 } else { 0x02 }];
-        attr.extend_from_slice(&(addr.port() ^ 0x2112).to_be_bytes());
-        match addr.ip() {
-            IpAddr::V4(ip) => {
-                attr.extend(ip.octets().iter().zip(cookie).map(|(o, k)| o ^ k));
-            }
-            IpAddr::V6(ip) => {
-                let key: Vec<u8> = cookie.iter().chain(TXN.iter()).copied().collect();
-                attr.extend(ip.octets().iter().zip(key).map(|(o, k)| o ^ k));
-            }
-        }
-        let mut resp = vec![0x01, 0x01];
-        resp.extend_from_slice(&((attr.len() + 4) as u16).to_be_bytes());
-        resp.extend_from_slice(&cookie);
-        resp.extend_from_slice(&TXN);
-        resp.extend_from_slice(&0x0020u16.to_be_bytes());
-        resp.extend_from_slice(&(attr.len() as u16).to_be_bytes());
-        resp.extend(attr);
-        resp
-    }
-
-    #[test]
-    fn xor_mapped_address_decodes_an_ipv4_reflexive_address() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 50_000);
-        assert_eq!(
-            parse_stun_xor_mapped_address(&binding_success(addr), &TXN),
-            Some(addr)
-        );
-    }
-
-    #[test]
-    fn xor_mapped_address_decodes_an_ipv6_reflexive_address() {
-        let addr = SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0xdead, 0xbeef)),
-            50_001,
-        );
-        assert_eq!(
-            parse_stun_xor_mapped_address(&binding_success(addr), &TXN),
-            Some(addr)
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unspecified_ipv4_bind_takes_the_route_to_the_probe() {
-        let probe = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3478);
-        let ip = resolve_candidate_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED), Some(probe))
-            .await
-            .unwrap();
-        assert_eq!(ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
-    }
-
-    #[tokio::test]
-    async fn an_unspecified_ipv6_bind_takes_the_route_to_the_probe() {
-        // Nothing to assert on a host without an IPv6 loopback.
-        if std::net::UdpSocket::bind("[::1]:0").is_err() {
-            return;
-        }
-        let probe = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 3478);
-        let ip = resolve_candidate_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED), Some(probe))
-            .await
-            .unwrap();
-        assert_eq!(ip, IpAddr::V6(Ipv6Addr::LOCALHOST));
-    }
-
-    #[tokio::test]
-    async fn a_specific_bind_address_is_the_candidate() {
-        let ip = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 7));
-        assert_eq!(resolve_candidate_ip(ip, None).await.unwrap(), ip);
-    }
-
-    #[test]
-    fn a_response_to_another_transaction_is_ignored() {
-        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)), 50_000);
-        let other = [0u8; 12];
-        assert_eq!(
-            parse_stun_xor_mapped_address(&binding_success(addr), &other),
-            None
-        );
-    }
-
-    #[test]
-    fn idle_beyond_max_triggers_timeout() {
-        assert!(bridge_should_time_out(
-            Duration::from_secs(1),
-            BRIDGE_MAX_IDLE + Duration::from_secs(1)
-        ));
-    }
-
-    #[test]
-    fn session_beyond_max_triggers_timeout() {
-        assert!(bridge_should_time_out(
-            BRIDGE_MAX_SESSION + Duration::from_secs(1),
-            Duration::from_secs(0)
-        ));
-    }
-
-    #[test]
-    fn active_call_within_limits_does_not_time_out() {
-        assert!(!bridge_should_time_out(
-            Duration::from_secs(600),
-            Duration::from_secs(1)
-        ));
-    }
-
-    #[test]
-    fn outcome_classification_matches_who_left() {
-        // cancelled → success regardless of anything else.
-        assert!(bridge_ended_successfully(true, true, true, true));
-        // client hung up (client not alive) → success.
-        assert!(bridge_ended_successfully(false, false, false, true));
-        // upstream died while client connected → worker failure.
-        assert!(!bridge_ended_successfully(false, false, true, false));
-        // upstream timed out silently while client connected → worker failure.
-        assert!(!bridge_ended_successfully(false, true, true, true));
-        // client-side idle timeout (upstream not flagged), both still alive → success.
-        assert!(bridge_ended_successfully(false, false, true, true));
-        // client hung up first, even if the upstream had also gone idle → success
-        // (a client close must never be recorded as an upstream 502).
-        assert!(bridge_ended_successfully(false, true, false, true));
-    }
-}
+#[path = "../../tests/unit/realtime/webrtc_bridge/tests.rs"]
+mod tests;

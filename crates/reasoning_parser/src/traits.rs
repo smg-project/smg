@@ -85,6 +85,11 @@ pub trait ReasoningParser: Send + Sync {
         false
     }
 
+    /// Configure structured JSON output before parsing a request.
+    /// Typed protocols can then distinguish JSON string data from framing.
+    /// Parsers without typed framing need no change.
+    fn set_json_mode(&mut self, _enabled: bool) {}
+
     /// Check if the parser is currently in reasoning mode.
     ///
     /// Returns true if the parser is currently parsing reasoning content.

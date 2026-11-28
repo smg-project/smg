@@ -5,7 +5,7 @@
 //! its per-runtime enums, so the variant dispatch lives here, next to the
 //! other transport glue, and nowhere else.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 pub use engine_zmq_adapter::{
     connect_for_worker, zmq_handshake_address, EncodeRendezvous, EngineCount, EosTokenIds,
@@ -13,11 +13,10 @@ pub use engine_zmq_adapter::{
     ZmqServerInfo,
 };
 use llm_tokenizer::traits::Tokenizer;
+use smg_grpc_client::engine_labels::{ModelInfo, ServerInfo};
+use smg_worker::identity::basic::CONTEXT_WINDOW_LABELS;
 
-use crate::routers::grpc::{
-    client::{ModelInfo, ServerInfo},
-    proto_wrapper::ProtoGenerateRequest,
-};
+use crate::routers::grpc::proto_wrapper::ProtoGenerateRequest;
 
 /// Submit the wrapper's request to the engine it was built for.
 pub(crate) async fn generate(
@@ -47,6 +46,62 @@ pub(crate) fn model_info(client: &ZmqEngineClient) -> ModelInfo {
     }
 }
 
+/// The labels a ZMQ worker's own link learned at the handshake: the engine's
+/// context window, under the key its dialect's model info carries it as
+/// (one of the card's window labels), so a refresh after the handshake gives
+/// the card the window the gateway's admission reads; and a TokenSpeed
+/// group's running window ([`tokenspeed_running_window`]). The rest of the
+/// handshake's report stays the link's own.
+pub(crate) fn link_labels(client: &ZmqEngineClient) -> HashMap<String, String> {
+    let info = model_info(client);
+    let tokenspeed = matches!(info, ModelInfo::TokenSpeed(_));
+    let mut labels = info.to_labels();
+    labels.retain(|key, _| CONTEXT_WINDOW_LABELS.contains(&key.as_str()));
+    if tokenspeed {
+        let engines = client.engines();
+        let max_num_seqs = engines
+            .first()
+            .map_or(0, |engine| engine.ready_response.max_num_seqs);
+        labels.extend(tokenspeed_running_window(max_num_seqs, engines.len()));
+    }
+    labels
+}
+
+/// The labels of [`tokenspeed_running_window`].
+const RUNNING_WINDOW_LABELS: [&str; 2] = ["max_num_seqs", "attn_dp_size"];
+
+/// A ZMQ worker's `record` of its engine's labels with what its link reports
+/// now. The record holds a rank worker's running window as that rank's
+/// share, and a refresh reads the report as the whole group's, so the
+/// record's share is dropped: left in place under a link that reports no
+/// window, every refresh would divide it by the ranks again.
+pub(crate) fn refreshed_labels(
+    record: &HashMap<String, String>,
+    link: HashMap<String, String>,
+) -> HashMap<String, String> {
+    let mut fresh = record.clone();
+    fresh.retain(|key, _| !RUNNING_WINDOW_LABELS.contains(&key.as_str()));
+    fresh.extend(link);
+    fresh
+}
+
+/// A TokenSpeed link's running window as the engine's report carries it:
+/// `max_num_seqs`, which every engine of a group declares as the whole
+/// group's, and the number of attention-DP ranks that share it, so a rank
+/// worker takes its share (`labels_for_rank`) and a grouped worker the whole.
+/// An engine that declares no window gives none.
+fn tokenspeed_running_window(max_num_seqs: u64, engines: usize) -> HashMap<String, String> {
+    let mut labels = HashMap::new();
+    if max_num_seqs == 0 {
+        return labels;
+    }
+    labels.insert("max_num_seqs".to_string(), max_num_seqs.to_string());
+    if engines > 1 {
+        labels.insert("attn_dp_size".to_string(), engines.to_string());
+    }
+    labels
+}
+
 /// Server metadata as the gateway's per-runtime variant.
 pub(crate) fn server_info(client: &ZmqEngineClient) -> ServerInfo {
     match client.server_info() {
@@ -70,44 +125,5 @@ pub(crate) fn fold_tokenizer_eos_backstop(
 }
 
 #[cfg(test)]
-mod tests {
-    use llm_tokenizer::mock::MockTokenizer;
-    use smg_grpc_client::{tokenspeed_proto, vllm_proto as vllm};
-
-    use super::*;
-
-    /// MockTokenizer's EOS set is {999}: a vLLM request gains it as a stop id.
-    #[test]
-    fn eos_backstop_folds_into_vllm_requests() {
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
-        let mut req = ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
-            sampling_params: Some(vllm::SamplingParams::default()),
-            ..Default::default()
-        }));
-        fold_tokenizer_eos_backstop(&mut req, Some(&tokenizer));
-        let ProtoGenerateRequest::Vllm(req) = req else {
-            panic!("expected vLLM request");
-        };
-        assert_eq!(req.sampling_params.unwrap().stop_token_ids, vec![999]);
-    }
-
-    /// The variant match is the only gate on the fold: a TokenSpeed request
-    /// (whose scheduler stops at EOS itself) is left untouched.
-    #[test]
-    fn eos_backstop_leaves_tokenspeed_requests_untouched() {
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
-        let mut req =
-            ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
-                sampling_params: Some(tokenspeed_proto::SamplingParams {
-                    stop_token_ids: vec![7],
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }));
-        fold_tokenizer_eos_backstop(&mut req, Some(&tokenizer));
-        let ProtoGenerateRequest::TokenSpeed(req) = req else {
-            panic!("expected TokenSpeed request");
-        };
-        assert_eq!(req.sampling_params.unwrap().stop_token_ids, vec![7]);
-    }
-}
+#[path = "../../../tests/unit/routers/grpc/zmq_client/tests.rs"]
+mod tests;

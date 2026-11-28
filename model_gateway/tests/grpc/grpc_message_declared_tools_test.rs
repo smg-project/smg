@@ -24,11 +24,11 @@ use serde_json::{json, Value};
 use smg::{
     config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::{RouterFactory, RouterTrait},
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory, RouterTrait},
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
 use smg_grpc_client::tokenspeed_scheduler::tokenspeed_proto as ts;
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::{net::TcpListener, task::JoinHandle};
 use validator::Validate;
 
@@ -199,7 +199,12 @@ fn chat_request(extra: Value) -> ChatCompletionRequest {
 async fn chat(gateway: &Gateway, extra: Value) -> Chat {
     let stream = extra["stream"] == true;
     let request = chat_request(extra);
-    let body = read(gateway.router.route_chat(None, &tenant(), request, MODEL)).await;
+    let body = read(
+        gateway
+            .router
+            .route_chat(None, &tenant(), Arc::new(request), MODEL),
+    )
+    .await;
     let arguments = |args: &str| match args {
         "" => Value::Null,
         args => serde_json::from_str(args).unwrap(),

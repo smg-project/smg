@@ -1,0 +1,884 @@
+//! The test guests of the WebAssembly plugin host: two small policies
+//! written as WebAssembly text, assembled and wrapped into components of the
+//! committed `smg:policy` worlds at test time (no binary fixture, no cross
+//! target). Both pick the candidate with the fewest requests in flight; a
+//! mode byte in `init`'s config makes one misbehave on purpose, so the
+//! host's failure rules can be proven.
+//!
+//! The record guest reads the canonical ABI layout of the constructor's
+//! arguments, and both guests write the layout of `score`'s result;
+//! [`check_canonical_layout`] holds their offsets against wit-parser's own
+//! size computation, so a change to the WIT fails here by name before it
+//! fails inside the guest.
+
+use std::path::PathBuf;
+
+use wit_component::{ComponentEncoder, StringEncoding};
+use wit_parser::{Int, PackageId, Resolve, SizeAlign, Type, TypeDefKind};
+
+/// `init` modes, by the first config byte.
+pub mod mode {
+    /// The honest policy.
+    pub const LEAST_IN_FLIGHT: u8 = 0;
+    /// `filter` traps.
+    pub const TRAP_IN_FILTER: u8 = 1;
+    /// `score` spins until the fuel runs out.
+    pub const SPIN_IN_SCORE: u8 = 2;
+    /// `filter` declines as not applicable.
+    pub const DECLINE_FILTER: u8 = 3;
+    /// `filter` names a position past the pool.
+    pub const FILTER_OUT_OF_RANGE: u8 = 4;
+    /// `score` answers NaN.
+    pub const NAN_SCORE: u8 = 5;
+    /// `filter` keeps the even positions only.
+    pub const KEEP_EVEN: u8 = 6;
+    /// `pick` names a filtered-out row.
+    pub const PICK_FILTERED_OUT: u8 = 7;
+    /// `pick` declines.
+    pub const DECLINE_PICK: u8 = 8;
+    /// `score` declines as not applicable.
+    pub const DECLINE_SCORE: u8 = 25;
+    /// `filter` names a position twice.
+    pub const FILTER_DUPLICATE: u8 = 9;
+    /// `filter` grows the linear memory by 32 MiB first.
+    pub const GROW_32_MIB: u8 = 10;
+    /// `filter`, `score` and `pick` each burn a fixed loop first.
+    pub const BURN_IN_STAGES: u8 = 11;
+    /// `pick` draws `random-u64` into a counter first.
+    pub const DRAW_IN_PICK: u8 = 12;
+    /// `filter` grows the table past the host's cap first.
+    pub const GROW_TABLE: u8 = 13;
+    /// `score` fills the whole memory (grown to the cap) in a loop: fuel
+    /// prices each fill by its size, so the loop is long on the clock and
+    /// cheap in fuel only under a calibration that underprices it.
+    pub const FILL_IN_SCORE: u8 = 14;
+    /// `filter` traps when the decision has four candidates: the decode side
+    /// of a pair of three prefills and four decodes.
+    pub const TRAP_ON_FOUR_CANDIDATES: u8 = 15;
+    /// `filter` fills the whole memory eight hundred times and returns, then `score`
+    /// fills it in a loop: a long call that answers, then an endless one.
+    pub const FILL_IN_FILTER_THEN_FILL: u8 = 16;
+    /// The constructor burns a fixed amount of fuel: a decision's opens spend
+    /// before any stage runs.
+    pub const BURN_IN_CONSTRUCTOR: u8 = 17;
+    /// The destructor makes fifty host calls: long on the clock,
+    /// cheap in fuel.
+    pub const SLOW_DESTRUCTOR: u8 = 18;
+    /// The lifecycle export traps.
+    pub const TRAP_IN_OBSERVE: u8 = 19;
+    /// The destructor fills its memory without end: the clock ends it where
+    /// the calibration underprices a fill, its fuel elsewhere.
+    pub const FILL_IN_DESTRUCTOR: u8 = 20;
+    /// `init` burns eight fixed loops: heavier than a small decision budget.
+    pub const BURN_IN_INIT: u8 = 21;
+    /// The decision's constructor spins without end.
+    pub const SPIN_IN_CONSTRUCTOR: u8 = 22;
+    /// The pick spins without end: the third stage, behind two cheap ones.
+    pub const SPIN_IN_PICK: u8 = 23;
+    /// The decision's constructor traps.
+    pub const TRAP_IN_CONSTRUCTOR: u8 = 24;
+    /// `score` writes a log line first: a host call a test can hold the
+    /// thread in. On three candidates it traps after the line: a call a test
+    /// can hold that then fails by itself.
+    pub const LOG_IN_SCORE: u8 = 26;
+    /// The destructor writes a log line, then loops once: a host call a test
+    /// can hold the thread in, and a check of the clock after it.
+    pub const LOG_IN_DESTRUCTOR: u8 = 27;
+    /// `score` writes a log line first and `pick` burns a fixed loop first:
+    /// a call a test can hold the thread in, then one that needs a burn's
+    /// fuel.
+    pub const LOG_THEN_BURN: u8 = 28;
+    /// `score` writes a log line, then declines as not applicable: a call a
+    /// test can hold that then declines.
+    pub const LOG_THEN_DECLINE: u8 = 29;
+    /// `filter` fills the whole memory eight times and returns, then `score`
+    /// fills it in a loop: a call of milliseconds that answers, then an
+    /// endless one.
+    pub const FILL_BRIEFLY_THEN_FILL: u8 = 30;
+    /// `observe` counts the dispatches told to its instance and `pick`
+    /// names the row at that count: what one instance heard, read from a
+    /// decision made on it.
+    pub const COUNT_DISPATCHES: u8 = 31;
+    /// `observe` counts the members the feed told its instance (a snapshot's
+    /// length, one up an addition, one down a removal) and `pick` names the
+    /// row at that count.
+    pub const COUNT_MEMBERS: u8 = 32;
+    /// As `COUNT_MEMBERS`, and `observe` traps on a snapshot of five
+    /// members: a telling that faults one instance and not the next.
+    pub const TRAP_ON_FIVE_MEMBERS: u8 = 33;
+    /// As `TRAP_ON_FIVE_MEMBERS`, and the destructor writes a log line as
+    /// `LOG_IN_DESTRUCTOR` does: a close a test can stop, on a guest whose
+    /// telling can fault.
+    pub const TRAP_ON_FIVE_AND_LOG_IN_DESTRUCTOR: u8 = 37;
+    /// `observe` counts members as `COUNT_MEMBERS` does and, at a dispatch,
+    /// keeps the count as it stood then; `pick` names the row at that count:
+    /// whether a change told ahead of a dispatch was heard ahead of it.
+    pub const MEMBERS_AT_A_DISPATCH: u8 = 34;
+    /// `observe` counts one up a relabelling and two up a resize, and `pick`
+    /// names the row at that count: the kinds one instance heard.
+    pub const COUNT_KINDS: u8 = 35;
+    /// `observe` counts the names of a `left` word (it traps where the
+    /// worker's id is not 100 or the first name does not begin with `m`) and
+    /// one more up a relabelling that follows one, and `pick` names the row
+    /// at that count: a word heard once, with its id and its names, ahead of
+    /// its relabelling.
+    pub const COUNT_LEFT: u8 = 36;
+    /// `score` answers the fixture's tie band beside its scores, and none on
+    /// a decision whose clock reads zero.
+    pub const SCORE_BAND: u8 = 38;
+    /// `score` answers a tie band that is no number.
+    pub const NAN_BAND: u8 = SCORE_BAND + 1;
+    /// `score` answers a tie band above one.
+    pub const ABOVE_ONE_BAND: u8 = NAN_BAND + 1;
+    /// `score` writes a log line, then spins: a call a test can hold the
+    /// thread in, which then runs until its fuel or its bound ends it.
+    pub const LOG_THEN_SPIN: u8 = ABOVE_ONE_BAND + 1;
+    /// A second config byte: `init` asks the host's live clock once. An
+    /// answer of zero lets it go on, of one makes it refuse, of two spin
+    /// without end, of three trap at once.
+    pub const INIT_ASKS_THE_CLOCK: u8 = 1;
+    /// `init` fails.
+    pub const REFUSE_INIT: u8 = 255;
+}
+
+/// The counters the guests add to (declared by the test's spec in this
+/// order).
+pub mod counter {
+    /// One per `observe` call.
+    pub const OBSERVED: u32 = 0;
+    /// `now-micros` as read in the constructor.
+    pub const NOW: u32 = 1;
+    /// `random-u64` as drawn in the constructor.
+    pub const RANDOM: u32 = 2;
+    /// `now-micros` as read in `observe`.
+    pub const OBSERVE_NOW: u32 = 3;
+    /// The lease's session key as `observe` saw it.
+    pub const OBSERVE_SESSION: u32 = 4;
+    /// `random-u64` as drawn in `pick` under `DRAW_IN_PICK`.
+    pub const PICK_RANDOM: u32 = 5;
+    /// The block hashes each request handed a guest of
+    /// [`hash_counting_guests`](super::hash_counting_guests), summed.
+    pub const HASHES: u32 = 6;
+}
+
+/// The canonical ABI layout the record guest reads, the constructor's
+/// arguments as one record of (request, list<candidate>, pool), and the one
+/// both guests write, `score`'s result.
+pub mod canonical {
+    /// Offset of the candidate list's pointer in the arguments.
+    pub const ARGS_CANDIDATES_PTR: usize = 136;
+    /// Offset of the candidate list's length in the arguments.
+    pub const ARGS_CANDIDATES_LEN: usize = 140;
+    /// Offset of the length of the request's `block-hashes` list in the
+    /// arguments: the request is their first field.
+    pub const ARGS_HASHES_LEN: usize = 52;
+    /// Size of one `candidate` record in guest memory.
+    pub const CANDIDATE_SIZE: usize = 120;
+    /// Offset of `in-flight` within a `candidate`.
+    pub const CANDIDATE_IN_FLIGHT: usize = 20;
+
+    /// Size of a `score-answer`.
+    pub const SCORE_ANSWER_SIZE: usize = 16;
+    /// Offset of `scores` within a `score-answer`: a pointer, then a length.
+    pub const SCORE_ANSWER_SCORES: usize = 0;
+    /// Offset of `tie-band` within a `score-answer`.
+    pub const SCORE_ANSWER_BAND: usize = 8;
+    /// Offset of the answer, or of the decline, within `score`'s result.
+    pub const SCORE_RESULT_PAYLOAD: usize = 4;
+    /// Offset of the band's value within `tie-band`.
+    pub const SCORE_BAND_PAYLOAD: usize = 4;
+}
+
+fn contracts_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("contracts")
+}
+
+/// The committed package, resolved.
+pub fn resolve() -> (Resolve, PackageId) {
+    let mut resolve = Resolve::new();
+    let (package, _sources) = resolve
+        .push_path(contracts_dir().join("smg-policy.wit"))
+        .expect("the committed WIT resolves");
+    (resolve, package)
+}
+
+/// Holds the guests' offsets against wit-parser's size computation of the
+/// committed WIT.
+pub fn check_canonical_layout() {
+    let (resolve, package) = resolve();
+    let mut sizes = SizeAlign::default();
+    sizes.fill(&resolve);
+    let types = resolve.packages[package].interfaces["types"];
+    let type_named = |name: &str| resolve.interfaces[types].types[name];
+    let record_offsets = |name: &str| -> Vec<(String, usize)> {
+        let TypeDefKind::Record(record) = &resolve.types[type_named(name)].kind else {
+            // A non-record has no fields: the asserts below fail on the gap.
+            return Vec::new();
+        };
+        sizes
+            .field_offsets(record.fields.iter().map(|f| &f.ty))
+            .into_iter()
+            .zip(&record.fields)
+            .map(|((offset, _), f)| (f.name.clone(), offset.size_wasm32()))
+            .collect()
+    };
+    let candidate = record_offsets("candidate");
+    let in_flight = candidate
+        .iter()
+        .find(|(n, _)| n == "in-flight")
+        .map(|(_, o)| *o)
+        .expect("candidate has in-flight");
+    assert_eq!(in_flight, canonical::CANDIDATE_IN_FLIGHT, "{candidate:?}");
+    let candidate_size = sizes.size(&Type::Id(type_named("candidate")));
+    assert_eq!(
+        candidate_size.size_wasm32(),
+        canonical::CANDIDATE_SIZE,
+        "{candidate:?}"
+    );
+    let request_size = sizes.size(&Type::Id(type_named("request")));
+    // The arguments record: request, then the list (align 4), then the pool.
+    let list_at = request_size.size_wasm32().next_multiple_of(4);
+    assert_eq!(list_at, canonical::ARGS_CANDIDATES_PTR);
+    assert_eq!(list_at + 4, canonical::ARGS_CANDIDATES_LEN);
+    let request = record_offsets("request");
+    let hashes = request
+        .iter()
+        .find(|(n, _)| n == "block-hashes")
+        .map(|(_, o)| *o)
+        .expect("request has block-hashes");
+    // A list is a pointer, then its length.
+    assert_eq!(hashes + 4, canonical::ARGS_HASHES_LEN, "{request:?}");
+
+    let score_answer = Type::Id(type_named("score-answer"));
+    let decline = Type::Id(type_named("decline"));
+    assert_eq!(
+        record_offsets("score-answer"),
+        [
+            ("scores".to_owned(), canonical::SCORE_ANSWER_SCORES),
+            ("tie-band".to_owned(), canonical::SCORE_ANSWER_BAND),
+        ]
+    );
+    assert_eq!(
+        sizes.size(&score_answer).size_wasm32(),
+        canonical::SCORE_ANSWER_SIZE
+    );
+    assert_eq!(
+        sizes
+            .payload_offset(Int::U8, [Some(&score_answer), Some(&decline)])
+            .size_wasm32(),
+        canonical::SCORE_RESULT_PAYLOAD
+    );
+    assert_eq!(
+        sizes
+            .payload_offset(Int::U8, [None, Some(&Type::F32)])
+            .size_wasm32(),
+        canonical::SCORE_BAND_PAYLOAD
+    );
+}
+
+/// Assembles `wat_text` and wraps it as a component of `world`.
+pub fn component(world: &str, wat_text: &str) -> Vec<u8> {
+    let (resolve, package) = resolve();
+    component_in(&resolve, package, world, wat_text)
+}
+
+/// A guest of `world` built against the world as `smg:policy@1.1.0` named
+/// it. Its shapes are today's, so nothing but the version sets it apart from
+/// today's guest of that world: a host that loads it reads no floor.
+pub fn older_minor_guest(world: &str) -> Vec<u8> {
+    let committed = contracts_dir().join("smg-policy.wit");
+    let text = std::fs::read_to_string(committed).expect("the committed WIT reads");
+    let mut resolve = Resolve::new();
+    let package = resolve
+        .push_str("smg-policy.wit", &text.replace("@1.2.0", "@1.1.0"))
+        .expect("the older package parses");
+    let guest = if world == "policy-packed" {
+        Guest::Packed
+    } else {
+        Guest::Record
+    };
+    let wat_text = guest_wat(guest).replace("@1.2.0", "@1.1.0");
+    component_in(&resolve, package, world, &wat_text)
+}
+
+/// Assembles `wat_text` and wraps it as a component of `world` in `package`.
+fn component_in(resolve: &Resolve, package: PackageId, world: &str, wat_text: &str) -> Vec<u8> {
+    let mut module = wat::parse_str(wat_text).expect("the guest assembles");
+    let world = resolve
+        .select_world(&[package], Some(world))
+        .expect("the world exists");
+    wit_component::embed_component_metadata(&mut module, resolve, world, StringEncoding::UTF8)
+        .expect("the world embeds");
+    ComponentEncoder::default()
+        .module(&module)
+        .expect("the module matches the world")
+        .validate(true)
+        .encode()
+        .expect("the component encodes")
+}
+
+/// A guest of the record world.
+pub fn record_guest() -> Vec<u8> {
+    component("policy", &guest_wat(Guest::Record))
+}
+
+/// A guest of the packed world.
+pub fn packed_guest() -> Vec<u8> {
+    component("policy-packed", &guest_wat(Guest::Packed))
+}
+
+/// Both guests with `band` as the tie band [`mode::SCORE_BAND`] answers.
+pub fn guests_with_band(band: f32) -> [(&'static str, Vec<u8>); 2] {
+    [
+        (
+            "record",
+            component("policy", &guest_wat_with_band(Guest::Record, band)),
+        ),
+        (
+            "packed",
+            component("policy-packed", &guest_wat_with_band(Guest::Packed, band)),
+        ),
+    ]
+}
+
+/// Both guests with a constructor that first tells the host, through the
+/// counter [`counter::HASHES`], how many block hashes the request handed
+/// it: the record guest reads the list's length in its arguments, the
+/// packed guest its request block's hash-count. Each by its world's name.
+pub fn hash_counting_guests() -> [(&'static str, Vec<u8>); 2] {
+    let counting = |guest: Guest, read: &str| {
+        let constructed = "    (call $on_construct)\n";
+        let counted = format!(
+            "    (call $counter (i32.const {}) (i64.extend_i32_u {read}))\n{constructed}",
+            counter::HASHES
+        );
+        let text = guest_wat(guest);
+        assert_eq!(
+            text.matches(constructed).count(),
+            1,
+            "the constructor tells the host once"
+        );
+        text.replacen(constructed, &counted, 1)
+    };
+    let record = format!(
+        "(i32.load offset={} (local.get $args))",
+        canonical::ARGS_HASHES_LEN
+    );
+    // The packed request block holds its hash-count at 48, a u16.
+    let packed = "(i32.load16_u offset=48 (local.get $rptr))";
+    [
+        (
+            "record",
+            component("policy", &counting(Guest::Record, &record)),
+        ),
+        (
+            "packed",
+            component("policy-packed", &counting(Guest::Packed, packed)),
+        ),
+    ]
+}
+
+/// A guest that imports a WASI interface: refused at load.
+pub fn wasi_importing_guest() -> Vec<u8> {
+    let text = guest_wat(Guest::Record).replacen(
+        "(memory (export \"memory\") 4)",
+        "(import \"wasi:clocks/monotonic-clock@0.2.0\" \"now\" (func $wasi_now (result i64)))\n  (memory (export \"memory\") 4)",
+        1,
+    );
+    // The embedded world must name the import for the encoder to accept it:
+    // a world of our own with the WASI import added.
+    let mut module = wat::parse_str(&text).expect("the guest assembles");
+    let (mut resolve, package) = resolve();
+    let wasi_text = "package wasi:clocks@0.2.0;\ninterface monotonic-clock { now: func() -> u64; }";
+    let wasi = resolve
+        .push_str("wasi-clocks.wit", wasi_text)
+        .expect("the wasi package parses");
+    let extra_text = "package test:extra;\nworld with-wasi { include smg:policy/policy@1.2.0; import wasi:clocks/monotonic-clock@0.2.0; }";
+    let _ = (package, wasi);
+    let extra = resolve
+        .push_str("with-wasi.wit", extra_text)
+        .expect("the test world parses");
+    let world = resolve
+        .select_world(&[extra], Some("with-wasi"))
+        .expect("the test world exists");
+    wit_component::embed_component_metadata(&mut module, &resolve, world, StringEncoding::UTF8)
+        .expect("the world embeds");
+    ComponentEncoder::default()
+        .module(&module)
+        .expect("the module matches the world")
+        .validate(true)
+        .encode()
+        .expect("the component encodes")
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Guest {
+    Record,
+    Packed,
+}
+
+/// The guest's text for one world. The two differ in the interface they
+/// export, the constructor's shape and where a candidate's in-flight count
+/// sits.
+fn guest_wat(guest: Guest) -> String {
+    guest_wat_with_band(guest, 0.25)
+}
+
+fn guest_wat_with_band(guest: Guest, band: f32) -> String {
+    let (iface, row, in_flight, constructor) = match guest {
+        Guest::Record => (
+            "smg:policy/plugin@1.2.0",
+            canonical::CANDIDATE_SIZE,
+            canonical::CANDIDATE_IN_FLIGHT,
+            // One pointer to the arguments record: the list sits at +136.
+            format!(
+                r#"(func (export "smg:policy/plugin@1.2.0#[constructor]decision") (param $args i32) (result i32)
+    (local $rep i32)
+    (local.set $rep (call $alloc (i32.const 8) (i32.const 4)))
+    (i32.store (local.get $rep) (i32.load offset={ptr} (local.get $args)))
+    (i32.store offset=4 (local.get $rep) (i32.load offset={len} (local.get $args)))
+    (call $on_construct)
+    (call $new (local.get $rep)))"#,
+                ptr = canonical::ARGS_CANDIDATES_PTR,
+                len = canonical::ARGS_CANDIDATES_LEN,
+            ),
+        ),
+        Guest::Packed => (
+            "smg:policy/plugin-packed@1.2.0",
+            104,
+            8,
+            // Seven flat params: request (ptr, len), candidates (ptr, len),
+            // count, pool (ptr, len).
+            r#"(func (export "smg:policy/plugin-packed@1.2.0#[constructor]decision") (param $rptr i32) (param $rlen i32) (param $cptr i32) (param $cand_len i32) (param $count i32) (param $pptr i32) (param $plen i32) (result i32)
+    (local $rep i32)
+    (local.set $rep (call $alloc (i32.const 8) (i32.const 4)))
+    (i32.store (local.get $rep) (local.get $cptr))
+    (i32.store offset=4 (local.get $rep) (local.get $count))
+    (call $on_construct)
+    (call $new (local.get $rep)))"#
+                .to_string(),
+        ),
+    };
+    format!(
+        r#"(module
+  (import "smg:policy/host@1.2.0" "counter" (func $counter (param i32 i64)))
+  (import "smg:policy/host@1.2.0" "now-micros" (func $now (result i64)))
+  (import "smg:policy/host@1.2.0" "random-u64" (func $random (result i64)))
+  (import "smg:policy/host@1.2.0" "log" (func $log (param i32 i32 i32)))
+  (import "[export]{iface}" "[resource-new]decision" (func $new (param i32) (result i32)))
+  (memory (export "memory") 4)
+  (table $t 1 funcref)
+  (global $heap (mut i32) (i32.const 1024))
+  (global $mode (mut i32) (i32.const 0))
+  (global $heard (mut i32) (i32.const 0))
+  (global $members (mut i32) (i32.const 0))
+  (global $left (mut i32) (i32.const 0))
+  (data (i32.const 16) "refused")
+  (data (i32.const 32) "observed")
+
+  ;; A bump allocator over the arena past the static data; the decision's
+  ;; destructor resets it, so a kept instance never grows across decisions.
+  (func $alloc (param $size i32) (param $align i32) (result i32)
+    (local $p i32)
+    (local.set $p
+      (i32.and
+        (i32.add (global.get $heap) (i32.sub (local.get $align) (i32.const 1)))
+        (i32.xor (i32.sub (local.get $align) (i32.const 1)) (i32.const -1))))
+    (global.set $heap (i32.add (local.get $p) (local.get $size)))
+    (if (i32.gt_u (global.get $heap) (i32.mul (memory.size) (i32.const 65536)))
+      (then
+        (if (i32.eq
+              (memory.grow
+                (i32.add
+                  (i32.shr_u
+                    (i32.sub (global.get $heap) (i32.mul (memory.size) (i32.const 65536)))
+                    (i32.const 16))
+                  (i32.const 1)))
+              (i32.const -1))
+          (then unreachable))))
+    (local.get $p))
+
+  (func (export "cabi_realloc") (param $old i32) (param $old_size i32) (param $align i32) (param $new_size i32) (result i32)
+    (local $p i32)
+    (local.set $p (call $alloc (local.get $new_size) (local.get $align)))
+    (if (i32.ne (local.get $old) (i32.const 0))
+      (then (memory.copy (local.get $p) (local.get $old) (local.get $old_size))))
+    (local.get $p))
+
+  ;; init(config) -> result<_, string>, by pointer: byte 0 the discriminant,
+  ;; the string at +4.
+  (func (export "{iface}#init") (param $ptr i32) (param $len i32) (result i32)
+    (local $r i32) (local $k i32) (local $asked i64)
+    (local.set $r (call $alloc (i32.const 12) (i32.const 4)))
+    (if (i32.gt_u (local.get $len) (i32.const 0))
+      (then (global.set $mode (i32.load8_u (local.get $ptr)))))
+    ;; A second config byte, when set: `init` asks the host's live clock, one
+    ;; host call that costs a few units of fuel however long the host takes
+    ;; to answer. An answer of one makes it refuse, of two spin without end,
+    ;; of three trap at once.
+    (if (i32.gt_u (local.get $len) (i32.const 1))
+      (then
+        (if (i32.load8_u offset=1 (local.get $ptr))
+          (then
+            (local.set $asked (call $now))
+            (if (i64.eq (local.get $asked) (i64.const 1))
+              (then (global.set $mode (i32.const 255))))
+            (if (i64.eq (local.get $asked) (i64.const 2))
+              (then (loop $spin (br $spin))))
+            (if (i64.eq (local.get $asked) (i64.const 3))
+              (then unreachable))))))
+    (if (i32.eq (global.get $mode) (i32.const {burn_init}))
+      (then
+        (local.set $k (i32.const 8))
+        (loop $again
+          (call $burn)
+          (local.set $k (i32.sub (local.get $k) (i32.const 1)))
+          (br_if $again (local.get $k)))))
+    (if (i32.eq (global.get $mode) (i32.const 255))
+      (then
+        (i32.store8 (local.get $r) (i32.const 1))
+        (i32.store offset=4 (local.get $r) (i32.const 16))
+        (i32.store offset=8 (local.get $r) (i32.const 7)))
+      (else (i32.store8 (local.get $r) (i32.const 0))))
+    (local.get $r))
+
+  ;; What the constructor tells the host through its counters.
+  (func $on_construct
+    (if (i32.eq (global.get $mode) (i32.const {trap_ctor})) (then unreachable))
+    (call $counter (i32.const 1) (call $now))
+    (call $counter (i32.const 2) (call $random))
+    (if (i32.eq (global.get $mode) (i32.const {burn_ctor})) (then (call $burn)))
+    (if (i32.eq (global.get $mode) (i32.const {spin_ctor})) (then (loop $spin (br $spin)))))
+
+  ;; A fixed amount of work, so a call's fuel is the same every time.
+  (func $burn (local $i i32)
+    (local.set $i (i32.const 20000))
+    (loop $more
+      (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+      (br_if $more (local.get $i))))
+
+  {constructor}
+
+  ;; filter() -> result<list<u32>, decline>, by pointer: byte 0 the
+  ;; discriminant; ok: the list at +4 (ptr) and +8 (len); err: the decline's
+  ;; discriminant at +4. A method's `self` is the rep itself: a borrow of a
+  ;; resource the callee implements lowers as its rep, not as a handle.
+  (func (export "{iface}#[method]decision.filter") (param $self i32) (result i32)
+    (local $rep i32) (local $len i32) (local $r i32) (local $out i32) (local $i i32) (local $n i32)
+    (local.set $rep (local.get $self))
+    (local.set $len (i32.load offset=4 (local.get $rep)))
+    (local.set $r (call $alloc (i32.const 16) (i32.const 4)))
+    (if (i32.eq (global.get $mode) (i32.const {trap_in_filter})) (then unreachable))
+    (if (i32.and (i32.eq (global.get $mode) (i32.const {trap_on_four})) (i32.eq (local.get $len) (i32.const 4)))
+      (then unreachable))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {fill_then_fill})) (i32.eq (global.get $mode) (i32.const {fill_briefly})))
+      (then
+        ;; Grown once: on an instance a decision kept, a second grow
+        ;; past the cap would trap.
+        (if (i32.lt_u (memory.size) (i32.const 256)) (then (drop (memory.grow (i32.const 252)))))
+        (local.set $i (select (i32.const 8) (i32.const 800) (i32.eq (global.get $mode) (i32.const {fill_briefly}))))
+        (loop $some
+          (memory.fill (i32.const 0) (i32.const 0) (i32.mul (memory.size) (i32.const 65536)))
+          (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+          (br_if $some (local.get $i)))))
+    (if (i32.eq (global.get $mode) (i32.const {burn})) (then (call $burn)))
+    (if (i32.eq (global.get $mode) (i32.const {grow_table}))
+      (then (drop (table.grow $t (ref.null func) (i32.const 70000)))))
+    (if (i32.eq (global.get $mode) (i32.const {grow}))
+      (then (drop (call $alloc (i32.const 33554432) (i32.const 8)))))
+    (if (i32.eq (global.get $mode) (i32.const {decline_filter}))
+      (then
+        (i32.store8 (local.get $r) (i32.const 1))
+        (i32.store8 offset=4 (local.get $r) (i32.const 0))
+        (return (local.get $r))))
+    (local.set $out (call $alloc (i32.mul (local.get $len) (i32.const 4)) (i32.const 4)))
+    (local.set $i (i32.const 0))
+    (local.set $n (i32.const 0))
+    (block $done
+      (loop $next
+        (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+        (if (i32.or
+              (i32.ne (global.get $mode) (i32.const {keep_even}))
+              (i32.eqz (i32.and (local.get $i) (i32.const 1))))
+          (then
+            (i32.store (i32.add (local.get $out) (i32.mul (local.get $n) (i32.const 4))) (local.get $i))
+            (local.set $n (i32.add (local.get $n) (i32.const 1)))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $next)))
+    (if (i32.and (i32.eq (global.get $mode) (i32.const {out_of_range})) (i32.gt_u (local.get $n) (i32.const 0)))
+      (then (i32.store (i32.add (local.get $out) (i32.mul (i32.sub (local.get $n) (i32.const 1)) (i32.const 4))) (local.get $len))))
+    (if (i32.and (i32.eq (global.get $mode) (i32.const {duplicate})) (i32.gt_u (local.get $n) (i32.const 1)))
+      (then (i32.store (i32.add (local.get $out) (i32.const 4)) (i32.const 0))))
+    (i32.store8 (local.get $r) (i32.const 0))
+    (i32.store offset=4 (local.get $r) (local.get $out))
+    (i32.store offset=8 (local.get $r) (local.get $n))
+    (local.get $r))
+
+  ;; score() -> result<score-answer, decline>: 1 - min(in-flight, 100) / 100
+  ;; a row, and the tie band the mode asks for.
+  (func (export "{iface}#[method]decision.score") (param $self i32) (result i32)
+    (local $rep i32) (local $cands i32) (local $len i32) (local $r i32) (local $out i32) (local $i i32) (local $f i32)
+    (local.set $rep (local.get $self))
+    (local.set $cands (i32.load (local.get $rep)))
+    (local.set $len (i32.load offset=4 (local.get $rep)))
+    (if (i32.eq (global.get $mode) (i32.const {spin})) (then (loop $spin (br $spin))))
+    (if (i32.eq (global.get $mode) (i32.const {burn})) (then (call $burn)))
+    (if (i32.eq (global.get $mode) (i32.const {log_in_score}))
+      (then
+        (call $log (i32.const 2) (i32.const 32) (i32.const 8))
+        (if (i32.eq (local.get $len) (i32.const 3)) (then unreachable))))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {log_then_burn})) (i32.eq (global.get $mode) (i32.const {log_then_decline})))
+      (then (call $log (i32.const 2) (i32.const 32) (i32.const 8))))
+    (if (i32.eq (global.get $mode) (i32.const {log_then_spin}))
+      (then
+        (call $log (i32.const 2) (i32.const 32) (i32.const 8))
+        (loop $spin (br $spin))))
+    (if (i32.or (i32.or (i32.eq (global.get $mode) (i32.const {fill})) (i32.eq (global.get $mode) (i32.const {fill_then_fill}))) (i32.eq (global.get $mode) (i32.const {fill_briefly})))
+      (then
+        ;; The filter of the second mode grew the memory already: a second
+        ;; grow past the cap would trap.
+        (if (i32.eq (global.get $mode) (i32.const {fill})) (then (drop (memory.grow (i32.const 252)))))
+        (loop $fill
+          (memory.fill (i32.const 0) (i32.const 0) (i32.mul (memory.size) (i32.const 65536)))
+          (br $fill))))
+    (local.set $r (call $alloc (i32.const {score_result_size}) (i32.const 4)))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {decline_score})) (i32.eq (global.get $mode) (i32.const {log_then_decline})))
+      (then
+        (i32.store8 (local.get $r) (i32.const 1))
+        (i32.store8 offset={score_result_payload} (local.get $r) (i32.const 0))
+        (return (local.get $r))))
+    (local.set $out (call $alloc (i32.mul (local.get $len) (i32.const 4)) (i32.const 4)))
+    (local.set $i (i32.const 0))
+    (block $done
+      (loop $next
+        (br_if $done (i32.ge_u (local.get $i) (local.get $len)))
+        (local.set $f (i32.load offset={in_flight} (i32.add (local.get $cands) (i32.mul (local.get $i) (i32.const {row})))))
+        (local.set $f (select (local.get $f) (i32.const 100) (i32.lt_u (local.get $f) (i32.const 100))))
+        (f32.store (i32.add (local.get $out) (i32.mul (local.get $i) (i32.const 4)))
+          (select
+            (f32.const nan)
+            (f32.sub (f32.const 1) (f32.div (f32.convert_i32_u (local.get $f)) (f32.const 100)))
+            (i32.eq (global.get $mode) (i32.const {nan_score}))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $next)))
+    (i32.store8 (local.get $r) (i32.const 0))
+    (i32.store offset={score_list} (local.get $r) (local.get $out))
+    (i32.store offset={score_list_len} (local.get $r) (local.get $len))
+    (i32.store8 offset={score_option} (local.get $r) (i32.const 0))
+    (block $no_band
+      (br_if $no_band (i32.gt_u (i32.sub (global.get $mode) (i32.const {score_band})) (i32.const {band_mode_span})))
+      (if (i32.eq (global.get $mode) (i32.const {score_band}))
+        (then (br_if $no_band (i64.eqz (call $now)))))
+      (i32.store8 offset={score_option} (local.get $r) (i32.const 1))
+      (f32.store offset={score_band_value} (local.get $r)
+        (select
+          (f32.const nan)
+          (select (f32.const 1.125) (f32.const {band}) (i32.eq (global.get $mode) (i32.const {above_one_band})))
+          (i32.eq (global.get $mode) (i32.const {nan_band})))))
+    (local.get $r))
+
+  ;; pick(scores) -> result<option<u32>, decline>: the best score at or
+  ;; above zero; a row below zero was filtered out.
+  (func (export "{iface}#[method]decision.pick") (param $self i32) (param $sptr i32) (param $slen i32) (result i32)
+    (local $r i32) (local $i i32) (local $best i32) (local $top f32) (local $s f32) (local $found i32)
+    (if (i32.eq (global.get $mode) (i32.const {spin_pick})) (then (loop $spin (br $spin))))
+    (local.set $r (call $alloc (i32.const 16) (i32.const 4)))
+    (i32.store8 (local.get $r) (i32.const 0))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {burn})) (i32.eq (global.get $mode) (i32.const {log_then_burn}))) (then (call $burn)))
+    (if (i32.eq (global.get $mode) (i32.const {draw_in_pick}))
+      (then (call $counter (i32.const 5) (call $random))))
+    (if (i32.eq (global.get $mode) (i32.const {decline_pick}))
+      (then
+        (i32.store8 offset=4 (local.get $r) (i32.const 0))
+        (return (local.get $r))))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {count_dispatches})) (i32.or (i32.eq (global.get $mode) (i32.const {members_at_a_dispatch})) (i32.or (i32.eq (global.get $mode) (i32.const {count_kinds})) (i32.eq (global.get $mode) (i32.const {count_left})))))
+      (then
+        (i32.store8 offset=4 (local.get $r) (i32.const 1))
+        (i32.store offset=8 (local.get $r) (global.get $heard))
+        (return (local.get $r))))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {count_members})) (i32.or (i32.eq (global.get $mode) (i32.const {trap_on_five_members})) (i32.eq (global.get $mode) (i32.const {trap_on_five_log_dtor}))))
+      (then
+        (i32.store8 offset=4 (local.get $r) (i32.const 1))
+        (i32.store offset=8 (local.get $r) (global.get $members))
+        (return (local.get $r))))
+    (local.set $i (i32.const 0))
+    (local.set $found (i32.const 0))
+    (local.set $top (f32.const -2))
+    (block $done
+      (loop $next
+        (br_if $done (i32.ge_u (local.get $i) (local.get $slen)))
+        (local.set $s (f32.load (i32.add (local.get $sptr) (i32.mul (local.get $i) (i32.const 4)))))
+        (if (i32.eq (global.get $mode) (i32.const {pick_filtered_out}))
+          (then
+            (if (f32.lt (local.get $s) (f32.const 0))
+              (then
+                (local.set $best (local.get $i))
+                (local.set $found (i32.const 1))
+                (br $done))))
+          (else
+            (if (i32.and (f32.ge (local.get $s) (f32.const 0)) (f32.gt (local.get $s) (local.get $top)))
+              (then
+                (local.set $top (local.get $s))
+                (local.set $best (local.get $i))
+                (local.set $found (i32.const 1))))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $next)))
+    (if (i32.and (i32.eq (global.get $mode) (i32.const {pick_filtered_out})) (i32.eqz (local.get $found)))
+      (then
+        (local.set $best (local.get $slen))
+        (local.set $found (i32.const 1))))
+    (i32.store8 offset=4 (local.get $r) (local.get $found))
+    (i32.store offset=8 (local.get $r) (local.get $best))
+    (local.get $r))
+
+  ;; observe(event): the flattened variant, sixteen values; counted. The
+  ;; sixth value is the lease's session key on every lease-bearing case.
+  (func (export "{iface}#observe") (param i32 i64 i64 i64 i32 i64 i64 i32 i64 i64 i32 i64 i32 i32 i32 i32)
+    (if (i32.eq (global.get $mode) (i32.const {trap_in_observe})) (then unreachable))
+    ;; A membership event is the outer case 4. Its inner case is the second
+    ;; value (an addition 0, a removal 1, a snapshot 5) and a snapshot's
+    ;; length the fourth: the members told to this instance, counted.
+    (if (i32.eq (local.get 0) (i32.const 4))
+      (then
+        (if (i64.eq (local.get 1) (i64.const 5))
+          (then
+            (if (i32.and (i32.or (i32.eq (global.get $mode) (i32.const {trap_on_five_members})) (i32.eq (global.get $mode) (i32.const {trap_on_five_log_dtor}))) (i64.eq (local.get 3) (i64.const 5)))
+              (then unreachable))
+            (global.set $members (i32.wrap_i64 (local.get 3)))))
+        (if (i64.eq (local.get 1) (i64.const 0))
+          (then (global.set $members (i32.add (global.get $members) (i32.const 1)))))
+        (if (i64.eq (local.get 1) (i64.const 1))
+          (then (global.set $members (i32.sub (global.get $members) (i32.const 1)))))
+        (if (i32.eq (global.get $mode) (i32.const {count_kinds}))
+          (then
+            (if (i64.eq (local.get 1) (i64.const 3))
+              (then (global.set $heard (i32.add (global.get $heard) (i32.const 1)))))
+            (if (i64.eq (local.get 1) (i64.const 4))
+              (then (global.set $heard (i32.add (global.get $heard) (i32.const 2)))))))
+        ;; A `left` word is the inner case 6: its id is the third value, its
+        ;; names the fourth (a pointer, widened) and the fifth (their count).
+        ;; A name is a pointer and a length, so the first name's first byte
+        ;; is read through two loads.
+        (if (i32.eq (global.get $mode) (i32.const {count_left}))
+          (then
+            (if (i64.eq (local.get 1) (i64.const 6))
+              (then
+                (if (i64.ne (local.get 2) (i64.const 100))
+                  (then unreachable))
+                (if (i32.ne (i32.load8_u (i32.load (i32.wrap_i64 (local.get 3)))) (i32.const 109))
+                  (then unreachable))
+                (global.set $heard (i32.add (global.get $heard) (local.get 4)))
+                (global.set $left (i32.const 1))))
+            (if (i32.and (i64.eq (local.get 1) (i64.const 3)) (global.get $left))
+              (then
+                (global.set $heard (i32.add (global.get $heard) (i32.const 1)))
+                (global.set $left (i32.const 0))))))))
+    ;; A dispatch is the outer case 1 of the event: counted on this instance.
+    (if (i32.eq (local.get 0) (i32.const 1))
+      (then
+        (if (i32.eq (global.get $mode) (i32.const {members_at_a_dispatch}))
+          (then (global.set $heard (global.get $members)))
+          (else (global.set $heard (i32.add (global.get $heard) (i32.const 1)))))))
+    (call $counter (i32.const 0) (i64.const 1))
+    (call $counter (i32.const 3) (call $now))
+    (call $counter (i32.const 4) (local.get 6))
+    (call $log (i32.const 2) (i32.const 32) (i32.const 8)))
+
+  ;; The destructor resets the arena.
+  (func (export "{iface}#[dtor]decision") (param $rep i32) (local $i i32)
+    (if (i32.eq (global.get $mode) (i32.const {fill_dtor}))
+      (then
+        (loop $fill
+          (memory.fill (i32.const 0) (i32.const 0) (i32.mul (memory.size) (i32.const 65536)))
+          (br $fill))))
+    (if (i32.eq (global.get $mode) (i32.const {slow_dtor}))
+      (then
+        (local.set $i (i32.const 50))
+        (loop $calls
+          (drop (call $now))
+          (local.set $i (i32.sub (local.get $i) (i32.const 1)))
+          (br_if $calls (local.get $i)))))
+    (if (i32.or (i32.eq (global.get $mode) (i32.const {log_dtor})) (i32.eq (global.get $mode) (i32.const {trap_on_five_log_dtor})))
+      (then
+        (call $log (i32.const 2) (i32.const 32) (i32.const 8))
+        (loop $once (br_if $once (i32.const 0)))))
+    (global.set $heap (i32.const 1024)))
+)"#,
+        iface = iface,
+        row = row,
+        in_flight = in_flight,
+        constructor = constructor,
+        trap_in_filter = mode::TRAP_IN_FILTER,
+        decline_filter = mode::DECLINE_FILTER,
+        keep_even = mode::KEEP_EVEN,
+        out_of_range = mode::FILTER_OUT_OF_RANGE,
+        duplicate = mode::FILTER_DUPLICATE,
+        grow = mode::GROW_32_MIB,
+        spin = mode::SPIN_IN_SCORE,
+        nan_score = mode::NAN_SCORE,
+        score_band = mode::SCORE_BAND,
+        nan_band = mode::NAN_BAND,
+        above_one_band = mode::ABOVE_ONE_BAND,
+        band_mode_span = mode::ABOVE_ONE_BAND - mode::SCORE_BAND,
+        score_result_size = canonical::SCORE_RESULT_PAYLOAD + canonical::SCORE_ANSWER_SIZE,
+        score_result_payload = canonical::SCORE_RESULT_PAYLOAD,
+        score_list = canonical::SCORE_RESULT_PAYLOAD + canonical::SCORE_ANSWER_SCORES,
+        score_list_len = canonical::SCORE_RESULT_PAYLOAD + canonical::SCORE_ANSWER_SCORES + 4,
+        score_option = canonical::SCORE_RESULT_PAYLOAD + canonical::SCORE_ANSWER_BAND,
+        score_band_value = canonical::SCORE_RESULT_PAYLOAD
+            + canonical::SCORE_ANSWER_BAND
+            + canonical::SCORE_BAND_PAYLOAD,
+        decline_score = mode::DECLINE_SCORE,
+        decline_pick = mode::DECLINE_PICK,
+        pick_filtered_out = mode::PICK_FILTERED_OUT,
+        burn = mode::BURN_IN_STAGES,
+        draw_in_pick = mode::DRAW_IN_PICK,
+        grow_table = mode::GROW_TABLE,
+        fill = mode::FILL_IN_SCORE,
+        trap_on_four = mode::TRAP_ON_FOUR_CANDIDATES,
+        fill_then_fill = mode::FILL_IN_FILTER_THEN_FILL,
+        burn_ctor = mode::BURN_IN_CONSTRUCTOR,
+        spin_ctor = mode::SPIN_IN_CONSTRUCTOR,
+        spin_pick = mode::SPIN_IN_PICK,
+        slow_dtor = mode::SLOW_DESTRUCTOR,
+        trap_in_observe = mode::TRAP_IN_OBSERVE,
+        fill_dtor = mode::FILL_IN_DESTRUCTOR,
+        burn_init = mode::BURN_IN_INIT,
+        trap_ctor = mode::TRAP_IN_CONSTRUCTOR,
+        log_in_score = mode::LOG_IN_SCORE,
+        log_dtor = mode::LOG_IN_DESTRUCTOR,
+        log_then_burn = mode::LOG_THEN_BURN,
+        log_then_decline = mode::LOG_THEN_DECLINE,
+        log_then_spin = mode::LOG_THEN_SPIN,
+        fill_briefly = mode::FILL_BRIEFLY_THEN_FILL,
+        count_dispatches = mode::COUNT_DISPATCHES,
+        count_members = mode::COUNT_MEMBERS,
+        trap_on_five_members = mode::TRAP_ON_FIVE_MEMBERS,
+        trap_on_five_log_dtor = mode::TRAP_ON_FIVE_AND_LOG_IN_DESTRUCTOR,
+        members_at_a_dispatch = mode::MEMBERS_AT_A_DISPATCH,
+        count_kinds = mode::COUNT_KINDS,
+        count_left = mode::COUNT_LEFT,
+    )
+}
+
+/// The record guest with four tables: more than the host allows one
+/// instance.
+pub fn four_table_guest() -> Vec<u8> {
+    let wat = guest_wat(Guest::Record).replacen(
+        "(table $t 1 funcref)",
+        "(table $t 1 funcref)\n  (table $t2 1 funcref)\n  (table $t3 1 funcref)\n  (table $t4 1 funcref)",
+        1,
+    );
+    component("policy", &wat)
+}
+
+/// The record guest with a second linear memory: more than the host allows
+/// one instance.
+pub fn two_memory_guest() -> Vec<u8> {
+    let wat = guest_wat(Guest::Record).replacen(
+        "(memory (export \"memory\") 4)",
+        "(memory (export \"memory\") 4)\n  (memory 1)",
+        1,
+    );
+    component("policy", &wat)
+}

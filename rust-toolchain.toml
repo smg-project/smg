@@ -8,5 +8,5 @@
 # those (grep for the release). rustfmt runs on nightly (`cargo +nightly fmt`),
 # which this pin does not affect.
 [toolchain]
-channel = "1.98.0"
+channel = "1.100.0"
 components = ["clippy", "rustfmt"]

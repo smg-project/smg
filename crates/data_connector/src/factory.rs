@@ -2,6 +2,7 @@
 
 use std::{sync::Arc, time::Duration};
 
+use tokio::sync::oneshot;
 use tracing::info;
 use url::Url;
 
@@ -49,17 +50,60 @@ pub struct StorageFactoryConfig<'a> {
 
 /// Why the start-up contact with a store failed. The contact, one connection
 /// and one round trip, is bounded by the backend's store-call bound
-/// (`op_timeout_secs`): the client library and the pool bound their own steps
-/// at twice that, so a store that accepts the connection and never answers is
-/// the contact's own verdict, with the bound in the text, for either backend;
-/// a store that refuses the connection is a verdict at once. The gateway does
-/// not start with a history backend it cannot reach.
+/// (`op_timeout_secs`) on Postgres and Redis, where the client library and
+/// the pool bound their own steps at twice that, and by the pool's wait
+/// (`pool_timeout_secs`) on Oracle, whose driver connects synchronously on a
+/// blocking thread; so a store that accepts the connection and never answers
+/// is the contact's own verdict, with the bound in the text, for every
+/// backend; a store that refuses the connection is a verdict at once. The
+/// gateway does not start with a history backend it cannot reach.
 #[derive(Debug)]
 pub(crate) enum StoreContactError {
     /// The connection or the round trip failed: refused, reset, rejected.
     Failed(String),
     /// Nothing came back within the bound.
     NoAnswer,
+}
+
+/// The start-up contact of a store whose driver connects synchronously:
+/// `connect` runs on a thread of its own, outside the runtime's blocking
+/// pool, and its answer is awaited under `bound` (`None`: no bound, as a
+/// pool with no wait bound). Nothing back within the bound is `NoAnswer`; a
+/// `connect` that failed, or whose thread ended without an answer (the
+/// helper runs the connect and the bootstrap, so the text names neither), is
+/// `Failed` with the cause. The bound ends the wait, not the thread: it
+/// returns when the driver does, and the process's exit ends it. It is not
+/// a `spawn_blocking` task because the runtime's drop waits for those: a
+/// start-up that gave up on the connect must still hand its error to the
+/// operator and exit.
+pub(crate) async fn contact_blocking<T: Send + 'static>(
+    bound: Option<Duration>,
+    connect: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, StoreContactError> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("history-store-start-up".to_string())
+        .spawn(move || {
+            // The receiver is gone when the bound fired first: nothing to do.
+            let _ = tx.send(connect());
+        })
+        .map_err(|e| {
+            StoreContactError::Failed(format!("the start-up thread could not start: {e}"))
+        })?;
+    let answer = match bound {
+        Some(bound) => match tokio::time::timeout(bound, rx).await {
+            Ok(answer) => answer,
+            Err(_elapsed) => return Err(StoreContactError::NoAnswer),
+        },
+        None => rx.await,
+    };
+    match answer {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(cause)) => Err(StoreContactError::Failed(cause)),
+        Err(_gone) => Err(StoreContactError::Failed(
+            "the start-up thread ended without an answer".to_string(),
+        )),
+    }
 }
 
 /// The start-up error for a store contact that failed: the backend, the store
@@ -145,13 +189,25 @@ pub async fn create_storage(config: StorageFactoryConfig<'_>) -> Result<StorageB
             let oracle_cfg = config
                 .oracle
                 .ok_or("oracle configuration is required when history_backend=oracle")?;
+            // The same numeric bounds as the Postgres and Redis paths, before
+            // any connection.
+            oracle_cfg
+                .validate_bounds()
+                .map_err(|e| format!("Invalid Oracle configuration: {e}"))?;
 
             info!(
-                "Initializing data connector: Oracle ATP (pool: {}-{})",
-                oracle_cfg.pool_min, oracle_cfg.pool_max
+                "Initializing data connector: Oracle ATP (pool: {}-{}, op_timeout_secs: {})",
+                oracle_cfg.pool_min, oracle_cfg.pool_max, oracle_cfg.op_timeout_secs
             );
 
-            let storages = create_oracle_storage(oracle_cfg)?;
+            // The driver runs each call on a blocking thread, which the bound
+            // does not interrupt: the request is answered at the bound; the
+            // thread returns when the driver does (each round trip of a pooled
+            // connection ends within its own call timeout of twice the bound).
+            let storages = bounded(
+                create_oracle_storage(oracle_cfg).await?,
+                CallBound::new("oracle", oracle_cfg.op_timeout()),
+            );
 
             info!("Data connector initialized successfully: Oracle ATP");
             storages
@@ -251,17 +307,45 @@ fn bounded(bundle: StorageBundle, bound: CallBound) -> StorageBundle {
 }
 
 /// Create Oracle storage backends with a single shared connection pool.
-fn create_oracle_storage(oracle_cfg: &OracleConfig) -> Result<StorageBundle, String> {
+async fn create_oracle_storage(oracle_cfg: &OracleConfig) -> Result<StorageBundle, String> {
     use crate::oracle::OracleStore;
 
-    let store = OracleStore::new(
-        oracle_cfg,
-        &[
-            OracleConversationStorage::init_schema,
-            OracleConversationItemStorage::init_schema,
-            OracleResponseStorage::init_schema,
-        ],
-    )?;
+    let store = OracleStore::new(oracle_cfg)?;
+    // The start-up connection under the pool's wait, as the Postgres and
+    // Redis contacts run under their call bound; a pool wait of 0 is no bound
+    // (then nothing can fail to answer in time, and the text's 0 s is unused).
+    let bound = oracle_cfg.pool_timeout();
+    let conn = store.contact(bound).await.map_err(|err| {
+        contact_error(
+            "Oracle",
+            &oracle_cfg.connect_descriptor,
+            bound.unwrap_or_default(),
+            err,
+        )
+    })?;
+    // The tables, the schema version and the indexes, on that connection and
+    // on the same kind of thread, so no round trip of the start-up runs on a
+    // runtime worker; unbounded, as before: a migration takes what it takes,
+    // and a store that stops answering after the login holds the start-up
+    // here (named in the change, not changed).
+    let bootstrap_store = store.clone();
+    contact_blocking(None, move || {
+        bootstrap_store.bootstrap(
+            &conn,
+            &[
+                OracleConversationStorage::init_schema,
+                OracleConversationItemStorage::init_schema,
+                OracleResponseStorage::init_schema,
+            ],
+        )?;
+        drop(conn);
+        Ok(())
+    })
+    .await
+    .map_err(|err| match err {
+        StoreContactError::Failed(cause) => cause,
+        StoreContactError::NoAnswer => "the start-up bootstrap gave no answer".to_string(),
+    })?;
 
     Ok(StorageBundle {
         response_storage: Arc::new(OracleResponseStorage::new(store.clone())),
@@ -315,404 +399,5 @@ async fn create_redis_storage(redis_cfg: &RedisConfig) -> Result<StorageBundle, 
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{net::TcpListener, time::Instant};
-
-    use serde_json::json;
-
-    use super::*;
-    use crate::{
-        core::{NewConversation, NewConversationItem, StoredResponse},
-        test_support::RefusedAddress,
-    };
-
-    /// A listener that completes the TCP handshake and never answers: the
-    /// store that accepts bytes and says nothing.
-    fn black_hole() -> (TcpListener, u16) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
-        let port = listener.local_addr().expect("local address").port();
-        (listener, port)
-    }
-
-    /// The store-call bound of the test configurations, the start-up
-    /// contact's bound: short, so the black-hole tests are quick, and under
-    /// the client's and pool's backstops (twice it) by construction.
-    const BOUND_SECS: u64 = 2;
-    const BOUND: Duration = Duration::from_secs(BOUND_SECS);
-
-    fn postgres_config(port: u16) -> PostgresConfig {
-        PostgresConfig {
-            db_url: format!("postgres://u:s3cr3t@127.0.0.1:{port}/db"),
-            pool_max: 1,
-            op_timeout_secs: BOUND_SECS,
-            schema: None,
-        }
-    }
-
-    #[test]
-    fn redacted_masks_the_password_in_the_userinfo_and_in_the_query() {
-        assert_eq!(
-            redacted_url("postgres://u:s3cr3t@h:5432/db"),
-            "postgres://u:****@h:5432/db"
-        );
-        assert_eq!(
-            redacted_url("postgres://u@h/db?password=s3cr3t&sslmode=require"),
-            "postgres://u@h/db?password=****&sslmode=require"
-        );
-        assert_eq!(
-            redacted_url("postgres://u:s3cr3t@h/db?Password=s3cr3t"),
-            "postgres://u:****@h/db?Password=****"
-        );
-        assert_eq!(
-            redacted_url("redis://:s3cr3t@h:6379/0"),
-            "redis://:****@h:6379/0"
-        );
-        assert_eq!(redacted_url("not a url"), "<redacted>");
-    }
-
-    fn redis_config(port: u16) -> RedisConfig {
-        RedisConfig {
-            url: format!("redis://:s3cr3t@127.0.0.1:{port}/0"),
-            pool_max: 1,
-            op_timeout_secs: BOUND_SECS,
-            schema: None,
-            retention_days: None,
-        }
-    }
-
-    /// The tests' hang guard: a start-up verdict, the contact's own at
-    /// `BOUND` or a backstop's at twice it, must come within it; the guard
-    /// only turns a start-up that never answers into a failure. A loaded
-    /// runner changes the tests' duration, never their verdict.
-    const HANG_GUARD: Duration = Duration::from_secs(30);
-
-    /// `create_storage` for one remote backend, given up on at the hang
-    /// guard: `None` is a start-up that never gave a verdict.
-    async fn start_up(
-        postgres: Option<&PostgresConfig>,
-        redis: Option<&RedisConfig>,
-    ) -> Option<Result<StorageBundle, String>> {
-        let backend = if postgres.is_some() {
-            HistoryBackend::Postgres
-        } else {
-            HistoryBackend::Redis
-        };
-        tokio::time::timeout(
-            HANG_GUARD,
-            create_storage(StorageFactoryConfig {
-                backend: &backend,
-                oracle: None,
-                postgres,
-                redis,
-                memory: None,
-                hook: None,
-            }),
-        )
-        .await
-        .ok()
-    }
-
-    #[tokio::test]
-    async fn a_postgres_store_that_accepts_and_never_answers_is_refused_within_the_start_up_bound()
-    {
-        let (_hole, port) = black_hole();
-        let started = Instant::now();
-        let verdict = start_up(Some(&postgres_config(port)), None)
-            .await
-            .expect("the start-up contact gives a verdict within its bound");
-        let err = verdict
-            .err()
-            .expect("a store that never answers is refused at start-up");
-        assert!(
-            err.contains("Postgres history backend")
-                && err.contains("did not answer within the start-up bound of 2 s"),
-            "{err}"
-        );
-        assert!(!err.contains("s3cr3t"), "the password is masked: {err}");
-        assert!(
-            started.elapsed() >= BOUND,
-            "the verdict waited for the bound"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_redis_store_that_accepts_and_never_answers_is_refused_within_the_start_up_bound() {
-        let (_hole, port) = black_hole();
-        let started = Instant::now();
-        let verdict = start_up(None, Some(&redis_config(port)))
-            .await
-            .expect("the start-up contact gives a verdict within its bound");
-        let err = verdict
-            .err()
-            .expect("a store that never answers is refused at start-up");
-        // The client's connect and the pool's create are bounded at twice the
-        // store-call bound: the start-up contact's own verdict comes first,
-        // the same as for Postgres. Only that verdict names the bound (a
-        // backstop's reads "is unreachable at start-up: ..."), so the text
-        // tells which came first; no clock on the test's side judges it.
-        assert!(
-            err.contains("Redis history backend")
-                && err.contains("did not answer within the start-up bound of 2 s"),
-            "{err}"
-        );
-        assert!(!err.contains("s3cr3t"), "the password is masked: {err}");
-        assert!(
-            started.elapsed() >= BOUND,
-            "the verdict waited for the bound"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unreachable_redis_store_is_refused_at_start_up_like_postgres() {
-        let refused = RefusedAddress::reserve();
-        let err = start_up(None, Some(&redis_config(refused.port())))
-            .await
-            .expect("the start-up contact gives a verdict within its bound")
-            .err()
-            .expect("an unreachable store is refused at start-up");
-        assert!(
-            err.contains("Redis history backend") && err.contains("is unreachable at start-up"),
-            "{err}"
-        );
-        assert!(!err.contains("s3cr3t"), "the password is masked: {err}");
-    }
-
-    #[tokio::test]
-    async fn an_unreachable_postgres_store_is_refused_at_start_up() {
-        let refused = RefusedAddress::reserve();
-        let err = start_up(Some(&postgres_config(refused.port())), None)
-            .await
-            .expect("the start-up contact gives a verdict within its bound")
-            .err()
-            .expect("an unreachable store is refused at start-up");
-        assert!(
-            err.contains("Postgres history backend") && err.contains("is unreachable at start-up"),
-            "{err}"
-        );
-        assert!(
-            err.contains("refused"),
-            "the cause of the refusal is in the text the operator sees: {err}"
-        );
-        assert!(!err.contains("s3cr3t"), "the password is masked: {err}");
-    }
-
-    /// The three stores of `bundle` take a write each and read it back.
-    async fn stores_and_reads_back(bundle: StorageBundle) {
-        let (resp, conv, items) = (
-            bundle.response_storage,
-            bundle.conversation_storage,
-            bundle.conversation_item_storage,
-        );
-        let mut response = StoredResponse::new(None);
-        response.input = json!("hello");
-        let id = resp.store_response(response).await.unwrap();
-        assert!(resp.get_response(&id).await.unwrap().is_some());
-
-        let conversation = conv
-            .create_conversation(NewConversation {
-                id: None,
-                metadata: None,
-                tenant: None,
-            })
-            .await
-            .unwrap();
-        assert!(conv
-            .get_conversation(&conversation.id)
-            .await
-            .unwrap()
-            .is_some());
-
-        let item = items
-            .create_item(NewConversationItem {
-                id: None,
-                response_id: None,
-                item_type: "message".to_string(),
-                role: Some("user".to_string()),
-                content: json!([]),
-                status: Some("completed".to_string()),
-                tenant: None,
-            })
-            .await
-            .unwrap();
-        assert!(items.get_item(&item.id).await.unwrap().is_some());
-    }
-
-    #[tokio::test]
-    async fn test_create_storage_memory() {
-        let config = StorageFactoryConfig {
-            backend: &HistoryBackend::Memory,
-            oracle: None,
-            postgres: None,
-            redis: None,
-            memory: None,
-            hook: None,
-        };
-        stores_and_reads_back(create_storage(config).await.unwrap()).await;
-    }
-
-    #[tokio::test]
-    async fn test_create_storage_none() {
-        let config = StorageFactoryConfig {
-            backend: &HistoryBackend::None,
-            oracle: None,
-            postgres: None,
-            redis: None,
-            memory: None,
-            hook: None,
-        };
-        let bundle = create_storage(config).await.unwrap();
-        let (resp, conv) = (bundle.response_storage, bundle.conversation_storage);
-
-        // NoOp storage should accept writes but return nothing on reads
-        let mut response = StoredResponse::new(None);
-        response.input = json!("hello");
-        let id = resp.store_response(response).await.unwrap();
-        assert!(resp.get_response(&id).await.unwrap().is_none());
-        assert!(conv
-            .get_conversation(&"nonexistent".into())
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn test_create_storage_oracle_missing_config() {
-        let err = create_storage(StorageFactoryConfig {
-            backend: &HistoryBackend::Oracle,
-            oracle: None,
-            postgres: None,
-            redis: None,
-            memory: None,
-            hook: None,
-        })
-        .await
-        .err()
-        .expect("should fail");
-        assert!(err.contains("oracle configuration is required"));
-    }
-
-    /// A store config reaches the factory from every entry path (the CLI, the
-    /// Python bindings, a config built by hand); a bound of 0 s is refused by
-    /// name here, before any connection, instead of failing every store call
-    /// once the gateway is up.
-    #[tokio::test]
-    async fn a_zero_call_bound_is_refused_by_the_factory_before_any_connection() {
-        let postgres_cfg = PostgresConfig {
-            db_url: "postgres://user:pass@localhost:5432/mydb".to_string(),
-            pool_max: 4,
-            op_timeout_secs: 0,
-            schema: None,
-        };
-        let err = create_storage(StorageFactoryConfig {
-            backend: &HistoryBackend::Postgres,
-            oracle: None,
-            postgres: Some(&postgres_cfg),
-            redis: None,
-            memory: None,
-            hook: None,
-        })
-        .await
-        .err()
-        .expect("a zero bound is refused");
-        assert!(err.contains("op_timeout_secs"), "{err}");
-
-        let redis_cfg = RedisConfig {
-            url: "redis://localhost:6379".to_string(),
-            pool_max: 4,
-            op_timeout_secs: 0,
-            retention_days: Some(1),
-            schema: None,
-        };
-        let err = create_storage(StorageFactoryConfig {
-            backend: &HistoryBackend::Redis,
-            oracle: None,
-            postgres: None,
-            redis: Some(&redis_cfg),
-            memory: None,
-            hook: None,
-        })
-        .await
-        .err()
-        .expect("a zero bound is refused");
-        assert!(err.contains("op_timeout_secs"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn test_create_storage_postgres_missing_config() {
-        let err = create_storage(StorageFactoryConfig {
-            backend: &HistoryBackend::Postgres,
-            oracle: None,
-            postgres: None,
-            redis: None,
-            memory: None,
-            hook: None,
-        })
-        .await
-        .err()
-        .expect("should fail");
-        assert!(err.contains("Postgres configuration is required"));
-    }
-
-    #[tokio::test]
-    async fn test_create_storage_redis_missing_config() {
-        let err = create_storage(StorageFactoryConfig {
-            backend: &HistoryBackend::Redis,
-            oracle: None,
-            postgres: None,
-            redis: None,
-            memory: None,
-            hook: None,
-        })
-        .await
-        .err()
-        .expect("should fail");
-        assert!(err.contains("Redis configuration is required"));
-    }
-
-    #[tokio::test]
-    async fn test_create_storage_with_hook() {
-        use std::sync::Arc;
-
-        use async_trait::async_trait;
-
-        use crate::{
-            context::RequestContext,
-            hooks::{BeforeHookResult, ExtraColumns, HookError, StorageHook, StorageOperation},
-        };
-
-        struct NoOpHook;
-
-        #[async_trait]
-        impl StorageHook for NoOpHook {
-            async fn before(
-                &self,
-                _op: StorageOperation,
-                _ctx: Option<&RequestContext>,
-                _payload: &serde_json::Value,
-            ) -> Result<BeforeHookResult, HookError> {
-                Ok(BeforeHookResult::default())
-            }
-
-            async fn after(
-                &self,
-                _op: StorageOperation,
-                _ctx: Option<&RequestContext>,
-                _payload: &serde_json::Value,
-                _result: &serde_json::Value,
-                extra: &ExtraColumns,
-            ) -> Result<ExtraColumns, HookError> {
-                Ok(extra.clone())
-            }
-        }
-
-        let config = StorageFactoryConfig {
-            backend: &HistoryBackend::Memory,
-            oracle: None,
-            postgres: None,
-            redis: None,
-            memory: None,
-            hook: Some(Arc::new(NoOpHook)),
-        };
-        stores_and_reads_back(create_storage(config).await.unwrap()).await;
-    }
-}
+#[path = "../tests/unit/factory/tests.rs"]
+mod tests;

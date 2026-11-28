@@ -15,7 +15,7 @@ use super::utils::{patch_response_with_request_metadata, restore_original_tools}
 use crate::{
     error,
     header_utils::{extract_forwardable_request_headers, ApiProvider},
-    mcp_utils::{ensure_request_mcp_client, request_uses_mcp_routing},
+    mcp_utils::{ensure_request_mcp_routing, request_uses_mcp_routing},
     openai::{
         context::{PayloadState, RequestContext, ResponsesPayloadState},
         mcp::{execute_tool_loop, prepare_mcp_tools_as_functions, ToolLoopExecutionContext},
@@ -23,6 +23,9 @@ use crate::{
     openai_bridge,
     persistence_utils::{persist_conversation_items, PersistStep},
     tenant::storage_tenant,
+    upstream_body::{
+        read_response_body_limited, ReadBodyResult, ERROR_BODY_TOO_LARGE, MAX_ERROR_RESPONSE_SIZE,
+    },
     worker::redacted_url,
 };
 
@@ -75,9 +78,12 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
                     "MCP format registry required for requests carrying MCP/builtin tools",
                 );
             };
-            ensure_request_mcp_client(mcp_orchestrator, registry, tools)
-                .await
-                .map(|servers| (servers, mcp_orchestrator.clone(), registry.clone()))
+            match ensure_request_mcp_routing(mcp_orchestrator, registry, tools).await {
+                Ok(servers) => {
+                    servers.map(|servers| (servers, mcp_orchestrator.clone(), registry.clone()))
+                }
+                Err(refusal) => return refusal,
+            }
         }
         _ => None,
     };
@@ -137,6 +143,9 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
             Ok(r) => r,
             Err(e) => {
                 worker.record_outcome(502);
+                // The client's text ends with the request URL: the line names the
+                // worker masked, and the answer names no address.
+                let e = e.without_url();
                 tracing::error!(
                     url = %redacted_url(&url),
                     error = %e,
@@ -153,9 +162,15 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
         worker.record_outcome(status.as_u16());
 
         if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            let body = error::sanitize_error_body(&body);
-            return (status, body).into_response();
+            return match read_response_body_limited(response, MAX_ERROR_RESPONSE_SIZE).await {
+                ReadBodyResult::Ok(body) => {
+                    (status, error::sanitize_error_body(&body)).into_response()
+                }
+                ReadBodyResult::TooLarge => {
+                    error::create_error(status, "upstream_error", ERROR_BODY_TOO_LARGE)
+                }
+                ReadBodyResult::Error(_) => (status, String::new()).into_response(),
+            };
         }
 
         response_json = match response.json::<Value>().await {
@@ -163,7 +178,7 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
             Err(e) => {
                 return error::internal_error(
                     "parse_error",
-                    format!("Failed to parse upstream response: {e}"),
+                    format!("Failed to parse upstream response: {}", e.without_url()),
                 );
             }
         };
@@ -216,63 +231,5 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use axum::http::StatusCode;
-    use openai_protocol::responses::ResponsesRequest;
-    use serde_json::json;
-
-    use super::handle_non_streaming_response;
-    use crate::{
-        openai::{
-            context::{
-                ComponentRefs, PayloadState, RequestContext, SharedComponents, WorkerSelection,
-            },
-            provider::OpenAIProvider,
-        },
-        test_support::{http_client, StubWorker, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL},
-    };
-
-    /// A request context past worker selection with its payload ready, the
-    /// worker at `worker_url`; the request names no tool, so the plain
-    /// forward is taken.
-    fn context_for(worker_url: &str) -> RequestContext {
-        let request: ResponsesRequest =
-            serde_json::from_value(json!({"model": "m", "input": "hi"})).expect("a request");
-        let mut ctx = RequestContext::for_responses(
-            Arc::new(request),
-            None,
-            Some("m".to_string()),
-            ComponentRefs::Shared(Arc::new(SharedComponents {
-                client: http_client(),
-            })),
-        );
-        ctx.state.worker = Some(WorkerSelection {
-            worker: StubWorker::at(worker_url),
-            provider: Arc::new(OpenAIProvider),
-        });
-        ctx.state.payload = Some(PayloadState {
-            json: json!({}),
-            url: format!("{worker_url}/v1/responses"),
-        });
-        ctx
-    }
-
-    /// The forward's failure line names the worker masked: a worker
-    /// registered with credentials at a port nobody listens on fails the
-    /// send, and the line carries the masked address, never the
-    /// credentials. The capture is the tracing subscriber itself, so the
-    /// rendering is read as a log reader would.
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn a_failed_forward_names_the_worker_masked_in_its_line() {
-        let response = handle_non_streaming_response(context_for(CREDENTIALED_WORKER_URL)).await;
-
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert!(!logs_contain("secret"));
-        assert!(!logs_contain("user:"));
-        assert!(logs_contain("Failed to forward request to OpenAI"));
-        assert!(logs_contain(&format!("{MASKED_WORKER_URL}/v1/responses")));
-    }
-}
+#[path = "../../../tests/unit/openai/responses/non_streaming/tests.rs"]
+mod tests;

@@ -21,6 +21,7 @@ use std::{
 
 use bytes::Bytes;
 use engine_servicer::{
+    sglang::encoder::{EncoderMediaItem, EncoderModality, EncoderServer},
     BoxFuture, EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
     EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq, MediaError,
     MediaFeatures, MediaProcessor, MediaRequest, ProcessedMedia, ServicerConfig, ServicerError,
@@ -31,7 +32,7 @@ use engine_servicer::{
     DEFAULT_ENGINE_SILENCE_TIMEOUT, DEFAULT_ENGINE_STARTUP_CEILING, DEFAULT_ENGINE_STARTUP_TIMEOUT,
     PIXEL_MODALITIES,
 };
-use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, Modality};
+use llm_multimodal::{jpeg_turbo::TurboJpegPolicy, MediaErrorCode, Modality};
 use prost::Message;
 use pyo3::{
     exceptions::{PyRuntimeError, PyTimeoutError, PyValueError},
@@ -359,15 +360,33 @@ fn lent_bytes(owner: Bound<'_, PyAny>) -> PyResult<Bytes> {
 /// Python's answer to one media request, called once: `("ok",
 /// (prompt_token_ids, mm_features | None, aux_frames, cache_salt | None,
 /// media_identity | None))` where each aux frame is a read-only numpy view
-/// lent without a copy, or `(kind, message)` with `kind` one of `invalid`,
-/// `unavailable`, `internal`.
+/// lent without a copy, `("media", (code, message))` for a failure of the
+/// request's own media under the public `code` the router answers (one it
+/// does not know is `media_fetch_failed`, as the router reads it), or
+/// `(kind, message)` with `kind` one of `invalid`, `unavailable`, `internal`,
+/// or, for a fetch that failed for the reference's own reason, `media_client`
+/// or `media_transient`: the media's fault under the fetch-failed code, as the
+/// gateway's own pipeline on a worker reports it.
 #[pyclass(name = "_MediaDone")]
 struct MediaDone {
     tx: Mutex<Option<oneshot::Sender<Result<ProcessedMedia, MediaError>>>>,
 }
 
+/// The outcome kinds of a fetch that failed for the reference's own reason,
+/// as the servicer package's bridge names them.
+const MEDIA_CLIENT_KIND: &str = "media_client";
+const MEDIA_TRANSIENT_KIND: &str = "media_transient";
+
 #[pymethods]
 impl MediaDone {
+    /// The media-fault kinds `__call__` reads. The servicer package sends a
+    /// kind only to a callback that lists it: one that predates a kind reads
+    /// it as `internal`.
+    #[classattr]
+    fn media_fault_kinds() -> (&'static str, &'static str) {
+        (MEDIA_CLIENT_KIND, MEDIA_TRANSIENT_KIND)
+    }
+
     fn __call__(&self, kind: &str, payload: &Bound<'_, PyAny>) -> PyResult<()> {
         let outcome = match kind {
             "ok" => {
@@ -394,8 +413,28 @@ impl MediaDone {
                     media_identity,
                 })
             }
+            "media" => {
+                let (code, message): (String, String) = payload.extract()?;
+                Err(MediaError::Media {
+                    fault: smg_grpc_client::WorkerMediaFault::Client,
+                    code: MediaErrorCode::parse(&code)
+                        .unwrap_or(MediaErrorCode::FetchFailed)
+                        .as_str(),
+                    message,
+                })
+            }
             "invalid" => Err(MediaError::Invalid(payload.extract()?)),
             "unavailable" => Err(MediaError::Unavailable(payload.extract()?)),
+            MEDIA_CLIENT_KIND => Err(MediaError::Media {
+                fault: smg_grpc_client::WorkerMediaFault::Client,
+                code: MediaErrorCode::FetchFailed.as_str(),
+                message: payload.extract()?,
+            }),
+            MEDIA_TRANSIENT_KIND => Err(MediaError::Media {
+                fault: smg_grpc_client::WorkerMediaFault::Transient,
+                code: MediaErrorCode::FetchFailed.as_str(),
+                message: payload.extract()?,
+            }),
             _ => Err(MediaError::Internal(payload.extract()?)),
         };
         let sender = self
@@ -480,7 +519,7 @@ impl MediaProcessor for SmgMediaProcessor {
         Box::pin(async move {
             let items = request
                 .items
-                .iter()
+                .into_iter()
                 .enumerate()
                 .map(|(index, item)| {
                     let modality = match item.modality.as_str() {
@@ -492,14 +531,11 @@ impl MediaProcessor for SmgMediaProcessor {
                             )))
                         }
                     };
-                    Ok(WorkerMediaItem {
-                        modality,
-                        url: item.url.clone(),
-                    })
+                    Ok(WorkerMediaItem::new(modality, item.url))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let output = pipeline
-                .process(request.prompt_token_ids, &items, request.want_identity)
+                .process(request.prompt_token_ids, items, request.want_identity)
                 .await
                 .map_err(|error| match error {
                     WorkerMediaError::Invalid(message) => MediaError::Invalid(message),
@@ -520,6 +556,47 @@ impl MediaProcessor for SmgMediaProcessor {
                 media_identity: output.identity,
             })
         })
+    }
+}
+
+/// Convert a worker-side media pipeline error into a typed tonic status.
+fn worker_media_error_to_status(error: WorkerMediaError) -> tonic::Status {
+    match error {
+        WorkerMediaError::Invalid(message) => tonic::Status::invalid_argument(message),
+        WorkerMediaError::Internal(message) => tonic::Status::internal(message),
+        WorkerMediaError::Media {
+            fault,
+            code,
+            message,
+        } => smg_grpc_client::stamp_media_code(
+            fault.stamp(match fault {
+                smg_grpc_client::WorkerMediaFault::Client => {
+                    tonic::Status::invalid_argument(message)
+                }
+                smg_grpc_client::WorkerMediaFault::Transient => tonic::Status::unavailable(message),
+            }),
+            code.as_str(),
+        ),
+    }
+}
+
+/// Parse an optional OpenAI image detail string (`auto`, `low`, `high`) into [`llm_multimodal::ImageDetail`].
+fn parse_image_detail(
+    raw: Option<&str>,
+) -> Result<Option<llm_multimodal::ImageDetail>, tonic::Status> {
+    let Some(detail) = raw.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if detail.eq_ignore_ascii_case("auto") {
+        Ok(Some(llm_multimodal::ImageDetail::Auto))
+    } else if detail.eq_ignore_ascii_case("low") {
+        Ok(Some(llm_multimodal::ImageDetail::Low))
+    } else if detail.eq_ignore_ascii_case("high") {
+        Ok(Some(llm_multimodal::ImageDetail::High))
+    } else {
+        Err(tonic::Status::invalid_argument(format!(
+            "unsupported image detail option: {detail:?}"
+        )))
     }
 }
 
@@ -567,24 +644,14 @@ impl SglangMediaProcessor for SmgSglangMediaProcessor {
                 // The shared pipeline matches anchors per modality, preserving URL order.
                 let items = mm.image_urls.into_iter().map(|url| (Modality::Image, url))
                     .chain(mm.video_urls.into_iter().map(|url| (Modality::Video, url)))
-                    .map(|(modality, url)| WorkerMediaItem { modality, url })
+                    .map(|(modality, url)| WorkerMediaItem::new(modality, url))
                     .collect::<Vec<_>>();
                 let tokenized = request.tokenized.as_mut()
                     .ok_or_else(|| tonic::Status::invalid_argument("media references require tokenized input"))?;
-                let (tokens, inputs, extras) = pipeline.process_sglang(
-                    std::mem::take(&mut tokenized.input_ids), &items,
-                ).await.map_err(|error| match error {
-                    WorkerMediaError::Invalid(message) => tonic::Status::invalid_argument(message),
-                    WorkerMediaError::Internal(message) => tonic::Status::internal(message),
-                    WorkerMediaError::Media { fault, code, message } => {
-                        smg_grpc_client::stamp_media_code(
-                            fault.stamp(match fault {
-                                smg_grpc_client::WorkerMediaFault::Client => tonic::Status::invalid_argument(message),
-                                smg_grpc_client::WorkerMediaFault::Transient => tonic::Status::unavailable(message),
-                            }), code.as_str(),
-                        )
-                    }
-                })?;
+                let (tokens, inputs, extras) = pipeline
+                    .process_sglang(std::mem::take(&mut tokenized.input_ids), items)
+                    .await
+                    .map_err(worker_media_error_to_status)?;
                 tokenized.input_ids = tokens;
                 request.mm_inputs = Some(Box::new(inputs));
                 request.extra_mm_inputs = extras;
@@ -638,7 +705,8 @@ fn native_media_options(
     // reported them; the pipeline refuses the entries that reach the family
     // (every rule the default loader reads for a family on that loader, the
     // flag rules for a family whose loader the engine registers for its
-    // processor class, none for a sampler that never followed a loader).
+    // processor class, none for a sampler that never followed a loader) and
+    // takes a `video.fps` entry as the rate of the interval walk.
     let video_frame_budget = count("video_frame_budget")?;
     // The engine's encoder budget, the most feature tokens one item may
     // carry; absent when the launcher could not tell, which leaves an item's
@@ -744,6 +812,7 @@ impl PyVllmGrpcServer {
         kv_connector = String::new(),
         kv_role = String::new(),
         kv_engine_id = String::new(),
+        pd_local_tail = 0,
         runs_mooncake = false,
         supports_ec_transfer = false,
         ec_connector = String::new(),
@@ -804,6 +873,7 @@ impl PyVllmGrpcServer {
         kv_connector: String,
         kv_role: String,
         kv_engine_id: String,
+        pd_local_tail: u32,
         runs_mooncake: bool,
         supports_ec_transfer: bool,
         ec_connector: String,
@@ -871,6 +941,7 @@ impl PyVllmGrpcServer {
             kv_connector,
             kv_role,
             kv_engine_id,
+            pd_local_tail,
             runs_mooncake,
             supports_ec_transfer,
             ec_connector,
@@ -1722,6 +1793,7 @@ impl PySglangGrpcServer {
         kv_events_topic = String::new(),
         encode_dispatcher = None,
         smg_media_processor = None,
+        managed_config = None,
         engine_startup_timeout_secs = None,
         engine_startup_ceiling_secs = None,
         engine_silence_timeout_secs = None,
@@ -1765,6 +1837,7 @@ impl PySglangGrpcServer {
         kv_events_topic: String,
         encode_dispatcher: Option<Bound<'_, PyAny>>,
         smg_media_processor: Option<Bound<'_, PyDict>>,
+        managed_config: Option<String>,
         engine_startup_timeout_secs: Option<f64>,
         engine_startup_ceiling_secs: Option<f64>,
         engine_silence_timeout_secs: Option<f64>,
@@ -1839,6 +1912,17 @@ impl PySglangGrpcServer {
             media_processor: None,
         };
         let inner = py.detach(|| -> PyResult<SglangServicerServer> {
+            if let Some(json) = managed_config {
+                if native.is_some() {
+                    return Err(PyValueError::new_err(
+                        "managed P/D cannot use legacy media preprocessing",
+                    ));
+                }
+                let managed = serde_json::from_str(&json).map_err(|e| {
+                    PyValueError::new_err(format!("invalid managed configuration: {e}"))
+                })?;
+                return SglangServicerServer::start_managed(config, managed).map_err(to_py_err);
+            }
             if let Some(native) = native {
                 if !matches!(
                     native.settings.encoder_dtype.as_str(),
@@ -1967,5 +2051,179 @@ impl PySglangGrpcServer {
         }
         let timeout = Duration::from_secs_f64(timeout_secs);
         py.detach(|| self.inner.stop(timeout)).map_err(to_py_err)
+    }
+}
+
+/// Convert managed encoder proto items into `WorkerMediaItem`s, forwarding validated image detail.
+fn encoder_items_to_worker_items(
+    modality: EncoderModality,
+    encoder_items: Vec<EncoderMediaItem>,
+) -> Result<Vec<WorkerMediaItem>, tonic::Status> {
+    let target_modality = match modality {
+        EncoderModality::Image => Modality::Image,
+        EncoderModality::Video => Modality::Video,
+    };
+    encoder_items
+        .into_iter()
+        .map(|item| {
+            let detail = parse_image_detail(item.detail.as_deref())?;
+            Ok(WorkerMediaItem {
+                modality: target_modality,
+                url: item.url,
+                detail,
+            })
+        })
+        .collect()
+}
+
+/// Native encoder control shares the existing servicer runtime and Rust media pipeline.
+#[pyclass(name = "ManagedEncoderServer")]
+pub struct PyManagedEncoderServer {
+    server: EncoderServer,
+}
+
+#[pymethods]
+impl PyManagedEncoderServer {
+    #[new]
+    /// Start Rust encoder control with the shared Rust media pipeline.
+    fn new(
+        py: Python<'_>,
+        config_json: String,
+        options: Bound<'_, PyDict>,
+        tokenizer_dir: String,
+        max_artifact_bytes: usize,
+    ) -> PyResult<Self> {
+        use engine_servicer::sglang::encoder::{EncoderArtifact, EncoderProcessor};
+        let native = native_media_options(&options, "managed-encoder")?;
+        if max_artifact_bytes == 0
+            || native.max_inflight == 0
+            || native.max_inflight > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(PyValueError::new_err(
+                "managed encoder requires finite nonzero limits",
+            ));
+        }
+        py.detach(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+            let pipeline = Arc::new(
+                runtime
+                    .block_on(async {
+                        let tokenizer =
+                            llm_tokenizer::factory::create_tokenizer_async(&tokenizer_dir).await?;
+                        let mut settings = native.settings;
+                        settings.tokenizer_dir = Some(tokenizer_dir);
+                        WorkerMediaPipeline::new_sglang(settings, tokenizer).await
+                    })
+                    .map_err(|error| PyValueError::new_err(format!("{error:#}")))?,
+            );
+            drop(runtime);
+            let process: EncoderProcessor = Arc::new(
+                move |modality: EncoderModality, encoder_items: Vec<EncoderMediaItem>| {
+                    let pipeline = pipeline.clone();
+                    Box::pin(async move {
+                        let items = encoder_items_to_worker_items(modality, encoder_items)?;
+                        let (_, inputs, extras) = pipeline
+                            .process_sglang_encoder_items(items)
+                            .await
+                            .map_err(worker_media_error_to_status)?;
+                        let embedding_tokens = std::iter::once(&inputs)
+                            .chain(extras.iter())
+                            .flat_map(|batch| batch.mm_placeholders.iter())
+                            .map(|item| u64::from(item.length))
+                            .sum();
+                        let artifact = smg_grpc_client::sglang_proto::GenerateRequest {
+                            mm_inputs: Some(Box::new(inputs)),
+                            extra_mm_inputs: extras,
+                            ..Default::default()
+                        };
+                        let encoded_len = artifact.encoded_len();
+                        if encoded_len > max_artifact_bytes {
+                            return Err(tonic::Status::invalid_argument(format!(
+                                "managed CPU artifact exceeds byte budget ({encoded_len} > {max_artifact_bytes} bytes)"
+                            )));
+                        }
+                        Ok(EncoderArtifact {
+                            bytes: artifact.encode_to_vec().into(),
+                            embedding_tokens,
+                        })
+                    })
+                },
+            );
+            EncoderServer::start(&config_json, process)
+                .map(|server| Self { server })
+                .map_err(to_py_err)
+        })
+    }
+
+    /// Stop admission and request cancellation without claiming native release.
+    fn drain(&self) {
+        self.server.drain();
+    }
+    /// Count encoder owners that still lack a native release receipt.
+    fn active(&self) -> usize {
+        self.server.active()
+    }
+    /// Expose control-thread liveness to the Python shutdown observer.
+    fn running(&self) -> bool {
+        self.server.running()
+    }
+    /// Return the recorded control failure so the launcher can begin cleanup.
+    fn last_error(&self) -> PyResult<Option<String>> {
+        self.server.last_error().map_err(to_py_err)
+    }
+    /// Stop the Rust listeners after the caller has drained native owners.
+    fn stop(&self, py: Python<'_>, timeout: f64) -> PyResult<()> {
+        let duration = Duration::try_from_secs_f64(timeout)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        py.detach(|| self.server.stop(duration).map_err(to_py_err))
+    }
+}
+
+#[cfg(test)]
+mod managed_encoder_tests {
+    use super::*;
+
+    #[test]
+    fn encoder_items_to_worker_items_forwards_image_detail_and_rejects_invalid() {
+        let items = encoder_items_to_worker_items(
+            EncoderModality::Image,
+            vec![
+                EncoderMediaItem {
+                    url: "https://example.test/a.png".into(),
+                    detail: Some("low".into()),
+                },
+                EncoderMediaItem {
+                    url: "https://example.test/b.png".into(),
+                    detail: Some("HIGH".into()),
+                },
+                EncoderMediaItem {
+                    url: "https://example.test/c.png".into(),
+                    detail: Some("auto".into()),
+                },
+                EncoderMediaItem {
+                    url: "https://example.test/d.png".into(),
+                    detail: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[0].detail, Some(llm_multimodal::ImageDetail::Low));
+        assert_eq!(items[1].detail, Some(llm_multimodal::ImageDetail::High));
+        assert_eq!(items[2].detail, Some(llm_multimodal::ImageDetail::Auto));
+        assert_eq!(items[3].detail, None);
+
+        let err = encoder_items_to_worker_items(
+            EncoderModality::Image,
+            vec![EncoderMediaItem {
+                url: "https://example.test/bad.png".into(),
+                detail: Some("ultra".into()),
+            }],
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

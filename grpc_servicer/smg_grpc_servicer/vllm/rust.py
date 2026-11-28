@@ -61,6 +61,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     DEFAULT_SILENCE_TIMEOUT_SECS,
     DEFAULT_STARTUP_CEILING_SECS,
     DEFAULT_STARTUP_TIMEOUT_SECS,
+    DRAIN_LINGER_SECS,
     IMPLS,
     SOURCE_DEFAULT,
     EngineProcess,
@@ -101,6 +102,16 @@ logger = logging.getLogger(__name__)
 SERVICER_IMPL_ENV = "SMG_VLLM_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_VLLM_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_VLLM_SERVICER_DRAIN_SECS"
+# How long the engine stays up after the drain's last stream: 1 s, or
+# KV_PRODUCER_DRAIN_LINGER_SECS for an engine that produces KV.
+DRAIN_LINGER_SECS_ENV = "SMG_VLLM_SERVICER_DRAIN_LINGER_SECS"
+# A PD prefill engine's stream ends when its prefill does; the decode worker
+# pulls the KV over the connector (NIXL) afterwards, which the servicer does
+# not see, so the engine stays up this long after the last stream. A busy
+# decode worker can pull later than this (NIXL reads the KV when the decode
+# scheduler admits the request); DRAIN_LINGER_SECS_ENV raises it.
+KV_PRODUCER_DRAIN_LINGER_SECS = 5.0
+KV_PRODUCER_ROLES = ("kv_producer", "kv_both")
 STARTUP_TIMEOUT_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS"
 STARTUP_CEILING_SECS_ENV = "SMG_VLLM_SERVICER_STARTUP_CEILING_SECS"
 SILENCE_TIMEOUT_SECS_ENV = "SMG_VLLM_SERVICER_SILENCE_TIMEOUT_SECS"
@@ -179,12 +190,30 @@ def model_info_from_config(
         # lists): the servicer withholds a PD decode side's KV-transfer rejection
         # notice there, whatever connector the projection above reports.
         "runs_mooncake": runs_mooncake(vllm_config),
+        # How many trailing prompt tokens a PD decode side computes itself
+        # after its KV pull; the servicer holds those to the model's
+        # vocabulary even when the request's handoff is honoured.
+        "pd_local_tail": pd_local_tail(vllm_config),
         # Encoder-cache disaggregation, off `ec_transfer_config` as the Python
-        # servicer reads it; the Rust servicer refuses a leg that names a
+        # servicer reads it; the Rust servicer refuses a request that names a
         # connector when none runs.
         **ec_transfer_facts(vllm_config),
         "log_stats": log_stats,
     }
+
+
+def pd_local_tail(vllm_config: Any) -> int:
+    """How many trailing prompt tokens a PD decode side still computes on
+    this engine after pulling the prompt's KV: the last one, which the
+    scheduler recomputes to sample the next, or the speculative drafter's
+    prefill lookahead where that is longer. vLLM 0.31 and later read it as
+    ``num_prefill_lookahead_tokens``, and NIXL pulls short of it so that the
+    decoder computes the drafter's window itself (``_prefill_backoff``, one
+    token less than the lookahead; the whole lookahead is a safe upper
+    bound). An older vLLM has no such lookahead: its connectors pull the
+    whole prompt, or all but the last token."""
+    lookahead = getattr(vllm_config, "num_prefill_lookahead_tokens", 0)
+    return max(1, int(lookahead or 0))
 
 
 def ec_transfer_facts(vllm_config: Any) -> dict[str, Any]:
@@ -288,7 +317,8 @@ def smg_media_options(
     entries that reach the family (every rule the default loader reads for a
     family on that loader, the flag rules for a family whose loader the engine
     registers for its processor class, none for a sampler that never followed
-    a loader) and passes the rest. The engine's encoder budget goes along as
+    a loader), takes a ``video.fps`` entry as the rate of the interval walk
+    and passes the rest. The engine's encoder budget goes along as
     well (``encoder_budget`` when the caller derived it, else derived here):
     the pipeline refuses an item above it before the engine, which would admit
     the item and never schedule it.
@@ -402,7 +432,9 @@ VIDEO_SAMPLING_KEYS = ("fps", "max_frames", "min_frames", "temporal_patch_size")
 
 def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) -> str | None:
     """The sampling rules of the engine's video loader that the smg pipeline
-    cannot follow, each named the way the launcher was given it, or ``None``:
+    cannot follow (but for the interval walk, which takes a reported
+    ``video.fps`` as its rate), each named the way the launcher was given it,
+    or ``None``:
     an explicit ``video.video_backend`` in ``--media-io-kwargs``, whatever its
     value (vLLM's media connector adds the loader it registers for a processor
     class only when the kwargs name none, so an explicit kwarg wins over that
@@ -420,8 +452,10 @@ def video_loader_rule(model_config, environ: Mapping[str, str] | None = None) ->
     processor class (the Qwen2-VL line, Qwen3-Omni, the GLM-5 family and the
     Qwen3-VL family: the environment variable never reaches that loader, an
     explicit ``opencv`` swaps it), the flag rules alone; and none for the
-    families with a sampler of their own, which never followed the loader and
-    start as before, so a fleet-wide loader setting does not block them."""
+    families with a sampler of their own, which start as before, so a
+    fleet-wide loader setting does not block them: they never followed the
+    loader, but for the interval walk, which takes a reported ``fps`` as its
+    rate."""
     source = os.environ if environ is None else environ
     mm_config = multimodal_config(model_config)
     kwargs = getattr(mm_config, "media_io_kwargs", None) or {}
@@ -595,6 +629,33 @@ def launch_engine_cores(ns: argparse.Namespace) -> EngineProcessGroup | EnginePr
 # ---------------------------------------------------------------------------
 
 
+def kv_role(args: Any) -> str:
+    """The ``kv_role`` of the launcher's ``--kv-transfer-config`` (typed, a
+    mapping, or its JSON form), or ``""`` without one."""
+    config = getattr(args, "kv_transfer_config", None)
+    if isinstance(config, str):
+        try:
+            config = json.loads(config) if config.strip() else None
+        except ValueError:
+            return ""
+    if config is None:
+        return ""
+    role = (
+        config.get("kv_role") if isinstance(config, Mapping) else getattr(config, "kv_role", None)
+    )
+    return str(role or "")
+
+
+def default_drain_linger_secs(args: Any) -> float:
+    """The drain's linger when :data:`DRAIN_LINGER_SECS_ENV` is unset:
+    :data:`KV_PRODUCER_DRAIN_LINGER_SECS` for an engine whose KV a decode
+    worker pulls after the stream ended (``kv_role`` ``kv_producer`` or
+    ``kv_both``), else :data:`DRAIN_LINGER_SECS`."""
+    return (
+        KV_PRODUCER_DRAIN_LINGER_SECS if kv_role(args) in KV_PRODUCER_ROLES else DRAIN_LINGER_SECS
+    )
+
+
 class VllmLauncher(RustLauncher):
     """The vLLM launcher's lifecycle: the engine config, built once from the
     launcher's parsed namespace, serves the facts, the tokenizer lookup and
@@ -608,6 +669,7 @@ class VllmLauncher(RustLauncher):
     ipc_prefix = "servicer"
     handshake_port_env = HANDSHAKE_PORT_ENV
     drain_secs_env = DRAIN_SECS_ENV
+    drain_linger_secs_env = DRAIN_LINGER_SECS_ENV
     startup_timeout_secs_env = STARTUP_TIMEOUT_SECS_ENV
     startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
     silence_timeout_secs_env = SILENCE_TIMEOUT_SECS_ENV
@@ -628,6 +690,9 @@ class VllmLauncher(RustLauncher):
 
     def warmup_wire(self, target: str) -> Any:
         return warmup_wire(target)
+
+    def default_drain_linger_secs(self, args: argparse.Namespace) -> float:
+        return default_drain_linger_secs(args)
 
     def prepare(self, args: argparse.Namespace) -> None:
         configure_logging()

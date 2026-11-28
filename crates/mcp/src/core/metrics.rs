@@ -169,33 +169,9 @@ impl LatencyStats {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.total_ms.fetch_add(ms, Ordering::Relaxed);
 
-        // Update min (relaxed ordering is fine for approximate stats)
-        let mut current_min = self.min_ms.load(Ordering::Relaxed);
-        while ms < current_min {
-            match self.min_ms.compare_exchange_weak(
-                current_min,
-                ms,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current_min = actual,
-            }
-        }
-
-        // Update max
-        let mut current_max = self.max_ms.load(Ordering::Relaxed);
-        while ms > current_max {
-            match self.max_ms.compare_exchange_weak(
-                current_max,
-                ms,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current_max = actual,
-            }
-        }
+        // The extremes: relaxed ordering is fine for approximate stats.
+        self.min_ms.fetch_min(ms, Ordering::Relaxed);
+        self.max_ms.fetch_max(ms, Ordering::Relaxed);
     }
 
     fn snapshot(&self) -> LatencySnapshot {
@@ -223,6 +199,9 @@ pub struct MetricsSnapshot {
     pub approvals_granted: u64,
     pub approvals_denied: u64,
     pub connection_errors: u64,
+    /// As the orchestrator records it: connects of configured servers, less
+    /// one at shutdown for each that connected; a reconnect adds one more. A
+    /// server a request names by `server_url` is pooled and not counted here.
     pub active_connections: u64,
     pub active_executions: u64,
 }
@@ -259,124 +238,5 @@ pub struct LatencySnapshot {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_call_metrics() {
-        let metrics = McpMetrics::new();
-        let tool = QualifiedToolName::new("server", "tool");
-
-        metrics.record_call_start(&tool);
-        assert_eq!(metrics.snapshot().total_calls, 1);
-        assert_eq!(metrics.snapshot().active_executions, 1);
-
-        metrics.record_call_end(&tool, true, 100);
-        assert_eq!(metrics.snapshot().successful_calls, 1);
-        assert_eq!(metrics.snapshot().active_executions, 0);
-
-        metrics.record_call_start(&tool);
-        metrics.record_call_end(&tool, false, 50);
-        assert_eq!(metrics.snapshot().failed_calls, 1);
-    }
-
-    #[test]
-    fn test_approval_metrics() {
-        let metrics = McpMetrics::new();
-
-        metrics.record_approval_requested();
-        metrics.record_approval_granted();
-        metrics.record_approval_requested();
-        metrics.record_approval_denied();
-
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.approvals_requested, 2);
-        assert_eq!(snapshot.approvals_granted, 1);
-        assert_eq!(snapshot.approvals_denied, 1);
-    }
-
-    #[test]
-    fn test_connection_metrics() {
-        let metrics = McpMetrics::new();
-
-        metrics.record_connection_opened();
-        metrics.record_connection_opened();
-        assert_eq!(metrics.snapshot().active_connections, 2);
-
-        metrics.record_connection_closed();
-        assert_eq!(metrics.snapshot().active_connections, 1);
-
-        metrics.record_connection_error();
-        assert_eq!(metrics.snapshot().connection_errors, 1);
-    }
-
-    #[test]
-    fn test_latency_stats() {
-        let metrics = McpMetrics::new();
-        let tool = QualifiedToolName::new("server", "tool");
-
-        metrics.record_call_start(&tool);
-        metrics.record_call_end(&tool, true, 100);
-
-        metrics.record_call_start(&tool);
-        metrics.record_call_end(&tool, true, 200);
-
-        metrics.record_call_start(&tool);
-        metrics.record_call_end(&tool, true, 150);
-
-        let latency = metrics.tool_latency(&tool).unwrap();
-        assert_eq!(latency.count, 3);
-        assert_eq!(latency.avg_ms, 150); // (100 + 200 + 150) / 3
-        assert_eq!(latency.min_ms, 100);
-        assert_eq!(latency.max_ms, 200);
-    }
-
-    #[test]
-    fn test_success_rate() {
-        let metrics = McpMetrics::new();
-        let tool = QualifiedToolName::new("server", "tool");
-
-        // 3 successful, 1 failed = 75%
-        for _ in 0..3 {
-            metrics.record_call_start(&tool);
-            metrics.record_call_end(&tool, true, 100);
-        }
-        metrics.record_call_start(&tool);
-        metrics.record_call_end(&tool, false, 100);
-
-        let snapshot = metrics.snapshot();
-        assert!((snapshot.success_rate() - 75.0).abs() < 0.1);
-    }
-
-    #[test]
-    fn test_reset() {
-        let metrics = McpMetrics::new();
-        let tool = QualifiedToolName::new("server", "tool");
-
-        metrics.record_call_start(&tool);
-        metrics.record_call_end(&tool, true, 100);
-        metrics.record_approval_requested();
-
-        metrics.reset();
-
-        let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.total_calls, 0);
-        assert_eq!(snapshot.approvals_requested, 0);
-    }
-
-    #[test]
-    fn test_all_tool_latencies() {
-        let metrics = McpMetrics::new();
-        let tool1 = QualifiedToolName::new("server1", "tool1");
-        let tool2 = QualifiedToolName::new("server2", "tool2");
-
-        metrics.record_call_start(&tool1);
-        metrics.record_call_end(&tool1, true, 100);
-
-        metrics.record_call_start(&tool2);
-        metrics.record_call_end(&tool2, true, 200);
-
-        let latencies = metrics.all_tool_latencies();
-        assert_eq!(latencies.len(), 2);
-    }
-}
+#[path = "../../tests/unit/core/metrics/tests.rs"]
+mod tests;

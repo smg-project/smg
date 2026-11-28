@@ -1,7 +1,14 @@
 //! MiniMax M3: reasoning between `<mm:think>` and `</mm:think>`, the calls of one turn between
 //! `<tool_call>` and `</tool_call>`, each call between `<invoke name="…">` and `</invoke>` as an
 //! XML tree of arguments, everything else content, and the separator token `]<]minimax[>[` before
-//! every tag, dropped wherever it stands. As recorded for `MiniMaxAI/MiniMax-M3`.
+//! every tag, dropped wherever it stands. As recorded for `MiniMaxAI/MiniMax-M3`;
+//! `MiniMax-M3.1-Flash` reads with it (the same tokenizer and wire; its template differs only
+//! outside the wire, as `docs/tables.md` notes).
+//!
+//! A JSON answer's whitespace is bounded to runs of thirty-two characters, as the LFM2.5 table's
+//! is (`formats/lfm2_5.rs`): held to a schema's JSON, the model can drift into whitespace between
+//! two tokens until the budget ends; the bound ends the run and leaves pretty-printing its room.
+//! The figure is that table's, not one measured on this model.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -48,6 +55,7 @@ pub fn minimax_m3() -> Format {
         .transition("calls", "calls_close", "after_calls")
         .calls(CallSyntax::Xml)
         .opens_turn("]~b]ai\n")
+        .bounds_answer_whitespace(32)
 }
 
 #[cfg(test)]
@@ -59,9 +67,11 @@ mod tests {
     use crate::{
         adapt::chat,
         engine::Engine,
-        event::{DropReason, Event, MalformedReason},
+        event::{CallEnd, DropReason, Event, MalformedReason},
         input::EngineFinish,
-        testing::{arguments_of, bytes, content, drive, drive_to, dropped, names, reasoning},
+        testing::{
+            arguments_of, bytes, content, drive, drive_to, dropped, endings, names, reasoning,
+        },
         Declared,
     };
 
@@ -683,6 +693,156 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
         ));
+    }
+
+    /// The bytes dropped as a malformed call's, in order.
+    fn refused_bytes(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(text.text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// One `get_weather` invoke for Paris in a block, whole.
+    const WHOLE: &str = concat!(
+        "<tool_call>\n<invoke name=\"get_weather\">\n<city>Paris</city>\n</invoke>\n",
+        "</tool_call>"
+    );
+    /// The same block, ended inside the city's value.
+    const OPEN: &str = "<tool_call>\n<invoke name=\"get_weather\">\n<city>Par";
+
+    /// Every invoke's end says who ended it. The model ends an invoke with its closing tag,
+    /// with the next invoke's opener or with the block's close; the model's own stop finds one
+    /// open, whatever the syntax closes for it; the token limit and an abort cut one. Only the
+    /// invoke the output's end found open ends as stopped or cut.
+    #[test]
+    fn an_invokes_end_says_who_ended_it() {
+        let read = |output: &str, finish: EngineFinish| {
+            drive_to(
+                &mut Engine::new(minimax_m3(), get_weather()),
+                "",
+                &[output],
+                finish,
+            )
+        };
+        for finish in [EngineFinish::Stop, EngineFinish::Length] {
+            let events = read(WHOLE, finish);
+            assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
+        }
+        // The next invoke's opener ends the first, the block's close the second.
+        let events = read(
+            concat!(
+                "<tool_call>\n<invoke name=\"get_weather\"><city>Paris</city>",
+                "<invoke name=\"get_weather\"><city>Rome</city></tool_call>"
+            ),
+            EngineFinish::Stop,
+        );
+        assert_eq!(
+            endings(&events),
+            [(0, CallEnd::Closed), (1, CallEnd::Closed)]
+        );
+        // The model's own stop inside the value: the string and the object are closed for it,
+        // which is said as a repair, and the end says that the stop found the invoke open.
+        let stopped = read(OPEN, EngineFinish::Stop);
+        assert_eq!(endings(&stopped), [(0, CallEnd::Stop)]);
+        assert_eq!(arguments_of(&stopped, 0), r#"{"city": "Par"}"#);
+        assert_eq!(
+            malformed(&stopped),
+            [(String::new(), MalformedReason::OpenAtTheStop)]
+        );
+        // The stop between two elements closes the object: stopped all the same.
+        let between = read(
+            "<tool_call>\n<invoke name=\"get_weather\">\n<city>Paris</city>\n",
+            EngineFinish::Stop,
+        );
+        assert_eq!(endings(&between), [(0, CallEnd::Stop)]);
+        assert_eq!(arguments_of(&between, 0), r#"{"city": "Paris"}"#);
+        for finish in [EngineFinish::Length, EngineFinish::Abort] {
+            let cut = read(OPEN, finish);
+            assert_eq!(endings(&cut), [(0, CallEnd::Cut)]);
+            assert_eq!(arguments_of(&cut, 0), r#"{"city": "Par"#);
+        }
+        // The invoke before the one the limit cut closed at its own tag.
+        let two = format!(
+            "{}\n<invoke name=\"get_weather\">\n<city>Ro",
+            WHOLE.trim_end_matches("</tool_call>").trim_end()
+        );
+        let events = read(&two, EngineFinish::Length);
+        assert_eq!(endings(&events), [(0, CallEnd::Closed), (1, CallEnd::Cut)]);
+    }
+
+    /// A block the syntax could not read ends only the calls it started. Inside an invoke the
+    /// model closed, the invoke's end is the model's, whatever the syntax refused of its
+    /// bytes; an invoke that named no call has no end at all, at its closing tag or at the
+    /// output's end. A function the request did not declare, and a value the invoke's close
+    /// found open, are calls the model ended.
+    #[test]
+    fn a_block_the_syntax_could_not_read_ends_only_the_calls_it_started() {
+        let read = |output: &str, finish: EngineFinish| {
+            drive_to(
+                &mut Engine::new(minimax_m3(), get_weather()),
+                "",
+                &[output],
+                finish,
+            )
+        };
+        // Prose where the invoke has tags.
+        let events = read(
+            "<tool_call>\n<invoke name=\"get_weather\">\nParis\n</invoke>\n</tool_call>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
+        assert_eq!(refused_bytes(&events), ["Paris"]);
+        assert_eq!(arguments_of(&events, 0), "");
+        // An invoke without a name starts no call and ends none.
+        let events = read(
+            "<tool_call>\n<invoke name=\"\"><city>Paris</city></invoke>\n</tool_call>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(endings(&events), []);
+        assert_eq!(names(&events), [] as [&str; 0]);
+        assert!(!refused_bytes(&events).is_empty());
+        // An invoke the output ended inside before its name closed: no call, no end, and the
+        // bytes refused in the output's last step, cut or stopped.
+        let cut = read("<tool_call>\n<invoke name=\"get_wea", EngineFinish::Length);
+        assert_eq!(endings(&cut), []);
+        assert_eq!(refused_bytes(&cut), ["get_wea"]);
+        let stopped = read("<tool_call>\n<invoke name=\"get_wea", EngineFinish::Stop);
+        assert_eq!(endings(&stopped), []);
+        assert_eq!(refused_bytes(&stopped), ["get_wea"]);
+        // Prose in the block where an invoke should be.
+        let events = read(
+            "<tool_call>\nget_weather Paris\n</tool_call>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(endings(&events), []);
+        // The function is not one the request declares, and the call goes out.
+        let events = read(
+            "<tool_call>\n<invoke name=\"other\"><city>Paris</city></invoke>\n</tool_call>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::UnknownTool)]
+        );
+        // The invoke's close found the value open, and the value is whole.
+        let events = read(
+            "<tool_call>\n<invoke name=\"get_weather\"><city>Paris</invoke>\n</tool_call>",
+            EngineFinish::Stop,
+        );
+        assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris"}"#);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::OpenAtTheMarker)]
+        );
     }
 
     #[test]
@@ -1385,6 +1545,188 @@ mod tests {
         assert_eq!(arguments_of(&events, 0), r#"{"name": "x""#);
         assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
         assert_eq!(refused(&events), "<cou");
+    }
+
+    /// One function whose `days` is a list of objects, each with a string, an integer, a list
+    /// of objects and an object.
+    fn plan() -> Declared {
+        declared(
+            "plan",
+            value!({"type": "object", "properties": {
+                "days": {"type": "array", "items": {"type": "object", "properties": {
+                    "day": {"type": "string"},
+                    "minutes": {"type": "integer"},
+                    "blocks": {"type": "array", "items": {"type": "object", "properties": {
+                        "marks": {"type": "array", "items": {"type": "string"}}}}},
+                    "notes": {"type": "object"},
+                }}},
+                "tags": {"type": "array", "items": {"type": "string"}},
+            }}),
+        )
+    }
+
+    /// One `plan` invoke with `body` as its elements, the template's separator before every tag.
+    fn plan_call(body: &str) -> String {
+        format!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"plan\">{}\
+             ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+            separated(body)
+        )
+    }
+
+    /// The events of a call with `levels` nested `<d>` elements and an empty `<e>`, declared a
+    /// list, in the innermost, which the first `</d>` cuts short.
+    fn an_empty_list_under(levels: usize) -> Vec<Event<'static>> {
+        let innermost = value!({"type": "object", "properties": {"e": {"type": "array"}}});
+        let schema = (1..levels).fold(
+            innermost,
+            |schema, _| value!({"type": "object", "properties": {"d": schema}}),
+        );
+        let body = format!("{}<e>{}", "<d>".repeat(levels), "</d>".repeat(levels));
+        let output = format!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"alert\">{}\
+             ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>",
+            separated(&body)
+        );
+        run_with(
+            declared(
+                "alert",
+                value!({"type": "object", "properties": {"d": schema}}),
+            ),
+            "",
+            &[&output],
+        )
+    }
+
+    /// A parameter the tool declares a list or an object, opened, left empty and never closed:
+    /// the closing tag of the element directly around it follows. A closing tag is no value of
+    /// a list or an object, so the element is written empty, as its own close would write it;
+    /// one `Malformed { TagCutShort }` event of no bytes stands before its fragment, nothing is
+    /// refused and the call closes whole: at every cut, for an object, with whitespace held in
+    /// the element, and in the deepest element the reader takes an empty list in.
+    #[test]
+    fn a_declared_list_or_object_the_close_around_it_cut_short_is_written_empty() {
+        use crate::{json::PartialJson, testing::the_same_at_every_cut};
+        let read = |pieces: &[&str]| run_with(plan(), "", pieces);
+        let output =
+            plan_call("<days><item><day>Sun</day><minutes>0</minutes><blocks></item></days>");
+        let said = the_same_at_every_cut(|pieces| read(pieces), &output);
+        assert_eq!(
+            said.calls,
+            [(
+                "plan".to_string(),
+                r#"{"days": [{"day": "Sun", "minutes": 0, "blocks": []}]}"#.to_string()
+            )]
+        );
+        assert_eq!(said.content, "");
+        let events = read(&[&output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+        assert_eq!(refused(&events), "");
+        assert_eq!(ends(&events), 1);
+        let counted = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the slip is counted");
+        let after: Vec<&str> = events[counted..]
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallArguments { json, .. } => Some(json.as_ref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(after, [r#", "blocks": []"#, "}", "]", "}"]);
+
+        for (body, written) in [
+            (
+                "<days><item><notes></item></days>",
+                value!({"days": [{"notes": {}}]}),
+            ),
+            (
+                "<days><item><blocks>\n </item></days>",
+                value!({"days": [{"blocks": []}]}),
+            ),
+        ] {
+            let output = plan_call(body);
+            let events = read(&[&output]);
+            assert_eq!(bytes(&events), output, "{body}");
+            assert_eq!(arguments(&events), written, "{body}");
+            assert_eq!(reported(&events), [MalformedReason::TagCutShort], "{body}");
+            assert_eq!(refused(&events), "", "{body}");
+        }
+
+        let deepest = PartialJson::DEFAULT_MAX_DEPTH;
+        let events = an_empty_list_under(deepest - 2);
+        assert_eq!(
+            arguments(&events),
+            value!({ "d": wrapped(value!({"e": []}), deepest - 3) })
+        );
+        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+        assert_eq!(refused(&events), "");
+    }
+
+    /// The close of the element around an open element is that element's text everywhere else:
+    /// under a declared string, a declared integer and an element the tool does not declare,
+    /// under a declared list that holds text, when it names an element further out than the one
+    /// directly around the list, and one element deeper than the reader takes an empty list in.
+    /// A string streams it, and the invoke's close closes the string; the others are held for a
+    /// close that never comes and refused at the call's end, as a list the call's own end finds
+    /// open is.
+    #[test]
+    fn the_close_around_any_other_open_element_is_that_elements_text() {
+        use crate::json::PartialJson;
+        let read = |body: &str| run_with(plan(), "", &[&plan_call(body)]);
+
+        let events = read("<days><item><day></item></days>");
+        assert_eq!(
+            arguments(&events),
+            value!({"days": [{"day": "</item></days>"}]})
+        );
+        assert_eq!(reported(&events), [MalformedReason::OpenAtTheMarker]);
+
+        for (body, written, lost) in [
+            (
+                "<days><item><minutes></item></days>",
+                r#"{"days": [{"#,
+                "<minutes></item></days>",
+            ),
+            (
+                "<days><item><extra></item></days>",
+                r#"{"days": [{"#,
+                "<extra></item></days>",
+            ),
+            (
+                "<days><item><blocks>x</item></days>",
+                r#"{"days": [{"#,
+                "<blocks>x</item></days>",
+            ),
+            (
+                "<days><item><blocks><item><marks></blocks></item></days>",
+                r#"{"days": [{"blocks": [{"#,
+                "<marks></blocks></item></days>",
+            ),
+        ] {
+            let events = read(body);
+            assert_eq!(arguments_of(&events, 0), written, "{body}");
+            assert_eq!(reported(&events), [MalformedReason::TagCutShort], "{body}");
+            assert_eq!(refused(&events), lost, "{body}");
+        }
+
+        let events = read("<tags>");
+        assert_eq!(arguments_of(&events, 0), "");
+        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+
+        let deepest = PartialJson::DEFAULT_MAX_DEPTH;
+        let events = an_empty_list_under(deepest - 1);
+        assert_eq!(
+            arguments_of(&events, 0),
+            format!("{{{}", "\"d\": {".repeat(deepest - 1))
+        );
+        assert_eq!(reported(&events), [MalformedReason::TagCutShort]);
+        assert_eq!(
+            refused(&events),
+            format!("<e>{}", "</d>".repeat(deepest - 1))
+        );
     }
 
     /// A closing tag that names an open element further out, an inner close left out (`</range>`

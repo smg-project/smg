@@ -5,7 +5,7 @@
 //! later, and nothing was sent in between. An idle-timeout proxy in front of
 //! the gateway cuts a connection that carries no byte for its idle window
 //! (sixty seconds is a common setting), and the client sees a stream that
-//! ends before it began. [`sse_keepalive_middleware`] gives every SSE
+//! ends before it began. [`SseKeepAlive::layer`] gives every SSE
 //! response a `KeepAlive`, carried by the edge's one body wrapper (the
 //! metrics layer's `EdgeBody`), so an interval
 //! of silence is broken by a frame the client ignores: an SSE comment on the
@@ -23,9 +23,8 @@ use std::{
 
 use axum::{
     body::Body,
-    extract::{Request, State},
+    extract::Request,
     http::header::{CONTENT_LENGTH, CONTENT_TYPE},
-    middleware::Next,
     response::Response,
 };
 use bytes::Bytes;
@@ -70,10 +69,12 @@ impl SseKeepAlive {
 
     /// Gives an SSE `response` whose length is not known up front (a
     /// complete SSE answer has nothing to wait for, and a body sent under a
-    /// `Content-Length` header must not grow past it: the relays copy an
-    /// upstream's header onto a streamed body) its keep-alive, handed to the
-    /// edge's body wrapper; `messages` selects the Messages API's ping over
-    /// the comment. Anything else is returned as it came.
+    /// `Content-Length` header must not grow past it: the relay drops an
+    /// upstream's header from a streamed SSE body, so the header that remains
+    /// is a non-SSE upstream body the PD router relabels as SSE) its
+    /// keep-alive, handed to the edge's body wrapper; `messages` selects the
+    /// Messages API's ping over the comment. Anything else is returned as it
+    /// came.
     pub(crate) fn apply(self, mut response: Response, messages: bool) -> Response {
         let Some(interval) = self.interval else {
             return response;
@@ -97,14 +98,23 @@ fn is_event_stream(response: &Response) -> bool {
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|content_type| content_type.trim_start().get(.."text/event-stream".len()))
+        .is_some_and(names_event_stream)
+}
+
+/// Whether `content_type` names an event stream. A media type's name is
+/// case-insensitive (RFC 9110, section 8.3.1), so a worker's
+/// `Text/Event-Stream` names one too; what follows the name (a charset) is
+/// not read.
+pub(crate) fn names_event_stream(content_type: &str) -> bool {
+    content_type
+        .trim_start()
+        .get(.."text/event-stream".len())
         .is_some_and(|head| head.eq_ignore_ascii_case("text/event-stream"))
 }
 
 impl SseKeepAlive {
     /// This keep-alive as a route layer: the service's own future maps the
-    /// response, nothing is cloned or boxed per request (the `from_fn` form
-    /// did both, on every request of the routes, streamed or not).
+    /// response, nothing is cloned or boxed per request.
     pub fn layer(self) -> SseKeepAliveLayer {
         SseKeepAliveLayer { keep_alive: self }
     }
@@ -177,18 +187,6 @@ where
         let response = std::task::ready!(this.inner.poll(cx))?;
         Poll::Ready(Ok(this.keep_alive.apply(response, *this.messages)))
     }
-}
-
-/// Route-layer middleware: the keep-alive on every SSE response of the
-/// routes it wraps ([`SseKeepAlive::layer`] is the same without the per-request
-/// clone and boxes of `from_fn`).
-pub async fn sse_keepalive_middleware(
-    State(keep_alive): State<SseKeepAlive>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    let messages = request.uri().path() == MESSAGES_ROUTE;
-    keep_alive.apply(next.run(request).await, messages)
 }
 
 /// The keep-alive of one SSE body: `frame` after `interval` of silence, on a
@@ -271,246 +269,5 @@ impl KeepAlive {
 }
 
 #[cfg(test)]
-mod tests {
-    use axum::{
-        http::{header::CONTENT_TYPE, Method, StatusCode},
-        routing::post,
-        Router,
-    };
-    use http_body_util::BodyExt;
-    use openai_protocol::messages::MessageStreamEvent;
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
-    use tower::ServiceExt;
-
-    use super::*;
-    use crate::{
-        middleware::{edge_body::at_the_edge, HttpMetricsLayer},
-        observability::inflight_tracker::InFlightRequestTracker,
-    };
-
-    const SECS: u64 = 15;
-    type Chunk = Result<Bytes, std::io::Error>;
-
-    /// What a read of the body gave within its time budget.
-    #[derive(Debug, PartialEq)]
-    enum Read {
-        Frame(Bytes),
-        End,
-        Silence,
-    }
-
-    /// The next data frame within `secs` of (virtual) time.
-    async fn next_within(body: &mut Body, secs: u64) -> Read {
-        match tokio::time::timeout(Duration::from_secs(secs), body.frame()).await {
-            Ok(Some(Ok(frame))) => frame.into_data().map_or(Read::End, Read::Frame),
-            Ok(_) => Read::End,
-            Err(_) => Read::Silence,
-        }
-    }
-
-    fn sse(rx: mpsc::Receiver<Chunk>) -> Response {
-        Response::builder()
-            .header(CONTENT_TYPE, "text/event-stream; charset=utf-8")
-            .body(Body::from_stream(ReceiverStream::new(rx)))
-            .unwrap()
-    }
-
-    /// An SSE body under the keep-alive, at the edge, fed through the
-    /// returned sender.
-    fn wrapped(secs: u64, messages: bool) -> (mpsc::Sender<Chunk>, Body) {
-        let (tx, rx) = mpsc::channel(16);
-        let response = SseKeepAlive::every_secs(secs).apply(sse(rx), messages);
-        (tx, at_the_edge(response).into_body())
-    }
-
-    async fn send(tx: &mpsc::Sender<Chunk>, bytes: &'static [u8]) {
-        tx.send(Ok(Bytes::from_static(bytes))).await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_quiet_stream_gets_a_comment_every_interval_from_the_headers() {
-        let (_tx, mut body) = wrapped(SECS, false);
-        assert_eq!(next_within(&mut body, SECS - 1).await, Read::Silence);
-        assert_eq!(
-            next_within(&mut body, 2).await,
-            Read::Frame(Bytes::from_static(COMMENT))
-        );
-        // The next one an interval after the keep-alive, not sooner.
-        assert_eq!(next_within(&mut body, SECS - 1).await, Read::Silence);
-        assert_eq!(
-            next_within(&mut body, 2).await,
-            Read::Frame(Bytes::from_static(COMMENT))
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_flowing_stream_carries_no_keep_alive() {
-        let (tx, mut body) = wrapped(SECS, false);
-        for _ in 0..6 {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            send(&tx, b"data: {\"delta\":\"x\"}\n\n").await;
-            assert_eq!(
-                next_within(&mut body, 0).await,
-                Read::Frame(Bytes::from_static(b"data: {\"delta\":\"x\"}\n\n"))
-            );
-        }
-        // The interval counts from the last frame.
-        assert_eq!(next_within(&mut body, SECS - 1).await, Read::Silence);
-        assert_eq!(
-            next_within(&mut body, 2).await,
-            Read::Frame(Bytes::from_static(COMMENT))
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_keep_alive_never_splits_a_frame() {
-        let (tx, mut body) = wrapped(SECS, false);
-        send(&tx, b"data: {\"delta\":").await;
-        assert_eq!(
-            next_within(&mut body, 0).await,
-            Read::Frame(Bytes::from_static(b"data: {\"delta\":"))
-        );
-        // Two intervals inside the frame: nothing is written.
-        assert_eq!(next_within(&mut body, 3 * SECS - 1).await, Read::Silence);
-        send(&tx, b"\"x\"}\n\n").await;
-        assert_eq!(
-            next_within(&mut body, 0).await,
-            Read::Frame(Bytes::from_static(b"\"x\"}\n\n"))
-        );
-        // Back on a boundary: the keep-alive an interval after the frame.
-        assert_eq!(next_within(&mut body, SECS - 1).await, Read::Silence);
-        assert_eq!(
-            next_within(&mut body, 2).await,
-            Read::Frame(Bytes::from_static(COMMENT))
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn an_interval_of_zero_sends_nothing() {
-        let (_tx, mut body) = wrapped(0, false);
-        assert_eq!(next_within(&mut body, 3600).await, Read::Silence);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_messages_stream_gets_the_api_s_ping_event() {
-        let (_tx, mut body) = wrapped(SECS, true);
-        assert_eq!(next_within(&mut body, SECS - 1).await, Read::Silence);
-        assert_eq!(
-            next_within(&mut body, 2).await,
-            Read::Frame(Bytes::from_static(MESSAGES_PING))
-        );
-        // The frame is the protocol's own ping event.
-        let ping = serde_json::to_string(&MessageStreamEvent::Ping).unwrap();
-        assert_eq!(
-            format!("event: ping\ndata: {ping}\n\n").as_bytes(),
-            MESSAGES_PING
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_end_of_the_stream_passes_at_once() {
-        let (tx, mut body) = wrapped(SECS, false);
-        send(&tx, b"data: [DONE]\n\n").await;
-        drop(tx);
-        assert_eq!(
-            next_within(&mut body, 0).await,
-            Read::Frame(Bytes::from_static(b"data: [DONE]\n\n"))
-        );
-        assert_eq!(next_within(&mut body, 0).await, Read::End);
-    }
-
-    fn app(response: impl Fn() -> Response + Clone + Send + Sync + 'static) -> Router {
-        let chat = response.clone();
-        Router::new()
-            .route("/v1/chat/completions", post(move || async move { chat() }))
-            .route(MESSAGES_ROUTE, post(move || async move { response() }))
-            .route_layer(SseKeepAlive::every_secs(SECS).layer())
-            .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
-    }
-
-    async fn call(app: Router, path: &str) -> Response {
-        app.oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri(path)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap()
-    }
-
-    /// An SSE response whose upstream never speaks.
-    fn silent_sse() -> Response {
-        Response::builder()
-            .header(CONTENT_TYPE, "text/event-stream")
-            .body(Body::from_stream(futures::stream::pending::<Chunk>()))
-            .unwrap()
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn the_middleware_writes_the_comment_on_an_openai_route_and_the_ping_on_messages() {
-        let mut chat = call(app(silent_sse), "/v1/chat/completions")
-            .await
-            .into_body();
-        assert_eq!(
-            next_within(&mut chat, SECS + 1).await,
-            Read::Frame(Bytes::from_static(COMMENT))
-        );
-        let mut messages = call(app(silent_sse), MESSAGES_ROUTE).await.into_body();
-        assert_eq!(
-            next_within(&mut messages, SECS + 1).await,
-            Read::Frame(Bytes::from_static(MESSAGES_PING))
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_response_that_is_not_an_event_stream_passes_untouched() {
-        let json = || {
-            Response::builder()
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from_stream(futures::stream::pending::<Chunk>()))
-                .unwrap()
-        };
-        let response = call(app(json), "/v1/chat/completions").await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let mut body = response.into_body();
-        assert_eq!(next_within(&mut body, 10 * SECS).await, Read::Silence);
-    }
-
-    /// A streamed body under an upstream's `Content-Length` (the relays copy
-    /// the header) is left alone: a keep-alive would push it past the length.
-    #[tokio::test(start_paused = true)]
-    async fn an_sse_answer_under_a_content_length_header_passes_untouched() {
-        let declared = || {
-            Response::builder()
-                .header(CONTENT_TYPE, "text/event-stream")
-                .header(CONTENT_LENGTH, "14")
-                .body(Body::from_stream(futures::stream::pending::<Chunk>()))
-                .unwrap()
-        };
-        let response = call(app(declared), "/v1/chat/completions").await;
-        assert_eq!(response.status(), StatusCode::OK);
-        let mut body = response.into_body();
-        assert_eq!(next_within(&mut body, 10 * SECS).await, Read::Silence);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_complete_sse_answer_passes_untouched() {
-        let done = || {
-            Response::builder()
-                .header(CONTENT_TYPE, "text/event-stream")
-                .body(Body::from("data: [DONE]\n\n"))
-                .unwrap()
-        };
-        let response = call(app(done), "/v1/chat/completions").await;
-        assert_eq!(
-            response.body().size_hint().exact(),
-            Some("data: [DONE]\n\n".len() as u64),
-            "a sized body keeps its length"
-        );
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(&bytes[..], b"data: [DONE]\n\n");
-    }
-}
+#[path = "../../tests/unit/middleware/sse_keepalive/tests.rs"]
+mod tests;

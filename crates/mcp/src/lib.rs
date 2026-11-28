@@ -17,12 +17,13 @@ pub mod inventory;
 pub mod tenant;
 // Re-export from core
 pub use core::{
-    ArgMappingConfig, BuiltinToolType, ConfigValidationError, HandlerRequestContext,
-    LatencySnapshot, McpConfig, McpMetrics, McpOrchestrator, McpRequestContext, McpServerBinding,
-    McpServerConfig, McpToolSession, McpTransport, MetricsSnapshot, PendingToolExecution,
-    PolicyConfig, PolicyDecisionConfig, PoolKey, RefreshRequest, ResponseFormatConfig,
-    ServerPolicyConfig, SmgClientHandler, Tool, ToolConfig, ToolExecutionInput,
-    ToolExecutionOutput, ToolExecutionResult, TrustLevelConfig, DEFAULT_SERVER_LABEL,
+    ArgMappingConfig, BuiltinToolType, ConfigValidationError, ConnectedServer,
+    HandlerRequestContext, LatencySnapshot, McpConfig, McpMetrics, McpOrchestrator,
+    McpRequestContext, McpServerBinding, McpServerConfig, McpToolSession, McpTransport,
+    MetricsSnapshot, PendingToolExecution, PolicyConfig, PolicyDecisionConfig, PoolKey,
+    RefreshRequest, ResponseFormatConfig, ServerPolicyConfig, SmgClientHandler, Tool, ToolConfig,
+    ToolExecutionInput, ToolExecutionOutput, ToolExecutionResult, TrustLevelConfig,
+    DEFAULT_SERVER_LABEL,
 };
 
 // Re-export shared types

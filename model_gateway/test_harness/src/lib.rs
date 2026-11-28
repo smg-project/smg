@@ -22,39 +22,48 @@ pub mod test_app;
 pub mod test_certs;
 pub mod test_config;
 pub mod tls_mock_worker;
+#[cfg(test)]
+mod worker_name_census;
 
 // Re-export commonly used test builders
 use std::{
     collections::HashMap,
     future::Future,
-    path::PathBuf,
     pin::Pin,
     sync::{Arc, OnceLock},
 };
 
 use llm_tokenizer::{mock::MockTokenizer, registry::TokenizerRegistry, traits::Tokenizer};
 use mock_worker::{MockWorker, MockWorkerConfig};
-use openai_protocol::common::{Function, Tool};
-use reasoning_parser::ParserFactory as ReasoningParserFactory;
+use openai_protocol::{
+    common::{Function, Tool},
+    model_card::ModelCard,
+};
 use serde_json::json;
 use smg::{
-    app_context::AppContext,
+    app_context::{AppContext, AppContextBuilder},
     config::{RouterConfig, RoutingMode},
     middleware::TokenBucket,
     policies::PolicyRegistry,
-    routers::{gateway::Gateway, RouterFactory, RouterTrait},
-    worker::{
-        BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerMonitor, WorkerRegistry,
-        WorkerType,
+    routers::{
+        common::snapshot::{WorkerMonitor, WorkerRegistry},
+        gateway::Gateway,
+        grpc::backend_client::BasicWorkerBuilder,
+        RouterFactory, RouterTrait,
     },
+    wasm::module_manager::WasmModuleManager,
     workflow::Job,
 };
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, StorageBundle,
 };
+use smg_grand_central::stages::StageRegistry;
+use smg_worker::{
+    health::liveness,
+    identity::basic::{RuntimeType, Worker, WorkerType},
+};
 #[allow(unused_imports)]
 pub use test_config::{TestRouterConfig, TestWorkerConfig};
-use tool_parser::ParserFactory as ToolParserFactory;
 
 /// Test context for directly testing mock workers without full router setup.
 pub struct WorkerTestContext {
@@ -355,6 +364,21 @@ impl AppTestContext {
 
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                 }
+
+                // A hash policy places a request on the ring the gateway
+                // keeps for the model, and that ring follows a registration
+                // by one fill of a task: a case starts on the ring of the
+                // workers it asked for.
+                while !app_context
+                    .policy_registry
+                    .hash_rings_are_current(&app_context.worker_registry)
+                {
+                    assert!(
+                        start.elapsed() <= timeout_duration,
+                        "Timeout waiting for the hash rings to follow the registered workers"
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                }
             }
 
             let inner_router = RouterFactory::create_router(&app_context).await.unwrap();
@@ -429,27 +453,98 @@ impl AppTestContext {
     }
 }
 
+tokio::task_local! {
+    /// The table of stages a test lent the Grand Central of the contexts it
+    /// builds ([`with_policy_stages`]).
+    static POLICY_STAGES: StageRegistry;
+}
+
+/// Runs `test` with `stages` lent to the Grand Central of every context it
+/// builds by [`create_test_context`] or one of its siblings in this file,
+/// which [`AppTestContext`] and the gRPC harness call. The builders of
+/// `test_app` start no engine and read no table. Where a context's
+/// configuration runs Grand Central
+/// (`grand_central: true`), this harness starts the engine by the
+/// gateway's own start, over the document in force (a supplied one,
+/// `policy_spec`, too) validated against `stages`. It is the table a host
+/// brings a served gateway (`smg::server::Extensions::policy_stages`): the
+/// stock stages and the test's own, so the document may name both. Outside
+/// this call a context's engine is started over the stock table.
+///
+/// The table is lent to the task that awaits this call: a context built on a
+/// task the test spawned does not see it.
+pub async fn with_policy_stages<T>(stages: StageRegistry, test: impl Future<Output = T>) -> T {
+    POLICY_STAGES.scope(stages, test).await
+}
+
+/// The environment value that runs a test run's contexts under Grand
+/// Central, whatever their configuration says:
+/// `SMG_TEST_GRAND_CENTRAL=on`. It reaches the contexts built by
+/// [`create_test_context`] or one of its siblings in this file, which
+/// [`AppTestContext`] and the gRPC harness call: a test binary built on
+/// them runs on Grand Central with no change to its tests. The
+/// builders of `test_app` (`create_test_app`, `create_test_app_context`
+/// and `create_test_app_context_with_config`) do not read it and start
+/// no engine: a case built on them runs on the classic policies under
+/// the value too.
+pub const GRAND_CENTRAL_ENV: &str = "SMG_TEST_GRAND_CENTRAL";
+
+/// Whether this run turns Grand Central on for the contexts the
+/// value reaches ([`GRAND_CENTRAL_ENV`]).
+pub fn grand_central_forced() -> bool {
+    std::env::var(GRAND_CENTRAL_ENV).is_ok_and(|value| value == "on")
+}
+
+/// Starts the Grand Central of a context this harness builds, where its
+/// configuration runs Grand Central: by the gateway's own start
+/// ([`AppContextBuilder::start_engine_by_hand`]), over the table the
+/// test lent ([`with_policy_stages`]) or else the stock one. A refused
+/// document fails the test with the refusal's words. With Grand
+/// Central off nothing is started.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn start_engine(
+    config: &RouterConfig,
+    policies: &PolicyRegistry,
+    registry: &Arc<WorkerRegistry>,
+    monitor: &WorkerMonitor,
+) {
+    let start = |stages: Option<&StageRegistry>| {
+        AppContextBuilder::start_engine_by_hand(config, stages, policies, registry, monitor)
+    };
+    POLICY_STAGES
+        .try_with(|stages| start(Some(stages)))
+        .unwrap_or_else(|_| start(None))
+        .expect("Grand Central starts");
+}
+
 /// Shared `AppContext` construction tail for the `create_test_context_*`
 /// family below: registries, storage backends, worker monitor, job queue,
 /// workflow engines, OpenAI-mode external worker registration, and MCP
 /// orchestrator startup are identical across all of them. Only the
-/// tokenizer registry, parser factories, rate-limit manager, and MCP config
-/// vary by caller, so those are the only parameters.
+/// tokenizer registry, whether the legacy parser factories are built, the
+/// rate-limit manager, and MCP config vary by caller, so those are the only
+/// parameters.
 #[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
 async fn build_test_app_context(
-    config: RouterConfig,
+    mut config: RouterConfig,
     tokenizer_registry: Arc<TokenizerRegistry>,
-    reasoning_parser_factory: Option<ReasoningParserFactory>,
-    tool_parser_factory: Option<ToolParserFactory>,
+    legacy_parsers: bool,
     rate_limit_manager: Option<Arc<smg::rate_limit::RateLimitManager>>,
     mcp_config: smg_mcp::McpConfig,
     storages: Option<StorageBundle>,
 ) -> Arc<AppContext> {
     use smg_mcp::McpOrchestrator;
+
+    if grand_central_forced() {
+        config.grand_central = true;
+    }
 
     // See `test_app::create_test_app_context`: no environment proxy in a test's path.
     let client = smg::server::http_client_builder()
@@ -472,16 +567,18 @@ async fn build_test_app_context(
         }
     };
 
-    // Initialize registries
+    // The configuration's liveness budgets before the policy registry is
+    // built, as `AppContextBuilder::from_config` orders them: the first call
+    // in a process wins.
+    liveness::configure_from(config.worker_liveness_budgets());
+
+    // Initialize registries. The policy registry is the configuration's, as
+    // `AppContextBuilder::from_config` builds it: under its pairing mode
+    // (without it a test router pairs under the default mode whatever its
+    // configuration says), and with no classic policy where the
+    // configuration runs Grand Central.
     let worker_registry = Arc::new(WorkerRegistry::new());
-    let policy_registry = Arc::new(
-        PolicyRegistry::with_override(config.policy.clone(), config.routing_key_override.clone())
-            .with_policy_engine(
-                config.policy_engine,
-                config.mode.get_prefill_policy(&config.policy),
-                config.mode.get_decode_policy(&config.policy),
-            ),
-    );
+    let policy_registry = Arc::new(PolicyRegistry::of_config(&config));
 
     // Initialize storage backends (Memory for tests, unless the caller brought
     // its own: a history store that is down, for one).
@@ -504,6 +601,12 @@ async fn build_test_app_context(
         config.disable_load_monitoring,
     )));
 
+    // Grand Central behind the load monitor, as the server's builder
+    // starts it: nothing where the configuration leaves the controller off.
+    if let Some(monitor) = &worker_monitor {
+        start_engine(&config, &policy_registry, &worker_registry, monitor);
+    }
+
     // Create empty OnceLock for worker job queue, workflow engines, and mcp orchestrator
     let worker_job_queue = Arc::new(OnceLock::new());
     let workflow_engines = Arc::new(OnceLock::new());
@@ -517,10 +620,20 @@ async fn build_test_app_context(
             .router_config(config.clone())
             .client(client)
             .rate_limiter(rate_limiter)
+            // The module manager where the configuration enables wasm, as
+            // the server's builder makes it: an app over a context without
+            // one attaches no wasm hook.
+            .wasm_manager(
+                config
+                    .enable_wasm
+                    .then(|| Arc::new(WasmModuleManager::with_default_config())),
+            )
             .rate_limit_manager(rate_limit_manager)
             .tokenizer_registry(tokenizer_registry)
-            .reasoning_parser_factory(reasoning_parser_factory)
-            .tool_parser_factory(tool_parser_factory)
+            // `Default` builds each factory: naming its type would make this
+            // crate depend on the legacy parser crates.
+            .reasoning_parser_factory(legacy_parsers.then(Default::default))
+            .tool_parser_factory(legacy_parsers.then(Default::default))
             .worker_registry(worker_registry)
             .policy_registry(policy_registry)
             .response_storage(response_storage)
@@ -651,8 +764,7 @@ pub fn create_test_context_with_rate_limiter(
         build_test_app_context(
             config,
             tokenizer_registry,
-            Some(ReasoningParserFactory::new()),
-            Some(ToolParserFactory::new()),
+            true,
             rate_limit_manager,
             empty_mcp_config(),
             None,
@@ -724,8 +836,7 @@ pub fn create_test_context_with_storages(
         build_test_app_context(
             config,
             tokenizer_registry,
-            Some(ReasoningParserFactory::new()),
-            Some(ToolParserFactory::new()),
+            true,
             tenant_rate_limit_manager,
             empty_mcp_config(),
             Some(storages),
@@ -741,8 +852,7 @@ pub fn create_test_context_with_parsers(
     Box::pin(build_test_app_context(
         config,
         Arc::new(TokenizerRegistry::new()),
-        Some(ReasoningParserFactory::new()),
-        Some(ToolParserFactory::new()),
+        true,
         None,
         empty_mcp_config(),
         None,
@@ -766,35 +876,13 @@ pub fn create_test_context_with_mcp_config(
         build_test_app_context(
             config,
             Arc::new(TokenizerRegistry::new()),
-            None,
-            None,
+            false,
             None,
             mcp_config,
             None,
         )
         .await
     })
-}
-
-// Tokenizer download configuration
-const TINYLLAMA_TOKENIZER_URL: &str =
-    "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json";
-/// Names another source of the TinyLlama tokenizer file: a mirror, or a stub
-/// standing in for the hub.
-const TINYLLAMA_TOKENIZER_URL_ENV: &str = "TINYLLAMA_TOKENIZER_URL";
-const CACHE_DIR: &str = ".tokenizer_cache";
-const TINYLLAMA_TOKENIZER_FILENAME: &str = "tinyllama_tokenizer.json";
-
-/// The TinyLlama tokenizer file, downloaded into the cache once per process
-/// unless it is there already ([`hub_fetch::cached_download`]: one download
-/// at a time, a rate-limited hub waited out, a lock a failed download left
-/// poisoned taken back). Returns the path to the cached tokenizer file.
-pub fn ensure_tokenizer_cached() -> PathBuf {
-    let url = std::env::var(TINYLLAMA_TOKENIZER_URL_ENV)
-        .unwrap_or_else(|_| TINYLLAMA_TOKENIZER_URL.to_string());
-    let path = PathBuf::from(CACHE_DIR).join(TINYLLAMA_TOKENIZER_FILENAME);
-    hub_fetch::cached_download(&smg::server::blocking_http_client(), &url, &path, 100);
-    path
 }
 
 /// Waits for `done` to hold, polling it every 20 ms, within `bound`; the

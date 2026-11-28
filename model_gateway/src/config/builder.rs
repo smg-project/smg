@@ -1,17 +1,39 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Read, path::Path};
 
 use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
 use openai_protocol::worker::{MmProcessingMode, TransportMode};
+use smg_grand_central::document::operator::{Format, SpecRejected, MAX_DOCUMENT_BYTES};
 use smg_mcp::McpConfig;
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType};
 
 use super::{
-    AccessLogField, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-    HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig, MetricsConfig,
-    OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig, PolicyEngineMode,
-    PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
-    TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+    validation::ConfigValidator, AccessLogField, CircuitBreakerConfig, ConfigError, ConfigResult,
+    DiscoveryConfig, GroupedDpSticky, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig,
+    MemoryConfig, MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig,
+    PolicyConfig, PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
+    RoutingMode, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
-use crate::worker::{ConnectionMode, RuntimeType};
+
+/// A policy document's bytes from its opened source, where `stated` is the
+/// size the file's metadata states. A file over the controller's bound on
+/// a document ([`MAX_DOCUMENT_BYTES`]) is refused by that size, unread, in
+/// the controller's words. A file may grow behind its metadata, and a
+/// source that is no regular file states no size: the read takes one byte
+/// past the bound and no more. The Grand Central crate's read ([`Format::read`])
+/// then refuses a source that reaches past the bound, by its size.
+fn bounded_document(stated: u64, source: impl Read) -> std::io::Result<Vec<u8>> {
+    if stated > MAX_DOCUMENT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            SpecRejected::TooLarge(stated).to_string(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    source
+        .take(MAX_DOCUMENT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
 
 /// Builder for RouterConfig that wraps the config itself
 /// This eliminates field duplication and stays in sync automatically
@@ -67,6 +89,12 @@ impl RouterConfigBuilder {
 
     pub fn policy(mut self, policy: PolicyConfig) -> Self {
         self.config.policy = policy;
+        self
+    }
+
+    /// Choose Grand Central for the whole process when `on`.
+    pub fn grand_central(mut self, on: bool) -> Self {
+        self.config.grand_central = on;
         self
     }
 
@@ -270,6 +298,11 @@ impl RouterConfigBuilder {
 
     pub fn load_monitor_interval_secs(mut self, interval: u64) -> Self {
         self.config.load_monitor_interval_secs = interval;
+        self
+    }
+
+    pub fn load_monitor_interval_ms(mut self, interval: Option<u64>) -> Self {
+        self.config.load_monitor_interval_ms = interval;
         self
     }
 
@@ -721,6 +754,8 @@ impl RouterConfigBuilder {
     // ==================== Boolean Setters ====================
     // Accept bool parameters to conditionally set flags without if statements
 
+    /// Deprecated, accepted and ignored: every registration reads an
+    /// engine's data-parallel size and registers one worker per rank.
     pub fn dp_aware(mut self, enable: bool) -> Self {
         self.config.dp_aware = enable;
         self
@@ -736,8 +771,8 @@ impl RouterConfigBuilder {
         self
     }
 
-    pub fn policy_engine(mut self, mode: PolicyEngineMode) -> Self {
-        self.config.policy_engine = mode;
+    pub fn grouped_dp_sticky(mut self, mode: GroupedDpSticky) -> Self {
+        self.config.grouped_dp_sticky = mode;
         self
     }
 
@@ -928,6 +963,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Load the policy document from this path during `build()`.
+    pub fn maybe_policy_spec_path(mut self, path: Option<impl Into<String>>) -> Self {
+        self.config.policy_spec_path = path.map(Into::into);
+        self
+    }
+
     // ==================== Build ====================
 
     pub fn build(self) -> ConfigResult<RouterConfig> {
@@ -936,6 +977,16 @@ impl RouterConfigBuilder {
 
     pub fn build_unchecked(self) -> RouterConfig {
         self.into()
+    }
+
+    /// The configuration of a builder that holds the routing part alone,
+    /// checked by the validator's routing rules alone. No file is read: no
+    /// certificate, no key, no MCP configuration and no policy document.
+    /// What `--print-policy-spec` converts.
+    pub fn build_routing(self) -> ConfigResult<RouterConfig> {
+        let config: RouterConfig = self.into();
+        ConfigValidator::validate_routing(&config)?;
+        Ok(config)
     }
 
     pub fn build_with_validation(mut self, validate: bool) -> ConfigResult<RouterConfig> {
@@ -947,6 +998,7 @@ impl RouterConfigBuilder {
 
         // Read MCP config from path if provided
         self = self.read_mcp_config()?;
+        self = self.read_policy_spec()?;
 
         let config: RouterConfig = self.into();
         if validate {
@@ -957,48 +1009,33 @@ impl RouterConfigBuilder {
 
     /// Internal method to read mTLS certificates from paths
     fn read_mtls_certificates(mut self) -> ConfigResult<Self> {
-        // Read client certificate and key
-        match (&self.client_cert_path, &self.client_key_path) {
-            (Some(cert_path), Some(key_path)) => {
-                let cert = std::fs::read(cert_path).map_err(|e| ConfigError::ValidationFailed {
-                    reason: format!("Failed to read client certificate from {cert_path}: {e}"),
-                })?;
-                let key = std::fs::read(key_path).map_err(|e| ConfigError::ValidationFailed {
-                    reason: format!("Failed to read client key from {key_path}: {e}"),
-                })?;
+        let pair = cert_and_key(
+            self.client_cert_path.as_deref(),
+            self.client_key_path.as_deref(),
+            "--client-cert-path and --client-key-path",
+        )?;
+        if let Some((cert_path, key_path)) = pair {
+            let cert = read_file(cert_path, "client certificate")?;
+            let key = read_file(key_path, "client key")?;
 
-                // Combine cert and key into single PEM for reqwest::Identity
-                // When using rustls, certificate must come first, then key
-                // Ensure proper PEM formatting with newlines
-                let mut combined = cert;
-                if !combined.ends_with(b"\n") {
-                    combined.push(b'\n');
-                }
-                combined.extend_from_slice(&key);
-                if !combined.ends_with(b"\n") {
-                    combined.push(b'\n');
-                }
+            // Combine cert and key into single PEM for reqwest::Identity
+            // When using rustls, certificate must come first, then key
+            // Ensure proper PEM formatting with newlines
+            let mut combined = cert;
+            if !combined.ends_with(b"\n") {
+                combined.push(b'\n');
+            }
+            combined.extend_from_slice(&key);
+            if !combined.ends_with(b"\n") {
+                combined.push(b'\n');
+            }
 
-                self.config.client_identity = Some(combined);
-                self.config.client_key_path = Some(key_path.clone());
-            }
-            (None, None) => {
-                // No client cert configured, that's fine
-            }
-            _ => {
-                return Err(ConfigError::ValidationFailed {
-                    reason:
-                        "Both --client-cert-path and --client-key-path must be specified together"
-                            .to_string(),
-                });
-            }
+            self.config.client_identity = Some(combined);
+            self.config.client_key_path = Some(key_path.to_string());
         }
 
-        // Read CA certificates
         for path in &self.ca_cert_paths {
-            let cert = std::fs::read(path).map_err(|e| ConfigError::ValidationFailed {
-                reason: format!("Failed to read CA certificate from {path}: {e}"),
-            })?;
+            let cert = read_file(path, "CA certificate")?;
             self.config.ca_certificates.push(cert);
         }
 
@@ -1007,25 +1044,15 @@ impl RouterConfigBuilder {
 
     /// Internal method to read Server TLS certificates from paths
     fn read_server_certificates(mut self) -> ConfigResult<Self> {
-        match (&self.server_cert_path, &self.server_key_path) {
-            (Some(cert_path), Some(key_path)) => {
-                let cert = std::fs::read(cert_path).map_err(|e| ConfigError::ValidationFailed {
-                    reason: format!("Failed to read server certificate from {cert_path}: {e}"),
-                })?;
-                let key = std::fs::read(key_path).map_err(|e| ConfigError::ValidationFailed {
-                    reason: format!("Failed to read server key from {key_path}: {e}"),
-                })?;
-                self.config.server_cert = Some(cert);
-                self.config.server_key = Some(key);
-                self.config.server_key_path = Some(key_path.clone());
-            }
-            (None, None) => {}
-            _ => {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "Both --tls-cert-path and --tls-key-path must be specified together"
-                        .to_string(),
-                });
-            }
+        let pair = cert_and_key(
+            self.server_cert_path.as_deref(),
+            self.server_key_path.as_deref(),
+            "--tls-cert-path and --tls-key-path",
+        )?;
+        if let Some((cert_path, key_path)) = pair {
+            self.config.server_cert = Some(read_file(cert_path, "server certificate")?);
+            self.config.server_key = Some(read_file(key_path, "server key")?);
+            self.config.server_key_path = Some(key_path.to_string());
         }
         Ok(self)
     }
@@ -1047,6 +1074,63 @@ impl RouterConfigBuilder {
 
         Ok(self)
     }
+
+    /// Reads the supplied policy document by the Grand Central crate's own read
+    /// ([`Format::read`]), the one an apply passes too, in the form the
+    /// file's name states ([`Format::of`]). A refusal names the file and
+    /// stands in that read's words: the field by its path, or the line and
+    /// column where the file itself does not read.
+    fn read_policy_spec(mut self) -> ConfigResult<Self> {
+        if let Some(path) = &self.config.policy_spec_path {
+            let refused = |reason: String| ConfigError::ValidationFailed {
+                reason: format!("Grand Central: {path}: {reason}"),
+            };
+            let document = std::fs::File::open(path)
+                .and_then(|file| Ok((file.metadata()?.len(), file)))
+                .and_then(|(stated, file)| bounded_document(stated, file))
+                .map_err(|error| {
+                    refused(format!("could not read the policy document ({error})"))
+                })?;
+            let format = Format::of(Path::new(path));
+            let spec = format.read(&document).map_err(|rejected| {
+                // The file's name alone made it JSON, and it does not read
+                // as JSON at all: it may be a YAML document.
+                let named = matches!(
+                    &rejected,
+                    SpecRejected::Unparsed { path, .. } if format == Format::Json && path.is_empty()
+                );
+                refused(if named {
+                    format!(
+                        "{rejected}: a file named .json is read as JSON, any other name as YAML"
+                    )
+                } else {
+                    rejected.to_string()
+                })
+            })?;
+            self.config.policy_spec = Some(spec);
+        }
+        Ok(self)
+    }
+}
+
+fn cert_and_key<'a>(
+    cert_path: Option<&'a str>,
+    key_path: Option<&'a str>,
+    flags: &str,
+) -> ConfigResult<Option<(&'a str, &'a str)>> {
+    match (cert_path, key_path) {
+        (Some(cert_path), Some(key_path)) => Ok(Some((cert_path, key_path))),
+        (None, None) => Ok(None),
+        _ => Err(ConfigError::ValidationFailed {
+            reason: format!("Both {flags} must be specified together"),
+        }),
+    }
+}
+
+fn read_file(path: &str, what: &str) -> ConfigResult<Vec<u8>> {
+    std::fs::read(path).map_err(|e| ConfigError::ValidationFailed {
+        reason: format!("Failed to read {what} from {path}: {e}"),
+    })
 }
 
 impl From<RouterConfigBuilder> for RouterConfig {
@@ -1063,56 +1147,5 @@ impl RouterConfig {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use super::*;
-
-    /// Test complex routing mode helper method
-    #[test]
-    fn test_builder_prefill_decode_mode() {
-        let config = RouterConfigBuilder::new()
-            .prefill_decode_mode(
-                vec![("http://prefill:8000".to_string(), Some(8001))],
-                vec!["http://decode:8000".to_string()],
-            )
-            .power_of_two_policy()
-            .build()
-            .unwrap();
-
-        assert!(config.mode.is_pd_mode());
-        assert_eq!(config.mode.worker_count(), 2);
-    }
-
-    /// Test complex policy helper method with multiple parameters
-    #[test]
-    fn test_builder_cache_aware_policy() {
-        let config = RouterConfigBuilder::new()
-            .regular_mode(vec!["http://worker1:8000".to_string()])
-            .cache_aware_policy(0.8, 10, 1.5, 300, 1000)
-            .build()
-            .unwrap();
-
-        match config.policy {
-            PolicyConfig::CacheAware {
-                cache_threshold, ..
-            } => {
-                assert!((cache_threshold - 0.8).abs() < 0.0001);
-            }
-            _ => panic!("Expected CacheAware policy"),
-        }
-    }
-
-    #[test]
-    fn test_builder_storage_context_headers_round_trip() {
-        let headers = HashMap::from([("x-tenant-id".to_string(), "tenant_id".to_string())]);
-
-        let config = RouterConfigBuilder::new()
-            .regular_mode(vec!["http://worker1:8000".to_string()])
-            .storage_context_headers(headers.clone())
-            .build()
-            .unwrap();
-
-        assert_eq!(config.storage_context_headers, headers);
-    }
-}
+#[path = "../../tests/unit/config/builder/tests.rs"]
+mod tests;

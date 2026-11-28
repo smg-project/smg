@@ -22,7 +22,7 @@ use tokio::{sync::oneshot, time::timeout};
 
 use super::{super::HarmonyStreamingProcessor, chunk, usage::harmony_tokens};
 use crate::routers::{
-    common::sse::sse_channel,
+    common::{placement::tests::heard_request, sse::sse_channel},
     grpc::{
         common::{
             response_formatting::TokenCounts, responses::streaming::ResponseStreamEventEmitter,
@@ -159,6 +159,7 @@ async fn streamed(execution: context::ExecutionResult, router_stops: &[String]) 
             None,
             None,
             router_stops,
+            None,
         )
         .await;
         drop(tx);
@@ -276,6 +277,41 @@ async fn a_router_stop_ends_the_streamed_turn_and_the_engine_request() {
         "{} of {} tokens",
         counts.completion,
         ids.len()
+    );
+}
+
+/// The streamed turn's stop leaves a whole answer. The iteration lets the
+/// engine go there, and Grand Central hears the worker's 200, though the
+/// stream is dropped before its own end.
+#[tokio::test]
+async fn a_router_stop_of_the_streamed_turn_is_heard_as_the_workers_good_end() {
+    let ids = harmony_tokens(None, "Hello STOP and on and on and on and on");
+    let chunks: Vec<_> = ids.chunks(3).map(|ids| chunk(ids.to_vec())).collect();
+    let (gate_tx, gate) = oneshot::channel::<()>();
+    let (mut stream, server) = gated_stream(chunks, gate, vec![complete(ids, "length")], "0").await;
+    let (heard, guard, end) = heard_request();
+    stream.report_through(end);
+
+    let streamed = timeout(
+        Duration::from_secs(5),
+        streamed(
+            context::ExecutionResult::Single {
+                stream,
+                dispatch_start: std::time::Instant::now(),
+            },
+            &stops(),
+        ),
+    )
+    .await
+    .expect("the stream ends at the stop, without the engine's Complete");
+    server.abort();
+    drop(gate_tx);
+    assert_eq!(streamed.text(), "Hello STOP", "{:?}", streamed.events);
+
+    drop(guard);
+    assert_eq!(
+        *heard.lock().expect("the stage heard"),
+        ["issued", "dispatched Single", "completed Ok 200"]
     );
 }
 

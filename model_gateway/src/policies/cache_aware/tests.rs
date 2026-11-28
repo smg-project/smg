@@ -1,11 +1,18 @@
 use kv_index::{compute_content_hash, ContentHash, GroupKind, SequenceHash, StoredBlock};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse, WorkerStatus};
+use smg_worker::load::state::TestFeed;
 use tokio::sync::watch;
 use tracing_test::traced_test;
 
 use super::*;
-use crate::{policies::test_support::make_workers, worker::load_state::TestFeed};
+use crate::{
+    config::{PolicyConfig, PowerOfTwoLoadMetric},
+    policies::{
+        test_support::{make_worker, make_workers},
+        PolicyRegistry, PowerOfTwoPolicy,
+    },
+};
 
 #[test]
 fn text_is_wanted_only_without_token_ids() {
@@ -30,7 +37,7 @@ fn overlap_affinity_group(
     workers: &[Arc<dyn Worker>],
     tokens: &[u32],
     healthy_indices: &[usize],
-    indexer: &KvIndex,
+    indexer: &Arc<KvIndex>,
     block_size: usize,
     tuning: &OverlapTuning<'_>,
 ) -> Vec<usize> {
@@ -44,12 +51,17 @@ fn overlap_affinity_group(
     );
     CacheAwarePolicy::affinity_score_group(&candidates, tuning.selection_temperature)
 }
+use smg_worker::{
+    identity::basic::WorkerType,
+    runtime::StallReason,
+    test_support::{no_health_check, ready_worker},
+};
+
 use crate::{
     observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
-    worker::{
-        runtime::StallReason,
-        test_support::{no_health_check, worker_of},
-        BasicWorkerBuilder, WorkerBlocks, WorkerType,
+    policies::kv_index::index_backend::WorkerBlocks,
+    routers::{
+        common::snapshot::test_support::worker_of, grpc::backend_client::BasicWorkerBuilder,
     },
 };
 
@@ -229,16 +241,18 @@ fn string_tree_totals_sums_tenant_chars() {
     tree.insert_text("", "http://w1:8000");
     assert_eq!(string_tree_totals(&tree), (0, 1));
 
+    // A node counts 1024 beside its chars, for every tenant on it.
     tree.insert_text("hello", "http://w1:8000");
-    assert_eq!(string_tree_totals(&tree), (5, 1));
+    assert_eq!(string_tree_totals(&tree), (5 + 1024, 1));
 
     // A shared path counts its chars for every tenant on it.
     tree.insert_text("hello", "http://w2:8000");
-    assert_eq!(string_tree_totals(&tree), (10, 2));
+    assert_eq!(string_tree_totals(&tree), (10 + 2 * 1024, 2));
 
-    // "help!" shares "hel", adds only "p!" for w1.
+    // "help!" shares "hel", adds only "p!" for w1: both tenants stand on
+    // "hel" and "lo" now, and w1 on "p!".
     tree.insert_text("help!", "http://w1:8000");
-    assert_eq!(string_tree_totals(&tree), (12, 2));
+    assert_eq!(string_tree_totals(&tree), (12 + 5 * 1024, 2));
 }
 
 #[test]
@@ -326,7 +340,7 @@ fn update_expected_wait_loads(
             )
         })
         .collect();
-    TestFeed::attached_to(policy).publish(&loads);
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&loads);
 }
 
 /// Like [`update_expected_wait_loads`], with each report counting the
@@ -350,7 +364,7 @@ fn update_expected_wait_loads_counting_held(
             (worker.url().to_string(), load)
         })
         .collect();
-    TestFeed::attached_to(policy).publish(&loads);
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&loads);
 }
 
 /// One selection for `text` through the string path.
@@ -589,7 +603,7 @@ fn a_miss_avoids_the_worker_whose_report_hides_the_requests_the_router_holds() {
     one_queued.loads[0].num_waiting_reqs = 1;
     let mut idle = expected_wait_load(0, 0.1, 100.0);
     idle.loads[0].num_running_reqs = 0;
-    TestFeed::attached_to(&policy).publish(&HashMap::from([
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&HashMap::from([
         (workers[0].url().to_string(), one_queued),
         (workers[1].url().to_string(), idle),
     ]));
@@ -621,7 +635,7 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
     running.loads[0].num_running_reqs = 3;
     let mut queued = expected_wait_load(3_100, 0.1, 100.0);
     queued.loads[0].num_running_reqs = 0;
-    TestFeed::attached_to(&policy).publish(&HashMap::from([
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&HashMap::from([
         (workers[0].url().to_string(), running),
         (workers[1].url().to_string(), queued),
     ]));
@@ -633,7 +647,7 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
     // the fixture's one running request (10.24 s each), so it cancels:
     // 40.96 s against `w2`'s 41.24 s.
     let (policy, workers) = initialised_pair();
-    TestFeed::attached_to(&policy).publish(&HashMap::from([
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&HashMap::from([
         (
             workers[0].url().to_string(),
             expected_wait_load(0, 0.1, 100.0),
@@ -661,7 +675,7 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
 #[test]
 fn a_report_the_snapshot_dropped_is_no_longer_scored() {
     let (policy, workers) = initialised_pair();
-    let feed = TestFeed::attached_to(&policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     feed.publish(&HashMap::from([
         (
             workers[0].url().to_string(),
@@ -696,7 +710,7 @@ fn a_report_the_snapshot_dropped_is_no_longer_scored() {
 #[test]
 fn the_shared_snapshot_is_the_score_source() {
     let (policy, workers) = initialised_pair();
-    let feed = TestFeed::attached_to(&policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     feed.publish(&HashMap::from([
         (
             workers[0].url().to_string(),
@@ -775,7 +789,7 @@ fn cache_aware_worker_removal_prunes_expected_wait_state() {
             (worker.url().to_string(), load)
         })
         .collect();
-    let feed = TestFeed::attached_to(&policy);
+    let feed = TestFeed::attached_to(|rx| policy.set_load_receiver(rx));
     feed.publish(&loads);
 
     let first = SelectWorkerInfo {
@@ -825,7 +839,7 @@ fn seed_string_tenants(
 ) -> Arc<Tree> {
     policy.init_workers(workers);
     let model_key = normalize_model_key(workers[0].model_id()).to_string();
-    let tree = Arc::clone(policy.string_trees.get(&model_key).unwrap().value());
+    let tree = policy.trees.string_tree(&model_key).unwrap();
     for url in tenant_urls {
         tree.insert_text(text, url);
     }
@@ -842,7 +856,7 @@ fn seed_token_tenants(
 ) -> Arc<TokenTree> {
     policy.init_workers(workers);
     let model_key = normalize_model_key(workers[0].model_id()).to_string();
-    let tree = Arc::clone(policy.token_trees.get(&model_key).unwrap().value());
+    let tree = policy.trees.token_tree(&model_key).unwrap();
     for url in tenant_urls {
         tree.insert_tokens(tokens, url);
     }
@@ -876,7 +890,7 @@ fn prefill_miss_ignores_generation_rate() {
             .map(|url| worker_of(url, WorkerType::Prefill))
             .collect();
         policy.init_workers(&workers);
-        let feed = TestFeed::attached_to(&policy.load_scorer);
+        let feed = TestFeed::attached_to(|rx| policy.load_scorer.set_load_receiver(rx));
         feed.publish(&HashMap::from([
             (
                 workers[0].url().to_string(),
@@ -905,7 +919,7 @@ fn string_tree_miss_uses_expected_wait_and_records_final_worker() {
     assert_only_final_worker_credited(&policy, &workers, 1, 1024);
 
     let model = normalize_model_key(workers[0].model_id());
-    let tree = policy.string_trees.get(model).unwrap();
+    let tree = policy.trees.string_tree(model).unwrap();
     let matched = tree.match_prefix_with_counts(text);
     assert!(matched
         .matched_tenants
@@ -1002,7 +1016,7 @@ fn token_tree_miss_uses_expected_wait_and_records_final_worker() {
     assert_only_final_worker_credited(&policy, &workers, 1, 8);
 
     let model = normalize_model_key(workers[0].model_id());
-    let tree = policy.token_trees.get(model).unwrap();
+    let tree = policy.trees.token_tree(model).unwrap();
     let matched = tree.match_prefix_with_counts(&tokens);
     assert!(matched
         .matched_tenants
@@ -1770,8 +1784,8 @@ fn test_remove_worker_purges_tree_tenants() {
     // Seed both tenants explicitly; worker cleanup is the behavior under
     // test, independent of random tie-breaking in a fully dark fleet.
     let model_key = normalize_model_key(workers[0].model_id()).to_string();
-    let string_tree = Arc::clone(policy.string_trees.get(&model_key).unwrap().value());
-    let token_tree = Arc::clone(policy.token_trees.get(&model_key).unwrap().value());
+    let string_tree = policy.trees.string_tree(&model_key).unwrap();
+    let token_tree = policy.trees.token_tree(&model_key).unwrap();
     string_tree.insert_text("purge me please", workers[0].url());
     string_tree.insert_text("keep me around", workers[1].url());
     let tokens_a: Vec<u32> = (0..32).collect();
@@ -1811,23 +1825,19 @@ fn test_remove_workers_from_model_does_not_mutate_other_models() {
     let tokens: Vec<u32> = (0..32).collect();
 
     for model_id in ["retired-model", "active-model"] {
-        let string_tree = Arc::new(Tree::new());
+        let string_tree = policy.trees.string_tree_or_new(model_id);
         string_tree.insert_text("shared prefix", worker_url);
-        policy
-            .string_trees
-            .insert(model_id.to_string(), string_tree);
 
-        let token_tree = Arc::new(policy.new_token_tree());
+        let token_tree = policy.trees.token_tree_or_new(model_id);
         token_tree.insert_tokens(&tokens, worker_url);
-        policy.token_trees.insert(model_id.to_string(), token_tree);
 
         policy.record_placement(model_id, None, &tokens, &[16], worker_url, Instant::now());
     }
 
     policy.remove_workers_from_model("retired-model", &HashSet::from([worker_url.to_string()]));
 
-    let retired_string = policy.string_trees.get("retired-model").unwrap();
-    let retired_token = policy.token_trees.get("retired-model").unwrap();
+    let retired_string = policy.trees.string_tree("retired-model").unwrap();
+    let retired_token = policy.trees.token_tree("retired-model").unwrap();
     assert!(!retired_string
         .get_tenant_char_count()
         .contains_key(worker_url));
@@ -1839,8 +1849,8 @@ fn test_remove_workers_from_model_does_not_mutate_other_models() {
         .get("retired-model")
         .is_some_and(|placements| placements.is_empty()));
 
-    let active_string = policy.string_trees.get("active-model").unwrap();
-    let active_token = policy.token_trees.get("active-model").unwrap();
+    let active_string = policy.trees.string_tree("active-model").unwrap();
+    let active_token = policy.trees.token_tree("active-model").unwrap();
     assert!(active_string
         .get_tenant_char_count()
         .contains_key(worker_url));
@@ -1978,9 +1988,10 @@ fn a_repaired_path_resolves_until_the_tree_evicts_it() {
     ));
 
     // Both workers hold each path now, so a budget under one copy of the
-    // tokens evicts both from the token tree and one from the string tree.
-    let string_tree = Arc::clone(policy.string_trees.get("model1").unwrap().value());
-    let token_tree = Arc::clone(policy.token_trees.get("model1").unwrap().value());
+    // tokens evicts both from the token tree; it is under the 1024 a node of
+    // the string tree counts too, so that tree keeps neither.
+    let string_tree = policy.trees.string_tree("model1").unwrap();
+    let token_tree = policy.trees.token_tree("model1").unwrap();
     assert_eq!(
         (string_tree.hashed_paths(), token_tree.hashed_paths()),
         (1, 1)
@@ -1993,8 +2004,6 @@ fn a_repaired_path_resolves_until_the_tree_evicts_it() {
         kv_index::hash_token_path(&tokens),
         "http://w3",
     ));
-    assert_eq!(string_tree.hashed_paths(), 1);
-    policy.evict_cache(text.len() - 1);
     assert_eq!(string_tree.hashed_paths(), 0);
     assert!(!policy.apply_known_remote_insert(
         "model1",
@@ -2066,10 +2075,12 @@ fn a_peer_delta_attaches_the_worker_along_the_whole_request() {
         kv_index::hash_node_path(&second),
         "http://remote",
     ));
-    let tree = Arc::clone(policy.string_trees.get(model).unwrap().value());
+    let tree = policy.trees.string_tree(model).unwrap();
+    // Two nodes (the first turn and what the second adds): 1024 each beside
+    // their characters.
     assert_eq!(
         tree.tenant_char_size(&Arc::<str>::from("http://remote")),
-        second.chars().count()
+        second.chars().count() + 2 * 1024
     );
 }
 
@@ -2096,7 +2107,7 @@ fn a_peer_delta_for_a_recent_request_resolves_after_eviction() {
     };
 
     let older = converse("first");
-    let tree = Arc::clone(policy.string_trees.get(model).unwrap().value());
+    let tree = policy.trees.string_tree(model).unwrap();
     let one_conversation = tree.total_char_size();
     let newer = converse("second");
     policy.evict_cache(one_conversation * 3 / 2);
@@ -2131,8 +2142,8 @@ fn every_turn_of_a_conversation_resolves_while_the_tree_keeps_it() {
             kv_index::hash_token_path(&tokens),
         ));
     }
-    let string_tree = Arc::clone(policy.string_trees.get(model).unwrap().value());
-    let token_tree = Arc::clone(policy.token_trees.get(model).unwrap().value());
+    let string_tree = policy.trees.string_tree(model).unwrap();
+    let token_tree = policy.trees.token_tree(model).unwrap();
     assert_eq!(
         (string_tree.hashed_paths(), token_tree.hashed_paths()),
         (5, 5)
@@ -2174,8 +2185,8 @@ fn nothing_is_hashed_without_the_mesh() {
     let tokens: Vec<u32> = (0..32).collect();
     route_text(&policy, &workers, text).unwrap();
     route_tokens(&policy, &workers, &tokens);
-    assert_eq!(policy.string_trees.get(model).unwrap().hashed_paths(), 0);
-    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 0);
+    assert_eq!(policy.trees.string_tree(model).unwrap().hashed_paths(), 0);
+    assert_eq!(policy.trees.token_tree(model).unwrap().hashed_paths(), 0);
     assert!(!policy.apply_known_remote_insert(
         model,
         TreeKind::String,
@@ -2205,10 +2216,10 @@ fn a_token_prompt_under_one_page_is_not_hashed() {
     let model = normalize_model_key(workers[0].model_id());
     let short: Vec<u32> = (0..15).collect();
     route_tokens(&policy, &workers, &short);
-    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 0);
+    assert_eq!(policy.trees.token_tree(model).unwrap().hashed_paths(), 0);
     let page: Vec<u32> = (0..16).collect();
     route_tokens(&policy, &workers, &page);
-    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 1);
+    assert_eq!(policy.trees.token_tree(model).unwrap().hashed_paths(), 1);
 }
 
 #[test]
@@ -2230,7 +2241,7 @@ fn a_routed_tailed_prompt_and_a_repair_page_name_the_node_by_its_aligned_hash() 
     let model = normalize_model_key(workers[0].model_id());
     let tailed: Vec<u32> = (0..17).collect();
     route_tokens(&policy, &workers, &tailed);
-    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 1);
+    assert_eq!(policy.trees.token_tree(model).unwrap().hashed_paths(), 1);
 
     let aligned: Vec<u32> = (0..16).collect();
     let never_routed: Vec<u32> = (100..116).collect();
@@ -2274,7 +2285,7 @@ fn a_routed_tailed_prompt_and_a_repair_page_name_the_node_by_its_aligned_hash() 
         resolves(&never_routed),
         "a repaired path the gateway never routed answers to its hash"
     );
-    assert_eq!(policy.token_trees.get(model).unwrap().hashed_paths(), 2);
+    assert_eq!(policy.trees.token_tree(model).unwrap().hashed_paths(), 2);
 }
 
 #[test]
@@ -2313,7 +2324,7 @@ fn peers_resolve_every_tail_of_a_shared_prefix() {
     for prompt in &prompts {
         route_tokens(&a, &workers, prompt);
     }
-    assert_eq!(a.token_trees.get(model).unwrap().hashed_paths(), 1);
+    assert_eq!(a.trees.token_tree(model).unwrap().hashed_paths(), 1);
     route_tokens(&b, &workers, &prompts[0]);
     let resolved = prompts
         .iter()
@@ -2353,7 +2364,7 @@ fn peers_resolve_every_tail_of_a_shared_prefix() {
         })
         .count();
     assert_eq!(resolved_after, prompts.len());
-    assert_eq!(b.token_trees.get(model).unwrap().hashed_paths(), 1);
+    assert_eq!(b.trees.token_tree(model).unwrap().hashed_paths(), 1);
 }
 
 #[test]
@@ -2572,7 +2583,7 @@ fn hybrid_holders_are_ranked_at_what_their_groups_can_serve() {
     ];
     for (w1_window, w1_state, w2_window, w2_state, want, note) in cells {
         let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-        let indexer = KvIndex::chain();
+        let indexer = Arc::new(KvIndex::chain());
         hybrid_worker(
             &indexer,
             "http://w1:8000",
@@ -2603,7 +2614,7 @@ fn hybrid_holders_are_ranked_at_what_their_groups_can_serve() {
 fn a_plain_worker_keeps_the_index_overlap_beside_a_hybrid_one() {
     let tokens: Vec<u32> = (1..=40).collect();
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-    let indexer = KvIndex::chain();
+    let indexer = Arc::new(KvIndex::chain());
     hybrid_worker(
         &indexer,
         "http://w1:8000",
@@ -3168,16 +3179,30 @@ fn fleet_with_holders(holders: usize) -> HolderFleet {
 /// Eight workers; the first `holders` hold `blocks` blocks each of their
 /// own sequence, the rest nothing.
 fn fleet_with_holders_of(holders: usize, blocks: usize) -> HolderFleet {
-    let policy = CacheAwarePolicy::with_config(test_config());
     let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
     let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
-    let workers = make_workers(&refs);
+    fleet_of(make_workers(&refs), holders, blocks)
+}
+
+/// A fleet of `workers`, eight of them; the first `holders` hold `blocks`
+/// blocks each of their own sequence, the rest nothing.
+fn fleet_of(workers: Vec<Arc<dyn Worker>>, holders: usize, blocks: usize) -> HolderFleet {
+    fleet_with_config(workers, holders, blocks, test_config())
+}
+
+fn fleet_with_config(
+    workers: Vec<Arc<dyn Worker>>,
+    holders: usize,
+    blocks: usize,
+    config: CacheAwareConfig,
+) -> HolderFleet {
+    let policy = CacheAwarePolicy::with_config(config);
     policy.init_workers(&workers);
     update_expected_wait_loads(&policy, &workers, &[0, 0, 0, 0, 0, 0, 0, 0]);
     let indexer = Arc::new(KvIndex::chain());
     let mut prefixes = Vec::new();
-    for (h, url) in urls.iter().enumerate() {
-        let id = indexer.intern_worker(url).unwrap();
+    for (h, worker) in workers.iter().enumerate() {
+        let id = indexer.intern_worker(worker.url()).unwrap();
         if h >= holders {
             continue;
         }
@@ -3198,6 +3223,70 @@ fn fleet_with_holders_of(holders: usize, blocks: usize) -> HolderFleet {
         indexer,
         heads: prefixes,
     }
+}
+
+const MAXIMAL_DIVERSION_PERIOD_CHILD: &str = "SMG_TEST_MAXIMAL_CACHE_AWARE_DIVERSION_PERIOD";
+
+/// Liveness budgets are first-set-wins process globals, so a child contains this test's value.
+/// The child's output is captured: its lines stay out of this run's own, and a failure shows them.
+#[test]
+fn a_maximal_cache_aware_diversion_period_does_not_overflow() {
+    if std::env::var_os(MAXIMAL_DIVERSION_PERIOD_CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "policies::cache_aware::tests::a_maximal_cache_aware_diversion_period_does_not_overflow",
+            ])
+            .env(MAXIMAL_DIVERSION_PERIOD_CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "isolated regression test failed: {}\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // A name that matches no test also exits with success: the child
+        // must have run this one case.
+        assert!(
+            stdout.contains("test result: ok. 1 passed;"),
+            "the isolated child ran no test:\n{stdout}"
+        );
+        return;
+    }
+
+    let mut budgets = liveness::budgets();
+    budgets.warmup_divert_every = (1_u64 << 63) + 1;
+    liveness::configure_from(budgets);
+    assert_eq!(liveness::warmup().divert_every, (1_u64 << 63) + 1);
+
+    let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let fleet = fleet_with_config(
+        make_workers(&refs),
+        7,
+        1_100,
+        CacheAwareConfig {
+            cache_threshold: 0.25,
+            ..test_config()
+        },
+    );
+    let mut shallow = fleet.heads[0][..32].to_vec();
+    shallow.extend(90_000_000..90_000_048);
+    for _ in 0..2 {
+        assert_eq!(route_tokens(&fleet.policy, &fleet.workers, &shallow), 0);
+    }
+    fleet.policy.divert_hits.store(u64::MAX, Ordering::Relaxed);
+    assert_eq!(route_tokens(&fleet.policy, &fleet.workers, &shallow), 0);
+}
+
+#[test]
+fn a_maximal_cache_aware_diversion_period_does_not_overflow_filter_guard() {
+    assert!(
+        std::env::var_os(MAXIMAL_DIVERSION_PERIOD_CHILD).is_none(),
+        "the isolated child also ran a sibling test"
+    );
 }
 
 #[test]
@@ -3304,7 +3393,7 @@ fn a_thin_worker_keeps_its_share_past_the_warm_up_blocks_until_the_ratio() {
     let thin = indexer.worker_id("http://w7:8000").unwrap();
     // The growth baselines date from the first table, built on the empty
     // fleet as on the run; the regrowth comes after.
-    policy.pool_table(&workers, &indexer, liveness::now_ms());
+    policy.pool_table(&workers, None, &indexer, liveness::now_ms());
     let regrown: Vec<u32> = (0..4_400).map(|i| 80_000_000 + i).collect();
     store_blocks(&indexer, thin, &regrown, 4, 8_000_000);
     assert_eq!(indexer.worker_block_count(thin), 1_100);
@@ -3322,6 +3411,7 @@ fn a_thin_worker_keeps_its_share_past_the_warm_up_blocks_until_the_ratio() {
             rebuilds += 1;
             policy.pool_table(
                 &workers,
+                None,
                 &indexer,
                 liveness::now_ms() + rebuilds * POOL_TABLE_REFRESH_MS,
             );
@@ -3380,10 +3470,12 @@ fn a_thin_worker_keeps_its_share_past_the_warm_up_blocks_until_the_ratio() {
     // counted.
     let table = policy.pool_table(
         &workers,
+        None,
         &indexer,
         liveness::now_ms() + (rebuilds + 1) * POOL_TABLE_REFRESH_MS,
     );
-    assert!(table.thin.is_empty(), "no longer thin: {:?}", table.thin);
+    let thin_rows = &table.rows().thin;
+    assert!(thin_rows.is_empty(), "no longer thin: {thin_rows:?}");
     let hits = policy.divert_hits.load(Ordering::Relaxed);
     for i in 0..32 {
         route_tokens(&policy, &workers, &request(20_000 + i));
@@ -3502,6 +3594,286 @@ fn event_spill_credits_only_expected_wait_final_worker() {
     assert_eq!(selected, 2, "spill must use expected wait over the fleet");
 }
 
+/// The password and the query token in the addresses the trace pin
+/// registers.
+const ADDRESS_SECRET: &str = "s3cret";
+
+/// Workers registered with a credential in the address, one a host: a
+/// password in the userinfo and a token in the query.
+fn workers_with_a_credential(hosts: &[&str]) -> Vec<Arc<dyn Worker>> {
+    hosts
+        .iter()
+        .map(|host| {
+            make_worker(&format!(
+                "http://user:{ADDRESS_SECRET}@{host}:8000/v1?token={ADDRESS_SECRET}"
+            ))
+        })
+        .collect()
+}
+
+/// No row of the cache trace carries a worker's registered address whole.
+/// The workers are registered with a password and a query token, and every
+/// row kind is written: a row's candidates and its selected worker, a score
+/// row of each of the four sources, and both gate rows. Each names its
+/// worker masked, the host and the port kept; the credential is in no row
+/// and not in the response header.
+#[tokio::test]
+async fn no_row_of_the_cache_trace_carries_a_registered_address_whole() {
+    let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+    let select = |policy: Arc<dyn LoadBalancingPolicy>,
+                  workers: &[Arc<dyn Worker>],
+                  info: &SelectWorkerInfo| {
+        registry
+            .select_worker_for_model(&policy, "unknown", workers, info)
+            .expect("a worker is selected");
+    };
+    let (rows, header) = cache_trace::scope(true, async {
+        // Least load: an expected-wait score row a candidate.
+        let workers = workers_with_a_credential(&["a", "b"]);
+        let plain = SelectWorkerInfo::default();
+        select(Arc::new(LeastLoadPolicy::new()), &workers, &plain);
+        // Power of two over resident tokens: a resident-work score row a
+        // candidate.
+        let resident = PowerOfTwoLoadMetric::ResidentTokens { request_tokens: 1 };
+        let power_of_two = PowerOfTwoPolicy::with_load_metric(resident);
+        select(Arc::new(power_of_two), &workers, &plain);
+        // Cache aware over the string tree: `w4` is overloaded (the
+        // eligibility gate), `w1` holds the prefix under a load that spills
+        // it (the spill gate), and the scores of the tree and of the
+        // selection policy are written before the expected wait picks.
+        let policy = Arc::new(CacheAwarePolicy::with_config(test_config()));
+        let workers = workers_with_a_credential(&["w1", "w2", "w3", "w4"]);
+        workers[3].set_overloaded(true);
+        let text = "shared string prefix that must spill";
+        seed_string_tenants(&policy, &workers, text, &[workers[0].url()]);
+        for _ in 0..100 {
+            workers[0].increment_load();
+        }
+        for _ in 0..10 {
+            workers[2].increment_load();
+        }
+        update_expected_wait_loads_counting_held(&policy, &workers, &[20_000, 10_000, 1_000]);
+        let info = SelectWorkerInfo {
+            request_text: Some(text),
+            ..Default::default()
+        };
+        select(policy, &workers, &info);
+
+        let rows = cache_trace::captured_selections();
+        let header = cache_trace::dispatch(Some("root"), 1, Vec::new(), true, "regular");
+        (rows, header)
+    })
+    .await;
+
+    // What each row kind names as its worker.
+    let mut named = Vec::new();
+    for row in &rows {
+        named.push(("selected".to_string(), &row["worker"]));
+        for candidate in row["candidates"].as_array().into_iter().flatten() {
+            named.push(("candidate".to_string(), &candidate["worker"]));
+        }
+        for score in row["scores"].as_array().into_iter().flatten() {
+            let source = score["source"].as_str().unwrap_or_default();
+            named.push((format!("score {source}"), &score["worker"]));
+        }
+        for gate in row["gates"].as_array().into_iter().flatten() {
+            let kind = if gate["phase"] == "eligibility" {
+                "gate eligibility"
+            } else {
+                "gate spill"
+            };
+            named.push((kind.to_string(), &gate["worker"]));
+        }
+    }
+    let mut unmasked: Vec<String> = named
+        .iter()
+        .filter(|(_, worker)| {
+            let worker = worker.as_str().unwrap_or_default();
+            !(worker.starts_with("http://***@") && worker.ends_with(":8000/v1"))
+        })
+        .map(|(kind, worker)| format!("{kind}: {worker}"))
+        .collect();
+    unmasked.sort_unstable();
+    unmasked.dedup();
+    assert!(
+        unmasked.is_empty(),
+        "rows that do not name their worker masked, with its host and port: {unmasked:#?}"
+    );
+    let mut kinds: Vec<&str> = named.iter().map(|(kind, _)| kind.as_str()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    assert_eq!(
+        kinds,
+        [
+            "candidate",
+            "gate eligibility",
+            "gate spill",
+            "score approximate_tree",
+            "score expected_wait",
+            "score policy_affinity",
+            "score resident_work",
+            "selected",
+        ],
+        "the row kinds the selections wrote"
+    );
+    let written = serde_json::to_string(&rows).expect("the rows are JSON");
+    assert!(
+        !written.contains(ADDRESS_SECRET),
+        "a trace row carries the credential: {written}"
+    );
+    let header = header.expect("the request asked for its header");
+    assert!(
+        !header.contains(ADDRESS_SECRET),
+        "the trace header carries the credential: {header}"
+    );
+}
+
+/// No debug line of a cache-aware decision carries a worker's registered
+/// address whole. The workers are registered with a password and a query
+/// token, and every line that names a worker is written by a decision of its
+/// own: the fallback under KV pressure, the released bookings, the tree
+/// decision, the event-driven decision, the warm-up slice and diversion, and
+/// both hash decisions. Each names its worker masked.
+#[test]
+#[traced_test]
+fn no_debug_line_of_a_decision_carries_a_registered_address_whole() {
+    // What tells each line among the test's lines.
+    const LINES: [(&str, &[&str]); 8] = [
+        (
+            "the fallback under KV pressure",
+            &["kv_pressure_expected_wait"],
+        ),
+        ("the released bookings", &["Released bookings"]),
+        ("the tree decision", &["tree_match"]),
+        ("the event-driven decision", &["Event-driven routing"]),
+        ("the warm-up slice", &["warmup_slice"]),
+        ("the warm-up diversion", &["warmup_divert"]),
+        ("the hash hit", &["hash_hit"]),
+        ("the hash fallback", &["hash", "expected_wait_fallback"]),
+    ];
+
+    // KV pressure abandons the affinity of `w1`: the expected-wait fallback.
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        block_size: 4,
+        ..kv_only_config(0.3, 0.95)
+    });
+    let workers = workers_with_a_credential(&["w1", "w2"]);
+    let tokens: Vec<u32> = (0..32).collect();
+    seed_token_tenants(&policy, &workers, &tokens, &[workers[0].url()]);
+    workers[0].increment_load();
+    let _tx = inject_kv(&policy, &workers, &[0.9, 0.1]);
+    route_tokens(&policy, &workers, &tokens);
+
+    // A booking whose completion never arrived is released.
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        selection_accounting_ttl_ms: 60_000,
+        ..test_config()
+    });
+    let accounting = policy.accounting.as_ref().expect("accounting enabled");
+    accounting.record_dispatch(workers[0].url(), 100, &[]);
+    accounting.record_dispatch(workers[0].url(), 200, &[]);
+    policy.reconcile_in_flight(workers[0].url(), 1);
+
+    // The string tree: `w1` holds the prefix and takes the request.
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers = workers_with_a_credential(&["w1", "w2"]);
+    let text = "a prefix the tree holds for one worker";
+    seed_string_tenants(&policy, &workers, text, &[workers[0].url()]);
+    route_text(&policy, &workers, text);
+
+    // The event index: `w1` holds a fleet-sized cache and `w2` nothing, so
+    // requests with a thin overlap are decided by the events, and `w2` gets
+    // its warm-up slice of them.
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers = workers_with_a_credential(&["w1", "w2"]);
+    policy.init_workers(&workers);
+    update_expected_wait_loads(&policy, &workers, &[0, 0]);
+    let held: Vec<u32> = (1..=4_400).collect();
+    let indexer = Arc::new(KvIndex::chain());
+    let holder = indexer.intern_worker(workers[0].url()).unwrap();
+    indexer.intern_worker(workers[1].url()).unwrap();
+    store_blocks(&indexer, holder, &held, 4, 1);
+    let monitor = Arc::new(KvEventMonitor::new());
+    monitor.indexers.insert("unknown".to_string(), indexer);
+    policy.set_kv_event_monitor(Some(monitor));
+    let mut request: Vec<u32> = (1..=4).collect();
+    request.extend(90_000..90_044);
+    for _ in 0..8 {
+        route_tokens(&policy, &workers, &request);
+    }
+
+    // Seven busy holders and an emptied worker: a deep hit is diverted to it.
+    let hosts = ["h0", "h1", "h2", "h3", "h4", "h5", "h6", "h7"];
+    let HolderFleet {
+        policy,
+        workers,
+        heads,
+        ..
+    } = fleet_of(workers_with_a_credential(&hosts), 7, 1_100);
+    for holder in &workers[..7] {
+        holder.increment_load();
+    }
+    for i in 0..8 {
+        let mut tokens = heads[i % 7].clone();
+        tokens.extend((0..16).map(|t| 90_000_000 + i as u32 * 16 + t));
+        route_tokens(&policy, &workers, &tokens);
+    }
+
+    // The hash index: a hit on the holder of the head, then a miss.
+    let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
+    let workers = workers_with_a_credential(&["w1", "w2"]);
+    let model = normalize_model_key(workers[0].model_id());
+    let cached: Vec<u32> = (0..16).collect();
+    policy.record_placement(
+        model,
+        None,
+        &cached,
+        &[16],
+        workers[0].url(),
+        Instant::now(),
+    );
+    update_expected_wait_loads(&policy, &workers, &[0, 0]);
+    route_tokens(&policy, &workers, &cached);
+    let novel: Vec<u32> = (100..116).collect();
+    route_tokens(&policy, &workers, &novel);
+
+    logs_assert(|lines: &[&str]| {
+        let written = |told_by: &[&str]| -> Vec<&str> {
+            lines
+                .iter()
+                .copied()
+                .filter(|line| told_by.iter().all(|part| line.contains(part)))
+                .collect()
+        };
+        let unwritten: Vec<&str> = LINES
+            .iter()
+            .filter(|(_, told_by)| written(told_by).is_empty())
+            .map(|(line, _)| *line)
+            .collect();
+        if !unwritten.is_empty() {
+            return Err(format!("lines no decision wrote: {unwritten:#?}"));
+        }
+        let whole: Vec<&str> = LINES
+            .iter()
+            .filter(|(_, told_by)| {
+                written(told_by)
+                    .iter()
+                    .any(|line| !line.contains("http://***@") || line.contains(ADDRESS_SECRET))
+            })
+            .map(|(line, _)| *line)
+            .collect();
+        if !whole.is_empty() {
+            return Err(format!(
+                "lines that do not name their worker masked: {whole:#?}"
+            ));
+        }
+        match lines.iter().find(|line| line.contains(ADDRESS_SECRET)) {
+            Some(line) => Err(format!("another line carries the credential: {line}")),
+            None => Ok(()),
+        }
+    });
+}
+
 #[test]
 fn event_equal_overlap_tie_uses_expected_wait_only_among_holders() {
     let policy = CacheAwarePolicy::with_config(test_config());
@@ -3545,7 +3917,7 @@ fn event_decay_keeps_strict_affinity_ahead_of_expected_wait() {
             expected_wait_load(8, 0.0, 1_000.0),
         ),
     ]);
-    TestFeed::attached_to(&policy).publish(&overlap_loads);
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&overlap_loads);
 
     let monitor = Arc::new(KvEventMonitor::new());
     monitor.indexers.insert("unknown".to_string(), indexer);
@@ -3835,7 +4207,7 @@ fn gated_pair(config: CacheAwareConfig) -> (CacheAwarePolicy, Vec<Arc<dyn Worker
     let policy = CacheAwarePolicy::with_config(gate_at_mean(config));
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     policy.init_workers(&workers);
-    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&skewed_rate_loads(&workers));
     (policy, workers)
 }
 
@@ -3922,7 +4294,7 @@ fn idle_rate_residual_does_not_herd_misses() {
         }],
         ..Default::default()
     };
-    TestFeed::attached_to(&policy).publish(&HashMap::from([
+    TestFeed::attached_to(|rx| policy.set_load_receiver(rx)).publish(&HashMap::from([
         (workers[0].url().to_string(), idle(0.36)),
         (workers[1].url().to_string(), idle(0.0)),
     ]));
@@ -4085,15 +4457,15 @@ fn hash_mode_never_touches_trees() {
     let policy = CacheAwarePolicy::with_config(hash_config(&[16]));
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     policy.init_workers(&workers);
-    assert!(policy.string_trees.is_empty());
-    assert!(policy.token_trees.is_empty());
+    assert_eq!(policy.trees.string_tree_count(), 0);
+    assert_eq!(policy.trees.token_tree_count(), 0);
 
     let tokens: Vec<u32> = (0..32).collect();
     route_tokens(&policy, &workers, &tokens);
     route_text(&policy, &workers, "a text prompt long enough to insert").unwrap();
 
-    assert!(policy.string_trees.is_empty());
-    assert!(policy.token_trees.is_empty());
+    assert_eq!(policy.trees.string_tree_count(), 0);
+    assert_eq!(policy.trees.token_tree_count(), 0);
     assert!(!policy.placement_index.is_empty());
 }
 
@@ -4185,7 +4557,7 @@ fn hash_mode_untokenized_text_stays_dark_fleet_expected_wait() {
         assert_eq!(policy.select_worker(&workers, &info), Some(1));
     }
     assert!(policy.placement_index.is_empty());
-    assert!(policy.string_trees.is_empty());
+    assert_eq!(policy.trees.string_tree_count(), 0);
 }
 
 #[test]
@@ -4567,7 +4939,7 @@ fn a_request_is_keyed_once_for_both_trees_and_the_marker_length_is_what_a_match_
     // What the token tree reads back for the namespaced key is the
     // prompt plus the marker: the match count minus the marker length
     // is the prompt's own match, and the plain key sees none of it.
-    let tree = policy.new_token_tree();
+    let tree = policy.trees.token_tree_or_new("keyed-once");
     tree.insert_tokens(&keyed, "http://w1:8000");
     let hit = tree.match_and_insert(&keyed, "http://w1:8000");
     assert_eq!(hit.matched_token_count - marker_len, prompt.len());
@@ -4642,7 +5014,7 @@ fn imbalance_fallback_inserts_under_the_cache_namespace() {
         .select_worker_fallback(&workers, &info, &[0, 1], model_id)
         .unwrap();
 
-    let tree = policy.token_trees.get(model_id).unwrap().value().clone();
+    let tree = policy.trees.token_tree(model_id).unwrap();
     // The unpartitioned prompt cannot see the namespaced insert...
     assert!(tree.prefix_match_legacy(&prompt).0.is_empty());
     // ...while the namespaced key matches in full.
@@ -5110,18 +5482,142 @@ fn a_large_pool_miss_spreads_over_the_pool() {
     );
 }
 
+/// `count` workers of one model behind a policy whose model has no event
+/// index: the token tree places, and it holds `tokens` for the worker at
+/// `holder`.
+fn large_pool_on_the_tree(
+    count: usize,
+    holder: usize,
+    tokens: &[u32],
+) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+    let urls: Vec<String> = (0..count).map(|i| format!("http://w{i}:8000")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let workers = make_workers(&refs);
+    let policy = CacheAwarePolicy::with_config(test_config());
+    seed_token_tenants(&policy, &workers, tokens, &[refs[holder]]);
+    policy.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new())));
+    (policy, workers)
+}
+
+/// A pool of one model above the sample's reach decides what the scan
+/// decides, at 33 workers and at 200. With an event index the sampled
+/// decision places the holder the index names; without one the scan decides
+/// (the tree's holder), and the sampled decision hands the request over
+/// before it draws a worker.
+#[test]
+fn a_large_pool_of_one_model_decides_as_the_scan_with_and_without_an_event_index() {
+    let prompt: Vec<u32> = (1..=8).collect();
+    for count in [2 * FLEET_SAMPLE + 1, 200] {
+        let holder = count - 3;
+        let (policy, workers) = large_pool(
+            count,
+            holder,
+            &[&[1, 2, 3, 4], &[5, 6, 7, 8]],
+            test_config(),
+        );
+        for _ in 0..8 {
+            let info = tokens_info(&prompt);
+            assert!(
+                matches!(
+                    policy.select_worker_sampled(&workers, &info),
+                    Sampled::Decided(Some(idx)) if idx == holder
+                ),
+                "{count} workers with an index: the sample decides"
+            );
+            assert_eq!(policy.select_worker(&workers, &info), Some(holder));
+            assert_eq!(policy.select_worker_scanned(&workers, &info), Some(holder));
+        }
+
+        let (policy, workers) = large_pool_on_the_tree(count, holder, &prompt);
+        for _ in 0..8 {
+            let info = tokens_info(&prompt);
+            assert!(
+                matches!(policy.select_worker_sampled(&workers, &info), Sampled::Scan),
+                "{count} workers without an index: the scan decides"
+            );
+            assert_eq!(policy.select_worker(&workers, &info), Some(holder));
+            assert_eq!(policy.select_worker_scanned(&workers, &info), Some(holder));
+        }
+    }
+}
+
+/// A pool whose workers name different models is the scan's when its first
+/// worker's model has no event index, whatever index the other workers'
+/// model has and whichever workers a sample would draw: no sample is drawn
+/// for it.
+#[test]
+fn a_mixed_pool_whose_first_worker_has_no_event_index_is_the_scans() {
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::{identity::basic::WorkerType, test_support::no_health_check};
+
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+
+    let (policy, mut workers) = large_pool(40, 37, &[&[1, 2, 3, 4], &[5, 6, 7, 8]], test_config());
+    workers[0] = Arc::new(
+        BasicWorkerBuilder::new("http://plain:8000")
+            .model(ModelCard::new("plain"))
+            .worker_type(WorkerType::Regular)
+            .health_config(no_health_check())
+            .build(),
+    );
+    policy.init_workers(&workers);
+    let prompt: Vec<u32> = (1..=8).collect();
+    for _ in 0..8 {
+        assert!(matches!(
+            policy.select_worker_sampled(&workers, &tokens_info(&prompt)),
+            Sampled::Scan
+        ));
+    }
+}
+
+/// The lookup after the draw still decides one pool: its first worker names
+/// a model with an event index and is never drawn, and every worker a sample
+/// can draw names a model without one. The sample's first worker names the
+/// index the decision reads, there is none, and the scan decides.
+#[test]
+fn a_mixed_pool_whose_sampled_workers_have_no_event_index_is_the_scans() {
+    use openai_protocol::model_card::ModelCard;
+    use smg_worker::{identity::basic::WorkerType, test_support::no_health_check};
+
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
+
+    let (policy, mut workers) = large_pool(40, 37, &[&[1, 2, 3, 4], &[5, 6, 7, 8]], test_config());
+    workers[0].set_status(WorkerStatus::NotReady);
+    for (i, worker) in workers.iter_mut().enumerate().skip(1) {
+        *worker = Arc::new(
+            BasicWorkerBuilder::new(format!("http://plain{i}:8000").as_str())
+                .model(ModelCard::new("plain"))
+                .worker_type(WorkerType::Regular)
+                .health_config(no_health_check())
+                .build(),
+        );
+    }
+    policy.init_workers(&workers);
+    let prompt: Vec<u32> = (1..=8).collect();
+    let info = tokens_info(&prompt);
+    assert!(!info.admits(workers[0].routing_state()));
+    assert!(info.admits(workers[1].routing_state()));
+    for _ in 0..8 {
+        assert!(matches!(
+            policy.select_worker_sampled(&workers, &info),
+            Sampled::Scan
+        ));
+    }
+}
+
 #[test]
 fn pool_table_places_ids_and_rejects_a_worker_swapped_in_at_the_position() {
     let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
     let indexer = setup_indexer_with_blocks("http://w3:8000", &[&[1, 2, 3, 4]]);
     let w3 = indexer.worker_id("http://w3:8000").unwrap();
-    let table = PoolTable::build(&workers, &indexer, liveness::now_ms());
-    assert!(table.describes(&workers));
-    assert!(table.fresh(liveness::now_ms()));
-    assert_eq!(table.position(w3, &workers), Some(2));
-    assert_eq!(table.id_at, vec![None, None, Some(w3)]);
+    let built = Arc::new(WorkersTable::build(&workers, &indexer, liveness::now_ms()));
+    assert!(built.describes(&workers, &indexer));
+    assert!(built.rows.fresh(liveness::now_ms()));
+    let table = PoolTable::Workers(Arc::clone(&built));
+    assert_eq!(table.candidate(w3, &workers), Some(2));
+    assert_eq!(built.rows.id_at, vec![None, None, Some(w3)]);
     assert_eq!(
-        table.position(w3 + 100, &workers),
+        table.candidate(w3 + 100, &workers),
         None,
         "an id never interned"
     );
@@ -5129,10 +5625,746 @@ fn pool_table_places_ids_and_rejects_a_worker_swapped_in_at_the_position() {
     // table was built from the old one and says so.
     let mut swapped = workers.clone();
     swapped[2] = make_workers(&["http://w3:8000"]).remove(0);
-    assert_eq!(table.position(w3, &swapped), None);
+    assert_eq!(table.candidate(w3, &swapped), None);
     // Every worker was admitted just now: a young fleet lists nothing to slice.
-    assert!(table.warming.is_empty());
-    assert!(!table.fresh(liveness::now_ms() + POOL_TABLE_REFRESH_MS));
+    assert!(built.rows.warming.is_empty());
+    assert!(!built.rows.fresh(liveness::now_ms() + POOL_TABLE_REFRESH_MS));
+}
+
+/// Eight workers behind one policy and one event index, for the lists a
+/// prefill-decode fleet hands a policy: `held[i]` is the token sequence
+/// stored for worker `i`, none when empty. Worker `busy` reports a queue and
+/// the others none, so a request placed by load never goes to it.
+fn two_lists(held: [&[u32]; 8], busy: usize) -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>) {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let workers = make_workers(&refs);
+    policy.init_workers(&workers);
+    let mut queued = [0; 8];
+    queued[busy] = 10_000;
+    update_expected_wait_loads(&policy, &workers, &queued);
+    let indexer = Arc::new(KvIndex::chain());
+    for (i, url) in urls.iter().enumerate() {
+        let id = indexer.intern_worker(url).unwrap();
+        if !held[i].is_empty() {
+            store_blocks(&indexer, id, held[i], 4, (i as u64 + 1) * 1_000_000);
+        }
+    }
+    let monitor = Arc::new(KvEventMonitor::new());
+    monitor.indexers.insert("unknown".to_string(), indexer);
+    policy.set_kv_event_monitor(Some(monitor));
+    (policy, workers)
+}
+
+/// The picked prefill's partner list is a `Vec` built per request, so two
+/// lists of one length come at one address. Each reads a table of its own
+/// workers: the second list's holder keeps its prompt.
+#[test]
+fn a_second_list_at_the_first_lists_address_keeps_its_own_holder() {
+    let first: Vec<u32> = (1..=16).collect();
+    let second: Vec<u32> = (101..=116).collect();
+    let mut held: [&[u32]; 8] = [&[]; 8];
+    held[1] = &first;
+    held[6] = &second;
+    // The second list's holder is its one busy worker: a request that
+    // misses it is placed by load on another.
+    let (policy, workers) = two_lists(held, 6);
+    // One buffer, as the allocator hands a request's list the address of
+    // the last one: the first list, then the second in its place.
+    let mut list: Vec<Arc<dyn Worker>> = workers[..4].to_vec();
+    assert_eq!(route_tokens(&policy, &list, &first), 1);
+    list.clone_from_slice(&workers[4..]);
+    assert_eq!(
+        route_tokens(&policy, &list, &second),
+        2,
+        "the second list's holder, at its own position"
+    );
+}
+
+/// One policy object serves every model of its role. A second model's pool
+/// of the first one's length, at its address, reads a table of its own
+/// workers and its own index.
+#[test]
+fn a_second_models_pool_at_the_first_models_address_keeps_its_own_holder() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let pool = |model: &str| -> Vec<Arc<dyn Worker>> {
+        (0..4)
+            .map(|i| ready_worker(&format!("http://{model}{i}:8000"), model))
+            .collect()
+    };
+    let (a, b) = (pool("a"), pool("b"));
+    let prompt: Vec<u32> = (1..=16).collect();
+    let monitor = Arc::new(KvEventMonitor::new());
+    // The second model's holder is the one busy worker: a request that
+    // misses it is placed by load on another.
+    let both: Vec<Arc<dyn Worker>> = a.iter().chain(&b).cloned().collect();
+    policy.init_workers(&both);
+    update_expected_wait_loads(&policy, &both, &[0, 0, 0, 0, 0, 10_000, 0, 0]);
+    // An index numbers its workers as their first batches arrive: here in
+    // opposite orders. Worker 1 of each model holds the prompt.
+    for (model, workers, order) in [("a", &a, [0, 1, 2, 3]), ("b", &b, [3, 2, 1, 0])] {
+        let indexer = Arc::new(KvIndex::chain());
+        for i in order {
+            let id = indexer.intern_worker(workers[i].url()).unwrap();
+            if i == 1 {
+                store_blocks(&indexer, id, &prompt, 4, 1_000_000);
+            }
+        }
+        monitor.indexers.insert(model.to_string(), indexer);
+    }
+    policy.set_kv_event_monitor(Some(monitor));
+    let mut list = a.clone();
+    assert_eq!(route_tokens(&policy, &list, &prompt), 1);
+    list.clone_from_slice(&b);
+    assert_eq!(
+        route_tokens(&policy, &list, &prompt),
+        1,
+        "the second model's holder, by its own index"
+    );
+}
+
+/// The warm-up slice reads a list's rows through the table. At the address
+/// a settled list left, the next list's emptied worker still takes its miss:
+/// the facts read are its own, not those of the row the first list had there.
+#[test]
+fn a_second_list_at_the_first_lists_address_reads_its_own_warm_up_facts() {
+    // 1,100 blocks a worker, past the level that makes an empty index thin;
+    // worker 6 holds nothing.
+    let cached: Vec<Vec<u32>> = (0..8u32)
+        .map(|i| (0..4_400).map(|t| (i + 1) * 100_000 + t).collect())
+        .collect();
+    let mut held: [&[u32]; 8] = [&[]; 8];
+    for (i, tokens) in cached.iter().enumerate() {
+        if i != 6 {
+            held[i] = tokens;
+        }
+    }
+    // The emptied worker is its list's one busy worker: a miss placed by
+    // load goes to another, the slice's first miss goes to it.
+    let (policy, workers) = two_lists(held, 6);
+    let novel = |turn: u32| -> Vec<u32> { (0..16).map(|t| 90_000_000 + turn * 16 + t).collect() };
+    let mut list: Vec<Arc<dyn Worker>> = workers[..4].to_vec();
+    // A miss on the settled list is placed by load and moves no counter.
+    route_tokens(&policy, &list, &novel(0));
+    assert_eq!(policy.warmup_misses.load(Ordering::Relaxed), 0);
+    list.clone_from_slice(&workers[4..]);
+    assert_eq!(
+        route_tokens(&policy, &list, &novel(1)),
+        2,
+        "the emptied worker of the second list takes the slice's miss"
+    );
+}
+
+/// A table answers for the workers it was built from under the index it was
+/// built against, and for no other list or index: a list of the same length
+/// with another worker at one position is not described, wherever it lives,
+/// nor the same workers under another index, and a copy of the list at
+/// another address is.
+#[test]
+fn a_pool_table_describes_its_own_workers_at_any_address() {
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
+    let indexer = setup_indexer_with_blocks("http://w3:8000", &[&[1, 2, 3, 4]]);
+    let weak_handles = Arc::weak_count(&workers[1]);
+    let table = WorkersTable::build(&workers, &indexer, liveness::now_ms());
+    let copy = workers.clone();
+    assert!(
+        table.describes(&copy, &indexer),
+        "the same workers in another buffer"
+    );
+    let mut other = workers.clone();
+    other[1] = make_workers(&["http://w2:8000"]).remove(0);
+    assert!(
+        !table.describes(&other, &indexer),
+        "another worker at one position"
+    );
+    assert!(!table.describes(&workers[..2], &indexer), "a shorter list");
+    // The same buffer with another list in it: the address alone says nothing.
+    let mut buffer = workers.clone();
+    let address = buffer.as_ptr();
+    buffer.clone_from_slice(&other);
+    assert_eq!(buffer.as_ptr(), address);
+    assert!(!table.describes(&buffer, &indexer));
+    // An index numbers its workers in its own space: the ids are the first
+    // index's alone, and the table keeps no index alive.
+    let another = setup_indexer_with_blocks("http://w3:8000", &[&[1, 2, 3, 4]]);
+    assert!(
+        !table.describes(&copy, &another),
+        "the same workers under another index"
+    );
+    assert_eq!(Arc::strong_count(&indexer), 1);
+    assert_eq!(Arc::weak_count(&indexer), 1);
+    // The table holds one weak handle a worker: the worker's address stays
+    // the table's while the table lives, and the worker dies with its last
+    // owner all the same.
+    assert_eq!(Arc::weak_count(&workers[1]), weak_handles + 1);
+    let second = Arc::downgrade(&workers[1]);
+    drop((workers, copy));
+    assert!(
+        second.upgrade().is_none(),
+        "the table keeps no worker alive"
+    );
+    assert!(!table.describes(&other, &indexer));
+    // Only the table holds the dead worker's allocation now: a worker made
+    // after the drop cannot land at its address.
+    drop(second);
+    let mut after = other.clone();
+    after[1] = make_workers(&["http://w2:8000"]).remove(0);
+    assert!(
+        !table.describes(&after, &indexer),
+        "a worker made after the drop"
+    );
+}
+
+/// Four workers of two models by turns behind one policy, as a pool of
+/// workers that serve both: each model's index holds the workers that report
+/// that model, numbered as their batches arrived. Worker 0 holds the first
+/// prompt in the first index, worker 3 the second prompt in the second. The
+/// second prompt's holder reports a queue and the others none, so a request
+/// that misses it is placed by load on another.
+fn mixed_primaries() -> (CacheAwarePolicy, Vec<Arc<dyn Worker>>, [Vec<u32>; 2]) {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers: Vec<Arc<dyn Worker>> = ["a", "b", "a", "b"]
+        .iter()
+        .enumerate()
+        .map(|(i, model)| ready_worker(&format!("http://w{i}:8000"), model))
+        .collect();
+    policy.init_workers(&workers);
+    update_expected_wait_loads(&policy, &workers, &[0, 0, 0, 10_000]);
+    let prompts: [Vec<u32>; 2] = [(1..=16).collect(), (101..=116).collect()];
+    let monitor = Arc::new(KvEventMonitor::new());
+    for (model, members, holder, prompt) in
+        [("a", [0, 2], 0, &prompts[0]), ("b", [1, 3], 3, &prompts[1])]
+    {
+        let indexer = Arc::new(KvIndex::chain());
+        for i in members {
+            let id = indexer.intern_worker(workers[i].url()).unwrap();
+            if i == holder {
+                store_blocks(&indexer, id, prompt, 4, 1_000_000);
+            }
+        }
+        monitor.indexers.insert(model.to_string(), indexer);
+    }
+    policy.set_kv_event_monitor(Some(monitor));
+    (policy, workers, prompts)
+}
+
+/// A table's ids are its index's own, and a decision reads the index of the
+/// model its list's first admitted worker reports. When that worker fails
+/// the same list comes under the next index inside the refresh period: its
+/// holder is found by that index's ids, not through the table built against
+/// the first.
+#[test]
+fn a_list_whose_first_worker_fails_reads_the_next_index() {
+    let (policy, workers, prompts) = mixed_primaries();
+    assert_eq!(route_tokens(&policy, &workers, &prompts[0]), 0);
+    workers[0].set_status(WorkerStatus::NotReady);
+    assert_eq!(
+        route_tokens(&policy, &workers, &prompts[1]),
+        3,
+        "the second index's holder, by its own ids"
+    );
+}
+
+/// The regression test of a table keyed by its workers alone: the same
+/// handles in another slice come under the second index once the list's
+/// first admitted worker fails, and read a table of that index. A key of
+/// the slice's address passes it by the second slice's other address; the
+/// case above holds the same state on one slice.
+#[test]
+fn a_second_slice_of_the_same_workers_reads_its_own_index() {
+    let (policy, workers, prompts) = mixed_primaries();
+    let first = workers.clone();
+    assert_eq!(route_tokens(&policy, &first, &prompts[0]), 0);
+    workers[0].set_status(WorkerStatus::NotReady);
+    let second = workers.clone();
+    assert_eq!(
+        route_tokens(&policy, &second, &prompts[1]),
+        3,
+        "the second index's holder, by its own ids"
+    );
+}
+
+/// Only the rebuild of a stale table takes the building flag, and only it
+/// gives the flag back: a table built for a list that had none leaves a
+/// rebuild running beside it its flag, whether the list is named or not.
+#[test]
+fn a_build_for_a_new_list_leaves_a_running_rebuild_its_flag() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let list: Arc<[Arc<dyn Worker>]> = workers.clone().into();
+    let name = NamedList {
+        list: &list,
+        positions: None,
+    };
+    let indexer = Arc::new(KvIndex::chain());
+    let now = liveness::now_ms();
+    for named in [None, Some(&name)] {
+        // Another decision is rebuilding a stale table: it holds the flag.
+        policy.pool_table_building.store(true, Ordering::Release);
+        policy.pool_table(&workers, named, &indexer, now);
+        assert!(
+            policy.pool_table_building.load(Ordering::Acquire),
+            "a first build is no rebuild"
+        );
+        policy.pool_table_building.store(false, Ordering::Release);
+        // The same list past its refresh: this rebuild takes the flag and
+        // gives it back.
+        policy.pool_table(&workers, named, &indexer, now + POOL_TABLE_REFRESH_MS);
+        assert!(!policy.pool_table_building.load(Ordering::Acquire));
+    }
+    assert_eq!(policy.pool_tables.load().len(), 1);
+    assert_eq!(policy.named_tables.load().len(), 1);
+}
+
+/// A list has one kept table wherever its slice lives: found inside the
+/// refresh period, rebuilt in its own place after it, and gone as the oldest
+/// once eight younger lists are kept.
+#[test]
+fn a_list_has_one_kept_table_and_the_ninth_list_takes_the_oldest_place() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let urls: Vec<String> = (0..8).map(|i| format!("http://w{i}:8000")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let workers = make_workers(&refs);
+    let indexer = Arc::new(KvIndex::chain());
+    let now = liveness::now_ms();
+    let first = policy.workers_table(&workers[..4], &indexer, now);
+    let copy = workers[..4].to_vec();
+    assert!(
+        Arc::ptr_eq(&first, &policy.workers_table(&copy, &indexer, now)),
+        "the same list in another buffer reads the kept table"
+    );
+    let rebuilt = policy.workers_table(&copy, &indexer, now + POOL_TABLE_REFRESH_MS);
+    assert!(!Arc::ptr_eq(&first, &rebuilt), "rebuilt past the period");
+    assert_eq!(
+        policy.pool_tables.load().len(),
+        1,
+        "in the stale one's place"
+    );
+    // The same list under another index has a table of its own.
+    let another = Arc::new(KvIndex::chain());
+    let under_another = policy.workers_table(&copy, &another, now + POOL_TABLE_REFRESH_MS);
+    assert!(!Arc::ptr_eq(&rebuilt, &under_another));
+    assert_eq!(policy.pool_tables.load().len(), 2);
+    // Eight younger lists, one worker each.
+    for (i, worker) in workers.iter().enumerate() {
+        let list = [Arc::clone(worker)];
+        policy.workers_table(&list, &indexer, now + POOL_TABLE_REFRESH_MS + 1 + i as u64);
+    }
+    let kept = policy.pool_tables.load();
+    assert_eq!(kept.len(), POOL_TABLES_KEPT);
+    assert!(
+        kept.iter().all(|table| !table.describes(&copy, &indexer)),
+        "the oldest table went"
+    );
+}
+
+/// Route `tokens` over the workers of `list` at `positions`, the policy told
+/// which list they are cut from: the candidate picked.
+fn route_named(
+    policy: &CacheAwarePolicy,
+    list: &Arc<[Arc<dyn Worker>]>,
+    positions: &[usize],
+    tokens: &[u32],
+) -> usize {
+    let workers: Vec<Arc<dyn Worker>> = positions.iter().map(|&at| Arc::clone(&list[at])).collect();
+    policy
+        .select_worker(
+            &workers,
+            &SelectWorkerInfo {
+                tokens: Some(tokens),
+                named: Some(NamedList {
+                    list,
+                    positions: Some(positions),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+}
+
+/// A list its caller names has ONE table whatever part of it a request may
+/// use: a prefill pool under its admission window hands the policy another
+/// open set with every request, and each finds the holder at its own place
+/// among the candidates without a table being built for it.
+#[test]
+fn a_named_list_has_one_table_whatever_part_of_it_is_open() {
+    let HolderFleet {
+        policy,
+        workers,
+        heads,
+        ..
+    } = fleet_with_holders(8);
+    // Worker 5 reports a queue: only its own prompt's affinity places a
+    // request on it.
+    update_expected_wait_loads(&policy, &workers, &[0, 0, 0, 0, 0, 10_000, 0, 0]);
+    let list: Arc<[Arc<dyn Worker>]> = workers.into();
+    for positions in [&[0, 1, 2][..], &[0, 3, 5, 7], &[0]] {
+        assert_eq!(
+            route_named(&policy, &list, positions, &heads[0]),
+            0,
+            "the holder among {positions:?}"
+        );
+    }
+    assert_eq!(
+        route_named(&policy, &list, &[2, 5, 7], &heads[5]),
+        1,
+        "the holder's place among the candidates, not its row"
+    );
+    assert_eq!(
+        policy.named_tables.load().len(),
+        1,
+        "one table for the list"
+    );
+    assert!(
+        policy.pool_tables.load().is_empty(),
+        "and none by the workers of an open set"
+    );
+}
+
+/// A holder the request may not use is no candidate: its row is not among
+/// the positions, and the worker standing at that index among the
+/// candidates is never taken for it. The worker there reports a queue, so
+/// only a holder's affinity would place the request on it.
+#[test]
+fn a_holder_outside_the_open_set_is_skipped_not_misplaced() {
+    let HolderFleet {
+        policy,
+        workers,
+        heads,
+        ..
+    } = fleet_with_holders(8);
+    update_expected_wait_loads(&policy, &workers, &[0, 10_000, 0, 0, 0, 0, 0, 0]);
+    let list: Arc<[Arc<dyn Worker>]> = workers.into();
+    assert_eq!(
+        route_named(&policy, &list, &[0, 1, 2], &heads[1]),
+        1,
+        "the queued holder keeps its request while it is open"
+    );
+    let picked = route_named(&policy, &list, &[1, 2, 3], &heads[0]);
+    assert_ne!(
+        picked, 0,
+        "row 0 is closed: the worker at candidate 0 is not its holder"
+    );
+    assert_eq!(
+        policy.misplaced.load(Ordering::Relaxed),
+        0,
+        "a closed holder is no mismatch: nothing is counted"
+    );
+}
+
+/// The caller's word is checked where it is used. Positions that do not
+/// match the workers beside them (here shifted by one) lose the holder,
+/// counted on the policy and said at the next publish of a named table, and
+/// the request is placed by load: never on the neighbour the positions
+/// pointed at.
+#[test]
+fn positions_that_do_not_match_their_workers_lose_the_holder_and_are_counted() {
+    let HolderFleet {
+        policy,
+        workers,
+        indexer,
+        heads,
+    } = fleet_with_holders(8);
+    update_expected_wait_loads(&policy, &workers, &[0, 10_000, 0, 0, 0, 0, 0, 0]);
+    let list: Arc<[Arc<dyn Worker>]> = workers.into();
+    // The candidates are the list's workers 1, 2 and 3; the positions say
+    // 0, 1 and 2. The request's holder is the list's worker 0.
+    let candidates = list[1..4].to_vec();
+    let picked = policy
+        .select_worker(
+            &candidates,
+            &SelectWorkerInfo {
+                tokens: Some(&heads[0]),
+                named: Some(NamedList {
+                    list: &list,
+                    positions: Some(&[0, 1, 2]),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_ne!(
+        picked, 0,
+        "the queued worker at candidate 0 is not the holder"
+    );
+    assert_eq!(policy.named_tables.load().len(), 1);
+    assert!(
+        policy.misplaced.load(Ordering::Relaxed) >= 1,
+        "the lost holder is counted"
+    );
+    // The next publish says what was lost and starts the count again.
+    policy.named_table(&list, &indexer, liveness::now_ms() + POOL_TABLE_REFRESH_MS);
+    assert_eq!(policy.misplaced.load(Ordering::Relaxed), 0);
+}
+
+/// The warm-up reads the pool, not the workers open to one request. Four of
+/// eight workers are new and hold nothing; the level is the upper median of
+/// the whole list (1,100 blocks), so the four are thin whoever is open.
+/// Among one busy holder and three new workers the open set's own median is
+/// an empty index: read over it, nobody is thin and the holder keeps every
+/// hit. A named list diverts a hit to a new worker inside one window.
+#[test]
+fn the_warm_up_reads_the_level_of_the_pool_not_of_the_open_workers() {
+    let request = |heads: &[Vec<u32>], i: usize| -> Vec<u32> {
+        let mut tokens = heads[0].clone();
+        tokens.extend((0..16).map(|t| 90_000_000 + i as u32 * 16 + t));
+        tokens
+    };
+    let open = [0usize, 4, 5, 6];
+
+    // The list nobody names: a table of the four open workers.
+    let HolderFleet {
+        policy,
+        workers,
+        heads,
+        ..
+    } = fleet_with_holders(4);
+    workers[0].increment_load();
+    let candidates: Vec<Arc<dyn Worker>> =
+        open.iter().map(|&at| Arc::clone(&workers[at])).collect();
+    for i in 0..32 {
+        assert_eq!(
+            route_tokens(&policy, &candidates, &request(&heads, i)),
+            0,
+            "no thin worker against a level of nothing"
+        );
+    }
+
+    // The same pool, named: the level and the thin workers are the pool's.
+    let HolderFleet {
+        policy,
+        workers,
+        indexer,
+        heads,
+    } = fleet_with_holders(4);
+    workers[0].increment_load();
+    let list: Arc<[Arc<dyn Worker>]> = workers.into();
+    let diverted = (0..32)
+        .map(|i| route_named(&policy, &list, &open, &request(&heads, i)))
+        .filter(|&candidate| candidate != 0)
+        .count();
+    assert!(diverted >= 1, "a hit goes to a new worker: {diverted}");
+    let table = policy.named_table(&list, &indexer, liveness::now_ms());
+    assert_eq!(table.rows.fleet_level, 1_100);
+    assert_eq!(
+        table.rows.thin,
+        vec![4, 5, 6, 7],
+        "the pool's thin workers, open or not"
+    );
+    // A miss goes through the slice, which reads each open worker's block
+    // count at its row in the list: read at its place among the candidates,
+    // the three new workers would show the settled workers 1 to 3 and none
+    // would be warming.
+    let miss: Vec<u32> = (0..64).map(|t| 95_000_000 + t).collect();
+    assert_eq!(policy.warmup_misses.load(Ordering::Relaxed), 0);
+    assert_ne!(
+        route_named(&policy, &list, &open, &miss),
+        0,
+        "a miss goes to a new worker"
+    );
+    assert_eq!(
+        policy.warmup_misses.load(Ordering::Relaxed),
+        1,
+        "through the warm-up slice"
+    );
+}
+
+/// Nine named lists keep nine tables: the bound of eight is the unnamed
+/// lists'. A named table is found by its list and its index, keeps neither
+/// alive, and leaves at the first publish after its list died.
+#[test]
+fn a_named_table_lives_as_long_as_its_list() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let indexer = Arc::new(KvIndex::chain());
+    let now = liveness::now_ms();
+    let named = |list: &Arc<[Arc<dyn Worker>]>, indexer: &Arc<KvIndex>| {
+        policy.named_table(list, indexer, now)
+    };
+    let mut lists: Vec<Arc<[Arc<dyn Worker>]>> = (0..9)
+        .map(|i| make_workers(&[format!("http://w{i}:8000").as_str()]).into())
+        .collect();
+    let tables: Vec<Arc<NamedTable>> = lists.iter().map(|list| named(list, &indexer)).collect();
+    assert_eq!(policy.named_tables.load().len(), 9);
+    assert!(policy.pool_tables.load().is_empty());
+    for (list, table) in lists.iter().zip(&tables) {
+        assert!(
+            Arc::ptr_eq(table, &named(list, &indexer)),
+            "each list reads its own table"
+        );
+    }
+    // The same list under another index has a table of its own.
+    let another = Arc::new(KvIndex::chain());
+    assert!(!Arc::ptr_eq(&tables[0], &named(&lists[0], &another)));
+    assert_eq!(policy.named_tables.load().len(), 10);
+    // Neither the list nor the index is kept alive.
+    assert_eq!(Arc::strong_count(&lists[8]), 1);
+    assert_eq!(Arc::strong_count(&another), 1);
+    drop(tables);
+    // A list and an index die; the next publish drops their tables.
+    drop(lists.pop());
+    drop(another);
+    let fresh: Arc<[Arc<dyn Worker>]> = make_workers(&["http://w9:8000"]).into();
+    named(&fresh, &indexer);
+    assert_eq!(
+        policy.named_tables.load().len(),
+        9,
+        "eight live lists and the new one"
+    );
+}
+
+/// One decision rebuilds a stale table while the others read it: a named
+/// list's and an unnamed one's alike. The flag is taken by the rebuild and
+/// given back by it.
+#[test]
+fn a_stale_table_is_rebuilt_by_one_decision_while_the_others_read_it() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let indexer = Arc::new(KvIndex::chain());
+    let now = liveness::now_ms();
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    let list: Arc<[Arc<dyn Worker>]> = workers.clone().into();
+    let name = NamedList {
+        list: &list,
+        positions: None,
+    };
+    for named in [None, Some(&name)] {
+        let first = policy.pool_table(&workers, named, &indexer, now);
+        // Another decision holds the flag: this one reads the stale table.
+        policy.pool_table_building.store(true, Ordering::Release);
+        let read = policy.pool_table(&workers, named, &indexer, now + POOL_TABLE_REFRESH_MS);
+        assert!(
+            std::ptr::eq(first.rows(), read.rows()),
+            "the stale table serves while it is rebuilt"
+        );
+        policy.pool_table_building.store(false, Ordering::Release);
+        let rebuilt = policy.pool_table(&workers, named, &indexer, now + POOL_TABLE_REFRESH_MS);
+        assert!(
+            !std::ptr::eq(first.rows(), rebuilt.rows()),
+            "the next one rebuilds it"
+        );
+        assert!(
+            !policy.pool_table_building.load(Ordering::Acquire),
+            "and gives the flag back"
+        );
+    }
+    assert_eq!(policy.pool_tables.load().len(), 1);
+    assert_eq!(policy.named_tables.load().len(), 1);
+}
+
+/// Three workers over one index for the tests of an id that changes hands:
+/// worker 0 holds `prompt` under the id `first`, worker 1 is interned and
+/// holds nothing, worker 2 is not interned yet. `request` opens with the
+/// prompt.
+struct IdHandOver {
+    policy: CacheAwarePolicy,
+    workers: Vec<Arc<dyn Worker>>,
+    indexer: Arc<KvIndex>,
+    prompt: Vec<u32>,
+    request: Vec<u32>,
+    first: u32,
+}
+
+impl IdHandOver {
+    /// The case, and what worker 0's stream holds in the index.
+    fn new() -> (Self, WorkerBlocks) {
+        let workers = make_workers(&["http://w0:8000", "http://w1:8000", "http://w2:8000"]);
+        let policy = CacheAwarePolicy::with_config(test_config());
+        policy.init_workers(&workers);
+        update_expected_wait_loads(&policy, &workers, &[0, 0, 0]);
+        let indexer = Arc::new(KvIndex::chain());
+        let first = indexer.intern_worker(workers[0].url()).unwrap();
+        indexer.intern_worker(workers[1].url()).unwrap();
+        let prompt: Vec<u32> = (0..4_400u32).map(|i| 100_000 + i).collect();
+        let held = Self::store(&indexer, first, &prompt, 1_000_000);
+        let monitor = Arc::new(KvEventMonitor::new());
+        monitor
+            .indexers
+            .insert("unknown".to_string(), Arc::clone(&indexer));
+        policy.set_kv_event_monitor(Some(monitor));
+        let mut request: Vec<u32> = prompt[..240].to_vec();
+        request.extend(90_000..90_016);
+        let case = Self {
+            policy,
+            workers,
+            indexer,
+            prompt,
+            request,
+            first,
+        };
+        (case, held)
+    }
+
+    /// The prompt's blocks stored for index worker `id`.
+    fn store(indexer: &KvIndex, id: u32, prompt: &[u32], seq_base: u64) -> WorkerBlocks {
+        let blocks: Vec<StoredBlock> = prompt
+            .chunks(4)
+            .enumerate()
+            .map(|(i, chunk)| StoredBlock {
+                seq_hash: SequenceHash(seq_base + i as u64),
+                content_hash: compute_content_hash(chunk),
+            })
+            .collect();
+        let mut held = WorkerBlocks::default();
+        indexer.apply_stored(id, &blocks, None, &mut held).unwrap();
+        held
+    }
+
+    /// Worker 0's stream ends, and worker 2 is interned and stores the
+    /// prompt: the id it was handed.
+    fn hand_on(&self, held: WorkerBlocks) -> u32 {
+        self.indexer.remove_worker(self.first, held);
+        let second = self.indexer.intern_worker(self.workers[2].url()).unwrap();
+        Self::store(&self.indexer, second, &self.prompt, 2_000_000);
+        second
+    }
+}
+
+/// A decision inside the rows' period reads them again once the index
+/// handed a removed worker's id to another: the prompt the new worker holds
+/// under the id goes to that worker, not to the id's former one.
+#[test]
+fn an_id_handed_on_inside_the_rows_period_names_its_new_worker() {
+    let (case, held) = IdHandOver::new();
+    // The first decision reads the rows while worker 0 holds the prompt.
+    let before = route_tokens(&case.policy, &case.workers, &case.request);
+    let second = case.hand_on(held);
+    assert_eq!(case.first, second, "the id changed hands");
+    let inside = route_tokens(&case.policy, &case.workers, &case.request);
+    assert_eq!((before, inside), (0, 2));
+}
+
+/// A decision that reads the standing rows while another reads them again
+/// maps no lookup through them once an id was handed on: the id's former
+/// worker is not named a holder of its new worker's blocks.
+#[test]
+fn a_lookup_behind_a_handed_on_id_names_nobody_through_the_standing_rows() {
+    let (case, held) = IdHandOver::new();
+    let hashes = compute_request_content_hashes(&case.request, 4);
+    let holders = |table: &PoolTable<'_>| -> Vec<usize> {
+        CacheAwarePolicy::overlap_holders(
+            &case.workers,
+            &hashes,
+            table,
+            &case.indexer,
+            4,
+            Gather::All { cap: None },
+            &SelectWorkerInfo::default(),
+        )
+        .iter()
+        .map(|candidate| candidate.idx)
+        .collect()
+    };
+    // The rows read while worker 0 holds the id.
+    let table = case
+        .policy
+        .pool_table(&case.workers, None, &case.indexer, liveness::now_ms());
+    assert_eq!(holders(&table), [0]);
+    let second = case.hand_on(held);
+    assert_eq!(case.first, second, "the id changed hands");
+    assert!(
+        holders(&table).is_empty(),
+        "the standing rows name no holder by an id that changed hands"
+    );
 }
 
 /// `count` workers that all hold the shared block `[1, 2, 3, 4]` (a chat
@@ -5251,7 +6483,7 @@ fn prefill_miss_uses_input_capacity_without_generation_rate_bias() {
             let mut more_work = expected_wait_load(4_000, 0.0, 2_000.0);
             less_work.loads[0].prefill_throughput = less_rate;
             more_work.loads[0].prefill_throughput = more_rate;
-            let feed = TestFeed::attached_to(&policy.load_scorer);
+            let feed = TestFeed::attached_to(|rx| policy.load_scorer.set_load_receiver(rx));
             feed.publish(&HashMap::from([
                 (workers[0].url().to_string(), less_work),
                 (workers[1].url().to_string(), more_work),

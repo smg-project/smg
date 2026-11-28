@@ -26,9 +26,13 @@ use crate::{
         grpc::{
             common::{
                 response_collection, response_formatting,
-                responses::utils::{generation_failure_error, response_status},
+                responses::{
+                    streaming::OutputItemKind,
+                    utils::{generation_failure_error, response_status},
+                },
             },
-            context::{DispatchMetadata, ExecutionResult},
+            context::{self, DispatchMetadata, ExecutionResult},
+            proto_wrapper::ProtoGenerateComplete,
             regular::processor::generation_start,
         },
     },
@@ -44,7 +48,8 @@ pub(super) fn chat_usage(
     counts: response_formatting::TokenCounts,
     parsed_reasoning_tokens: u32,
 ) -> Usage {
-    response_formatting::chat_usage(counts.usage(), Some(parsed_reasoning_tokens), 0)
+    // The Harmony models take no images: no image count to report.
+    response_formatting::chat_usage(counts.usage(), Some(parsed_reasoning_tokens), 0, None)
 }
 
 /// The usage of one Responses API iteration: the engine's counters with the
@@ -97,6 +102,31 @@ fn enforce_router_stops(
     matched
 }
 
+/// The Harmony channels of one complete response, with the parser that read
+/// them. `function` names the caller in a failure's log line.
+fn parse_complete_response(
+    complete: &ProtoGenerateComplete,
+    function: &'static str,
+) -> Result<(HarmonyParserAdapter, HarmonyChannelOutput), Response> {
+    let mut parser = HarmonyParserAdapter::new().map_err(|e| {
+        error!(function, error = %e, "Failed to create Harmony parser");
+        error::internal_error(
+            "create_harmony_parser_failed",
+            format!("Failed to create Harmony parser: {e}"),
+        )
+    })?;
+    let parsed = parser
+        .parse_complete(complete.output_ids(), complete.finish_reason().to_string())
+        .map_err(|e| {
+            error!(function, error = %e, "Harmony parsing failed on complete response");
+            error::internal_error(
+                "harmony_parsing_failed",
+                format!("Harmony parsing failed: {e}"),
+            )
+        })?;
+    Ok((parser, parsed))
+}
+
 /// Processor for non-streaming Harmony responses
 ///
 /// Collects all output tokens from execution and parses them using
@@ -145,33 +175,8 @@ impl HarmonyResponseProcessor {
         for (index, complete) in all_responses.iter().enumerate() {
             let matched_stop = complete.matched_stop_json();
 
-            // Parse Harmony channels with HarmonyParserAdapter
-            let mut parser = HarmonyParserAdapter::new().map_err(|e| {
-                error!(
-                    function = "process_non_streaming_chat_response",
-                    error = %e,
-                    "Failed to create Harmony parser"
-                );
-                error::internal_error(
-                    "create_harmony_parser_failed",
-                    format!("Failed to create Harmony parser: {e}"),
-                )
-            })?;
-
-            // Parse Harmony channels with finish_reason
-            let mut parsed = parser
-                .parse_complete(complete.output_ids(), complete.finish_reason().to_string())
-                .map_err(|e| {
-                    error!(
-                        function = "process_non_streaming_chat_response",
-                        error = %e,
-                        "Harmony parsing failed on complete response"
-                    );
-                    error::internal_error(
-                        "harmony_parsing_failed",
-                        format!("Harmony parsing failed: {e}"),
-                    )
-                })?;
+            let (_, mut parsed) =
+                parse_complete_response(complete, "process_non_streaming_chat_response")?;
 
             // Convert output logprobs if present: one entry per generated
             // token, with the candidates the request's `top_logprobs` asked for.
@@ -223,20 +228,25 @@ impl HarmonyResponseProcessor {
         let usage = chat_usage(counts, total_reasoning_tokens);
 
         // Final ChatCompletionResponse
-        let response = ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
+        let response = ChatCompletionResponse::builder(&dispatch.request_id, &dispatch.model)
             .created(dispatch.created)
             .choices(choices)
             .usage(usage)
             .maybe_system_fingerprint(dispatch.weight_version.as_deref())
             .build();
         // The records the streamed answer makes at its end; a collected
-        // answer shows no first token.
+        // answer shows no first token. Its dispatch wait needs none: it is
+        // read here, inside the request's future, against the dispatch the
+        // generation clock starts at.
+        let waited = context::dispatch_wait(started);
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: metrics_labels::BACKEND_HARMONY,
             model_id: &chat_request.model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
             ttft: None,
+            dispatch_wait: waited.map(|waited| waited.since_entry),
+            dispatch_wait_after_body: waited.map(|waited| waited.since_body),
             generation_duration: started.elapsed(),
             input_tokens: Some(u64::from(counts.prompt)),
             cached_tokens: Some(u64::from(counts.cached)),
@@ -323,32 +333,8 @@ impl HarmonyResponseProcessor {
             .first()
             .ok_or_else(|| error::internal_error("no_complete_response", "No complete response"))?;
 
-        // Parse Harmony channels
-        let mut parser = HarmonyParserAdapter::new().map_err(|e| {
-            error!(
-                function = "process_responses_iteration",
-                error = %e,
-                "Failed to create Harmony parser"
-            );
-            error::internal_error(
-                "create_harmony_parser_failed",
-                format!("Failed to create Harmony parser: {e}"),
-            )
-        })?;
-
-        let mut parsed = parser
-            .parse_complete(complete.output_ids(), complete.finish_reason().to_string())
-            .map_err(|e| {
-                error!(
-                    function = "process_responses_iteration",
-                    error = %e,
-                    "Harmony parsing failed on complete response"
-                );
-                error::internal_error(
-                    "harmony_parsing_failed",
-                    format!("Harmony parsing failed: {e}"),
-                )
-            })?;
+        let (parser, mut parsed) =
+            parse_complete_response(complete, "process_responses_iteration")?;
 
         // VALIDATION: Check if model incorrectly generated Tool role messages
         // This happens when the model copies the format of tool result messages
@@ -398,7 +384,7 @@ impl HarmonyResponseProcessor {
         // Map analysis channel → ResponseOutputItem::Reasoning
         if let Some(analysis) = parsed.analysis {
             let reasoning_item = ResponseOutputItem::new_reasoning(
-                format!("reasoning_{}", dispatch.request_id),
+                OutputItemKind::Reasoning.new_id(),
                 vec![],
                 vec![ResponseReasoningContent::ReasoningText { text: analysis }],
                 Some("completed".to_string()),
@@ -415,7 +401,7 @@ impl HarmonyResponseProcessor {
         // Map final channel → ResponseOutputItem::Message
         if !parsed.final_text.is_empty() {
             let message_item = ResponseOutputItem::Message {
-                id: format!("msg_{}", dispatch.request_id),
+                id: OutputItemKind::Message.new_id(),
                 role: "assistant".to_string(),
                 content: vec![ResponseContentPart::OutputText {
                     text: parsed.final_text,
@@ -493,8 +479,11 @@ mod tests {
             );
         }
         // The engine counted reasoning itself: its count stands on both paths.
-        assert_eq!(reasoning_of(&chat_usage(counts(7), 3)), Some(7));
-        assert_eq!(reasoning_of(&iteration_usage(counts(7), 3)), Some(7));
-        assert_eq!(reasoning_of(&iteration_usage(counts(7), 0)), Some(7));
+        assert_eq!(reasoning_of(&chat_usage(counts(4), 3)), Some(4));
+        assert_eq!(reasoning_of(&iteration_usage(counts(4), 3)), Some(4));
+        assert_eq!(reasoning_of(&iteration_usage(counts(4), 0)), Some(4));
+        // A count above the five completion tokens is reported as five on both.
+        assert_eq!(reasoning_of(&chat_usage(counts(7), 3)), Some(5));
+        assert_eq!(reasoning_of(&iteration_usage(counts(7), 3)), Some(5));
     }
 }

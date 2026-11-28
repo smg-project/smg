@@ -9,21 +9,23 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
-use openai_protocol::worker::ProviderType;
+use openai_protocol::worker::{ProviderType, WorkerSpec};
 use reqwest::Client;
+use smg_worker::{
+    identity::{basic::RuntimeType, endpoint::Endpoint},
+    workflow::{http_base_url, try_grpc_reachable, try_http_reachable, WorkerKind, WorkflowHost},
+};
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::util::{http_base_url, try_grpc_reachable, try_http_reachable};
 use crate::{
     routers::provider_support,
-    worker::{basic::RuntimeType, endpoint::Endpoint},
-    workflow::data::{WorkerKind, WorkerWorkflowData},
+    workflow::data::{require_app_context, WorkerWorkflowData},
 };
 
 /// Quick-probe timeout for classification. Deliberately short — the full
 /// connection timeout is applied later by `DetectConnectionModeStep`.
-const CLASSIFY_PROBE_TIMEOUT_SECS: u64 = 2;
+pub(crate) const CLASSIFY_PROBE_TIMEOUT_SECS: u64 = 2;
 
 /// Known local backend `owned_by` values returned by `/v1/models`.
 const LOCAL_OWNED_BY: &[&str] = &["sglang", "vllm", "trtllm", "nvidia"];
@@ -65,6 +67,20 @@ async fn probe_models_owned_by(
     }
 }
 
+/// The kind a spec states with no probe: an explicit runtime says it, and a
+/// spec that names no runtime at a known provider's URL is external. `None`
+/// for a spec the probes classify: it ends local whatever they answer.
+fn stated_kind(config: &WorkerSpec) -> Option<WorkerKind> {
+    if config.runtime_type.is_specified() {
+        return Some(if config.runtime_type == RuntimeType::External {
+            WorkerKind::External
+        } else {
+            WorkerKind::Local
+        });
+    }
+    ProviderType::from_url(&config.url).map(|_| WorkerKind::External)
+}
+
 /// Step 0: Classify the worker as Local or External.
 ///
 /// Detection logic:
@@ -96,20 +112,19 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
                 message: format!(
                     "worker {} targets the {} provider, but this build carries no {} router; \
                      rebuild with the `{}` Cargo feature to admit it",
-                    config.url, missing.label, missing.label, missing.feature
+                    Endpoint::redacted_str(&config.url),
+                    missing.label,
+                    missing.label,
+                    missing.feature
                 ),
             });
         }
 
-        // 1. Any explicit runtime → classify immediately, no probing needed
-        if config.runtime_type.is_specified() {
-            let kind = if config.runtime_type == RuntimeType::External {
-                WorkerKind::External
-            } else {
-                WorkerKind::Local
-            };
+        // 1-3. Any explicit runtime, or a known cloud provider's URL →
+        // classify immediately, no probing needed
+        if let Some(kind) = stated_kind(config) {
             debug!(
-                "Worker {} explicitly configured as {} → {:?}",
+                "Worker {} states its kind (runtime {}) → {:?}",
                 Endpoint::redacted_str(&config.url),
                 config.runtime_type,
                 kind
@@ -118,23 +133,8 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
             return Ok(StepResult::Success);
         }
 
-        // 3. URL matches known cloud provider → External (no probing needed)
-        if let Some(provider) = ProviderType::from_url(&config.url) {
-            debug!(
-                "Worker {} URL matches known provider ({}) → External",
-                Endpoint::redacted_str(&config.url),
-                provider
-            );
-            context.data.worker_kind = Some(WorkerKind::External);
-            return Ok(StepResult::Success);
-        }
-
         // Unspecified + unknown URL — probe the endpoint
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.host.as_ref())?;
         let timeout = CLASSIFY_PROBE_TIMEOUT_SECS;
         let client = &app_context.client;
 
@@ -152,7 +152,14 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
         }
 
         // 5. gRPC health → Local (external APIs never use gRPC)
-        if try_grpc_reachable(&config.url, timeout).await.is_ok() {
+        if try_grpc_reachable(
+            app_context.engine_connector().as_ref(),
+            &config.url,
+            timeout,
+        )
+        .await
+        .is_ok()
+        {
             debug!(
                 "Worker {} responded to gRPC health → Local",
                 Endpoint::redacted_str(&config.url)
@@ -190,48 +197,5 @@ impl StepExecutor<WorkerWorkflowData> for ClassifyWorkerTypeStep {
 }
 
 #[cfg(test)]
-mod tests {
-    use axum::{routing::get, Json, Router};
-    use serde_json::json;
-    use tokio::net::TcpListener;
-
-    use super::probe_models_owned_by;
-
-    #[tokio::test]
-    async fn probe_models_owned_by_accepts_nvidia_as_local() {
-        async fn models() -> Json<serde_json::Value> {
-            Json(json!({
-                "data": [{
-                    "id": "test-model",
-                    "object": "model",
-                    "owned_by": "nvidia"
-                }],
-                "object": "list"
-            }))
-        }
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test-only mock /v1/models server; handle is aborted at test end"
-        )]
-        let server = tokio::spawn(async move {
-            axum::serve(listener, Router::new().route("/v1/models", get(models)))
-                .await
-                .unwrap();
-        });
-
-        let owned_by = probe_models_owned_by(
-            &format!("http://{addr}"),
-            5,
-            &crate::server::http_client(),
-            None,
-        )
-        .await
-        .unwrap();
-        server.abort();
-
-        assert_eq!(owned_by, "nvidia");
-    }
-}
+#[path = "../../../tests/unit/workflow/steps/classify/tests.rs"]
+mod tests;

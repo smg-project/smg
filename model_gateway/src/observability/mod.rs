@@ -13,4 +13,6 @@ pub mod metrics;
 pub mod metrics_server;
 pub mod otel_trace;
 pub mod runtime_metrics;
-pub(crate) mod worker_metrics;
+#[cfg(test)]
+#[path = "../../tests/unit/observability/worker_metrics_tests.rs"]
+mod worker_metrics_tests;

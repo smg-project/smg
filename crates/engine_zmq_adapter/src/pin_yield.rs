@@ -5,12 +5,11 @@
 //! dispatches by `bootstrap_room % dp_size` and whose KV sender fails a
 //! request that runs elsewhere), a `data_parallel_rank` that names another
 //! rank yields to the room: the placement is the engine's own rule, never a
-//! refusal. A dp-aware Router in front of a prefill side of several ranks
-//! pins a rank per request and mints a room whose residue agrees with the pin
-//! for one request in N, so there the yield is the common case, not an
-//! operator error. The connection's first yield is a WARN line with the
-//! request's fields; every later one is a DEBUG line, so the logger's real
-//! warnings stay readable.
+//! refusal. A dp-aware Router that pins a rank per request but mints a free
+//! room agrees with the pin for one request in N on a prefill side of N
+//! ranks, so there the yield is the common case, not an operator error. The
+//! connection's first yield is a WARN line with the request's fields; every
+//! later one is a DEBUG line, so the logger's real warnings stay readable.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

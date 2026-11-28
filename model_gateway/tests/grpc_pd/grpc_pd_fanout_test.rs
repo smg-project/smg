@@ -23,12 +23,8 @@ use llm_tokenizer::{
     Decoder, Encoder, Encoding, MockTokenizer, SpecialTokens,
 };
 use openai_protocol::completion::CompletionRequest;
-use smg::{
-    middleware::TenantRequestMeta,
-    routers::RouterTrait,
-    tenant::TenantKey,
-    worker::{RuntimeType, WorkerType},
-};
+use smg::{middleware::TenantRequestMeta, routers::RouterTrait, tenant::TenantKey};
+use smg_worker::identity::basic::{RuntimeType, WorkerType};
 
 use crate::common;
 
@@ -274,7 +270,9 @@ async fn chat_continuous_usage_is_opt_in_for_single_and_multiple_choices() {
                 "stream_options": options,
             }))
             .unwrap();
-            let response = router.route_chat(None, &tenant(), request, MODEL).await;
+            let response = router
+                .route_chat(None, &tenant(), Arc::new(request), MODEL)
+                .await;
             let status = response.status();
             let body = read_body(response).await;
             assert_eq!(status, http::StatusCode::OK, "{body}");

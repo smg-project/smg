@@ -131,18 +131,15 @@ pub async fn parse_webrtc_request(
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    // The media type without its parameters (a multipart boundary, say).
+    let media_type = content_type
+        .split_once(';')
+        .map_or(content_type, |(media_type, _parameters)| media_type)
+        .trim();
 
-    if content_type
-        .split(';')
-        .next()
-        .is_some_and(|mt| mt.trim().eq_ignore_ascii_case("multipart/form-data"))
-    {
+    if media_type.eq_ignore_ascii_case("multipart/form-data") {
         parse_multipart(content_type, body).await
-    } else if content_type
-        .split(';')
-        .next()
-        .is_some_and(|mt| mt.trim().eq_ignore_ascii_case("application/sdp"))
-    {
+    } else if media_type.eq_ignore_ascii_case("application/sdp") {
         parse_sdp(body, query_model)
     } else {
         error!(
@@ -375,38 +372,31 @@ fn resolve_auth(
     worker_api_key: Option<&String>,
 ) -> Result<String, Response> {
     let effective_auth = auth_header.or_else(|| extract_auth_header(None, worker_api_key));
+    // Either refusal is the request's: no credential, or one that is not text.
+    let refused = |response: Response| {
+        Metrics::record_router_error(
+            labels.router,
+            labels.backend,
+            metrics_labels::CONNECTION_WEBRTC,
+            model,
+            metrics_labels::ENDPOINT_REALTIME,
+            metrics_labels::ERROR_VALIDATION,
+            metrics_labels::REASON_INVALID_REQUEST,
+        );
+        response
+    };
     match effective_auth {
         Some(v) => match v.to_str() {
             Ok(s) => Ok(s.to_string()),
-            Err(_) => {
-                Metrics::record_router_error(
-                    labels.router,
-                    labels.backend,
-                    metrics_labels::CONNECTION_WEBRTC,
-                    model,
-                    metrics_labels::ENDPOINT_REALTIME,
-                    metrics_labels::ERROR_VALIDATION,
-                    metrics_labels::REASON_INVALID_REQUEST,
-                );
-                Err((
+            Err(_) => Err(refused(
+                (
                     StatusCode::BAD_REQUEST,
                     "Authorization header contains invalid UTF-8 characters",
                 )
-                    .into_response())
-            }
+                    .into_response(),
+            )),
         },
-        None => {
-            Metrics::record_router_error(
-                labels.router,
-                labels.backend,
-                metrics_labels::CONNECTION_WEBRTC,
-                model,
-                metrics_labels::ENDPOINT_REALTIME,
-                metrics_labels::ERROR_VALIDATION,
-                metrics_labels::REASON_INVALID_REQUEST,
-            );
-            Err(StatusCode::UNAUTHORIZED.into_response())
-        }
+        None => Err(refused(StatusCode::UNAUTHORIZED.into_response())),
     }
 }
 
@@ -533,133 +523,9 @@ async fn setup_and_spawn_bridge(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        net::{IpAddr, Ipv4Addr},
-        sync::Arc,
-    };
-
-    use axum::{body::Bytes, http::HeaderMap};
-
-    use super::{parse_sdp, setup_and_spawn_bridge, validate_sdp, RealtimeRegistry};
-    use crate::test_support::{StubWorker, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL};
-
-    #[test]
-    fn validate_sdp_rejects_non_v0() {
-        assert!(validate_sdp(b"not-an-sdp-offer").is_err());
-    }
-
-    #[test]
-    fn validate_sdp_rejects_empty() {
-        assert!(validate_sdp(b"").is_err());
-    }
-
-    #[test]
-    fn parse_sdp_requires_model() {
-        // Empty/whitespace query model is rejected before SDP validation.
-        let body = Bytes::from_static(b"v=0\r\n");
-        assert!(parse_sdp(&body, "   ").is_err());
-    }
-
-    /// The bridge set-up line names the worker masked: a worker registered
-    /// with credentials at a port nobody listens on cannot take the upstream
-    /// offer, and neither the set-up line nor the failure line carries the
-    /// credentials. The model rides as its own field, so the query the
-    /// upstream URL carries it in is not missed when the address is cut at
-    /// its path.
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn the_bridge_set_up_line_names_the_worker_masked() {
-        let response = setup_and_spawn_bridge(
-            &HeaderMap::new(),
-            "v=0\r\n",
-            "m",
-            None,
-            "Bearer k",
-            StubWorker::at(CREDENTIALED_WORKER_URL),
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
-            None,
-            Arc::new(RealtimeRegistry::new()),
-            "direct SDP",
-        )
-        .await;
-
-        assert!(!logs_contain("secret"));
-        assert!(!logs_contain("user:"));
-        assert!(response.status().is_server_error(), "{}", response.status());
-        assert!(logs_contain("Creating WebRTC bridge"));
-        assert!(logs_contain(&format!(
-            "{MASKED_WORKER_URL}/v1/realtime/calls"
-        )));
-    }
-}
+#[path = "../../tests/unit/realtime/webrtc/tests.rs"]
+mod tests;
 
 #[cfg(test)]
-mod family_tests {
-    use super::*;
-
-    fn v4(last: u8) -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, last)), 3478)
-    }
-
-    fn v6(last: u16) -> SocketAddr {
-        SocketAddr::new(
-            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, last)),
-            3478,
-        )
-    }
-
-    #[test]
-    fn an_ipv4_bind_takes_the_first_ipv4_answer() {
-        assert_eq!(
-            pick_stun_address([v6(1), v4(1), v4(2)], IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-            Some(v4(1))
-        );
-        assert_eq!(
-            pick_stun_address([v6(1)], IpAddr::V4(Ipv4Addr::UNSPECIFIED)),
-            None
-        );
-    }
-
-    #[test]
-    fn an_ipv6_bind_takes_the_first_ipv6_answer() {
-        let bind = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 7));
-        assert_eq!(pick_stun_address([v4(1), v6(1), v6(2)], bind), Some(v6(1)));
-        assert_eq!(
-            pick_stun_address([v4(1)], bind),
-            None,
-            "a socket bound to one IPv6 address cannot reach an IPv4 server"
-        );
-    }
-
-    #[test]
-    fn a_dual_stack_bind_falls_back_to_a_mapped_ipv4_answer() {
-        let bind = IpAddr::V6(Ipv6Addr::UNSPECIFIED);
-        assert_eq!(pick_stun_address([v4(1), v6(1)], bind), Some(v6(1)));
-        assert_eq!(
-            pick_stun_address([v4(1)], bind),
-            Some(SocketAddr::new(
-                IpAddr::V6(Ipv4Addr::new(198, 51, 100, 1).to_ipv6_mapped()),
-                3478
-            ))
-        );
-    }
-
-    #[test]
-    fn the_default_bind_follows_the_serving_hosts_family() {
-        for host in ["0.0.0.0", "127.0.0.1", "10.0.0.7", "localhost", ""] {
-            assert_eq!(
-                default_bind_addr(host),
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                "{host}"
-            );
-        }
-        for host in ["::", "[::]", "::1", "[fd00::7]", " :: "] {
-            assert_eq!(
-                default_bind_addr(host),
-                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                "{host}"
-            );
-        }
-    }
-}
+#[path = "../../tests/unit/realtime/webrtc/family_tests.rs"]
+mod family_tests;

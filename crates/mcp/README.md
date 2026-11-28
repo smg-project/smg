@@ -437,6 +437,8 @@ let session = McpToolSession::new(
         label: "my-server".to_string(),
         server_key: "my-server".to_string(),
         allowed_tools: None,
+        list_error: None,
+        pool_key: None,
     }],
     "req-123",
 );
@@ -473,6 +475,8 @@ let binding = McpServerBinding {
     label: "my-server".to_string(),
     server_key: "my-server".to_string(),
     allowed_tools: None,
+    list_error: None,
+    pool_key: None,
 };
 
 // Only expose specific tools from this server
@@ -480,10 +484,16 @@ let binding = McpServerBinding {
     label: "my-server".to_string(),
     server_key: "my-server".to_string(),
     allowed_tools: Some(vec!["tool_a".to_string(), "tool_b".to_string()]),
+    list_error: None,
+    pool_key: None,
 };
 
 let session = McpToolSession::new(&orchestrator, vec![binding], "req-123");
 ```
+
+`list_error` is the connect's to fill: why the server's tools could not be listed when the
+binding was made, `None` when they were. The `mcp_list_tools` item builders read it as the
+item's `error`; a binding built by hand, as above, names it `None`.
 
 **Key types:**
 - `ToolExecutionInput`: Tool call ID, name, and arguments
@@ -501,6 +511,8 @@ Router code should use `McpToolSession` so exposed tool names are collision-safe
 |------|----------|----------|
 | `PolicyOnly` | Batch processing, Chat API | Auto-decide via PolicyEngine |
 | `Interactive` | Responses API | Return approval request to client |
+
+On a Responses request through the OpenAI-compatible HTTP router or the regular pipeline of the gRPC router, a tool that requires approval is not run without it. The approval request reaches the client on a non-streamed request through the HTTP router; on the others the call fails with the approval error. The Harmony pipeline of the gRPC router does not apply `require_approval` yet: its tools run under the policy engine alone.
 
 ### Trust Levels
 

@@ -28,12 +28,15 @@
 #
 # Environment:
 #   CI_APT_ROOT                 apt configuration root (default /etc/apt).
+#   CI_APT_UPDATE_ATTEMPTS      attempts of the fallback (default 3). A caller
+#                               that retries the whole step itself asks for 1.
 #   CI_APT_UPDATE_RETRY_DELAY   first delay of the retry, seconds (default 10).
 
 set -euo pipefail
 
 SUDO="${1:-}"
 APT_ROOT="${CI_APT_ROOT:-/etc/apt}"
+ATTEMPTS="${CI_APT_UPDATE_ATTEMPTS:-3}"
 RETRY_DELAY="${CI_APT_UPDATE_RETRY_DELAY:-10}"
 RETRY="$(dirname "${BASH_SOURCE[0]}")/ci_retry.sh"
 
@@ -150,5 +153,5 @@ log "${kept} Ubuntu source file(s) kept"
 # from one of them would find no package until an update of its own succeeds.
 # They stay as the failed update left them, next to fresh Ubuntu indexes.
 # shellcheck disable=SC2086
-bash "${RETRY}" 3 "${RETRY_DELAY}" ${SUDO} apt-get update -o APT::Get::List-Cleanup=false \
+bash "${RETRY}" "${ATTEMPTS}" "${RETRY_DELAY}" ${SUDO} apt-get update -o APT::Get::List-Cleanup=false \
     -o Dir::Etc::sourcelist="${legacy}" -o Dir::Etc::sourceparts="${parts}"

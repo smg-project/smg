@@ -51,3 +51,7 @@ pub(crate) async fn previous_interaction_loading(
     ctx.state = RequestState::BuildRequest;
     Ok(StepResult::Continue)
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/gemini/steps/previous_interaction_loading/tests.rs"]
+mod tests;

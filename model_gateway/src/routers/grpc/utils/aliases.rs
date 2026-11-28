@@ -32,8 +32,12 @@ pub fn answering_to(name: &str) -> Option<Table> {
 /// the name a downstream launcher passes for a model family whose table has no older parser
 /// (`muse` for `muse_spark`), so that the launcher's flags read with the table, or an engine's
 /// exact name for a table (`llama4_pythonic` for `llama4`, whose generic legacy name `pythonic`
-/// is in [`UNANSWERED`] while another family carries it).
-pub const ALIASES: [(&str, Table); 19] = [
+/// is in [`UNANSWERED`] while another family carries it). One row names a family, not a format:
+/// `minimax` reads with the table of the family's current line (`minimax_m3`), though the
+/// legacy reasoning parser of that name reads the M2 line's thought; a deployment of that line
+/// names its table by the table's own name, `minimax_m2`, where the registry does not list
+/// its model: alone, the name gives way to the registry ([`gives_way`]).
+pub const ALIASES: [(&str, Table); 21] = [
     ("qwen", Table::Qwen3),
     ("qwen_xml", Table::Qwen3Tagged),
     ("qwen_coder", Table::Qwen3Tagged),
@@ -47,8 +51,13 @@ pub const ALIASES: [(&str, Table); 19] = [
     ("deepseek32", Table::DeepSeekV3_2),
     ("deepseek_v41", Table::DeepSeekV4_1),
     ("llama4_pythonic", Table::Llama4),
-    ("minimax", Table::MinimaxM2),
+    ("minimax", Table::MinimaxM3),
     ("muse", Table::MuseSpark),
+    // Command A's and Command R v01's calls, and Command A's thought. Where the table reads
+    // otherwise than the legacy parsers of the two names read: `docs/tables.md`, the
+    // Command table.
+    ("cohere", Table::Command),
+    ("cohere_cmd", Table::Command),
     ("kimik2", Table::KimiK2),
     ("kimi_thinking", Table::KimiK2),
     ("kimi_k25", Table::KimiK2),
@@ -69,7 +78,7 @@ pub const ALIASES: [(&str, Table); 19] = [
 /// the next source decides: after a worker's labels the registry's table for a model it
 /// knows, else the gateway's flags, else the legacy parsers (`passthrough` excepted, which
 /// keeps the legacy parsers either way).
-pub const UNANSWERED: [(&str, &str); 12] = [
+pub const UNANSWERED: [(&str, &str); 9] = [
     (
         "passthrough",
         "leaves its channel as written, which no table reads for: the way back to the \
@@ -110,65 +119,32 @@ pub const UNANSWERED: [(&str, &str); 12] = [
          table exactly",
     ),
     (
-        "kimi",
-        "a thought between `◁think▷` and `◁/think▷`, which no table reads: the Kimi K2 \
-         line's table reads `<think>`",
+        "step3",
+        "Step 3's calls and thought, which the registry reads with the steptml table; the legacy \
+         parser types a value by its look, the table by what the tool declares: no alias yet",
     ),
-    ("step3", "Step 3's calls and thought: no table"),
     ("sarashina", "Sarashina's calls: no table"),
-    ("cohere", "Command R and Command A's calls: no table"),
-    ("cohere_cmd", "Command R and Command A's thought: no table"),
 ];
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// The legacy reasoning parsers' names that give way where they stand alone ([`gives_way`]): a
+/// table answers to each, and before the table came each selected nothing, its parser reading
+/// the thought beside whatever read the calls. A source that names one and no tool-call parser
+/// still selects nothing while another reader is left: the registry's table reads a model it
+/// knows, and what the next source's names select reads the others. The name's table reads
+/// where nothing else does, in the place of the legacy parsers. `minimax`, a family's name with
+/// two lines, joined them so that the registry, which tells the lines apart, reads a model of
+/// either line it lists; alone, it selected the M2 line's table before.
+pub const GIVING_WAY: [&str; 3] = ["kimi", "cohere_cmd", "minimax"];
 
-    #[test]
-    fn every_alias_spells_its_table_and_is_no_tables_own_name() {
-        let mut seen = std::collections::HashSet::new();
-        for (alias, table) in ALIASES {
-            assert!(seen.insert(alias), "{alias} is listed twice");
-            assert!(
-                Table::ALL.iter().all(|own| own.name() != alias),
-                "{alias} is a table's own name"
-            );
-            assert_eq!(Table::named(alias), None, "{alias} is a table's own name");
-            // Every table a name can select stands in `ALL`: `Table::shared` keeps its tables
-            // at their positions there.
-            assert!(Table::ALL.contains(&table), "{alias}'s table is not in ALL");
-            assert_eq!(answering_to(alias), Some(table), "{alias}");
-            assert_eq!(
-                answering_to(&alias.to_ascii_uppercase()),
-                Some(table),
-                "{alias}"
-            );
-        }
-        assert_eq!(answering_to("llama"), Some(Table::Json));
-        assert_eq!(answering_to("pythonic"), None);
-        assert_eq!(answering_to("passthrough"), None);
-        // A launcher's name for a family whose table has no older parser answers for the table.
-        assert_eq!(answering_to("muse"), Some(Table::MuseSpark));
-        assert_eq!(Table::named("muse"), None);
-    }
-
-    #[test]
-    fn every_unanswered_name_answers_to_no_table_and_says_why() {
-        let mut seen = std::collections::HashSet::new();
-        for (name, reason) in UNANSWERED {
-            assert!(seen.insert(name), "{name} is listed twice");
-            assert_eq!(
-                name,
-                name.trim().to_ascii_lowercase(),
-                "{name} is not spelled as the legacy registries spell their names"
-            );
-            assert_eq!(Table::named(name), None, "{name} is a table's own name");
-            assert_eq!(
-                answering_to(name),
-                None,
-                "{name} answers to a table: remove its row"
-            );
-            assert!(!reason.trim().is_empty(), "{name} has no reason");
-        }
-    }
+/// Whether `name` is a reasoning parser's that gives way where it stands alone
+/// (`GIVING_WAY`).
+pub fn gives_way(name: &str) -> bool {
+    let name = name.trim();
+    GIVING_WAY
+        .iter()
+        .any(|legacy| legacy.eq_ignore_ascii_case(name))
 }
+
+#[cfg(test)]
+#[path = "../../../../tests/unit/routers/grpc/utils/aliases/tests.rs"]
+mod tests;

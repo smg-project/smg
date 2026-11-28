@@ -1,21 +1,35 @@
 use std::{
     net::{IpAddr, SocketAddr},
     path::Path,
+    time::Duration,
 };
 
 use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use smg_worker::identity::url_door::listed_worker_url_refusal;
+use smg_worker::{
+    identity::{basic::ConnectionMode, endpoint::Endpoint, url_door::worker_url_refusal},
+    load::monitor::LEAST_POLL_INTERVAL,
+};
 use tokio::sync::Semaphore;
 
 use super::*;
-use crate::{
-    middleware::scheduler,
-    policies::{
-        cost as selection_cost,
-        engine_host::{preset_name, Decider},
-    },
-    worker::endpoint::Endpoint,
-};
+use crate::{middleware::scheduler, policies::cost as selection_cost, tenant::MAX_TENANT_ID_LEN};
+
+/// The credential header names `routing_key_override.headers` may not carry
+/// (see [`ConfigValidator::validate_routing_key_headers`]). The Grand
+/// Central crate refuses the same names in a specification's header
+/// lists.
+const DENIED_HEADERS: [&str; 7] = [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "x-api-key",
+    "api-key",
+    "x-goog-api-key",
+];
 
 /// Each listener needs its own port. `listeners` are `(field, flag, port)`
 /// in configuration order; the first two on one port are refused under the
@@ -77,7 +91,7 @@ fn names_a_local_path(source: &str) -> bool {
 /// register); or a start-up URL names a gRPC worker itself. The connection
 /// mode alone misses the middle two: it follows the start-up URLs only.
 fn a_grpc_worker_may_register(config: &RouterConfig) -> bool {
-    if config.connection_mode == crate::worker::ConnectionMode::Grpc
+    if config.connection_mode == ConnectionMode::Grpc
         || config.enable_igw
         || config.discovery.is_some()
     {
@@ -196,8 +210,39 @@ pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
     Ok(())
 }
 
-/// Validate a single worker URL: non-empty, an allowed scheme, and a
-/// parseable host. Shared by `ConfigValidator::validate_urls` (startup
+/// Refuse a zero or a negative for a setting that must be positive.
+fn require_positive<T: Default + Ord + std::fmt::Display>(
+    field: &str,
+    value: T,
+) -> ConfigResult<()> {
+    if value <= T::default() {
+        return Err(ConfigError::invalid_value(field, value, "Must be > 0"));
+    }
+    Ok(())
+}
+
+/// Refuse a NaN, an infinity or a value under 1.0 for a factor that starts
+/// at 1.0.
+fn require_at_least_one<T: Copy + Into<f64> + std::fmt::Display>(
+    field: &str,
+    value: T,
+) -> ConfigResult<()> {
+    let factor: f64 = value.into();
+    if !factor.is_finite() || factor < 1.0 {
+        return Err(ConfigError::invalid_value(
+            field,
+            value,
+            "Must be finite and >= 1.0",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a single worker URL: non-empty, an allowed scheme, a parseable
+/// host, and one address to both of its readers (`read_two_ways`: the URL
+/// library a client dials by and the gateway's own type every line names
+/// by), as written and in the form routes are joined to. Shared by
+/// `ConfigValidator::validate_urls` (startup
 /// config) and the worker-management API so both reject schemeless or
 /// unparsable URLs identically. Rejecting at the API boundary prevents
 /// the orphaned `url_to_id` reservation from #1533: the AddWorker
@@ -205,116 +250,14 @@ pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
 /// reservation keyed on the raw URL would never match the registered
 /// worker.
 pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
-    if url.is_empty() {
-        return Err(ConfigError::invalid_value(
+    match worker_url_refusal(url) {
+        None => Ok(()),
+        Some(refusal) => Err(ConfigError::invalid_value(
             "worker_url",
-            url,
-            "URL cannot be empty",
-        ));
+            refusal.named,
+            refusal.reason,
+        )),
     }
-
-    // Exact (lowercase) scheme allow-list. Case-insensitive matching is
-    // tempting but wrong here: the AddWorker workflow's normalize_url
-    // matches schemes case-sensitively, so a mixed-case scheme would be
-    // rewritten downstream and diverge from the reservation key — the
-    // same orphan failure as a schemeless URL.
-    const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "ipc", "tcp"];
-    let scheme = url.split_once("://").map_or("", |(s, _)| s);
-    // A gRPC worker over TLS is refused by name, with the reason: the
-    // gateway's gRPC channel speaks plain HTTP/2 over TCP, and no build of
-    // the gateway holds a root store to validate an engine's certificate
-    // against, so no `grpcs://` worker ever completed a handshake the
-    // gateway could trust; the refusal belongs here, at start-up, not at
-    // the first call.
-    if scheme == "grpcs" {
-        return Err(ConfigError::invalid_value(
-            "worker_url",
-            Endpoint::redacted_str(url),
-            "grpcs:// workers are not supported: the gateway's gRPC channel speaks plain \
-             HTTP/2 and holds no certificate store to validate an engine's; use grpc://"
-                .to_string(),
-        ));
-    }
-    // A refusal names the address through the gateway's masking: it is
-    // written to stderr at start-up and answered to the API caller, and
-    // the URL may carry credentials. What the address parser accepts (a
-    // schemeless address, a known scheme in upper case) is written with
-    // its userinfo masked and its scheme lowercase; what it refuses (an
-    // unknown scheme, no host, a parse failure) reads `<unparsable
-    // address>`. The scheme is what this refusal is about and the masked
-    // address no longer shows it as written, so the reason names it when
-    // it is one (RFC 3986 scheme characters): the prefix before a `://`
-    // further into a URL could be a userinfo, and is left out.
-    if !ALLOWED_SCHEMES.contains(&scheme) {
-        let rule =
-            "URL must start with a lowercase http://, https://, grpc://, ipc://, or tcp:// scheme";
-        let is_a_scheme = !scheme.is_empty()
-            && scheme
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-        let reason = if is_a_scheme {
-            format!("scheme '{scheme}://' is not allowed; {rule}")
-        } else {
-            rule.to_string()
-        };
-        return Err(ConfigError::invalid_value(
-            "worker_url",
-            Endpoint::redacted_str(url),
-            reason,
-        ));
-    }
-
-    // ipc:// worker URLs are same-host ZMQ unix-socket paths (no host); validate
-    // the path is present rather than requiring a host below.
-    if scheme == "ipc" {
-        let path = url.strip_prefix("ipc://").unwrap_or("");
-        if path.is_empty() {
-            return Err(ConfigError::invalid_value(
-                "worker_url",
-                Endpoint::redacted_str(url),
-                "ipc:// worker URL must include a socket path",
-            ));
-        }
-        return Ok(());
-    }
-
-    match ::url::Url::parse(url) {
-        Ok(parsed) => {
-            if parsed.host_str().is_none() {
-                return Err(ConfigError::invalid_value(
-                    "worker_url",
-                    Endpoint::redacted_str(url),
-                    "URL must have a valid host",
-                ));
-            }
-        }
-        Err(e) => {
-            return Err(ConfigError::invalid_value(
-                "worker_url",
-                Endpoint::redacted_str(url),
-                format!("Invalid URL format: {e}"),
-            ));
-        }
-    }
-    // A tcp:// worker URL is what the ZMQ sockets bind, where a userinfo
-    // (`user:secret@`) has no meaning at all: refused, by the adapter's own
-    // reading (an `@` anywhere after the scheme), so that nothing the
-    // validator passes is refused at registration instead, whatever the
-    // `Endpoint` grammar makes of the rest of the string. (A gRPC worker
-    // URL's userinfo is accepted and named by [`unused_credentials_warning`],
-    // at start-up and at registration, where a log line is seen.)
-    if url
-        .strip_prefix("tcp://")
-        .is_some_and(|authority| authority.contains('@'))
-    {
-        return Err(ConfigError::invalid_value(
-            "worker_url",
-            Endpoint::redacted_str(url),
-            "a tcp:// worker URL takes no userinfo: the gateway binds its ZMQ sockets at the \
-             host and port",
-        ));
-    }
-    Ok(())
 }
 
 /// The warning for a `grpc://` worker URL that carries userinfo
@@ -454,27 +397,40 @@ pub fn runtime_worker_threads_oversubscription(threads: usize, cpus: usize) -> O
     })
 }
 
-/// The warning for `--dp-minimum-tokens-scheduler` set with `--dp-aware`,
-/// `None` for every other pair. The scheduler chooses a data-parallel rank
-/// for a request from the ranks' reported token loads where an engine is
-/// registered as one worker (the HTTP prefill-decode router's rank choice
-/// for an engine the gateway does not expand); under `--dp-aware` an engine
-/// registers as one worker per rank, the routing policy's pick among those
-/// workers is the rank choice, and the scheduler, asked about a worker that
-/// is one rank, can only answer that rank: it chooses nothing. Advice at
-/// start-up, not a refusal: the pair runs as `--dp-aware` alone does, and
-/// the flag's cache of per-rank token loads is kept up for nothing. Pure
-/// over the two settings so the rule is testable; start-up logs it with the
+/// The deprecation line for `dp_aware` set (`--dp-aware`, the settings
+/// field, a binding's argument), `None` where it is left out. The setting is
+/// accepted and does nothing: every registration reads an engine's
+/// data-parallel size and registers one worker per rank, with it or without.
+/// Pure over the setting so the rule is testable; start-up logs it with the
 /// configuration's other warnings.
+pub fn dp_aware_deprecation_warning(dp_aware: bool) -> Option<String> {
+    dp_aware.then(|| {
+        "dp_aware (--dp-aware) is deprecated and does nothing: every registration reads an \
+         engine's data-parallel size and registers one worker per rank; remove the setting"
+            .to_string()
+    })
+}
+
+/// The warning for `--dp-minimum-tokens-scheduler` set, `None` where it is
+/// not. The scheduler chooses a data-parallel rank for a request from the
+/// ranks' reported token loads where an engine is registered as one worker
+/// (the HTTP prefill-decode router's rank choice). An engine that reports
+/// its data-parallel size registers as one worker per rank, the routing
+/// policy's pick among those workers is the rank choice, and the scheduler,
+/// asked about a worker that is one rank, can only answer that rank: it
+/// chooses nothing there, and its cache of per-rank token loads is kept up
+/// for nothing. It still chooses for an engine that registered as one worker
+/// because the registration read no size. Advice at start-up, not a
+/// refusal. Pure over the setting so the rule is testable; start-up logs it
+/// with the configuration's other warnings.
 pub fn dp_minimum_tokens_scheduler_scope_warning(
-    dp_aware: bool,
     dp_minimum_tokens_scheduler: bool,
 ) -> Option<String> {
-    (dp_aware && dp_minimum_tokens_scheduler).then(|| {
-        "dp_minimum_tokens_scheduler chooses nothing under dp_aware: the engine's ranks are \
-         registered as workers and the routing policy's pick among them is the rank choice; \
-         the scheduler applies to the HTTP prefill-decode router for an engine registered as \
-         one worker"
+    dp_minimum_tokens_scheduler.then(|| {
+        "dp_minimum_tokens_scheduler chooses nothing for an engine that reports its \
+         data-parallel size: the engine's ranks are registered as workers and the routing \
+         policy's pick among them is the rank choice; the scheduler applies to the HTTP \
+         prefill-decode router for an engine registered as one worker"
             .to_string()
     })
 }
@@ -489,71 +445,66 @@ pub fn available_cpus() -> usize {
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 impl ConfigValidator {
-    /// Under `--policy-engine engine` every policy that decides (the default
-    /// and the two pair sides) is one whose stages the engine carries in
-    /// this build, and the engine itself accepts the configuration: the
-    /// decider is built once here, so a tunable the engine refuses fails
-    /// the start instead of falling back to the legacy path.
-    fn validate_policy_engine(config: &RouterConfig) -> ConfigResult<()> {
-        if config.policy_engine != PolicyEngineMode::Engine {
-            return Ok(());
-        }
-        // The decider binds the default, prefill and decode profiles; an
-        // encode side has none in this build, so an encode decision would
-        // run the default profile where the legacy path hashes content. The
-        // mode is refused by name until the encode step binds its profile.
-        if matches!(config.mode, RoutingMode::EncodePrefillDecode { .. }) {
-            return Err(ConfigError::invalid_value(
-                "policy_engine",
-                "encode-prefill-decode",
-                "the policy engine carries no encode profile in this build; \
-                 encode-prefill-decode runs under --policy-engine legacy",
-            ));
-        }
-        let prefill = config.mode.get_prefill_policy(&config.policy);
-        let decode = config.mode.get_decode_policy(&config.policy);
-        for policy in [&config.policy, prefill, decode] {
-            if preset_name(policy).is_none() {
-                return Err(ConfigError::invalid_value(
-                    "policy_engine",
-                    policy.name(),
-                    "the policy engine carries random, round_robin, passthrough, power_of_two \
-                     (expected_wait, requests, least_requests), least_load and manual in this \
-                     build",
-                ));
-            }
-        }
-        Decider::from_configs(
-            &config.policy,
-            prefill,
-            decode,
-            &config.routing_key_override,
-        )
-        .map_err(|error| {
-            let mut names = vec![config.policy.name()];
-            for policy in [prefill, decode] {
-                if !names.contains(&policy.name()) {
-                    names.push(policy.name());
-                }
-            }
-            ConfigError::invalid_value("policy_engine", names.join("/"), error.to_string())
-        })?;
-        Ok(())
-    }
-
-    pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
+    /// The shapes of the routing part: the mode, the bounds, the policy, the
+    /// routing-key headers and the cache boundaries. A start's first checks.
+    fn validate_routing_shapes(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
-        Self::validate_policy_engine(config)?;
-        Self::validate_cache_boundaries(&config.cache_boundaries)?;
+        Self::validate_routing_key_headers(config)?;
+        Self::validate_cache_boundaries(&config.cache_boundaries)
+    }
+
+    /// The two overload thresholds. They are `>=` comparisons, so the
+    /// excluded ends of these ranges are exactly the values that would veto
+    /// every worker unconditionally. Mirrors the CLI parsers for the
+    /// config-file and bindings paths.
+    fn validate_overload_thresholds(config: &RouterConfig) -> ConfigResult<()> {
+        if config.worker_overload_waiting_requests == Some(0) {
+            return Err(ConfigError::invalid_value(
+                "worker_overload_waiting_requests",
+                "0",
+                "Must be >= 1 (0 would mark every worker overloaded)",
+            ));
+        }
+        if let Some(threshold) = config.worker_overload_token_usage {
+            if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
+                return Err(ConfigError::invalid_value(
+                    "worker_overload_token_usage",
+                    threshold,
+                    "Must be a fraction in (0.0, 1.0]",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The validator's checks of the routing part, in a start's order: its
+    /// shapes, the overload thresholds, the tenant header's name, the
+    /// discovery settings, then the fit of the policies to the pools. A
+    /// start runs them among its other checks ([`Self::validate`]), and
+    /// then resolves a discovery provider's runtime settings. Consul's
+    /// address syntax and environment are checked during that resolution.
+    /// `--print-policy-spec` runs these alone, over a configuration that
+    /// holds the routing part alone. None reads a file.
+    pub(crate) fn validate_routing(config: &RouterConfig) -> ConfigResult<()> {
+        Self::validate_routing_shapes(config)?;
+        Self::validate_overload_thresholds(config)?;
+        Self::validate_tenant_resolution(config)?;
+        if let Some(discovery) = &config.discovery {
+            Self::validate_discovery(discovery, &config.mode)?;
+        }
+        Self::validate_compatibility(config)
+    }
+
+    pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        Self::validate_routing_shapes(config)?;
         Self::validate_server_settings(config)?;
         Self::validate_cors_allowed_origins(config)?;
         Self::validate_value_shapes(config)?;
         Self::validate_log_dir(config)?;
         Self::validate_access_log_fields(config)?;
         Self::validate_storage_context_headers(config)?;
-        Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
         Self::validate_memory_history(config)?;
@@ -578,7 +529,15 @@ impl ConfigValidator {
         let retry_cfg = config.effective_retry_config();
         let cb_cfg = config.effective_circuit_breaker_config();
         Self::validate_retry(&retry_cfg)?;
-        Self::validate_circuit_breaker(&cb_cfg)?;
+        Self::validate_circuit_breaker(
+            [
+                "circuit_breaker.failure_threshold",
+                "circuit_breaker.success_threshold",
+                "circuit_breaker.timeout_duration_secs",
+                "circuit_breaker.window_duration_secs",
+            ],
+            &cb_cfg,
+        )?;
         Self::validate_health_check(&config.health_check)?;
 
         if config.history_backend == HistoryBackend::Oracle {
@@ -771,6 +730,12 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// `routing_key_override.headers` names routing keys, never credentials:
+    /// a thread turn's client lineage goes out under the first configured
+    /// name, and the provider paths forward a request's `Authorization` over
+    /// the worker's own key, so a credential name there sends a lineage as a
+    /// credential and the upstream refuses the turn. The names of
+    /// [`DENIED_HEADERS`] are refused at load by name.
     fn validate_routing_key_headers(config: &RouterConfig) -> ConfigResult<()> {
         for name in &config.routing_key_override.headers {
             HeaderName::try_from(name.as_str()).map_err(|e| ConfigError::ValidationFailed {
@@ -778,6 +743,16 @@ impl ConfigValidator {
                     "routing_key_override.headers contains an invalid HTTP header name '{name}': {e}"
                 ),
             })?;
+            if DENIED_HEADERS
+                .iter()
+                .any(|denied| denied.eq_ignore_ascii_case(name))
+            {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!(
+                        "routing_key_override.headers contains the credential header name '{name}': a routing key is never a credential"
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -880,12 +855,11 @@ impl ConfigValidator {
             }
             // The canonical key is stored with every response and
             // conversation, in a 255-byte column on the SQL backends.
-            if entry.tenant_id.len() > crate::tenant::MAX_TENANT_ID_LEN {
+            if entry.tenant_id.len() > MAX_TENANT_ID_LEN {
                 return Err(ConfigError::ValidationFailed {
                     reason: format!(
                         "tenant_api_keys tenant_id '{}' is longer than {} bytes",
-                        entry.tenant_id,
-                        crate::tenant::MAX_TENANT_ID_LEN
+                        entry.tenant_id, MAX_TENANT_ID_LEN
                     ),
                 });
             }
@@ -969,24 +943,24 @@ impl ConfigValidator {
             ));
         }
 
-        if oracle.pool_timeout_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "oracle.pool_timeout_secs",
-                oracle.pool_timeout_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive("oracle.pool_timeout_secs", oracle.pool_timeout_secs)?;
+
+        require_positive("oracle.op_timeout_secs", oracle.op_timeout_secs)?;
 
         Ok(())
     }
 
     fn validate_mode(mode: &RoutingMode) -> ConfigResult<()> {
         match mode {
-            RoutingMode::Regular { worker_urls } => {
+            // Allow empty URLs to support dynamic worker addition
+            // URLs will be validated if provided
+            RoutingMode::Regular { worker_urls }
+            | RoutingMode::OpenAI { worker_urls }
+            | RoutingMode::Anthropic { worker_urls }
+            | RoutingMode::Gemini { worker_urls } => {
                 if !worker_urls.is_empty() {
                     Self::validate_urls(worker_urls)?;
                 }
-                // Allow empty URLs without service discovery to match legacy behavior
             }
             RoutingMode::PrefillDecode {
                 prefill_urls,
@@ -996,26 +970,11 @@ impl ConfigValidator {
             } => {
                 // Allow empty URLs even without service discovery to support dynamic worker addition
                 // URLs will be validated if provided
-                if !prefill_urls.is_empty() {
-                    let prefill_url_strings: Vec<String> =
-                        prefill_urls.iter().map(|(url, _)| url.clone()).collect();
-                    Self::validate_urls(&prefill_url_strings)?;
-                }
+                Self::validate_url_port_urls(prefill_urls)?;
                 if !decode_urls.is_empty() {
                     Self::validate_urls(decode_urls)?;
                 }
-
-                for (_url, port) in prefill_urls {
-                    if let Some(port) = port {
-                        if *port == 0 {
-                            return Err(ConfigError::invalid_value(
-                                "bootstrap_port",
-                                port,
-                                "Port must be between 1 and 65535",
-                            ));
-                        }
-                    }
-                }
+                Self::validate_bootstrap_ports(prefill_urls)?;
 
                 if let Some(p_policy) = prefill_policy {
                     Self::validate_policy(p_policy)?;
@@ -1033,22 +992,8 @@ impl ConfigValidator {
                 decode_policy,
             } => {
                 for urls in [encode_urls, prefill_urls] {
-                    if !urls.is_empty() {
-                        let url_strings: Vec<String> =
-                            urls.iter().map(|(url, _)| url.clone()).collect();
-                        Self::validate_urls(&url_strings)?;
-                    }
-                    for (_url, port) in urls {
-                        if let Some(port) = port {
-                            if *port == 0 {
-                                return Err(ConfigError::invalid_value(
-                                    "bootstrap_port",
-                                    port,
-                                    "Port must be between 1 and 65535",
-                                ));
-                            }
-                        }
-                    }
+                    Self::validate_url_port_urls(urls)?;
+                    Self::validate_bootstrap_ports(urls)?;
                 }
                 if !decode_urls.is_empty() {
                     Self::validate_urls(decode_urls)?;
@@ -1064,24 +1009,24 @@ impl ConfigValidator {
                     Self::validate_policy(policy)?;
                 }
             }
-            RoutingMode::OpenAI { worker_urls } => {
-                // Allow empty URLs to support dynamic worker addition
-                // URLs will be validated if provided
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
-                }
-            }
-            RoutingMode::Anthropic { worker_urls } => {
-                // Allow empty URLs to support dynamic worker addition
-                // URLs will be validated if provided
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
-                }
-            }
-            RoutingMode::Gemini { worker_urls } => {
-                // Allow empty URLs to support dynamic worker addition
-                if !worker_urls.is_empty() {
-                    Self::validate_urls(worker_urls)?;
+        }
+        Ok(())
+    }
+
+    fn validate_url_port_urls(urls: &[(String, Option<u16>)]) -> ConfigResult<()> {
+        urls.iter()
+            .try_for_each(|(url, _)| validate_worker_url(url))
+    }
+
+    fn validate_bootstrap_ports(urls: &[(String, Option<u16>)]) -> ConfigResult<()> {
+        for (_url, port) in urls {
+            if let Some(port) = port {
+                if *port == 0 {
+                    return Err(ConfigError::invalid_value(
+                        "bootstrap_port",
+                        port,
+                        "Port must be between 1 and 65535",
+                    ));
                 }
             }
         }
@@ -1131,13 +1076,7 @@ impl ConfigValidator {
                     ));
                 }
 
-                if *cache_ttl_secs == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "cache_ttl_secs",
-                        cache_ttl_secs,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("cache_ttl_secs", *cache_ttl_secs)?;
 
                 if *cache_index == CacheIndexKind::Hash && cache_boundaries.is_empty() {
                     return Err(ConfigError::invalid_value(
@@ -1163,13 +1102,7 @@ impl ConfigValidator {
                     ));
                 }
 
-                if *block_size == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "block_size",
-                        block_size,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("block_size", *block_size)?;
 
                 // NaN passes every comparison and an infinite threshold is a typo
                 // for "disabled": both are refused with the sign errors.
@@ -1201,29 +1134,11 @@ impl ConfigValidator {
                     ));
                 }
 
-                if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
-                    return Err(ConfigError::invalid_value(
-                        "balance_rel_threshold",
-                        balance_rel_threshold,
-                        "Must be finite and >= 1.0",
-                    ));
-                }
+                require_at_least_one("balance_rel_threshold", *balance_rel_threshold)?;
 
-                if *eviction_interval_secs == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "eviction_interval_secs",
-                        eviction_interval_secs,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("eviction_interval_secs", *eviction_interval_secs)?;
 
-                if *max_tree_size == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "max_tree_size",
-                        max_tree_size,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("max_tree_size", *max_tree_size)?;
             }
             PolicyConfig::PowerOfTwo { .. } => {}
             PolicyConfig::LeastLoad {
@@ -1239,13 +1154,7 @@ impl ConfigValidator {
                     ));
                 }
 
-                if *mean_prefill_tokens == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "mean_prefill_tokens",
-                        mean_prefill_tokens,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("mean_prefill_tokens", *mean_prefill_tokens)?;
 
                 if !default_throughput.is_finite() || *default_throughput <= 0.0 {
                     return Err(ConfigError::invalid_value(
@@ -1260,13 +1169,7 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 bucket_adjust_interval_secs,
             } => {
-                if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
-                    return Err(ConfigError::invalid_value(
-                        "balance_rel_threshold",
-                        balance_rel_threshold,
-                        "Must be finite and >= 1.0",
-                    ));
-                }
+                require_at_least_one("balance_rel_threshold", *balance_rel_threshold)?;
 
                 if *bucket_adjust_interval_secs < 1 {
                     return Err(ConfigError::invalid_value(
@@ -1289,21 +1192,9 @@ impl ConfigValidator {
                 balance_abs_threshold: _,
                 cache_boundaries,
             } => {
-                if *prefix_token_count == 0 {
-                    return Err(ConfigError::invalid_value(
-                        "prefix_token_count",
-                        prefix_token_count,
-                        "Must be > 0",
-                    ));
-                }
+                require_positive("prefix_token_count", *prefix_token_count)?;
 
-                if !load_factor.is_finite() || *load_factor < 1.0 {
-                    return Err(ConfigError::invalid_value(
-                        "load_factor",
-                        load_factor,
-                        "Must be finite and >= 1.0",
-                    ));
-                }
+                require_at_least_one("load_factor", *load_factor)?;
 
                 Self::validate_cache_boundaries(cache_boundaries)?;
             }
@@ -1437,13 +1328,7 @@ impl ConfigValidator {
         let listeners: Vec<_> = listeners.into_iter().flatten().collect();
         validate_distinct_listener_ports(&listeners)?;
 
-        if config.max_payload_size == 0 {
-            return Err(ConfigError::invalid_value(
-                "max_payload_size",
-                config.max_payload_size,
-                "Must be > 0",
-            ));
-        }
+        require_positive("max_payload_size", config.max_payload_size)?;
 
         if config.mm_per_request_image_limit == Some(0) {
             return Err(ConfigError::invalid_value(
@@ -1505,34 +1390,9 @@ impl ConfigValidator {
             ));
         }
 
-        // Overload thresholds are `>=` comparisons, so the excluded ends of
-        // these ranges are exactly the values that would veto every worker
-        // unconditionally. Mirrors the CLI parsers for the config-file and
-        // bindings paths.
-        if config.worker_overload_waiting_requests == Some(0) {
-            return Err(ConfigError::invalid_value(
-                "worker_overload_waiting_requests",
-                "0",
-                "Must be >= 1 (0 would mark every worker overloaded)",
-            ));
-        }
-        if let Some(threshold) = config.worker_overload_token_usage {
-            if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
-                return Err(ConfigError::invalid_value(
-                    "worker_overload_token_usage",
-                    threshold,
-                    "Must be a fraction in (0.0, 1.0]",
-                ));
-            }
-        }
+        Self::validate_overload_thresholds(config)?;
 
-        if config.request_timeout_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "request_timeout_secs",
-                config.request_timeout_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive("request_timeout_secs", config.request_timeout_secs)?;
 
         // The connection limit is a semaphore's permit count, and the
         // runtime refuses more than its maximum at construction (a panic):
@@ -1572,36 +1432,27 @@ impl ConfigValidator {
             }
         }
 
-        if config.worker_startup_timeout_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "worker_startup_timeout_secs",
-                config.worker_startup_timeout_secs,
-                "Must be > 0",
-            ));
-        }
-
-        if config.worker_startup_check_interval_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "worker_startup_check_interval_secs",
-                config.worker_startup_check_interval_secs,
-                "Must be > 0",
-            ));
-        }
-
-        if config.zmq_startup_timeout_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "zmq_startup_timeout_secs",
-                config.zmq_startup_timeout_secs,
-                "Must be > 0",
-            ));
-        }
-
-        if config.load_monitor_interval_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "load_monitor_interval_secs",
-                config.load_monitor_interval_secs,
-                "Must be > 0",
-            ));
+        require_positive(
+            "worker_startup_timeout_secs",
+            config.worker_startup_timeout_secs,
+        )?;
+        require_positive(
+            "worker_startup_check_interval_secs",
+            config.worker_startup_check_interval_secs,
+        )?;
+        require_positive("zmq_startup_timeout_secs", config.zmq_startup_timeout_secs)?;
+        require_positive(
+            "load_monitor_interval_secs",
+            config.load_monitor_interval_secs,
+        )?;
+        if let Some(millis) = config.load_monitor_interval_ms {
+            if Duration::from_millis(millis) < LEAST_POLL_INTERVAL {
+                return Err(ConfigError::invalid_value(
+                    "load_monitor_interval_ms",
+                    millis,
+                    format!("Must be >= {}", LEAST_POLL_INTERVAL.as_millis()),
+                ));
+            }
         }
 
         Ok(())
@@ -1800,308 +1651,19 @@ impl ConfigValidator {
     }
 
     fn validate_discovery(discovery: &DiscoveryConfig, mode: &RoutingMode) -> ConfigResult<()> {
-        match discovery {
-            DiscoveryConfig::Kubernetes(kubernetes) => {
-                Self::validate_kubernetes_discovery(kubernetes, mode)
-            }
-            DiscoveryConfig::File(file) => Self::validate_file_discovery(file, mode),
-            DiscoveryConfig::Slurm(slurm) => Self::validate_slurm_discovery(slurm, mode),
-            DiscoveryConfig::Consul(consul) => Self::validate_consul_discovery(consul, mode),
-        }
-    }
-
-    /// What `squeue` and `scontrol` report is checked at every poll, not here.
-    /// This checks that the job names map onto the routing mode's pools.
-    fn validate_slurm_discovery(
-        discovery: &SlurmDiscoveryConfig,
-        mode: &RoutingMode,
-    ) -> ConfigResult<()> {
-        let invalid = |field: &str, value: String, reason: &str| ConfigError::InvalidValue {
-            field: field.to_string(),
-            value,
-            reason: reason.to_string(),
+        let Some(roles) = mode.discovery_roles() else {
+            let unsupported = match mode {
+                RoutingMode::OpenAI { .. } => "OpenAI",
+                RoutingMode::Anthropic { .. } => "Anthropic",
+                RoutingMode::Gemini { .. } => "Gemini",
+                RoutingMode::Regular { .. } => "Regular",
+                RoutingMode::PrefillDecode { .. } => "PD",
+                RoutingMode::EncodePrefillDecode { .. } => "EPD",
+            };
+            let reason = format!("{unsupported} mode does not support service discovery");
+            return Err(ConfigError::ValidationFailed { reason });
         };
-        if discovery.port == 0 {
-            return Err(invalid(
-                "discovery.port",
-                "0".to_string(),
-                "Port must be > 0",
-            ));
-        }
-        if discovery.bootstrap_port == Some(0) {
-            return Err(invalid(
-                "discovery.bootstrap_port",
-                "0".to_string(),
-                "Port must be > 0",
-            ));
-        }
-        if discovery.check_interval_secs == 0 {
-            return Err(invalid(
-                "discovery.check_interval_secs",
-                "0".to_string(),
-                "Must be > 0",
-            ));
-        }
-
-        let roles = [
-            ("discovery.job_names", "regular", &discovery.job_names),
-            (
-                "discovery.encode_job_names",
-                "encode",
-                &discovery.encode_job_names,
-            ),
-            (
-                "discovery.prefill_job_names",
-                "prefill",
-                &discovery.prefill_job_names,
-            ),
-            (
-                "discovery.decode_job_names",
-                "decode",
-                &discovery.decode_job_names,
-            ),
-        ];
-        // Each value reaches `squeue` inside a comma-separated list, where a
-        // comma would split it into two filters.
-        let scopes = [
-            ("discovery.user", &discovery.user),
-            ("discovery.account", &discovery.account),
-            ("discovery.partition", &discovery.partition),
-        ];
-        let values = roles
-            .iter()
-            .flat_map(|(field, _, names)| names.iter().map(move |name| (*field, name)))
-            .chain(
-                scopes
-                    .iter()
-                    .filter_map(|(field, value)| value.as_ref().map(|value| (*field, value))),
-            );
-        for (field, value) in values {
-            if value.is_empty() || value.contains(',') {
-                return Err(invalid(
-                    field,
-                    value.clone(),
-                    "Must be non-empty and contain no comma",
-                ));
-            }
-        }
-
-        let mut role_of = std::collections::HashMap::<&str, &str>::new();
-        for (_, role, names) in &roles {
-            for name in *names {
-                if let Some(other) = role_of.insert(name, role) {
-                    if other != *role {
-                        return Err(ConfigError::ValidationFailed {
-                            reason: format!(
-                                "Slurm job name '{name}' maps to both {other} and {role} workers"
-                            ),
-                        });
-                    }
-                }
-            }
-        }
-
-        let [regular, encode, prefill, decode] = roles.map(|(_, _, names)| !names.is_empty());
-        let (needed, unused) = match mode {
-            RoutingMode::Regular { .. } => (
-                (!regular)
-                    .then_some("Regular mode with Slurm discovery requires a regular job name"),
-                (encode || prefill || decode).then_some(
-                    "Regular mode has no encode, prefill or decode workers to map Slurm jobs to",
-                ),
-            ),
-            RoutingMode::PrefillDecode { .. } => (
-                (!(prefill || decode)).then_some(
-                    "PD mode with Slurm discovery requires a prefill or decode job name",
-                ),
-                (regular || encode)
-                    .then_some("PD mode has no regular or encode workers to map Slurm jobs to"),
-            ),
-            RoutingMode::EncodePrefillDecode { .. } => (
-                (!(encode && prefill && decode)).then_some(
-                    "EPD mode with Slurm discovery requires encode, prefill and decode job names",
-                ),
-                regular.then_some("EPD mode has no regular workers to map Slurm jobs to"),
-            ),
-            RoutingMode::OpenAI { .. } => {
-                (Some("OpenAI mode does not support service discovery"), None)
-            }
-            RoutingMode::Anthropic { .. } => (
-                Some("Anthropic mode does not support service discovery"),
-                None,
-            ),
-            RoutingMode::Gemini { .. } => {
-                (Some("Gemini mode does not support service discovery"), None)
-            }
-        };
-        if let Some(reason) = needed.or(unused) {
-            return Err(ConfigError::ValidationFailed {
-                reason: reason.to_string(),
-            });
-        }
-        if discovery.bootstrap_port.is_some() && !(encode || prefill) {
-            return Err(ConfigError::ValidationFailed {
-                reason: "A Slurm bootstrap port applies only to encode and prefill workers"
-                    .to_string(),
-            });
-        }
-        Ok(())
-    }
-
-    /// The manifest's own contents (worker types against the routing mode
-    /// included) are checked each time it is read, not here: it may not exist
-    /// yet, and it changes while the router runs.
-    fn validate_file_discovery(
-        discovery: &FileDiscoveryConfig,
-        mode: &RoutingMode,
-    ) -> ConfigResult<()> {
-        if discovery.path.as_os_str().is_empty() {
-            return Err(ConfigError::invalid_value(
-                "discovery.path",
-                String::new(),
-                "File discovery needs a manifest path",
-            ));
-        }
-        Self::validate_record_discovery(discovery.check_interval_secs, mode)
-    }
-
-    /// Consul's address, ACL token and TLS settings are resolved, with the
-    /// environment, when discovery starts; each instance's metadata is checked
-    /// against the routing mode whenever Consul answers.
-    fn validate_consul_discovery(
-        discovery: &ConsulDiscoveryConfig,
-        mode: &RoutingMode,
-    ) -> ConfigResult<()> {
-        if discovery.service.is_empty() {
-            return Err(ConfigError::invalid_value(
-                "discovery.service",
-                String::new(),
-                "Consul discovery needs a service name",
-            ));
-        }
-        for (field, value) in [
-            ("discovery.address", &discovery.address),
-            ("discovery.datacenter", &discovery.datacenter),
-        ] {
-            if value.as_deref() == Some("") {
-                return Err(ConfigError::invalid_value(
-                    field,
-                    String::new(),
-                    "Must not be empty when given",
-                ));
-            }
-        }
-        Self::validate_record_discovery(discovery.check_interval_secs, mode)
-    }
-
-    /// What the file and Consul providers share: their records name their own
-    /// worker types, so any mode with worker pools can use them.
-    fn validate_record_discovery(check_interval_secs: u64, mode: &RoutingMode) -> ConfigResult<()> {
-        if check_interval_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "discovery.check_interval_secs",
-                check_interval_secs,
-                "Must be > 0",
-            ));
-        }
-
-        let unsupported = match mode {
-            RoutingMode::Regular { .. }
-            | RoutingMode::PrefillDecode { .. }
-            | RoutingMode::EncodePrefillDecode { .. } => return Ok(()),
-            RoutingMode::OpenAI { .. } => "OpenAI",
-            RoutingMode::Anthropic { .. } => "Anthropic",
-            RoutingMode::Gemini { .. } => "Gemini",
-        };
-        Err(ConfigError::ValidationFailed {
-            reason: format!("{unsupported} mode does not support service discovery"),
-        })
-    }
-
-    fn validate_kubernetes_discovery(
-        discovery: &KubernetesDiscoveryConfig,
-        mode: &RoutingMode,
-    ) -> ConfigResult<()> {
-        if discovery.port == 0 {
-            return Err(ConfigError::invalid_value(
-                "discovery.port",
-                discovery.port,
-                "Port must be > 0",
-            ));
-        }
-
-        if discovery.check_interval_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "discovery.check_interval_secs",
-                discovery.check_interval_secs,
-                "Must be > 0",
-            ));
-        }
-
-        for (field, value) in [
-            (
-                "discovery.kv_connector_annotation",
-                &discovery.kv_connector_annotation,
-            ),
-            (
-                "discovery.kv_engine_id_annotation",
-                &discovery.kv_engine_id_annotation,
-            ),
-        ] {
-            let trimmed = value.trim();
-            if trimmed.is_empty() || trimmed != value {
-                return Err(ConfigError::invalid_value(
-                    field,
-                    value,
-                    "Annotation name must not be empty or padded with whitespace",
-                ));
-            }
-        }
-
-        match mode {
-            RoutingMode::Regular { .. } => {
-                if discovery.selector.is_empty() {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: "Regular mode with service discovery requires a non-empty selector"
-                            .to_string(),
-                    });
-                }
-            }
-            RoutingMode::PrefillDecode { .. } => {
-                if discovery.prefill_selector.is_empty() && discovery.decode_selector.is_empty() {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: "PD mode with service discovery requires at least one non-empty selector (prefill or decode)".to_string(),
-                    });
-                }
-            }
-            RoutingMode::EncodePrefillDecode { .. } => {
-                if discovery.encode_selector.is_empty()
-                    || discovery.prefill_selector.is_empty()
-                    || discovery.decode_selector.is_empty()
-                {
-                    return Err(ConfigError::ValidationFailed {
-                        reason: "EPD mode with service discovery requires non-empty encode_selector, prefill_selector, and decode_selector".to_string(),
-                    });
-                }
-            }
-            RoutingMode::OpenAI { .. } => {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "OpenAI mode does not support service discovery".to_string(),
-                });
-            }
-            RoutingMode::Anthropic { .. } => {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "Anthropic mode does not support service discovery".to_string(),
-                });
-            }
-            RoutingMode::Gemini { .. } => {
-                return Err(ConfigError::ValidationFailed {
-                    reason: "Gemini mode does not support service discovery".to_string(),
-                });
-            }
-        }
-
-        Ok(())
+        discovery.validate(roles).map_err(ConfigError::from)
     }
 
     fn validate_metrics(metrics: &MetricsConfig) -> ConfigResult<()> {
@@ -2202,13 +1764,7 @@ impl ConfigValidator {
                 "Must be >= 1 (set to 1 to effectively disable retries)",
             ));
         }
-        if retry.initial_backoff_ms == 0 {
-            return Err(ConfigError::invalid_value(
-                "retry.initial_backoff_ms",
-                retry.initial_backoff_ms,
-                "Must be > 0",
-            ));
-        }
+        require_positive("retry.initial_backoff_ms", retry.initial_backoff_ms)?;
         if retry.max_backoff_ms < retry.initial_backoff_ms {
             return Err(ConfigError::invalid_value(
                 "retry.max_backoff_ms",
@@ -2216,13 +1772,7 @@ impl ConfigValidator {
                 "Must be >= initial_backoff_ms",
             ));
         }
-        if !retry.backoff_multiplier.is_finite() || retry.backoff_multiplier < 1.0 {
-            return Err(ConfigError::invalid_value(
-                "retry.backoff_multiplier",
-                retry.backoff_multiplier,
-                "Must be finite and >= 1.0",
-            ));
-        }
+        require_at_least_one("retry.backoff_multiplier", retry.backoff_multiplier)?;
         if !(0.0..=1.0).contains(&retry.jitter_factor) {
             return Err(ConfigError::invalid_value(
                 "retry.jitter_factor",
@@ -2233,35 +1783,30 @@ impl ConfigValidator {
         Ok(())
     }
 
-    fn validate_circuit_breaker(cb: &CircuitBreakerConfig) -> ConfigResult<()> {
+    /// The floors of the breaker's settings. The four names are the failure
+    /// threshold, the success threshold, the open time and the failure
+    /// window as the caller's input spells them: the global settings, or a
+    /// worker's overrides at registration.
+    pub(crate) fn validate_circuit_breaker(
+        [failure_threshold, success_threshold, timeout, window]: [&str; 4],
+        cb: &CircuitBreakerConfig,
+    ) -> ConfigResult<()> {
         if cb.failure_threshold < 1 {
             return Err(ConfigError::invalid_value(
-                "circuit_breaker.failure_threshold",
+                failure_threshold,
                 cb.failure_threshold,
                 "Must be >= 1 (set to u32::MAX to effectively disable CB)",
             ));
         }
         if cb.success_threshold < 1 {
             return Err(ConfigError::invalid_value(
-                "circuit_breaker.success_threshold",
+                success_threshold,
                 cb.success_threshold,
                 "Must be >= 1",
             ));
         }
-        if cb.timeout_duration_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "circuit_breaker.timeout_duration_secs",
-                cb.timeout_duration_secs,
-                "Must be > 0",
-            ));
-        }
-        if cb.window_duration_secs == 0 {
-            return Err(ConfigError::invalid_value(
-                "circuit_breaker.window_duration_secs",
-                cb.window_duration_secs,
-                "Must be > 0",
-            ));
-        }
+        require_positive(timeout, cb.timeout_duration_secs)?;
+        require_positive(window, cb.window_duration_secs)?;
         Ok(())
     }
 
@@ -2405,7 +1950,42 @@ impl ConfigValidator {
         Ok(())
     }
 
+    /// The two refusals of a policy document that would not run as it was
+    /// given: one beside the switch off, and a path whose document was
+    /// never loaded. The validator holds a configuration to them, and so
+    /// can a start that is handed a configuration it never validated.
+    pub(crate) fn validate_policy_document(config: &RouterConfig) -> ConfigResult<()> {
+        // A launcher gives the document's path, and a host may hand the
+        // document itself. Either one, with the switch off, would be dropped
+        // and the classic policies would serve.
+        if !config.engine_decides()
+            && (config.policy_spec_path.is_some() || config.policy_spec.is_some())
+        {
+            return Err(ConfigError::invalid_value(
+                "policy_spec",
+                config
+                    .policy_spec_path
+                    .as_deref()
+                    .unwrap_or("the given document"),
+                "a policy document is run by Grand Central: set --grand-central on",
+            ));
+        }
+        // The path is written with the configuration and the document is
+        // not. A configuration that was not built by its builder holds the
+        // path alone, and would run the routing settings' document.
+        if let (Some(path), None) = (&config.policy_spec_path, &config.policy_spec) {
+            return Err(ConfigError::invalid_value(
+                "policy_spec",
+                path,
+                "the policy document of this path is not loaded: the builder reads it, or set policy_spec",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
+        Self::validate_policy_document(config)?;
+
         let has_service_discovery = config.discovery.is_some();
         let invalid_decode_policy = match &config.mode {
             RoutingMode::PrefillDecode { decode_policy, .. } if !config.enable_igw => {
@@ -2425,84 +2005,17 @@ impl ConfigValidator {
             });
         }
 
-        // IGW may receive workers dynamically, so worker-count validation cannot
-        // reason about its eventual topology. Mode-level compatibility still applies.
+        // IGW may receive workers dynamically: only the mode-level
+        // compatibility above applies to it.
         if config.enable_igw {
             return Ok(());
         }
 
-        Self::validate_mtls(config)?;
-
-        // Under dp_aware each URL registers one worker per DP rank.
-        if !has_service_discovery && !config.dp_aware {
-            if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
-                let worker_count = config.mode.worker_count();
-                if worker_count < 2 {
-                    return Err(ConfigError::IncompatibleConfig {
-                        reason: "Power-of-two policy requires at least 2 workers".to_string(),
-                    });
-                }
-            }
-
-            if let RoutingMode::PrefillDecode {
-                prefill_urls,
-                decode_urls,
-                prefill_policy,
-                decode_policy,
-            } = &config.mode
-            {
-                if let Some(PolicyConfig::PowerOfTwo { .. }) = prefill_policy {
-                    if prefill_urls.len() < 2 {
-                        return Err(ConfigError::IncompatibleConfig {
-                            reason: "Power-of-two policy for prefill requires at least 2 prefill workers".to_string(),
-                        });
-                    }
-                }
-
-                if let Some(PolicyConfig::PowerOfTwo { .. }) = decode_policy {
-                    if decode_urls.len() < 2 {
-                        return Err(ConfigError::IncompatibleConfig {
-                            reason:
-                                "Power-of-two policy for decode requires at least 2 decode workers"
-                                    .to_string(),
-                        });
-                    }
-                }
-            }
-
-            if let RoutingMode::EncodePrefillDecode {
-                prefill_urls,
-                decode_urls,
-                prefill_policy,
-                decode_policy,
-                ..
-            } = &config.mode
-            {
-                let effective_prefill_policy = prefill_policy.as_ref().unwrap_or(&config.policy);
-                let effective_decode_policy = decode_policy.as_ref().unwrap_or(&config.policy);
-
-                if matches!(effective_prefill_policy, PolicyConfig::PowerOfTwo { .. })
-                    && prefill_urls.len() < 2
-                {
-                    return Err(ConfigError::IncompatibleConfig {
-                        reason:
-                            "Power-of-two policy for prefill requires at least 2 prefill workers"
-                                .to_string(),
-                    });
-                }
-
-                if matches!(effective_decode_policy, PolicyConfig::PowerOfTwo { .. })
-                    && decode_urls.len() < 2
-                {
-                    return Err(ConfigError::IncompatibleConfig {
-                        reason: "Power-of-two policy for decode requires at least 2 decode workers"
-                            .to_string(),
-                    });
-                }
-            }
-        }
-
-        Ok(())
+        // No rule counts the worker URLs a policy is given: a URL registers
+        // one worker per data-parallel rank of its engine, which start-up
+        // does not know. A policy that compares two workers picks the one
+        // it has where there is one.
+        Self::validate_mtls(config)
     }
 
     fn validate_urls(urls: &[String]) -> ConfigResult<()> {
@@ -2517,7 +2030,34 @@ impl ConfigValidator {
 mod tests {
 
     use super::*;
-    use crate::worker::ConnectionMode;
+
+    /// The reason reads "Must be > 0", so a signed zero and a negative are refused alike.
+    #[test]
+    fn require_positive_refuses_zero_and_negative() {
+        assert!(require_positive("field", 1_i64).is_ok());
+        for value in [0_i64, -1] {
+            assert!(matches!(
+                require_positive("field", value),
+                Err(ConfigError::InvalidValue { reason, .. }) if reason == "Must be > 0"
+            ));
+        }
+    }
+
+    /// A factor is refused when it is not a number, not finite or under 1.0,
+    /// whichever float type holds it, and the error names it as it was written.
+    #[test]
+    fn require_at_least_one_refuses_nan_infinity_and_under_one() {
+        assert!(require_at_least_one("field", 1.0_f32).is_ok());
+        assert!(require_at_least_one("field", 1.25_f64).is_ok());
+        assert!(require_at_least_one("field", f64::NAN).is_err());
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.1] {
+            assert!(matches!(
+                require_at_least_one("field", value),
+                Err(ConfigError::InvalidValue { value: named, reason, .. })
+                    if named == value.to_string() && reason == "Must be finite and >= 1.0"
+            ));
+        }
+    }
 
     /// Serialized thresholds survive round trips and reject invalid values for either role.
     #[test]
@@ -2736,115 +2276,6 @@ mod tests {
         ));
     }
 
-    /// A tunable the engine refuses (a default throughput that overflows the
-    /// engine's single-precision parameter) fails the start under the
-    /// switch instead of falling back; the legacy path takes it.
-    #[test]
-    fn the_engine_switch_refuses_a_tunable_the_engine_cannot_carry() {
-        let config = RouterConfig {
-            policy_engine: PolicyEngineMode::Engine,
-            policy: PolicyConfig::LeastLoad {
-                kv_pressure_weight: 0.15,
-                mean_prefill_tokens: 1024,
-                default_throughput: 1e40,
-            },
-            ..Default::default()
-        };
-        assert!(matches!(
-            ConfigValidator::validate(&config),
-            Err(ConfigError::InvalidValue { ref field, ref value, ref reason })
-                if field == "policy_engine" && value == "least_load" && reason.contains("default_throughput")
-        ));
-        let legacy = RouterConfig {
-            policy_engine: PolicyEngineMode::Legacy,
-            ..config
-        };
-        assert!(ConfigValidator::validate(&legacy).is_ok());
-    }
-
-    /// Under `engine` the encode-prefill-decode mode is refused at start by
-    /// name: the decider binds no encode profile in this build, so an encode
-    /// decision would run the default profile; the legacy path takes it.
-    #[test]
-    fn the_engine_switch_refuses_encode_prefill_decode_without_an_encode_profile() {
-        let config = RouterConfig {
-            policy_engine: PolicyEngineMode::Engine,
-            mode: RoutingMode::EncodePrefillDecode {
-                encode_urls: vec![("http://encode:8000".to_string(), None)],
-                prefill_urls: vec![("http://prefill:8000".to_string(), None)],
-                decode_urls: vec!["http://decode:8000".to_string()],
-                encode_policy: None,
-                prefill_policy: None,
-                decode_policy: None,
-            },
-            ..Default::default()
-        };
-        assert!(matches!(
-            ConfigValidator::validate(&config),
-            Err(ConfigError::InvalidValue { ref field, ref value, .. })
-                if field == "policy_engine" && value == "encode-prefill-decode"
-        ));
-        let legacy = RouterConfig {
-            policy_engine: PolicyEngineMode::Legacy,
-            ..config
-        };
-        assert!(ConfigValidator::validate(&legacy).is_ok());
-    }
-
-    /// Under `engine` a policy the engine does not carry is refused at start
-    /// by name, on the default and on a pair side; the legacy path takes it.
-    #[test]
-    fn the_engine_switch_refuses_a_policy_the_engine_does_not_carry() {
-        let config = RouterConfig {
-            policy_engine: PolicyEngineMode::Engine,
-            policy: PolicyConfig::cache_aware(0.5, 32, 1.1, 30, 1000),
-            ..Default::default()
-        };
-        assert!(matches!(
-            ConfigValidator::validate(&config),
-            Err(ConfigError::InvalidValue { ref field, ref value, .. })
-                if field == "policy_engine" && value == "cache_aware"
-        ));
-        let legacy = RouterConfig {
-            policy_engine: PolicyEngineMode::Legacy,
-            ..config
-        };
-        assert!(ConfigValidator::validate(&legacy).is_ok());
-
-        let carried = RouterConfig {
-            policy_engine: PolicyEngineMode::Engine,
-            policy: PolicyConfig::RoundRobin,
-            mode: RoutingMode::PrefillDecode {
-                prefill_urls: vec![],
-                decode_urls: vec![],
-                prefill_policy: Some(PolicyConfig::LeastLoad {
-                    kv_pressure_weight: 1.0,
-                    mean_prefill_tokens: 100,
-                    default_throughput: 1000.0,
-                }),
-                decode_policy: None,
-            },
-            ..Default::default()
-        };
-        assert!(ConfigValidator::validate(&carried).is_ok());
-        let decode_side = RouterConfig {
-            mode: RoutingMode::PrefillDecode {
-                prefill_urls: vec![],
-                decode_urls: vec![],
-                prefill_policy: None,
-                decode_policy: Some(PolicyConfig::PowerOfTwo {
-                    load_metric: PowerOfTwoLoadMetric::ResidentTokens { request_tokens: 64 },
-                }),
-            },
-            ..carried
-        };
-        assert!(matches!(
-            ConfigValidator::validate(&decode_side),
-            Err(ConfigError::InvalidValue { ref field, ref value, .. })
-                if field == "policy_engine" && value == "power_of_two"
-        ));
-    }
-
     #[test]
     fn zero_mm_per_request_image_limit_is_rejected() {
         let config = RouterConfig {
@@ -2861,6 +2292,27 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// A load monitor interval in milliseconds under the monitor's least is
+    /// refused under its own name, zero included. The least itself is
+    /// taken, and so is a configuration that states none.
+    #[test]
+    fn a_load_monitor_interval_under_the_least_is_refused_by_its_name() {
+        let least = u64::try_from(LEAST_POLL_INTERVAL.as_millis()).expect("milliseconds");
+        let stating = |millis: Option<u64>| RouterConfig {
+            load_monitor_interval_ms: millis,
+            ..Default::default()
+        };
+        for under in [0, least - 1] {
+            assert!(matches!(
+                ConfigValidator::validate(&stating(Some(under))),
+                Err(ConfigError::InvalidValue { ref field, ref reason, .. })
+                    if field == "load_monitor_interval_ms" && reason == "Must be >= 100"
+            ));
+        }
+        assert!(ConfigValidator::validate(&stating(Some(least))).is_ok());
+        assert!(ConfigValidator::validate(&stating(None)).is_ok());
     }
 
     /// A `RouterConfig` built directly, as a language binding or a library
@@ -3163,33 +2615,49 @@ mod tests {
         }
     }
 
-    /// The minimum-tokens scheduler set with rank expansion is a warning,
-    /// not a refusal: the pure rule names the pair and the scheduler's
-    /// scope, says nothing for the other three settings, and the validator
-    /// passes the pair.
+    /// The minimum-tokens scheduler is a warning, not a refusal, on a
+    /// gateway given no other setting: the pure rule names the scheduler's
+    /// scope where it is set and says nothing where it is not, and the
+    /// validator passes it.
     #[test]
-    fn the_minimum_tokens_scheduler_under_dp_aware_warns_without_a_refusal() {
-        let warning = dp_minimum_tokens_scheduler_scope_warning(true, true).expect("a warning");
+    fn the_minimum_tokens_scheduler_warns_without_a_refusal() {
+        let warning = dp_minimum_tokens_scheduler_scope_warning(true).expect("a warning");
         assert!(
-            warning.contains("chooses nothing under dp_aware")
+            warning.contains("chooses nothing for an engine that reports its data-parallel size")
                 && warning.contains("HTTP prefill-decode router"),
             "{warning}"
         );
-        for (dp_aware, scheduler) in [(false, false), (true, false), (false, true)] {
-            assert_eq!(
-                dp_minimum_tokens_scheduler_scope_warning(dp_aware, scheduler),
-                None,
-                "dp_aware {dp_aware}, scheduler {scheduler}"
-            );
-        }
-        // The pair validates: advice, not a refusal.
+        assert_eq!(dp_minimum_tokens_scheduler_scope_warning(false), None);
+        // It validates: advice, not a refusal.
         let config = RouterConfig::builder()
             .regular_mode(vec![])
             .round_robin_policy()
-            .dp_aware(true)
             .dp_minimum_tokens_scheduler(true)
             .build_unchecked();
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// `dp_aware` is accepted and does nothing. Set, it is one deprecation
+    /// line that says so and names what every registration does; left out,
+    /// nothing is said. The validator passes it either way.
+    #[test]
+    fn dp_aware_set_is_a_deprecation_line_without_a_refusal() {
+        let warning = dp_aware_deprecation_warning(true).expect("a deprecation line");
+        assert!(
+            warning.contains("--dp-aware")
+                && warning.contains("deprecated and does nothing")
+                && warning.contains("one worker per rank"),
+            "{warning}"
+        );
+        assert_eq!(dp_aware_deprecation_warning(false), None);
+        for dp_aware in [false, true] {
+            let config = RouterConfig::builder()
+                .regular_mode(vec![])
+                .round_robin_policy()
+                .dp_aware(dp_aware)
+                .build_unchecked();
+            assert!(ConfigValidator::validate(&config).is_ok(), "{dp_aware}");
+        }
     }
 
     /// A count above a small multiple of the CPUs available to the process
@@ -3681,7 +3149,10 @@ mod tests {
     /// What the ZMQ adapter refuses for a userinfo, the validator refuses
     /// first: a `tcp://` URL with an `@` that the endpoint grammar reads as
     /// something else (a rank suffix after it, an empty userinfo) is refused
-    /// here, masked, instead of passing to a refusal at registration.
+    /// here, masked, instead of passing to a refusal at registration. The
+    /// one the grammar reads with a rank shows its scheme alone: that
+    /// reading is not a caller's, so its rendering is not trusted with what
+    /// stands before the `@`.
     #[test]
     fn a_tcp_worker_url_the_adapter_refuses_is_refused_by_the_validator() {
         for url in ["tcp://user:secret@host:1@2", "tcp://@host:31000"] {
@@ -3692,7 +3163,10 @@ mod tests {
         let text = validate_worker_url("tcp://user:secret@host:1@2")
             .expect_err("refused")
             .to_string();
-        assert!(text.contains("tcp://***@host:1@2"), "{text}");
+        assert!(
+            text.starts_with("Invalid value for field 'worker_url': tcp://*** - "),
+            "{text}"
+        );
     }
 
     /// A `grpc://` worker URL with userinfo stays accepted and earns the one
@@ -3706,7 +3180,13 @@ mod tests {
         assert!(warning.contains("grpc://***@worker:50051"), "{warning}");
         assert!(warning.contains("not sent to a gRPC worker"), "{warning}");
         assert!(!warning.contains("secret"), "{warning}");
-        for url in ["http://user:secret@worker:8000", "grpc://worker:50051"] {
+        // An `@` inside a query or fragment is no userinfo: no warning.
+        for url in [
+            "http://user:secret@worker:8000",
+            "grpc://worker:50051",
+            "grpc://worker:50051?token=a@b",
+            "grpc://worker:50051#a@b",
+        ] {
             assert_eq!(unused_credentials_warning(url), None, "{url}");
         }
 
@@ -3746,6 +3226,297 @@ mod tests {
     #[test]
     fn worker_url_rejects_unparsable() {
         assert!(validate_worker_url("http://").is_err());
+    }
+
+    /// An address the URL library and the gateway's own type read apart is
+    /// refused: a client would dial one host while every line named another,
+    /// or join its routes under a path the gateway's type takes for a
+    /// userinfo. The refusal names the address by its scheme alone and its
+    /// reason names no part of it.
+    #[test]
+    fn a_worker_url_read_two_ways_is_refused() {
+        // The refusal of `url`: the scheme and no other part of the address,
+        // then the reason, whose text is the same for every address.
+        let refused = |url: &str, reason: &str| {
+            let text = validate_worker_url(url).expect_err(url).to_string();
+            let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
+            let shown = format!("Invalid value for field 'worker_url': {scheme}://*** - {reason}");
+            assert!(text.starts_with(&shown), "{url}: {text}");
+            assert!(!text.contains("s3cret"), "{url}: {text}");
+        };
+        // A caller's rank suffix. A client dials the digits as the host, or
+        // reads them as the end of the path or the query (the fifth and the
+        // sixth). The last two have no userinfo to the gateway's type, which
+        // reads a host and its rank: a token alone, a user and a password of
+        // digits.
+        for url in [
+            "http://127.0.0.1:35099@2130706433",
+            "http://user:s3cret@127.0.0.1:52605@2130706433",
+            "grpc://127.0.0.1:61845@2130706433",
+            "http://user:s3cret@127.0.0.1:57697@3",
+            "http://10.0.0.1:30000/v1@2",
+            "grpc://worker:50051?token=s3cret@3",
+            "http://s3cret-token@8080",
+            "http://s3cret-user:8080@2130706433",
+        ] {
+            refused(url, "a worker URL cannot end in '@' and digits");
+        }
+        // What a client reads and the gateway's type does not: an empty
+        // port, port 0, a tab a client drops, a userinfo before a host of
+        // digits alone.
+        for url in [
+            "http://user:s3cret@worker:/v1",
+            "http://user:s3cret@worker:0",
+            "http://user:s3cret@wor\tker:8000",
+            "http://user:s3cret@8080",
+        ] {
+            refused(
+                url,
+                "the gateway cannot read this address as a host and a port",
+            );
+        }
+        // Two addresses in one: a backslash ends the authority for an HTTP
+        // client and not for the gateway's type. The hosts part in the
+        // first, the ports alone in the second. In the third a bracket
+        // parts two names under `grpc` that differ beyond their ASCII
+        // case.
+        for url in [
+            "http://s3cret-dialled\\@named.example",
+            "http://worker\\@worker:8000",
+            "grpc://[u@W\u{f6}rker.example:50051/]@w\u{f6}rk\u{e9}r.example:50051",
+        ] {
+            refused(
+                url,
+                "the address reads two ways: a client would dial one host and port",
+            );
+        }
+        // One host and port to both readers, which end the authority
+        // apart: a client joins every route under the rest as a path, and
+        // the gateway's type reads a userinfo that is not there. At a
+        // backslash under `http` and `https`: alone, with a path behind it,
+        // with a userinfo before it, under `https`. At a slash, a question
+        // mark or a hash before the first `]` of an authority that opens
+        // with a bracket: with a backslash behind the bracket, without one,
+        // with a path behind it, under `grpc`.
+        for url in [
+            "http://worker:8000\\@worker:8000",
+            "http://worker:8000\\@worker:8000/v1",
+            "http://user:s3cret@worker:8000\\@worker:8000",
+            "https://worker.example.com\\@worker.example.com",
+            "http://[u@worker:8000/]\\@worker:8000",
+            "http://[u@worker:8000/]@worker:8000",
+            "http://[u@worker:8000/]@worker:8000/v1",
+            "http://[u@worker:8000?x]@worker:8000",
+            "http://[u@worker:8000#x]@worker:8000",
+            "grpc://[u@worker:50051/]@worker:50051",
+        ] {
+            refused(
+                url,
+                "the address reads two ways: a client ends the authority inside what the gateway",
+            );
+        }
+    }
+
+    /// An earlier rule of the door names the address it refuses by the
+    /// gateway's masked rendering, which reads a token before an `@` and
+    /// digits as a host and its rank: such an address shows its scheme alone
+    /// in the refusal, whichever rule refuses it.
+    #[test]
+    fn a_refusal_shows_the_scheme_alone_of_an_address_read_with_a_rank() {
+        for (url, shown, reason) in [
+            (
+                "tcp://s3cret-token@8080",
+                "tcp://***",
+                "a tcp:// worker URL takes no userinfo",
+            ),
+            (
+                "grpcs://s3cret-token@8080",
+                "grpcs://***",
+                "grpcs:// workers are not supported",
+            ),
+            (
+                "HTTP://s3cret-token@8080",
+                "http://***",
+                "scheme 'HTTP://' is not allowed",
+            ),
+            (
+                "s3cret-token@8080",
+                "***",
+                "URL must start with a lowercase",
+            ),
+            (
+                "http://s3cret-token@99999999999",
+                "http://***",
+                "Invalid URL format",
+            ),
+        ] {
+            let text = validate_worker_url(url).expect_err(url).to_string();
+            let named = format!("Invalid value for field 'worker_url': {shown} - {reason}");
+            assert!(text.starts_with(&named), "{url}: {text}");
+            assert!(!text.contains("s3cret"), "{url}: {text}");
+        }
+        // No rank, no change: the masked rendering, as before.
+        let text = validate_worker_url("tcp://user:s3cret@10.0.0.5:31000")
+            .expect_err("a tcp userinfo")
+            .to_string();
+        assert!(
+            text.starts_with("Invalid value for field 'worker_url': tcp://***@10.0.0.5:31000 - "),
+            "{text}"
+        );
+    }
+
+    /// The door as a discovery manifest's reader asks it: an address with no
+    /// scheme is asked under `http://`, or under `grpc://` where the URL
+    /// library cannot read it under `http://`, a known scheme in any case
+    /// under its lowercase form, and the answer is the door's reason alone,
+    /// which names no part of the address behind its scheme.
+    #[test]
+    fn a_listed_worker_url_is_asked_of_the_door_in_the_forms_it_is_stored_in() {
+        for url in [
+            "10.0.0.11:8000",
+            "user:pass@10.0.0.11:8000",
+            "[2001:db8::1]:8000",
+            "HTTP://10.0.0.11:8000",
+            "grpc://decode.internal:9000",
+            "ipc:///tmp/engine.sock",
+            // The URL library cannot read it under `http://`: asked under
+            // `grpc://`, the one scheme it can be stored with, and taken.
+            "256.1.1.1:8000",
+        ] {
+            assert_eq!(listed_worker_url_refusal(url), None, "{url}");
+        }
+        for (url, reason) in [
+            (
+                "http://adm1n:s3cret@2130706433/",
+                "the gateway cannot read this address as a host and a port",
+            ),
+            (
+                "adm1n:s3cret@2130706433",
+                "the gateway cannot read this address as a host and a port",
+            ),
+            ("Http://s3cret@2130706433", "reads them as a rank suffix"),
+            ("http://adm1n:s3cret@99999999999", "Invalid URL format"),
+            (
+                "grpcs://adm1n:s3cret@w:9000",
+                "grpcs:// workers are not supported",
+            ),
+            // The library reads it under `http://` and the door refuses it
+            // there alone: under `grpc://` the door takes it.
+            ("user\\@worker:50051", "the address reads two ways"),
+        ] {
+            let refusal = listed_worker_url_refusal(url).unwrap_or_default();
+            assert!(refusal.contains(reason), "{url}: {refusal}");
+            for part in ["adm1n", "s3cret", "2130706433", "99999999999"] {
+                assert!(
+                    !refusal.contains(part),
+                    "{url}: the refusal names '{part}': {refusal}"
+                );
+            }
+        }
+    }
+
+    /// What the two readings agree on stays accepted, however it is
+    /// written: a userinfo (an `@` inside it too), the scheme's own port
+    /// written out or left out, a name in upper case or percent-encoded,
+    /// an IPv4 address as one number, an IPv6 literal, a query that holds
+    /// an `@`, a name outside ASCII under `tcp` or `grpc` in either case, a
+    /// backslash behind the authority or under `grpc`.
+    #[test]
+    fn a_worker_url_both_readings_agree_on_is_accepted() {
+        for url in [
+            "http://user:pass@worker:3000",
+            "http://a@b:pass@worker:3000",
+            "http://worker:3000/v1",
+            "http://10.0.0.5:8000",
+            "http://worker:80",
+            "https://worker.example.com:443/v1",
+            "http://Worker.Example:8000",
+            "http://w%6frker:8000",
+            "http://2130706433:8000",
+            "https://[::1]:8443",
+            "grpc://10.0.0.5:50051",
+            "grpc://Worker:50051",
+            "grpc://[fd00::1]:50051",
+            "grpc://worker:50051?token=a@b",
+            "http://worker:8000?x=a\\@b",
+            "grpc://user\\@worker:50051",
+            "tcp://10.0.0.5:31000",
+            "tcp://w\u{f6}rker.example:31000",
+            "tcp://W\u{f6}rker.example:31000",
+            "grpc://W\u{f6}rker.example:50051",
+        ] {
+            validate_worker_url(url).expect(url);
+        }
+    }
+
+    /// Routes join to the address less its trailing slashes, and a line may
+    /// name a worker by that form: the door reads it both ways too. An
+    /// address that is one host to both readers as written, and a rank or
+    /// no address at all to the gateway's type without its trailing slashes,
+    /// is refused and named by its scheme alone.
+    #[test]
+    fn a_worker_url_read_two_ways_without_its_trailing_slashes_is_refused() {
+        for (url, reason) in [
+            (
+                "http://s3cret-token@2130706433/",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "http://s3cret-token@2130706433//",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "https://10.0.0.5:8000@2130706433/",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "http://127.0.0.1:8000/?token=s3cret@123456/",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "http://127.0.0.1:8000?token=s3cret@42/",
+                "a worker URL cannot end in '@' and digits",
+            ),
+            (
+                "http://s3cret-user:s3cret@2130706433/",
+                "the gateway cannot read this address as a host and a port",
+            ),
+        ] {
+            let text = validate_worker_url(url).expect_err(url).to_string();
+            let scheme = url.split_once("://").map_or("", |(scheme, _)| scheme);
+            let shown = format!("Invalid value for field 'worker_url': {scheme}://*** - {reason}");
+            assert!(text.starts_with(&shown), "{url}: {text}");
+            assert!(!text.contains("s3cret"), "{url}: {text}");
+        }
+        // A trailing slash alone changes nothing: what both read as one in
+        // both forms stays accepted.
+        for url in [
+            "http://worker:3000/",
+            "http://worker:3000//",
+            "http://user:pass@worker:3000/",
+            "https://worker.example.com/v1/",
+            "http://worker:3000/?token=a@b/",
+            "http://2130706433:8000/",
+        ] {
+            validate_worker_url(url).expect(url);
+        }
+    }
+
+    /// The refusal ends a start too: the configuration's worker URLs go
+    /// through the one door.
+    #[test]
+    fn a_start_refuses_a_worker_url_read_two_ways() {
+        let config = RouterConfig::new(
+            RoutingMode::Regular {
+                worker_urls: vec!["http://user:s3cret@127.0.0.1:52605@2130706433".to_string()],
+            },
+            PolicyConfig::Random,
+        );
+        let text = ConfigValidator::validate(&config)
+            .expect_err("refused")
+            .to_string();
+        assert!(text.contains("cannot end in '@' and digits"), "{text}");
+        assert!(!text.contains("s3cret"), "{text}");
     }
 
     #[test]
@@ -3792,28 +3563,49 @@ mod tests {
         )
     }
 
-    /// Under `engine` the sticky override's headers are the default
-    /// binding's sessions rule: a name repeated in another case is one
-    /// header, as under legacy; a header on the engine's deny-list refuses
-    /// the start by name, where the legacy path takes it.
+    /// A routing-key header is never a credential: every name on the shared
+    /// header deny-list is refused at load by name, in any letter case and in
+    /// any position of the list, where a plain name beside it is taken.
     #[test]
-    fn the_engine_switch_takes_a_repeated_routing_header_and_refuses_a_denied_one() {
+    fn routing_key_headers_refuse_credential_names() {
         let mut config = regular_mode_config();
-        config.policy_engine = PolicyEngineMode::Engine;
         config.routing_key_override.enabled = true;
-        config.routing_key_override.headers =
-            vec!["X-Routing-Key".to_string(), "x-routing-key".to_string()];
+        config.routing_key_override.headers = vec!["x-routing-key".to_string()];
         assert!(ConfigValidator::validate(&config).is_ok());
-        config.routing_key_override.headers = vec!["x-api-key".to_string()];
-        assert!(matches!(
-            ConfigValidator::validate(&config),
-            Err(ConfigError::InvalidValue { ref field, ref reason, .. })
-                if field == "policy_engine"
-                    && reason.contains("x-api-key")
-                    && reason.contains("deny-list")
-        ));
-        config.policy_engine = PolicyEngineMode::Legacy;
-        assert!(ConfigValidator::validate(&config).is_ok());
+        for denied in DENIED_HEADERS {
+            for name in [denied.to_string(), denied.to_ascii_uppercase()] {
+                config.routing_key_override.headers =
+                    vec!["x-routing-key".to_string(), name.clone()];
+                assert!(
+                    matches!(
+                        ConfigValidator::validate(&config),
+                        Err(ConfigError::ValidationFailed { ref reason })
+                            if reason.contains("routing_key_override.headers")
+                                && reason.contains(&name)
+                                && reason.contains("credential")
+                    ),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    /// The deny-list by name: a name dropped from it would be taken as a
+    /// routing-key header with no case above turning red.
+    #[test]
+    fn the_denied_routing_key_headers_are_the_seven_credential_names() {
+        assert_eq!(
+            DENIED_HEADERS,
+            [
+                "authorization",
+                "proxy-authorization",
+                "cookie",
+                "set-cookie",
+                "x-api-key",
+                "api-key",
+                "x-goog-api-key",
+            ]
+        );
     }
 
     #[test]
@@ -4022,6 +3814,41 @@ mod tests {
 
         // Should pass validation since service discovery is enabled
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn vendor_modes_refuse_discovery_before_any_provider_check() {
+        let discovery = KubernetesDiscoveryConfig {
+            port: 0,
+            ..Default::default()
+        }
+        .into();
+        for (mode, expected) in [
+            (
+                RoutingMode::OpenAI {
+                    worker_urls: vec![],
+                },
+                "OpenAI mode does not support service discovery",
+            ),
+            (
+                RoutingMode::Anthropic {
+                    worker_urls: vec![],
+                },
+                "Anthropic mode does not support service discovery",
+            ),
+            (
+                RoutingMode::Gemini {
+                    worker_urls: vec![],
+                },
+                "Gemini mode does not support service discovery",
+            ),
+        ] {
+            let result = ConfigValidator::validate_discovery(&discovery, &mode);
+            assert!(
+                matches!(&result, Err(ConfigError::ValidationFailed { reason }) if reason == expected),
+                "{result:?}"
+            );
+        }
     }
 
     #[test]
@@ -4318,6 +4145,30 @@ mod tests {
                 ConfigValidator::validate(&config),
                 Err(ConfigError::InvalidValue { field: ref actual, .. }) if actual == field
             ));
+        }
+    }
+
+    #[test]
+    fn a_pairing_protocol_label_that_is_empty_or_padded_is_refused() {
+        for bad in ["", " ", " example.com/rollout", "example.com/rollout "] {
+            let mut config = regular_mode_config();
+            config.discovery = Some(
+                KubernetesDiscoveryConfig {
+                    selector: [("app".to_string(), "worker".to_string())].into(),
+                    pairing_protocol_label: bad.to_string(),
+                    ..Default::default()
+                }
+                .into(),
+            );
+
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&config),
+                    Err(ConfigError::InvalidValue { ref field, .. })
+                        if field == "discovery.pairing_protocol_label"
+                ),
+                "{bad:?}"
+            );
         }
     }
 
@@ -4761,31 +4612,43 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// No rule counts the worker URLs a power-of-two policy is given: one
+    /// URL registers one worker per data-parallel rank of its engine, which
+    /// start-up does not know. One URL validates in every mode, with
+    /// `dp_aware` set or not: the setting changes nothing.
     #[test]
-    fn test_validate_pd_mode_power_of_two_insufficient_workers() {
-        let mut config = RouterConfig::new(
-            RoutingMode::PrefillDecode {
-                prefill_urls: vec![("http://prefill1:8000".to_string(), None)], // Only 1 prefill
-                decode_urls: vec![
-                    "http://decode1:8000".to_string(),
-                    "http://decode2:8000".to_string(),
-                ],
-                prefill_policy: Some(PolicyConfig::PowerOfTwo {
-                    load_metric: Default::default(),
-                }), // Requires 2+ workers
-                decode_policy: None,
+    fn power_of_two_with_one_worker_url_validates_in_every_mode() {
+        let power_of_two = || PolicyConfig::PowerOfTwo {
+            load_metric: Default::default(),
+        };
+        let one = || vec!["http://decode1:8000".to_string()];
+        let modes = [
+            RoutingMode::Regular {
+                worker_urls: vec!["http://worker1:8000".to_string()],
             },
-            PolicyConfig::Random,
-        );
-
-        let result = ConfigValidator::validate(&config);
-        assert!(result.is_err());
-        if let Err(e) = result {
-            assert!(e.to_string().contains("prefill requires at least 2"));
+            RoutingMode::PrefillDecode {
+                prefill_urls: vec![("http://prefill1:8000".to_string(), None)],
+                decode_urls: one(),
+                prefill_policy: Some(power_of_two()),
+                decode_policy: Some(power_of_two()),
+            },
+            RoutingMode::EncodePrefillDecode {
+                encode_urls: vec![("http://encode1:8000".to_string(), None)],
+                prefill_urls: vec![("http://prefill1:8000".to_string(), None)],
+                decode_urls: one(),
+                encode_policy: Some(PolicyConfig::RoundRobin),
+                prefill_policy: Some(power_of_two()),
+                decode_policy: Some(power_of_two()),
+            },
+        ];
+        for mode in modes {
+            for dp_aware in [false, true] {
+                let mut config = RouterConfig::new(mode.clone(), power_of_two());
+                config.dp_aware = dp_aware;
+                let result = ConfigValidator::validate(&config);
+                assert!(result.is_ok(), "{mode:?}, dp_aware {dp_aware}: {result:?}");
+            }
         }
-
-        config.dp_aware = true;
-        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]

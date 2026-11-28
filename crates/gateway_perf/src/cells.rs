@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 
 use crate::{
     bed::{enqueue, script_counts, Bed, BedConfig, ScriptCounts},
-    counters::{parse_jemalloc, snapshot, PerfStat, Snapshot},
+    counters::{parse_jemalloc, settled_snapshot, snapshot, PerfStat, Snapshot},
     gate, hms, loadavg, now_seconds,
     paths::{answers, interleaved_order, PathSpec},
     py_g,
@@ -32,6 +32,9 @@ pub struct Settings {
     pub out: PathBuf,
     pub bed: BedConfig,
     pub binaries: BTreeMap<String, PathBuf>,
+    /// The base's own gateway flags, where it runs under other flags than the
+    /// head (`--base-gw-args`): one binary measured under two settings.
+    pub base_gw_args: Option<String>,
     pub paths: Vec<PathSpec>,
     pub requests: u64,
     pub repeats: usize,
@@ -55,6 +58,7 @@ impl Settings {
             out: out.to_path_buf(),
             bed,
             binaries,
+            base_gw_args: None,
             paths,
             requests: 10_000,
             repeats: 3,
@@ -73,6 +77,33 @@ impl Settings {
             .get(side)
             .map(PathBuf::as_path)
             .ok_or_else(|| anyhow!("no gateway binary for the {side} side"))
+    }
+
+    /// The gateway flags `side` runs under: the base's own where it has any,
+    /// else the bed's.
+    pub fn gw_args(&self, side: &str) -> &str {
+        match (side, &self.base_gw_args) {
+            ("base", Some(flags)) => flags,
+            _ => &self.bed.gw_args,
+        }
+    }
+
+    /// A bed for `side`: its binary under its gateway flags.
+    pub fn side_bed(&self, side: &str, run_dir: &Path, jemalloc_stats: bool) -> Result<Bed> {
+        let mut cfg = self.bed.clone();
+        cfg.gw_args = self.gw_args(side).to_string();
+        Ok(Bed::new(&cfg, self.binary(side)?, run_dir, jemalloc_stats))
+    }
+
+    /// What a setup line says where the two sides ran under different gateway
+    /// flags: nothing where they ran under the same.
+    pub fn flags_text(&self) -> String {
+        let (base, head) = (self.gw_args("base"), self.gw_args("pr"));
+        if base == head {
+            String::new()
+        } else {
+            format!("; gateway flags before `{base}`, after `{head}`")
+        }
     }
 }
 
@@ -121,6 +152,8 @@ pub struct CellRecord {
     pub path: String,
     pub label: String,
     pub binary: String,
+    /// The extra gateway flags the cell's gateway ran under.
+    pub gw_args: String,
     pub dir: String,
     pub sent: u64,
     pub ok: u64,
@@ -295,7 +328,9 @@ fn measure(
     };
     thread::sleep(Duration::from_secs(1));
     let counters = perf.map(PerfStat::stop).unwrap_or_default();
-    let s1 = snapshot(bed)?;
+    // The memory after the window is the gated figure: it is read once the purge this
+    // snapshot's scrape starts has ended.
+    let s1 = settled_snapshot(bed)?;
     let script = spec.map(|_| script_counts(bed));
     Ok(Measured {
         summary,
@@ -319,7 +354,7 @@ pub fn cell(
     let cdir = settings.out.join("cells").join(side).join(name).join(label);
     fs::create_dir_all(&cdir)?;
     let binary = settings.binary(side)?;
-    let mut bed = Bed::new(&settings.bed, binary, &cdir.join("bed"), true);
+    let mut bed = settings.side_bed(side, &cdir.join("bed"), true)?;
     let t_start = Instant::now();
     println!(
         "[{}] cell {side}/{name}/{label} load={:.2}",
@@ -336,6 +371,7 @@ pub fn cell(
         path: name.to_string(),
         label: label.to_string(),
         binary: binary.display().to_string(),
+        gw_args: settings.gw_args(side).to_string(),
         dir: cdir.display().to_string(),
         ..CellRecord::default()
     };
@@ -448,6 +484,21 @@ pub fn per_request(c: &CellRecord, idle: Option<&CellRecord>) -> BTreeMap<String
     let kb = |key: &str| c.status_1.get(key).copied().unwrap_or(0) as f64 / 1024.0;
     out.insert("rss_mb_after_window".to_string(), kb("VmRSS"));
     out.insert("hwm_mb".to_string(), kb("VmHWM"));
+    // The anonymous and the file part of the resident set, where the kernel reports them
+    // (the whole set is these two and shared memory). The anonymous part is what the
+    // gateway allocated. The file part is the file pages the kernel has mapped, mostly
+    // the gateway's own binary (and its shared libraries): a fault maps the cached
+    // neighbours inside the 64 KB window around it, so the part follows how much of the
+    // measured file is cached and where the linker put the code that runs, and two
+    // copies of one binary read apart. The gate judges the anonymous part.
+    for (field, metric) in [
+        ("RssAnon", "rss_anon_mb_after_window"),
+        ("RssFile", "rss_file_mb_after_window"),
+    ] {
+        if let Some(kib) = c.status_1.get(field) {
+            out.insert(metric.to_string(), *kib as f64 / 1024.0);
+        }
+    }
     let perf_per_request = |key: &str, divisor: f64| {
         c.perf
             .get(key)
@@ -555,11 +606,12 @@ pub fn setup_text(settings: &Settings, mode: &str) -> String {
         prompt.push_str(&format!(", {} distinct", settings.distinct));
     }
     format!(
-        "{mode}: {} requests per cell at the path's rate x {}, {prompt}, {}, {} runtime threads{cores}",
+        "{mode}: {} requests per cell at the path's rate x {}, {prompt}, {}, {} runtime threads{cores}{}",
         thousands(settings.requests as f64, 0, false),
         py_g(settings.rate_scale, 6),
         settings.bed.engines_text(),
-        settings.bed.gw_threads
+        settings.bed.gw_threads,
+        settings.flags_text()
     )
 }
 
@@ -823,10 +875,11 @@ fn soak_windows(
     let seconds = window_seconds(settings.requests, rate);
     let mut rows = Vec::new();
     let mut summaries = Vec::new();
+    // Every row is a memory read after idle seconds, as a cell's read after its window is.
     let row = |after: String| -> Result<SoakRow> {
         Ok(SoakRow {
             after,
-            snap: snapshot(bed)?,
+            snap: settled_snapshot(bed)?,
         })
     };
     thread::sleep(Duration::from_secs(2));
@@ -912,12 +965,7 @@ pub fn mem_soak(
         .join(format!("mem-{}", spec.name))
         .join(label);
     fs::create_dir_all(&cdir)?;
-    let mut bed = Bed::new(
-        &settings.bed,
-        settings.binary(side)?,
-        &cdir.join("bed"),
-        false,
-    );
+    let mut bed = settings.side_bed(side, &cdir.join("bed"), false)?;
     println!(
         "[{}] mem {side}/{}/{label}: {windows} windows of {} + a burst at x{}",
         hms(),
@@ -1004,10 +1052,11 @@ pub fn run_mem(
         unit: Some(String::new()),
     };
     let setup = format!(
-        "mem: {windows} windows of {} requests on one gateway, then a burst at x{}; {}",
+        "mem: {windows} windows of {} requests on one gateway, then a burst at x{}; {}{}",
         thousands(settings.requests as f64, 0, false),
         py_g(burst, 6),
-        settings.bed.engines_text()
+        settings.bed.engines_text(),
+        settings.flags_text()
     );
     let values: Vec<Value> = records
         .iter()
@@ -1019,12 +1068,7 @@ pub fn run_mem(
 /// `bed smoke`: the bed up, one request per path with the first response shown, the
 /// script counts, the bed down. Returns 0 when every path answered from the script.
 pub fn smoke(settings: &Settings, paths: &[PathSpec]) -> Result<i32> {
-    let mut bed = Bed::new(
-        &settings.bed,
-        settings.binary("pr")?,
-        &settings.out.join("bed"),
-        true,
-    );
+    let mut bed = settings.side_bed("pr", &settings.out.join("bed"), true)?;
     let info = bed.up()?.clone();
     println!(
         "bed up: gateway pid {} at {}, {}, bed.json {}",
@@ -1103,12 +1147,7 @@ fn smoke_paths(settings: &Settings, bed: &Bed, paths: &[PathSpec]) -> Result<i32
 
 /// The record that `bed up` prints and `bed down` needs: the same bed object.
 pub fn bed_for(settings: &Settings, jemalloc_stats: bool) -> Result<Bed> {
-    Ok(Bed::new(
-        &settings.bed,
-        settings.binary("pr")?,
-        &settings.out.join("bed"),
-        jemalloc_stats,
-    ))
+    settings.side_bed("pr", &settings.out.join("bed"), jemalloc_stats)
 }
 
 /// The log line of a sleep-free timestamp (for the `live` mode's steps).
@@ -1117,337 +1156,5 @@ pub fn elapsed_since(t: f64) -> f64 {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-
-    /// A results file from per-id samples: run i holds the i-th value of every id that
-    /// has one.
-    pub(crate) fn results_of(base: &[(&str, &[f64])], pr: &[(&str, &[f64])]) -> Results {
-        fn runs(values: &[(&str, &[f64])]) -> Vec<BTreeMap<String, f64>> {
-            let n = values.iter().map(|(_, v)| v.len()).max().unwrap_or(0);
-            (0..n)
-                .map(|i| {
-                    values
-                        .iter()
-                        .filter_map(|(k, v)| v.get(i).map(|x| ((*k).to_string(), *x)))
-                        .collect()
-                })
-                .collect()
-        }
-        Results {
-            base: SideResults {
-                runs: runs(base),
-                ..SideResults::default()
-            },
-            pr: SideResults {
-                runs: runs(pr),
-                ..SideResults::default()
-            },
-            repeats: 3,
-            unit: Some(String::new()),
-            ..Results::default()
-        }
-    }
-
-    fn idle_cell(side: &str) -> CellRecord {
-        CellRecord {
-            side: side.to_string(),
-            path: "idle".to_string(),
-            label: "idle".to_string(),
-            window_s: 10.0,
-            cpu_s: 0.1,
-            perf: BTreeMap::from([
-                ("instructions:u".to_string(), 1e8),
-                ("instructions".to_string(), 2e8),
-                ("cycles".to_string(), 3e8),
-            ]),
-            jemalloc: json!({"nrequests": 1_000, "bytes_requested": 100_000, "large_nrequests": 1}),
-            ..CellRecord::default()
-        }
-    }
-
-    fn loaded_cell(side: &str, label: &str) -> CellRecord {
-        CellRecord {
-            side: side.to_string(),
-            path: "chat".to_string(),
-            label: label.to_string(),
-            sent: 1_000,
-            window_s: 20.0,
-            cpu_s: 0.7,
-            status_1: BTreeMap::from([
-                ("VmRSS".to_string(), 102_400),
-                ("VmHWM".to_string(), 112_640),
-            ]),
-            perf: BTreeMap::from([
-                ("instructions:u".to_string(), 7e8),
-                ("instructions".to_string(), 13e8),
-                ("cycles".to_string(), 16e8),
-            ]),
-            jemalloc: json!({
-                "nrequests": 301_000,
-                "bytes_requested": 100_000 + 1_000 * 1024 * 120,
-                "large_nrequests": 1,
-            }),
-            ..CellRecord::default()
-        }
-    }
-
-    fn close(a: f64, b: f64) -> bool {
-        (a - b).abs() < 1e-9 * b.abs().max(1.0)
-    }
-
-    #[test]
-    fn window_is_the_ceiling_of_requests_over_the_rate() {
-        assert_eq!(window_seconds(10_000, 500.0), 20);
-        assert_eq!(window_seconds(10_000, 250.0), 40);
-        assert_eq!(window_seconds(10_001, 500.0), 21);
-        assert_eq!(window_seconds(10, 0.5), 10);
-        assert_eq!(window_seconds(0, 500.0), 1);
-    }
-
-    #[test]
-    fn per_request_subtracts_the_idle_rate_over_the_window() {
-        let r = per_request(&loaded_cell("base", "r1"), Some(&idle_cell("base")));
-        // 7e8 user instructions minus 20 s of the idle rate (1e8 / 10 s) = 5e8 over 1,000 requests
-        assert!(close(r["user_instructions_per_request_M"], 0.5));
-        assert!(close(r["instructions_per_request_M"], 0.9));
-        assert!(close(r["cycles_per_request_M"], 1.0));
-        assert!(close(r["cpu_us_per_request"], (0.7 - 0.2) / 1_000.0 * 1e6));
-        assert!(close(r["allocation_calls_per_request"], 300.0));
-        assert!(close(r["kib_requested_per_request"], 120.0));
-        assert_eq!(r["large_allocations_per_request"], 0.0);
-        assert_eq!(r["rss_mb_after_window"], 100.0);
-        assert_eq!(r["hwm_mb"], 110.0);
-    }
-
-    #[test]
-    fn per_request_without_counters_or_idle_still_gives_cpu_time_and_rss() {
-        let mut cell = loaded_cell("base", "r1");
-        cell.perf.clear();
-        cell.jemalloc = json!({"error": "none"});
-        let r = per_request(&cell, None);
-        let keys: Vec<&String> = r.keys().collect();
-        assert_eq!(
-            keys,
-            ["cpu_us_per_request", "hwm_mb", "rss_mb_after_window"]
-        );
-        assert!(close(r["cpu_us_per_request"], 700.0));
-        cell.sent = 0;
-        assert!(per_request(&cell, None).is_empty());
-    }
-
-    #[test]
-    fn results_file_has_one_run_per_repeat_in_bench_gate_shape() {
-        let mut cells = vec![idle_cell("base"), idle_cell("pr")];
-        for (i, side) in interleaved_order(3) {
-            let mut c = loaded_cell(side, &format!("r{i}"));
-            let allocs = if side == "base" { 301_000 } else { 291_000 };
-            c.jemalloc =
-                json!({"nrequests": allocs, "bytes_requested": 100_000, "large_nrequests": 1});
-            cells.push(c);
-        }
-        let binaries = BTreeMap::from([
-            ("base".to_string(), PathBuf::from("/b")),
-            ("pr".to_string(), PathBuf::from("/h")),
-        ]);
-        let results = results_from_cells(&cells, 3, &binaries, "n");
-        assert_eq!(results.unit.as_deref(), Some(""));
-        assert_eq!(results.repeats, 3);
-        assert_eq!(results.note, "n");
-        assert_eq!(
-            results.order,
-            ["base-1", "pr-1", "pr-2", "base-2", "base-3", "pr-3"]
-        );
-        assert_eq!(results.base.runs.len(), 3);
-        assert_eq!(results.pr.runs.len(), 3);
-        assert!(close(
-            results.base.runs[0]["chat/allocation_calls_per_request"],
-            300.0
-        ));
-        assert!(close(
-            results.pr.runs[0]["chat/allocation_calls_per_request"],
-            290.0
-        ));
-        assert_eq!(results.base.binary, "/b");
-        let text = serde_json::to_string(&results).unwrap();
-        assert!(text.contains(r#""unit":"""#), "{text}");
-        assert!(text.contains(r#""filter":null"#), "{text}");
-    }
-
-    #[test]
-    fn outputs_are_written_and_a_warned_cell_fails_the_run() {
-        let dir = tempfile::tempdir().unwrap();
-        std::env::remove_var("GITHUB_STEP_SUMMARY");
-        let cells = vec![
-            idle_cell("base"),
-            idle_cell("pr"),
-            loaded_cell("base", "r1"),
-            loaded_cell("pr", "r1"),
-        ];
-        let results = results_from_cells(&cells, 1, &BTreeMap::new(), "");
-        let mut values: Vec<Value> = cells
-            .iter()
-            .map(|c| serde_json::to_value(c).unwrap())
-            .collect();
-        assert_eq!(
-            write_outputs(dir.path(), &values, &results, None, "setup").unwrap(),
-            0
-        );
-        assert!(dir.path().join("numbers.md").exists());
-        assert!(dir.path().join("results.json").exists());
-        assert!(dir.path().join("gate.md").exists());
-        assert!(dir.path().join("cells.json").exists());
-        values[3]["warnings"] = json!(["3 failed requests"]);
-        assert_eq!(
-            write_outputs(dir.path(), &values, &results, None, "setup").unwrap(),
-            2
-        );
-        let numbers = fs::read_to_string(dir.path().join("numbers.md")).unwrap();
-        assert!(
-            numbers.contains("chat: allocation calls per request"),
-            "{numbers}"
-        );
-        assert!(numbers.contains("1-minute load average"), "{numbers}");
-        let reread: Results =
-            serde_json::from_str(&fs::read_to_string(dir.path().join("results.json")).unwrap())
-                .unwrap();
-        assert_eq!(reread.base.runs.len(), 1);
-    }
-
-    #[test]
-    fn a_cell_whose_requests_the_drain_cut_off_warns_like_one_with_failed_requests() {
-        let measured = |summary: Value| Measured {
-            summary,
-            s0: Snapshot::default(),
-            s1: Snapshot::default(),
-            counters: BTreeMap::new(),
-            script: None,
-        };
-        let drain_warning = "2 requests cut off at the client's drain".to_string();
-        let mut cut = CellRecord::default();
-        fill_record(
-            &mut cut,
-            true,
-            &measured(json!({"sent": 10, "ok": 8, "failed": 0, "unfinished": 2})),
-            "",
-        );
-        assert_eq!(
-            (cut.sent, cut.ok, cut.failed, cut.unfinished),
-            (10, 8, 0, 2)
-        );
-        assert!(cut.warnings.contains(&drain_warning), "{:?}", cut.warnings);
-        let mut whole = CellRecord::default();
-        fill_record(
-            &mut whole,
-            true,
-            &measured(json!({"sent": 10, "ok": 10, "failed": 0, "unfinished": 0})),
-            "",
-        );
-        assert_eq!(whole.unfinished, 0);
-        assert!(
-            !whole.warnings.contains(&drain_warning),
-            "{:?}",
-            whole.warnings
-        );
-        let mut idle = CellRecord::default();
-        fill_record(&mut idle, false, &measured(json!({"unfinished": 2})), "");
-        assert!(
-            !idle.warnings.contains(&drain_warning),
-            "an idle cell sends nothing: {:?}",
-            idle.warnings
-        );
-    }
-
-    #[test]
-    fn mem_soak_record_warns_on_failed_requests_and_script_misses() {
-        let snap = |rss: u64| Snapshot {
-            status: BTreeMap::from([("VmRSS".to_string(), rss), ("VmHWM".to_string(), 2048)]),
-            ..Snapshot::default()
-        };
-        let rows = vec![
-            SoakRow {
-                after: "start".to_string(),
-                snap: snap(1024),
-            },
-            SoakRow {
-                after: "window 1".to_string(),
-                snap: snap(1024),
-            },
-            SoakRow {
-                after: "burst".to_string(),
-                snap: snap(1024),
-            },
-            SoakRow {
-                after: "10 s idle".to_string(),
-                snap: snap(1024),
-            },
-        ];
-        let counts = ScriptCounts {
-            hits: 18,
-            misses: 2,
-            unreadable: 1,
-            queued_left: None,
-        };
-        let summaries = [
-            json!({"sent": 10, "ok": 9, "failed": 1}),
-            json!({"sent": 10, "ok": 7, "failed": 2, "unfinished": 1}),
-        ];
-        let spec = crate::paths::path_named("stream").unwrap();
-        let measured = SoakMeasured {
-            rows,
-            summaries: summaries.to_vec(),
-            script: counts.clone(),
-        };
-        let record = soak_record("pr", spec, "r1", Path::new("/d"), measured, 1, 10).unwrap();
-        assert_eq!(record.sent, 20);
-        assert_eq!(record.failed, 3);
-        assert_eq!(record.unfinished, 1);
-        assert_eq!(record.script, counts);
-        assert_eq!(
-            record.warnings,
-            [
-                "3 failed requests",
-                "1 requests cut off at the client's drain",
-                "2 script misses (answers served by the engine simulator)",
-                "1 script counters unreadable (misses unknown)",
-            ]
-        );
-        assert_eq!(record.values["mem-stream/rss_mb_after_first_window"], 1.0);
-        assert_eq!(record.values["mem-stream/peak_rss_mb_after_burst"], 2.0);
-        assert_eq!(
-            record.values["mem-stream/rss_growth_mb_per_10k_requests"],
-            0.0
-        );
-        let value = serde_json::to_value(&record).unwrap();
-        assert_eq!(value["rows"][0]["after"], "start");
-        assert_eq!(value["rows"][0]["status"]["VmRSS"], 1024);
-        assert_eq!(value["unfinished"], 1);
-    }
-
-    #[test]
-    fn setup_text_names_the_cell_parameters() {
-        let cfg = BedConfig::new(Path::new("/bed.sh"), Path::new("/m"), Path::new("/l"), "/t");
-        let mut settings = Settings::new(Path::new("/out"), cfg, BTreeMap::new(), Vec::new());
-        assert_eq!(
-            setup_text(&settings, "cpu"),
-            "cpu: 10,000 requests per cell at the path's rate x 1, 64-word prompts, 4 scripted mock engines, 8 runtime threads"
-        );
-        settings.bed.gw_cores = "0-7".to_string();
-        settings.distinct = 128;
-        settings.rate_scale = 0.5;
-        assert_eq!(
-            setup_text(&settings, "alloc"),
-            "alloc: 10,000 requests per cell at the path's rate x 0.5, 64-word prompts, 128 distinct, 4 scripted mock engines, 8 runtime threads; gateway pinned to cores 0-7"
-        );
-        settings.bed.fleet = crate::bed::Fleet::PrefillDecode;
-        assert_eq!(
-            setup_text(&settings, "cpu"),
-            "cpu: 10,000 requests per cell at the path's rate x 0.5, 64-word prompts, 128 distinct, 1 prefill and 4 decode scripted mock engines on the prefill-decode path, 8 runtime threads; gateway pinned to cores 0-7"
-        );
-        settings.bed.fleet = crate::bed::Fleet::Http;
-        assert_eq!(
-            setup_text(&settings, "cpu"),
-            "cpu: 10,000 requests per cell at the path's rate x 0.5, 64-word prompts, 128 distinct, 4 scripted mock engines on the HTTP wire, 8 runtime threads; gateway pinned to cores 0-7"
-        );
-    }
-}
+#[path = "../tests/unit/cells/tests.rs"]
+pub(crate) mod tests;

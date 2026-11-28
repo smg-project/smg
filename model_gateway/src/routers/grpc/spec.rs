@@ -13,7 +13,7 @@ use std::sync::Arc;
 use llm_multimodal::registry::transcription::TranscriptionFamily;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{StreamOptions, StringOrArray, Tool, ToolChoice},
+    common::{ResponseFormat, StreamOptions, StringOrArray, Tool, ToolChoice},
     completion::CompletionRequest,
     generate::GenerateRequest,
     messages::{self, CreateMessageRequest},
@@ -34,12 +34,23 @@ pub(crate) enum ResponseSpec {
     Generate(GenerateResponseSpec),
     Completion(CompletionResponseSpec),
     Messages(Box<MessagesResponseSpec>),
-    /// Embedding/classify response processing needs only dispatch metadata.
-    Embedding,
+    /// Embedding response processing: the encoding the request asked for;
+    /// the rest is dispatch metadata.
+    Embedding(EmbeddingResponseSpec),
+    /// Classify response processing needs only dispatch metadata.
     Classify,
     Decisions(DecisionsResponseSpec),
     Harmony(HarmonyResponseSpec),
     Transcription(TranscriptionResponseSpec),
+}
+
+/// Response-phase contract for an embeddings request: whether the answer's
+/// vectors leave as the base64 of their little-endian f32 bytes
+/// (`encoding_format: "base64"`) or as float arrays, as read by request
+/// building where the request is at hand.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EmbeddingResponseSpec {
+    pub base64: bool,
 }
 
 #[derive(Clone)]
@@ -79,6 +90,8 @@ pub(crate) struct ChatResponseSpec {
     /// the client asked for ([`Wire::of`]): the stream's shape follows it.
     pub wire: Wire,
     pub separate_reasoning: bool,
+    /// Preserve JSON string data when a typed reasoning parser removes framing.
+    pub json_mode: bool,
     pub tool_choice: Option<ToolChoice>,
     /// The tools the response is read against, shared with the readers that
     /// type its calls (one per choice) rather than copied into each.
@@ -98,8 +111,19 @@ pub(crate) struct ChatResponseSpec {
     pub ignore_eos: bool,
     /// Fallback when preparation derived no override.
     pub skip_special_tokens: bool,
+    /// The rendered prompt a stream's first opening chunk carries, for a
+    /// request that asked for it (`return_prompt_text`): moved in by response
+    /// processing from `ResponseState::prompt_text` for the attempt that
+    /// answers, so no attempt's clone of the spec copies the text.
+    pub prompt_text: Option<String>,
     /// Rendered prompt tokens the provider does not bill; set by request building.
     pub unbilled_prompt_tokens: u32,
+    /// The image tokens the gateway's multimodal expansion wrote into the
+    /// prompt, summed over the request's images, reported as
+    /// `prompt_tokens_details.image_tokens`; set by request building from the
+    /// multimodal intermediate. `None` for a request without an image the
+    /// gateway processed (no media, or media a worker processes itself).
+    pub image_tokens: Option<u32>,
     /// Whether the prompt ends inside the model's thinking block, decided by
     /// request building from the rendered prompt.
     pub reasoning_in_prefill: bool,
@@ -127,7 +151,7 @@ pub(crate) fn scans_for_tool_calls_for(
     request: &ChatCompletionRequest,
     provider: ProviderProfile,
 ) -> bool {
-    request.declares_tools() || provider.parses_tool_calls_without_tools()
+    request.declares_tools_for(provider) || provider.parses_tool_calls_without_tools()
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
@@ -137,6 +161,17 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
 }
 
 impl ChatResponseSpec {
+    /// The spec's `json_mode` of `request`: a `json_object` or `json_schema`
+    /// response format holds the answer to JSON; a structural tag is free text
+    /// around its tags. The one rule the legacy chat path and the Symphony
+    /// path read (its `Asks::json_answer`).
+    pub(crate) fn json_mode_of(request: &ChatCompletionRequest) -> bool {
+        matches!(
+            request.response_format,
+            Some(ResponseFormat::JsonObject | ResponseFormat::JsonSchema { .. })
+        )
+    }
+
     /// The spec of `request` under `provider`, its model's profile as the
     /// request's preparation derived it once; `From` derives the profile for
     /// a request that carries none.
@@ -144,6 +179,7 @@ impl ChatResponseSpec {
         Self {
             wire: Wire::of(provider),
             separate_reasoning: request.separate_reasoning,
+            json_mode: Self::json_mode_of(request),
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
             // included: the request's own list shared, not copied (a new list
@@ -152,7 +188,8 @@ impl ChatResponseSpec {
             // (`ChatCompletionRequest::declares_tools`, the one answer every
             // gate reads) and the provider does not parse tool calls without
             // them (`scans_for_tool_calls_for`).
-            tools: scans_for_tool_calls_for(request, provider).then(|| request.shared_tool_list()),
+            tools: scans_for_tool_calls_for(request, provider)
+                .then(|| request.shared_tool_list_for(provider)),
             history_tool_calls_count: request.history_tool_calls_count(),
             stream_options: request.stream_options.clone(),
             first_tool_call_only: request.disables_parallel_tool_calls(),
@@ -164,7 +201,9 @@ impl ChatResponseSpec {
             no_stop_trim: request.no_stop_trim,
             ignore_eos: request.ignore_eos,
             skip_special_tokens: request.skip_special_tokens,
+            prompt_text: None,
             unbilled_prompt_tokens: 0,
+            image_tokens: None,
             reasoning_in_prefill: false,
             symphony: None,
             parser_names: None,
@@ -238,8 +277,54 @@ pub(crate) struct MessagesResponseSpec {
     pub parser_names: Option<Names>,
 }
 
+/// A Messages request's tools as the pipeline carries them: whether the
+/// request declared a `tools` field, and its custom tools as chat tools,
+/// converted once. The route takes them out of the request it still owns
+/// before the request is shared, so the schemas move instead of being copied
+/// per request; a reader with only a borrowed request converts by reference.
+#[derive(Clone)]
+pub(crate) struct MessagesTools {
+    pub declared: bool,
+    pub chat_tools: Arc<[Tool]>,
+}
+
+impl MessagesTools {
+    /// The tools taken out of `request`: its `tools` field reads `None` from
+    /// here on, and `declared` remembers that it was set.
+    pub(crate) fn take_from(request: &mut CreateMessageRequest) -> Self {
+        let tools = request.tools.take();
+        Self {
+            declared: tools.is_some(),
+            chat_tools: tools
+                .map(messages::into_chat_tools)
+                .unwrap_or_default()
+                .into(),
+        }
+    }
+}
+
+impl From<&CreateMessageRequest> for MessagesTools {
+    /// The tools of a request its caller keeps, converted by reference.
+    fn from(request: &CreateMessageRequest) -> Self {
+        Self {
+            declared: request.tools.is_some(),
+            chat_tools: request.chat_tools().into(),
+        }
+    }
+}
+
 impl From<&CreateMessageRequest> for MessagesResponseSpec {
     fn from(request: &CreateMessageRequest) -> Self {
+        Self::with_tools(request, None)
+    }
+}
+
+impl MessagesResponseSpec {
+    /// The spec of `request`, its tools handed in by the route that owned the
+    /// request (`tools`) or, when `None`, converted from the request by
+    /// reference.
+    pub(crate) fn with_tools(request: &CreateMessageRequest, tools: Option<MessagesTools>) -> Self {
+        let tools = tools.unwrap_or_else(|| MessagesTools::from(request));
         Self {
             thinking_requested: request.thinking_toggle().unwrap_or(false),
             thinking_text_returned: request
@@ -250,9 +335,9 @@ impl From<&CreateMessageRequest> for MessagesResponseSpec {
             max_tokens: request.max_tokens,
             context_window: None,
             tool_choice: request.tool_choice.clone(),
-            has_tools: request.tools.is_some(),
+            has_tools: tools.declared,
             history_tool_calls_count: request.history_tool_calls_count(),
-            chat_tools: request.chat_tools().into(),
+            chat_tools: tools.chat_tools,
             stop_sequences: request.stop_sequences.clone().map(StringOrArray::Array),
             symphony: None,
             first_tool_call_only: request.disables_parallel_tool_use(),
@@ -343,204 +428,5 @@ pub(crate) enum HarmonyResponseSpec {
 }
 
 #[cfg(test)]
-mod tests {
-    use serde_json::{json, Value};
-
-    use super::*;
-    use crate::routers::grpc::testing::tool;
-
-    fn chat_request(value: Value) -> ChatCompletionRequest {
-        serde_json::from_value(value).expect("request deserializes")
-    }
-
-    fn tool_names(spec: &ChatResponseSpec) -> Vec<String> {
-        spec.tools
-            .iter()
-            .flat_map(|tools| tools.iter())
-            .map(|tool| tool.function.name.clone())
-            .collect()
-    }
-
-    #[test]
-    fn chat_spec_tools_include_dynamic_tools() {
-        let request = chat_request(json!({
-            "model": "kimi-k3",
-            "messages": [
-                {"role": "system", "content": "", "tools": [tool("get_weather")]},
-                {"role": "user", "content": "what is the weather in beijing?"}
-            ],
-            "tool_choice": "required"
-        }));
-
-        let spec = ChatResponseSpec::from(&request);
-
-        assert_eq!(tool_names(&spec), ["get_weather"]);
-    }
-
-    /// The point of sharing: with request tools and no message-declared tool,
-    /// the spec holds the request's own list, not a copy of it.
-    #[test]
-    fn chat_spec_shares_the_request_s_tool_list() {
-        let request = chat_request(json!({
-            "model": "kimi-k3",
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [tool("get_weather")]
-        }));
-
-        let spec = ChatResponseSpec::from(&request);
-
-        assert!(Arc::ptr_eq(
-            request.tools.as_ref().expect("the request's tools"),
-            spec.tools.as_ref().expect("the spec's tools")
-        ));
-    }
-
-    #[test]
-    fn chat_spec_tools_keep_request_tools_first() {
-        let request = chat_request(json!({
-            "model": "kimi-k3",
-            "messages": [
-                {"role": "system", "content": "", "tools": [tool("dynamic_a")]},
-                {"role": "user", "content": "hi"},
-                {"role": "developer", "content": "", "tools": [tool("dynamic_b")]}
-            ],
-            "tools": [tool("global")]
-        }));
-
-        let spec = ChatResponseSpec::from(&request);
-
-        assert_eq!(tool_names(&spec), ["global", "dynamic_a", "dynamic_b"]);
-    }
-
-    #[test]
-    fn chat_spec_tools_follow_an_empty_request_list_beside_a_message_declaration() {
-        // The empty request-level list is a declaration (the normalizer answers
-        // it with `tool_choice: none`, which switches the calls off); the
-        // message's tool is the set.
-        let request = chat_request(json!({
-            "model": "kimi-k3",
-            "messages": [
-                {"role": "system", "content": "", "tools": [tool("get_weather")]},
-                {"role": "user", "content": "hi"}
-            ],
-            "tools": []
-        }));
-
-        assert_eq!(
-            tool_names(&ChatResponseSpec::from(&request)),
-            ["get_weather"]
-        );
-    }
-
-    #[test]
-    fn chat_spec_tools_none_for_a_message_declaration_the_profile_does_not_read() {
-        let request = chat_request(json!({
-            "model": "self-hosted-model",
-            "messages": [
-                {"role": "system", "content": "", "tools": [tool("get_weather")]},
-                {"role": "user", "content": "hi"}
-            ]
-        }));
-
-        assert!(ChatResponseSpec::from(&request).tools.is_none());
-    }
-
-    #[test]
-    fn chat_spec_tools_none_without_any_declaration() {
-        let request = chat_request(json!({
-            "model": "kimi-k3",
-            "messages": [{"role": "user", "content": "hi"}]
-        }));
-
-        assert!(ChatResponseSpec::from(&request).tools.is_none());
-    }
-
-    /// The wire follows the profile of the requested model, which the
-    /// stream's shape then reads off the spec.
-    #[test]
-    fn chat_spec_wire_follows_the_requested_model() {
-        for (model, wire) in [
-            ("MiniMax-M3", Wire::Minimax),
-            ("deepseek-flash", Wire::DeepSeek),
-            ("gpt-4o", Wire::OpenAi),
-            ("self-hosted-model", Wire::OpenAi),
-        ] {
-            let request = chat_request(json!({
-                "model": model,
-                "messages": [{"role": "user", "content": "hi"}]
-            }));
-
-            assert_eq!(ChatResponseSpec::from(&request).wire, wire, "{model}");
-        }
-    }
-
-    #[test]
-    fn chat_spec_scans_minimax_responses_for_tool_calls_without_tools() {
-        let request = chat_request(json!({
-            "model": "MiniMax-M3",
-            "messages": [{"role": "user", "content": "try again"}]
-        }));
-
-        assert_eq!(
-            ChatResponseSpec::from(&request).tools.as_deref(),
-            Some(&[][..])
-        );
-    }
-
-    /// The Messages spec carries the request's budget; the window waits for
-    /// request building.
-    #[test]
-    fn messages_spec_takes_the_budget_from_the_request() {
-        let request: CreateMessageRequest = serde_json::from_value(json!({
-            "model": "m", "max_tokens": 64,
-            "messages": [{"role": "user", "content": "hi"}]
-        }))
-        .expect("request deserializes");
-
-        let spec = MessagesResponseSpec::from(&request);
-
-        assert_eq!(spec.max_tokens, 64);
-        assert_eq!(spec.context_window, None);
-    }
-
-    /// An engine `length` finish is `max_tokens` when the budget was used
-    /// whole and `model_context_window_exceeded` when the generation stopped
-    /// short of it or the prompt and the output together filled the window.
-    #[test]
-    fn a_length_finish_reads_the_budget_against_the_window() {
-        use messages::StopReason::{MaxTokens, ModelContextWindowExceeded};
-
-        let mut spec = MessagesResponseSpec::from(
-            &serde_json::from_value::<CreateMessageRequest>(json!({
-                "model": "m", "max_tokens": 64,
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .expect("request deserializes"),
-        );
-        spec.prompt_tokens = 100;
-
-        // No window known: the budget alone decides.
-        assert_eq!(spec.length_stop_reason(100, 64), MaxTokens);
-        assert_eq!(spec.length_stop_reason(100, 3), ModelContextWindowExceeded);
-        assert_eq!(spec.length_stop_reason(100, 0), ModelContextWindowExceeded);
-
-        // A window the whole budget stays inside: still the budget.
-        spec.context_window = Some(165);
-        assert_eq!(spec.length_stop_reason(100, 64), MaxTokens);
-        // The prompt and the output together reach the window.
-        spec.context_window = Some(164);
-        assert_eq!(spec.length_stop_reason(100, 64), ModelContextWindowExceeded);
-        // Short of the budget, whatever the window.
-        assert_eq!(spec.length_stop_reason(100, 3), ModelContextWindowExceeded);
-        // The engine's count decides, not the rendered one the spec carries:
-        // media expanded on the worker fills the window the spec would miss.
-        spec.context_window = Some(170);
-        assert_eq!(spec.length_stop_reason(100, 64), MaxTokens);
-        assert_eq!(spec.length_stop_reason(110, 64), ModelContextWindowExceeded);
-        // A synthetic count never overflows the sum.
-        assert_eq!(
-            spec.length_stop_reason(u32::MAX, 64),
-            ModelContextWindowExceeded
-        );
-    }
-}
+#[path = "../../../tests/unit/routers/grpc/spec/tests.rs"]
+mod tests;

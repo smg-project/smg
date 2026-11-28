@@ -54,8 +54,8 @@ mod prefix_hash_tests {
             .model_id()
             .to_string();
         assert!(
-            registry.get_hash_ring(&model_id).is_some(),
-            "the ring for {model_id} has to exist for the policy to hash onto it"
+            !registry.get_by_model(&model_id).is_empty(),
+            "{model_id} has to have workers for the policy to hash onto their ring"
         );
 
         (ctx, recorders, model_id)

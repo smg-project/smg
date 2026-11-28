@@ -20,7 +20,7 @@ import time
 from abc import ABC, abstractmethod
 
 from smg.launch_router import launch_router
-from smg.router_args import RouterArgs
+from smg.router_args import RouterArgs, _policy_name
 
 logger = logging.getLogger("smg.serve")
 
@@ -390,10 +390,11 @@ class VllmWorkerLauncher(WorkerLauncher):
 
         SMG (the router) binds the tcp handshake + ipc data-plane sockets it
         derives from the ipc:// worker URL; the engines connect in. An
-        engine-level ``--data-parallel-size N`` (after ``--``) launches a
-        grouped worker: N engines on one socket set, balanced by the
-        connector. The default stays one standalone engine per worker;
-        running several workers is dense data parallelism.
+        engine-level ``--data-parallel-size N`` (after ``--``) launches an
+        engine group: N engines on one socket set, which the router, given
+        their count, registers as one worker per engine. The default stays
+        one standalone engine per worker; running several workers is dense
+        data parallelism.
         """
         engine_dp = _backend_arg_int(backend_args, "--data-parallel-size", 1)
         rpc_port = _zmq_handshake_port(_zmq_ipc_url(port))
@@ -452,10 +453,11 @@ class TokenspeedWorkerLauncher(WorkerLauncher):
 
         SMG (the router) binds the tcp handshake + ipc data-plane sockets it
         derives from the ipc:// worker URL; the engines connect in. An
-        engine-level ``--data-parallel-size N`` (after ``--``) launches a
-        grouped worker: N ranks on one socket set, each dialing with its own
-        identity (``--zmq-engine-index`` is the group's base). The default
-        stays one standalone engine per worker.
+        engine-level ``--data-parallel-size N`` (after ``--``) launches an
+        engine group: N ranks on one socket set, each dialing with its own
+        identity (``--zmq-engine-index`` is the group's base), which the
+        router, given their count, registers as one worker per rank. The
+        default stays one standalone engine per worker.
 
         Two ports are the launcher's to own, or co-located workers collide:
 
@@ -1122,11 +1124,12 @@ class ServeOrchestrator:
                     self.args.data_parallel_size,
                 )
                 router_args.disable_circuit_breaker = True
-            # A single backend has nothing to balance across, so force the
-            # passthrough policy (overriding any --policy). It keeps no KV
-            # index; the worker's load is read as under any policy (polled, or
-            # streamed by a servicer that pushes its records).
-            if router_args.policy != "passthrough":
+            # A single backend has nothing to balance across. Without a
+            # policy document, force passthrough so it keeps no KV index.
+            if (
+                getattr(router_args, "policy_spec", None) is None
+                and _policy_name(router_args.policy) != "passthrough"
+            ):
                 logger.info(
                     "dp=%d: forcing router policy to passthrough (single backend; no KV index)",
                     self.args.data_parallel_size,

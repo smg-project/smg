@@ -16,19 +16,30 @@ use super::{
     execution::{scope as parallel_scope, task_count},
     scratch,
 };
+use crate::buffer_pool;
 pub use crate::error::TransformError;
 
-pub type Result<T> = std::result::Result<T, TransformError>;
+pub(crate) type Result<T> = std::result::Result<T, TransformError>;
 
 /// Extract RGB pixel data from a DynamicImage, avoiding a copy when already RGB8.
 /// Returns (width, height, raw_bytes) where raw_bytes is interleaved R,G,B,R,G,B,...
+/// and exactly `3 * width * height` long: an RGB8 image's container may be
+/// longer than its pixels (`ImageBuffer::from_raw` takes any that is long
+/// enough), and the bytes behind them are not the image. An 8-bit grey
+/// image's levels are written three times each: the bytes of the image
+/// library's conversion without the colour cast it runs on every sample.
 pub fn rgb_bytes(image: &DynamicImage) -> (usize, usize, std::borrow::Cow<'_, [u8]>) {
     match image {
-        DynamicImage::ImageRgb8(rgb) => (
-            rgb.width() as usize,
-            rgb.height() as usize,
-            std::borrow::Cow::Borrowed(rgb.as_raw()),
-        ),
+        DynamicImage::ImageRgb8(rgb) => {
+            let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+            (w, h, std::borrow::Cow::Borrowed(&rgb.as_raw()[..3 * w * h]))
+        }
+        DynamicImage::ImageLuma8(grey) => {
+            let (w, h) = (grey.width() as usize, grey.height() as usize);
+            let mut rgb = plain_buffer(3 * w * h);
+            spread_grey(&grey.as_raw()[..w * h], &mut rgb);
+            (w, h, std::borrow::Cow::Owned(rgb))
+        }
         _ => {
             let rgb = image.to_rgb8();
             let w = rgb.width() as usize;
@@ -77,23 +88,14 @@ impl Default for TransparentBgConfig {
 }
 
 impl TransparentBgConfig {
-    /// Background grey level for pixel `(x, y)`.
-    fn background_at(self, x: u32, y: u32) -> u8 {
+    /// The grey level of a flat background; `None` for the chessboard, whose
+    /// level depends on the pixel.
+    fn flat_level(self) -> Option<u8> {
         match self.pattern {
-            TransparentBgPattern::White => 255,
-            TransparentBgPattern::Black => 0,
-            TransparentBgPattern::Gray => 128,
-            TransparentBgPattern::Chessboard => {
-                // A square size of 0 would divide by zero here; the reference
-                // raises on the same input, so clamp instead of panicking.
-                let size = self.chessboard_square_size.max(1);
-                let gray_cell = u32::from(self.chessboard_square_on_top_left);
-                if (y / size + x / size) % 2 == gray_cell {
-                    self.chessboard_gray_value
-                } else {
-                    self.chessboard_white_value
-                }
-            }
+            TransparentBgPattern::White => Some(255),
+            TransparentBgPattern::Black => Some(0),
+            TransparentBgPattern::Gray => Some(128),
+            TransparentBgPattern::Chessboard => None,
         }
     }
 }
@@ -126,33 +128,80 @@ pub struct TransparentBg {
 /// reference's early return. Note that dropping alpha (what `to_rgb8` does on
 /// its own) is *not* equivalent: a fully transparent pixel usually stores RGB
 /// `(0,0,0)`, so it would read as solid black instead of as background.
-pub fn fill_transparent_bg(image: &DynamicImage, config: TransparentBgConfig) -> RgbImage {
+///
+/// The reference computes `a * img + (1 - a) * bg` in float32 with
+/// `a = alpha / 255`, then truncates. `a` depends on the pixel's alpha alone
+/// and `(1 - a) * bg` on the alpha and the background's level, so each is
+/// computed once per level, 256 values, and a pixel reads the two it needs.
+pub(crate) fn fill_transparent_bg(image: &DynamicImage, config: TransparentBgConfig) -> RgbImage {
     if !image.color().has_alpha() {
         return image.to_rgb8();
     }
 
-    let rgba = image.to_rgba8();
+    // An RGBA8 image is read where it is; another layout with alpha converts.
+    let converted;
+    let rgba = match image {
+        DynamicImage::ImageRgba8(rgba) => rgba,
+        other => {
+            converted = other.to_rgba8();
+            &converted
+        }
+    };
     let (width, height) = rgba.dimensions();
-    let mut out = Vec::with_capacity(width as usize * height as usize * 3);
+    let (w, h) = (width as usize, height as usize);
+    // A container may be longer than the image: the fill ends at the image's
+    // own pixels.
+    let pixels = &rgba.as_raw()[..4 * w * h];
+    // Filled run by run in the image's order; nothing is zeroed first.
+    let mut out: Vec<[u8; 3]> = Vec::with_capacity(w * h);
 
-    for (y, row) in rgba.as_raw().chunks_exact(width as usize * 4).enumerate() {
-        for (x, px) in row.as_chunks::<4>().0.iter().enumerate() {
-            let bg = f32::from(config.background_at(x as u32, y as u32));
-            let alpha = f32::from(px[3]) / 255.0;
-            let inv = 1.0 - alpha;
-            // numpy's `.astype(np.uint8)` truncates rather than rounds, and so
-            // does an `as` cast; keep them consistent.
-            out.push((alpha * f32::from(px[0]) + inv * bg) as u8);
-            out.push((alpha * f32::from(px[1]) + inv * bg) as u8);
-            out.push((alpha * f32::from(px[2]) + inv * bg) as u8);
+    let mut alpha = [0f32; 256];
+    for (a, level) in alpha.iter_mut().zip(0u8..=255) {
+        *a = f32::from(level) / 255.0;
+    }
+    let background_share = |level: u8| alpha.map(|a| (1.0 - a) * f32::from(level));
+    // numpy's `.astype(np.uint8)` truncates rather than rounds, and so does an
+    // `as` cast; keep them consistent.
+    let blend = |px: &[u8; 4], share: &[f32; 256]| {
+        let a = usize::from(px[3]);
+        [px[0], px[1], px[2]].map(|value| (alpha[a] * f32::from(value) + share[a]) as u8)
+    };
+
+    match config.flat_level() {
+        Some(level) => {
+            let share = background_share(level);
+            out.extend(pixels.as_chunks::<4>().0.iter().map(|px| blend(px, &share)));
+        }
+        None => {
+            // `bg[y, x] = gray if (y // size + x // size) % 2 == gray_cell
+            // else white`. A square size of 0 would divide by zero; the
+            // reference raises on the same input, so clamp instead of
+            // panicking. A row changes level only at a square's edge, so the
+            // level is found once per run of a square's width.
+            let size = config.chessboard_square_size.max(1) as usize;
+            let gray_cell = usize::from(config.chessboard_square_on_top_left);
+            let shares = [
+                background_share(config.chessboard_white_value),
+                background_share(config.chessboard_gray_value),
+            ];
+            // An image with no width has no rows, and a chunk of no bytes
+            // panics.
+            let stride = w.max(1);
+            for (y, row) in pixels.chunks_exact(4 * stride).enumerate() {
+                for (square, run) in row.chunks(4 * size).enumerate() {
+                    let share = &shares[usize::from((y / size + square) % 2 == gray_cell)];
+                    out.extend(run.as_chunks::<4>().0.iter().map(|px| blend(px, share)));
+                }
+            }
         }
     }
 
     #[expect(
         clippy::expect_used,
-        reason = "out holds exactly width*height*3 bytes by construction"
+        reason = "out holds exactly width*height pixels by construction"
     )]
-    RgbImage::from_raw(width, height, out).expect("buffer matches image dimensions")
+    RgbImage::from_raw(width, height, out.into_flattened())
+        .expect("buffer matches image dimensions")
 }
 
 /// Deinterleave interleaved RGB bytes into separate R, G, B f32 planes with
@@ -160,7 +209,7 @@ pub fn fill_transparent_bg(image: &DynamicImage, config: TransparentBgConfig) ->
 ///
 /// Processes 8 pixels at a time so the compiler can unroll and auto-vectorize
 /// the stride-3 gather pattern.
-pub fn deinterleave_rgb_to_planes(
+pub(crate) fn deinterleave_rgb_to_planes(
     rgb: &[u8],
     r_plane: &mut [f32],
     g_plane: &mut [f32],
@@ -286,6 +335,21 @@ fn deinterleave_contiguous_by_table(
     }
 }
 
+/// [`deinterleave_rgb_to_planes_by_table`] appended to `out`, on the caller's
+/// thread: the red, green and blue planes of `rgb` in that order, each plane
+/// taken from the bytes in a pass of its own. For a batch buffer that holds
+/// several images' planes one after another: every float is written once,
+/// with no tensor of the image's own, zero fill or copy in between. It stays
+/// on the caller's thread on purpose: banding a patch across the
+/// preprocessing pool measured more CPU a request under concurrent requests.
+pub(crate) fn extend_planes_by_table(out: &mut Vec<f32>, rgb: &[u8], table: &[[f32; 256]; 3]) {
+    let [red, green, blue] = table;
+    let (pixels, _) = rgb.as_chunks::<3>();
+    out.extend(pixels.iter().map(|pixel| red[usize::from(pixel[0])]));
+    out.extend(pixels.iter().map(|pixel| green[usize::from(pixel[1])]));
+    out.extend(pixels.iter().map(|pixel| blue[usize::from(pixel[2])]));
+}
+
 /// Build a [C, H, W] f32 tensor from interleaved RGB bytes with per-channel
 /// `scale` and `bias`: `output[c][i] = raw[i*3 + c] * scale[c] + bias[c]`.
 fn build_planar_tensor(
@@ -340,46 +404,57 @@ fn build_planar_tensor_by_table(
 /// the canvas is cropped at its right and bottom edges.
 pub fn paint_rgb_onto_planes(
     rgb: &[u8],
-    image: (usize, usize),
-    canvas: (usize, usize),
+    image_size: (usize, usize),
+    canvas_size: (usize, usize),
     scale: [f32; 3],
     bias: [f32; 3],
     planes: &mut [f32],
 ) {
-    paint_rows(rgb, image, canvas, bias, planes, |row, r, g, b| {
-        deinterleave_rgb_to_planes(row, r, g, b, scale, bias);
-    });
+    paint_onto_planes(
+        rgb,
+        image_size,
+        canvas_size,
+        bias,
+        planes,
+        |row, r, g, b| {
+            deinterleave_rgb_to_planes(row, r, g, b, scale, bias);
+        },
+    );
 }
 
-/// [`paint_rgb_onto_planes`] through a per-channel table: every painted byte
-/// maps through `table[c][byte]` and the canvas outside the image holds
-/// `table[c][0]`, what a zero byte of padding maps to under the same
-/// arithmetic.
-pub(crate) fn paint_rgb_onto_planes_by_table(
+/// [`paint_rgb_onto_planes`] through a per-channel table instead of a scale
+/// and a bias: every painted byte maps to `table[c][byte]`, and the margin
+/// holds the mapped black, `table[c][0]`.
+pub fn paint_rgb_onto_planes_by_table(
     rgb: &[u8],
-    image: (usize, usize),
-    canvas: (usize, usize),
+    image_size: (usize, usize),
+    canvas_size: (usize, usize),
     table: &[[f32; 256]; 3],
     planes: &mut [f32],
 ) {
-    let black = [table[0][0], table[1][0], table[2][0]];
-    paint_rows(rgb, image, canvas, black, planes, |row, r, g, b| {
-        deinterleave_rgb_to_planes_by_table(row, r, g, b, table);
-    });
+    let black = std::array::from_fn(|c| table[c][0]);
+    paint_onto_planes(
+        rgb,
+        image_size,
+        canvas_size,
+        black,
+        planes,
+        |row, r, g, b| {
+            deinterleave_rgb_to_planes_by_table(row, r, g, b, table);
+        },
+    );
 }
 
-/// The canvas fill and the row walk of the paints: `black` fills the canvas,
-/// then `paint_row` maps each image row's bytes onto its three plane slices.
-fn paint_rows<K>(
+/// The canvas of [`paint_rgb_onto_planes`]: `planes` filled with `black` per
+/// channel, then each painted row of `rgb` written by `deinterleave`.
+fn paint_onto_planes(
     rgb: &[u8],
     (image_w, image_h): (usize, usize),
     (canvas_w, canvas_h): (usize, usize),
     black: [f32; 3],
     planes: &mut [f32],
-    paint_row: K,
-) where
-    K: Fn(&[u8], &mut [f32], &mut [f32], &mut [f32]),
-{
+    deinterleave: impl Fn(&[u8], &mut [f32], &mut [f32], &mut [f32]),
+) {
     let canvas_pixels = canvas_w * canvas_h;
     debug_assert_eq!(planes.len(), 3 * canvas_pixels);
     debug_assert!(rgb.len() >= image_w * image_h * 3);
@@ -395,7 +470,7 @@ fn paint_rows<K>(
     for y in 0..painted_h {
         let src_row = &rgb[y * image_w * 3..(y * image_w + painted_w) * 3];
         let dst = y * canvas_w;
-        paint_row(
+        deinterleave(
             src_row,
             &mut r_plane[dst..dst + painted_w],
             &mut g_plane[dst..dst + painted_w],
@@ -419,7 +494,7 @@ pub fn to_tensor(image: &DynamicImage) -> Array3<f32> {
 /// keeps the table of its reference's fused rescale-and-normalize
 /// ([`PixelNorm::table_f32`](crate::encoder_inputs::PixelNorm::table_f32)),
 /// which no single multiply-add reproduces in the last bit.
-pub fn to_tensor_by_table(image: &DynamicImage, table: &[[f32; 256]; 3]) -> Array3<f32> {
+pub(crate) fn to_tensor_by_table(image: &DynamicImage, table: &[[f32; 256]; 3]) -> Array3<f32> {
     let (w, h, raw) = rgb_bytes(image);
     build_planar_tensor_by_table(&raw, w, h, table)
 }
@@ -464,20 +539,30 @@ pub fn normalize(tensor: &mut Array3<f32>, mean: &[f64; 3], std: &[f64; 3]) {
     }
 }
 
-/// Convert image to tensor and normalize in a single pass.
+/// Convert image to tensor and normalize in a single pass, in the fused
+/// arithmetic of the reference image processors (`BaseImageProcessorFast`
+/// with `do_rescale` and `do_normalize`): the mean and std scaled into byte
+/// units, then one subtraction and one division in `f32`, as [`PixelNorm`]
+/// does. A multiply-add by `1 / (255 * std)` differs in the last bit, which
+/// can move the value across a rounding tie when the engine casts to bf16.
 ///
-/// Fuses `to_tensor` (u8→f32 with /255) and `normalize` ((x-mean)/std)
-/// into one loop to avoid an extra pass over the data.
+/// [`PixelNorm`]: crate::encoder_inputs::PixelNorm
 pub fn to_tensor_and_normalize(
     image: &DynamicImage,
     mean: &[f64; 3],
     std: &[f64; 3],
 ) -> Array3<f32> {
     let (w, h, raw) = rgb_bytes(image);
-    // Fused: (pixel/255 - mean) / std = pixel * (1/(255*std)) - mean/std
-    let scale: [f32; 3] = std::array::from_fn(|c| 1.0 / (255.0 * std[c] as f32));
-    let bias: [f32; 3] = std::array::from_fn(|c| -(mean[c] as f32) / (std[c] as f32));
-    build_planar_tensor(&raw, w, h, scale, bias)
+    build_planar_tensor_by_table(&raw, w, h, &to_tensor_and_normalize_table(mean, std))
+}
+
+/// The per-channel table of [`to_tensor_and_normalize`]:
+/// `(byte - 255 * mean[c]) / (255 * std[c])` in `f32` for every byte.
+pub(crate) fn to_tensor_and_normalize_table(mean: &[f64; 3], std: &[f64; 3]) -> [[f32; 256]; 3] {
+    std::array::from_fn(|c| {
+        let (offset, divisor) = (mean[c] as f32 * 255.0, std[c] as f32 * 255.0);
+        std::array::from_fn(|byte| (byte as f32 - offset) / divisor)
+    })
 }
 
 /// Convert image to tensor and normalize in the steps of torchvision's
@@ -486,7 +571,7 @@ pub fn to_tensor_and_normalize(
 /// [`to_tensor_and_normalize`] differs from these three roundings in the
 /// last bit on about half of the byte values; a reference that composes the
 /// two transforms takes this one.
-pub fn to_tensor_then_normalize(
+pub(crate) fn to_tensor_then_normalize(
     image: &DynamicImage,
     mean: &[f64; 3],
     std: &[f64; 3],
@@ -505,20 +590,12 @@ pub(crate) fn to_tensor_then_normalize_table(mean: &[f64; 3], std: &[f64; 3]) ->
     })
 }
 
-/// Rescale tensor by a constant factor.
-///
-/// Used when `do_rescale=True` in HuggingFace configs (typically 1/255).
-pub fn rescale(tensor: &mut Array3<f32>, factor: f64) {
-    let factor = factor as f32;
-    tensor.mapv_inplace(|v| v * factor);
-}
-
 /// Python-compatible rounding (banker's rounding / round half to even).
 /// Matches Python's `round()` where 0.5 rounds to the nearest even number
 /// (`12.5 -> 12`, `13.5 -> 14`), unlike Rust's `f64::round()` which rounds
 /// half away from zero.
 #[inline]
-pub fn round_half_to_even(x: f64) -> f64 {
+pub(crate) fn round_half_to_even(x: f64) -> f64 {
     let rounded = x.round();
     // Check if we're exactly at a .5 case
     if (x - x.floor() - 0.5).abs() < 1e-9 {
@@ -553,10 +630,48 @@ fn to_fir_algorithm(filter: FilterType) -> ResizeAlg {
     clippy::slow_vector_initialization,
     reason = "the zero-filled `vec!` is the calloc this helper exists to avoid; see its doc comment"
 )]
-fn plain_buffer(len: usize) -> Vec<u8> {
+pub(crate) fn plain_buffer(len: usize) -> Vec<u8> {
     let mut buffer = Vec::with_capacity(len);
     buffer.resize(len, 0);
     buffer
+}
+
+/// Where a resample's buffers come from: fresh allocations for a caller
+/// whose result is kept or dropped by code that knows no pool, or the
+/// crate's pool ([`buffer_pool`]) for a caller that hands its resized bytes
+/// back there when it is done with them.
+#[derive(Clone, Copy)]
+enum Buffers {
+    Fresh,
+    Pooled,
+}
+
+impl Buffers {
+    /// `len` bytes for a pass that writes every one of them.
+    fn output(self, len: usize) -> Vec<u8> {
+        match self {
+            Self::Fresh => plain_buffer(len),
+            Self::Pooled => buffer_pool::take(len),
+        }
+    }
+
+    /// The empty buffer a band loop keeps its width-pass rows in: a fresh one
+    /// grows band by band; the pool's has room for `bound()` bytes, the most
+    /// a band holds, so it is taken once and never grows.
+    fn band(self, bound: impl FnOnce() -> usize) -> Vec<u8> {
+        match self {
+            Self::Fresh => Vec::new(),
+            // A refused reservation leaves the fresh buffer and its growth.
+            Self::Pooled => buffer_pool::take_empty(bound()).unwrap_or_default(),
+        }
+    }
+
+    /// A band loop's buffer when its rows are written.
+    fn release(self, band: Vec<u8>) {
+        if matches!(self, Self::Pooled) {
+            buffer_pool::recycle(band);
+        }
+    }
 }
 
 /// [`plain_buffer`] for a kernel that writes `f32` values.
@@ -682,7 +797,7 @@ pub(crate) fn resize_catmull_rom_rgb(src: &RgbImage, width: u32, height: u32) ->
 
 /// Resize borrowed interleaved RGB bytes without first materializing an
 /// `image::RgbImage` over an owned input buffer.
-pub fn resize_rgb_bytes(
+pub(crate) fn resize_rgb_bytes(
     data: &[u8],
     width: u32,
     height: u32,
@@ -736,8 +851,9 @@ fn fir_image_to_dynamic(
 //
 // The image processors whose reference resizes via `PIL.Image.resize(size,
 // BICUBIC)` on the uint8 image take this kernel; the ones whose reference is
-// torchvision-backed (the Qwen vision families, Gemma 4) take the `uint8`
-// resampler below, which differs only in how the taps are quantized. The SIMD
+// torchvision-backed (the Qwen vision families, Gemma 4, and Llama 4 with
+// the bilinear filter) take the `uint8` resampler below, which differs only
+// in how the taps are quantized. The SIMD
 // `fast_image_resize` path above is the same filter *family* (Catmull-Rom,
 // a=-0.5) but diverges bit-wise on non-integer ratios (support scaling +
 // fixed-point details), which the vision encoder amplifies into a large
@@ -1081,26 +1197,75 @@ fn pil_h_outputs<const C: usize>(row: &[u8], kernel: &FixedKernel, first: usize,
 /// loop; on an x86-64 processor that reports AVX2, the 16-bit multiply-add
 /// steps of [`avx2::h_band`] over the kernel's taps split for them; on one
 /// that reports AVX-512 VNNI and VBMI, the byte dot products of
-/// [`avx512::h_band`] over the taps' byte chunks, for an axis whose output
-/// groups fit its gather ([`GroupTaps`]).
+/// [`avx512::h_band`] over the taps' byte chunks, in the layout the axis
+/// takes ([`Avx512Taps`]).
 enum WidthPass {
     Portable,
     #[cfg(target_arch = "x86_64")]
     Avx2(SplitTaps),
     #[cfg(target_arch = "x86_64")]
-    Avx512(GroupTaps),
+    Avx512(Avx512Taps),
+}
+
+/// The layout [`avx512::h_band`] reads an axis's taps in: several outputs
+/// per vector through a gather ([`GroupTaps`]), or one output per vector
+/// ([`LongTaps`]) for an axis whose gather would carry
+/// [`LongTaps::GROUP_FLOOR`] outputs or fewer, or that no gather fits.
+#[cfg(target_arch = "x86_64")]
+enum Avx512Taps {
+    Groups(GroupTaps),
+    Long(LongTaps),
+}
+
+#[cfg(target_arch = "x86_64")]
+impl Avx512Taps {
+    fn new<const C: usize>(kernel: &FixedKernel) -> Self {
+        // A gather that would carry two outputs or fewer leaves most of its
+        // lanes empty: such an axis takes one output per vector.
+        match GroupTaps::new::<C>(kernel) {
+            Some(groups) if groups.outputs > LongTaps::GROUP_FLOOR => Self::Groups(groups),
+            _ => Self::Long(LongTaps::new::<C>(kernel)),
+        }
+    }
+}
+
+/// The vector width kernels' per-row scratch (the AVX2 arm's spread rows,
+/// the AVX-512 arm's row tails), owned by the pass's caller:
+/// a band loop sizes it once and every band reuses it, where a buffer per
+/// band was a zeroed allocation per band (and, past the sizes the allocator
+/// keeps cached pages for, one faulted in page by page: about 280 of them per
+/// 8k-class image). The kernels write the bytes their rows cover and zero the
+/// padding they read past them at the top of every band, so the scratch only
+/// keeps the allocation: nothing a kernel reads depends on what it held.
+#[derive(Default)]
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    expect(dead_code, reason = "the portable width kernel keeps no scratch")
+)]
+struct BandScratch {
+    bytes: Vec<u8>,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl BandScratch {
+    /// `len` bytes, zeroed when the length is new to this scratch.
+    fn bytes(&mut self, len: usize) -> &mut [u8] {
+        if self.bytes.len() != len {
+            self.bytes.clear();
+            self.bytes.resize(len, 0);
+        }
+        &mut self.bytes
+    }
 }
 
 impl WidthPass {
     #[cfg(target_arch = "x86_64")]
     fn new<const C: usize>(kernel: &FixedKernel) -> Self {
         if avx512::detected() {
-            if let Some(groups) = GroupTaps::new::<C>(kernel) {
-                return Self::Avx512(groups);
-            }
+            return Self::Avx512(Avx512Taps::new::<C>(kernel));
         }
         if std::arch::is_x86_feature_detected!("avx2") {
-            Self::Avx2(SplitTaps::new(kernel, 0, kernel.bounds.len(), 4))
+            Self::Avx2(SplitTaps::of_width::<C>(kernel))
         } else {
             Self::Portable
         }
@@ -1111,15 +1276,33 @@ impl WidthPass {
         Self::Portable
     }
 
+    /// Whether [`Self::new`] picks the AVX2 rows on this host, for a caller
+    /// that asks before it has a kernel.
+    fn runs_avx2_rows() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            !avx512::detected() && std::arch::is_x86_feature_detected!("avx2")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
     /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass;
     /// a vector arm detects its features and calls in one place, as the
-    /// crate's NEON kernels and the FMA pass keep them.
+    /// crate's NEON kernels and the FMA pass keep them, and works in the
+    /// caller's `scratch` (one per band loop, reused band after band).
     #[cfg_attr(
         target_arch = "x86_64",
         expect(
             unsafe_code,
             reason = "the target-feature function runs only after this function detected its features"
         )
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pass's scratch rides along so every band of a pass reuses it"
     )]
     fn rows<const C: usize>(
         &self,
@@ -1129,6 +1312,14 @@ impl WidthPass {
         out_w: usize,
         y0: usize,
         band: &mut [u8],
+        #[cfg_attr(
+            not(target_arch = "x86_64"),
+            expect(
+                unused_variables,
+                reason = "the portable width kernel keeps no scratch"
+            )
+        )]
+        scratch: &mut BandScratch,
     ) {
         match self {
             Self::Portable => pil_h_band::<C>(src, kernel, in_w, out_w, y0, band),
@@ -1140,17 +1331,17 @@ impl WidthPass {
                 // SAFETY: `is_x86_feature_detected!("avx2")` answered true just
                 // above, the only requirement of a `target_feature(enable =
                 // "avx2")` function.
-                unsafe { avx2::h_band::<C>(src, kernel, split, in_w, out_w, y0, band) }
+                unsafe { avx2::h_band::<C>(src, kernel, split, in_w, out_w, y0, band, scratch) }
             }
             #[cfg(target_arch = "x86_64")]
-            Self::Avx512(groups) => {
+            Self::Avx512(taps) => {
                 if !avx512::detected() {
                     return pil_h_band::<C>(src, kernel, in_w, out_w, y0, band);
                 }
                 // SAFETY: `avx512::detected()` answered true just above: the
                 // processor reports every feature the `target_feature`
                 // function enables, its only requirement.
-                unsafe { avx512::h_band::<C>(src, kernel, groups, in_w, out_w, y0, band) }
+                unsafe { avx512::h_band::<C>(src, kernel, taps, in_w, out_w, y0, band, scratch) }
             }
         }
     }
@@ -1185,18 +1376,139 @@ fn split_tap(tap: i32) -> (i16, i16) {
 /// `i32`, the pair a broadcast spreads for the multiply-add of adjacent
 /// lanes; `pairs` of them per output at `hi[x * pairs..]` and `lo[x *
 /// pairs..]`.
+///
+/// Where every tap of the outputs fits a 16-bit lane by itself (the taps
+/// PyTorch's `uint8` resampler scales to `int16`), the taps are `whole`:
+/// nothing is split, `lo` holds each pair as it is, `hi` stays empty and the
+/// windows are padded to a multiple of `whole_step`, so the arms take one
+/// multiply-add where the split takes two and no recombination.
+///
+/// Whole taps of a width pass over three- or four-channel pixels stand a
+/// second time in `wide`, as the vector that sums two outputs at once reads
+/// them: per two outputs `(2j, 2j + 1)` and per pair, eight lanes, the pair
+/// of the even output four times and the pair of the odd one four times (zero
+/// where the axis ends on an even output). Whole taps of every width pass
+/// stand with `fours`, where every four outputs read ([`four_starts`]).
 #[cfg(target_arch = "x86_64")]
 struct SplitTaps {
     hi: Vec<i32>,
     lo: Vec<i32>,
+    wide: Vec<i32>,
+    fours: Vec<FourStarts>,
     pairs: usize,
+    whole: bool,
+}
+
+/// Where four consecutive outputs of a width pass read a row: the first byte
+/// of the first output's window, and how many bytes behind it the windows of
+/// the other three begin. With the distances a byte each, one bounds test
+/// of `base + NEAR_STEPS + reach` covers the reads of all four.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FourStarts {
+    base: u32,
+    steps: [u8; 3],
+}
+
+/// The longest distance [`FourStarts`] holds.
+#[cfg(target_arch = "x86_64")]
+const NEAR_STEPS: usize = u8::MAX as usize;
+
+/// [`FourStarts`] of every whole four of the outputs of `bounds` over
+/// `C`-channel pixels. Empty where one window begins before its four's
+/// first or more than [`NEAR_STEPS`] bytes behind it (three channels: a
+/// downscale past twenty-eight to one), or where a row passes `u32`: the
+/// kernel then tests every window by itself.
+#[cfg(target_arch = "x86_64")]
+fn four_starts<const C: usize>(bounds: &[(usize, usize)]) -> Vec<FourStarts> {
+    let fours = bounds.as_chunks::<4>().0;
+    // One allocation of the table's length: a collect through `Option`
+    // knows no length and grows the table call by call.
+    let mut starts = Vec::with_capacity(fours.len());
+    for four in fours {
+        let Some(start) = four_start::<C>(four) else {
+            return Vec::new();
+        };
+        starts.push(start);
+    }
+    starts
+}
+
+/// [`FourStarts`] of one four of windows, `None` where it holds none (see
+/// [`four_starts`]).
+#[cfg(target_arch = "x86_64")]
+fn four_start<const C: usize>(
+    &[(first, _), rest @ ..]: &[(usize, usize); 4],
+) -> Option<FourStarts> {
+    let mut steps = [0_u8; 3];
+    for (step, (x0, _)) in steps.iter_mut().zip(rest) {
+        *step = u8::try_from(x0.checked_sub(first)? * C).ok()?;
+    }
+    Some(FourStarts {
+        base: u32::try_from(first * C).ok()?,
+        steps,
+    })
 }
 
 #[cfg(target_arch = "x86_64")]
 impl SplitTaps {
-    fn new(kernel: &FixedKernel, first: usize, count: usize, step: usize) -> Self {
+    /// The taps of every output of a width pass over `C`-channel pixels:
+    /// four taps a step, sixteen for whole taps over one channel (a step of
+    /// [`avx2::h_whole_levels`]).
+    fn of_width<const C: usize>(kernel: &FixedKernel) -> Self {
+        let whole_step = if C == 1 { 16 } else { 4 };
+        let mut split = Self::new(kernel, 0, kernel.bounds.len(), 4, whole_step);
+        if split.whole && C != 1 {
+            let pairs = split.pairs;
+            // One allocation of the table's length (eight lanes a pair for
+            // every two outputs): a collect of the nested iterator knows no
+            // length and grows the table call by call.
+            let mut wide = Vec::with_capacity(kernel.bounds.len().div_ceil(2) * pairs * 8);
+            wide.extend(split.lo.chunks(2 * pairs).flat_map(|two| {
+                let (even, odd) = two.split_at(pairs);
+                even.iter().enumerate().flat_map(move |(pair, &a)| {
+                    let b = odd.get(pair).copied().unwrap_or(0);
+                    [a, a, a, a, b, b, b, b]
+                })
+            }));
+            split.wide = wide;
+        }
+        if split.whole {
+            split.fours = four_starts::<C>(&kernel.bounds);
+        }
+        split
+    }
+
+    fn new(
+        kernel: &FixedKernel,
+        first: usize,
+        count: usize,
+        step: usize,
+        whole_step: usize,
+    ) -> Self {
         let outputs = &kernel.taps[first..first + count];
         let longest = outputs.iter().map(Vec::len).max().unwrap_or(0);
+        let whole = outputs
+            .iter()
+            .flatten()
+            .all(|&tap| i16::try_from(tap).is_ok());
+        if whole {
+            let pairs = longest.max(1).next_multiple_of(whole_step) / 2;
+            let mut lo = vec![0_i32; count * pairs];
+            for (lo, taps) in lo.chunks_exact_mut(pairs).zip(outputs) {
+                for (lo, pair) in lo.iter_mut().zip(taps.chunks(2)) {
+                    *lo = lane_pair(pair[0] as i16, pair.get(1).map_or(0, |&tap| tap as i16));
+                }
+            }
+            return Self {
+                hi: Vec::new(),
+                lo,
+                wide: Vec::new(),
+                fours: Vec::new(),
+                pairs,
+                whole,
+            };
+        }
         let pairs = longest.max(1).next_multiple_of(step) / 2;
         let mut hi = vec![0_i32; count * pairs];
         let mut lo = vec![0_i32; count * pairs];
@@ -1212,7 +1524,14 @@ impl SplitTaps {
                 *lo = lane_pair(lo0, lo1);
             }
         }
-        Self { hi, lo, pairs }
+        Self {
+            hi,
+            lo,
+            wide: Vec::new(),
+            fours: Vec::new(),
+            pairs,
+            whole,
+        }
     }
 }
 
@@ -1254,20 +1573,22 @@ fn tap_chunks(tap: i32) -> [i8; 3] {
 }
 
 /// The taps of one axis as the AVX-512 width pass reads them: the outputs in
-/// groups of `outputs` (five for three channels, four for four, fewer when
+/// groups of `outputs` (16, 5, 4 for one, three, four channels, fewer when
 /// the windows of a group would not fit one gather), the sixteen 32-bit
 /// lanes of a vector being the group's outputs' channels. Per group, 64
 /// bytes of gather indices (for every lane, the four consecutive source
 /// pixels of its channel relative to the group's first window start, taken
 /// four taps at a time from a 128-byte window that moves four pixels per
-/// step), then per step of four taps three 64-byte blocks, one per chunk
-/// level, in the lanes' layout (a lane's four bytes: its output's four
+/// step), then per step of four taps one 64-byte block per chunk level the
+/// kernel needs ([`chunk_levels`]), in the lanes' layout (a lane's four bytes: its output's four
 /// taps' chunks of that level), zero where a window ends or a lane has no
 /// output.
 #[cfg(target_arch = "x86_64")]
 struct GroupTaps {
     outputs: usize,
-    /// Bytes per group in `table`: the indices plus three blocks per step.
+    /// Chunk levels the table carries per step ([`chunk_levels`]).
+    levels: usize,
+    /// Bytes per group in `table`: the indices plus `levels` blocks per step.
     stride: usize,
     table: Vec<u8>,
     /// Steps of four taps per group (the group's longest window).
@@ -1276,6 +1597,11 @@ struct GroupTaps {
     /// the windows of the row's last groups: a gather of 128 bytes from the
     /// last step's start.
     tail: usize,
+    /// Every group's windows end inside the first 64 bytes of its gather
+    /// (`(span + 4) * C <= 64`, a downscale up to about 4.3 at three
+    /// channels): the pass then loads one vector per step and row and
+    /// permutes that one source.
+    narrow: bool,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1284,8 +1610,8 @@ impl GroupTaps {
     const WINDOW: usize = 128;
 
     /// `None` when even pairs of outputs spread over more than one window
-    /// (a downscale by more than about thirty), the arm's limit; the axis
-    /// then takes the split-tap arm.
+    /// (a downscale by more than about thirty, about 124 at one channel),
+    /// the arm's limit; the axis then takes the split-tap arm.
     fn new<const C: usize>(kernel: &FixedKernel) -> Option<Self> {
         let count = kernel.bounds.len();
         let longest = kernel.taps.iter().map(Vec::len).max().unwrap_or(0).max(1);
@@ -1296,8 +1622,13 @@ impl GroupTaps {
                 (span + 4) * C <= Self::WINDOW
             })
         })?;
+        let narrow = kernel.bounds.chunks(outputs).all(|group| {
+            let span = group[group.len() - 1].0 - group[0].0;
+            (span + 4) * C <= 64
+        });
         let groups = count.div_ceil(outputs);
-        let stride = 64 * (1 + 3 * most_steps);
+        let levels = chunk_levels(kernel);
+        let stride = 64 * (1 + levels * most_steps);
         let mut table = vec![0_u8; groups * stride];
         let mut steps = Vec::with_capacity(groups);
         for ((g, group), block) in kernel
@@ -1318,8 +1649,8 @@ impl GroupTaps {
                     }
                 }
                 for (k, &tap) in kernel.taps[g * outputs + o].iter().enumerate() {
-                    for (level, chunk) in tap_chunks(tap).into_iter().enumerate() {
-                        let block = &mut blocks[64 * (3 * (k / 4) + level)..][..64];
+                    for (level, chunk) in tap_chunks(tap).into_iter().take(levels).enumerate() {
+                        let block = &mut blocks[64 * (levels * (k / 4) + level)..][..64];
                         for c in 0..C {
                             block[4 * (o * C + c) + k % 4] = chunk as u8;
                         }
@@ -1330,11 +1661,87 @@ impl GroupTaps {
         }
         Some(Self {
             outputs,
+            levels,
             stride,
             table,
             steps,
             tail: Self::WINDOW + 4 * C * most_steps,
+            narrow,
         })
+    }
+}
+
+/// The chunk levels a kernel's taps need in the AVX-512 width pass: two when
+/// the top chunk of every tap is zero (a tap in `[-32896, 32639]`, which the
+/// 16-bit taps of the torch quantization are but for a largest weight in the
+/// last 128 values below 2^15), else all three. A level the pass leaves out
+/// is a dot product of zeros per step, so either count gives the same sums.
+#[cfg(any(target_arch = "x86_64", test))]
+fn chunk_levels(kernel: &FixedKernel) -> usize {
+    let two = kernel
+        .taps
+        .iter()
+        .flatten()
+        .all(|&tap| tap_chunks(tap)[2] == 0);
+    if two {
+        2
+    } else {
+        3
+    }
+}
+
+/// The taps of one axis as the AVX-512 width pass reads them where an
+/// output's window is long (a gather would carry two outputs or fewer, most
+/// of its lanes empty): one output per vector, sixteen taps per step. A
+/// step's 64 source bytes from its first tap are permuted into four 128-bit
+/// quarters, a quarter holding four consecutive pixels channel by channel
+/// (a 32-bit lane per channel, the lanes of the channels a pixel lacks
+/// reading zero taps), and the table holds per output and step one 64-byte
+/// block per chunk level in that layout, zero past the window's end.
+#[cfg(target_arch = "x86_64")]
+struct LongTaps {
+    /// Chunk levels the table carries per step ([`chunk_levels`]).
+    levels: usize,
+    /// Bytes per output in `table`: `levels` blocks per step.
+    stride: usize,
+    table: Vec<u8>,
+    /// Bytes of a row's end the pass copies behind zero padding, enough for
+    /// the row's last windows: every step of the longest and one load.
+    tail: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+impl LongTaps {
+    /// Taps one step sums: four pixels in each of a vector's four quarters.
+    const TAPS: usize = 16;
+    /// Bytes one step loads from its first tap.
+    const LOAD: usize = 64;
+    /// The outputs per gather at or below which the axis comes here.
+    const GROUP_FLOOR: usize = 2;
+
+    fn new<const C: usize>(kernel: &FixedKernel) -> Self {
+        let longest = kernel.taps.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        let most_steps = longest.div_ceil(Self::TAPS);
+        let levels = chunk_levels(kernel);
+        let stride = 64 * levels * most_steps;
+        let mut table = vec![0_u8; kernel.taps.len() * stride];
+        for (taps, blocks) in kernel.taps.iter().zip(table.chunks_exact_mut(stride)) {
+            for (k, &tap) in taps.iter().enumerate() {
+                let (step, quarter, at) = (k / Self::TAPS, k % Self::TAPS / 4, k % 4);
+                for (level, chunk) in tap_chunks(tap).into_iter().take(levels).enumerate() {
+                    let block = &mut blocks[64 * (levels * step + level)..][..64];
+                    for c in 0..C {
+                        block[16 * quarter + 4 * c + at] = chunk as u8;
+                    }
+                }
+            }
+        }
+        Self {
+            levels,
+            stride,
+            table,
+            tail: Self::LOAD + Self::TAPS * C * most_steps,
+        }
     }
 }
 
@@ -1461,7 +1868,7 @@ impl HeightPass {
                 if !std::arch::is_x86_feature_detected!("avx2") {
                     return pil_v_band(src, first_row, kernel, row_len, y0, band);
                 }
-                let split = SplitTaps::new(kernel, y0, band.len() / row_len, 2);
+                let split = SplitTaps::new(kernel, y0, band.len() / row_len, 2, 2);
                 // SAFETY: `is_x86_feature_detected!("avx2")` answered true just
                 // above, the only requirement of a `target_feature(enable =
                 // "avx2")` function.
@@ -1495,16 +1902,21 @@ mod avx2 {
         reason = "the vector loads and stores; every pointer is bounded by an exact-size chunk of a slice"
     )]
 
-    use std::arch::x86_64::{
-        __m128i, __m256i, _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepu8_epi16,
-        _mm256_extracti128_si256, _mm256_madd_epi16, _mm256_packs_epi32, _mm256_packus_epi16,
-        _mm256_permute4x64_epi64, _mm256_set1_epi32, _mm256_set_m128i, _mm256_setr_epi8,
-        _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_slli_epi32, _mm256_sra_epi32,
-        _mm256_storeu_si256, _mm256_unpackhi_epi16, _mm256_unpacklo_epi16, _mm_cvtsi128_si32,
-        _mm_cvtsi32_si128, _mm_loadu_si128, _mm_setr_epi8, _mm_shuffle_epi8, _mm_storeu_si128,
+    use std::{
+        arch::x86_64::{
+            __m128i, __m256i, _mm256_add_epi32, _mm256_castsi256_si128, _mm256_cvtepu8_epi16,
+            _mm256_extracti128_si256, _mm256_hadd_epi32, _mm256_madd_epi16, _mm256_packs_epi32,
+            _mm256_packus_epi16, _mm256_permute4x64_epi64, _mm256_permutevar8x32_epi32,
+            _mm256_set1_epi32, _mm256_set_m128i, _mm256_setr_epi32, _mm256_setr_epi8,
+            _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_slli_epi32, _mm256_sra_epi32,
+            _mm256_storeu_si256, _mm256_unpackhi_epi16, _mm256_unpacklo_epi16, _mm_add_epi32,
+            _mm_cvtsi128_si32, _mm_cvtsi32_si128, _mm_loadu_si128, _mm_setr_epi8,
+            _mm_shuffle_epi32, _mm_shuffle_epi8, _mm_storeu_si128,
+        },
+        ops::Range,
     };
 
-    use super::{FixedKernel, SplitTaps, SPLIT_LOW_BITS};
+    use super::{BandScratch, FixedKernel, SplitTaps, NEAR_STEPS, SPLIT_LOW_BITS};
 
     /// Pixels a scratch row carries past the source row: a window padded to
     /// a multiple of four taps reads at most three pixels past its last tap.
@@ -1520,6 +1932,10 @@ mod avx2 {
     /// lane, the high and the low halves of the taps into accumulators of
     /// their own. A band's odd last row runs alone in both halves.
     #[target_feature(enable = "avx2")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pass's scratch rides along so every band of a pass reuses it"
+    )]
     pub(super) fn h_band<const C: usize>(
         src: &[u8],
         kernel: &FixedKernel,
@@ -1528,12 +1944,21 @@ mod avx2 {
         out_w: usize,
         y0: usize,
         band: &mut [u8],
+        scratch: &mut BandScratch,
     ) {
+        if split.whole {
+            return h_whole_band::<C>(src, kernel, split, in_w, out_w, y0, band, scratch);
+        }
         let row_in = in_w * C;
         let row_out = out_w * C;
         let scratch_len = (in_w + PADDING_PIXELS) * 4;
-        let mut scratch = vec![0_u8; 2 * scratch_len];
+        let scratch = scratch.bytes(2 * scratch_len);
         let (first, second) = scratch.split_at_mut(scratch_len);
+        // The spread rows are read PADDING_PIXELS past their end as zeros;
+        // zero that padding here, so the kernel owes nothing to what the
+        // scratch held before this band.
+        first[in_w * 4..].fill(0);
+        second[in_w * 4..].fill(0);
         let mut pairs = band.chunks_exact_mut(2 * row_out);
         let mut y = y0;
         for pair in pairs.by_ref() {
@@ -1550,14 +1975,635 @@ mod avx2 {
         }
     }
 
+    /// The width pass over whole taps ([`SplitTaps`]): the rows are read where
+    /// they lie, no spread copy. An output reads `reach` bytes from its
+    /// window's first pixel (its padded taps, and for three channels the
+    /// four bytes a sixteen-byte load takes past its four pixels); the
+    /// outputs whose read would pass the row's end read a copy of the row's
+    /// last pixels with zeros behind it instead, the only bytes the scratch
+    /// holds. Two rows a step for three or four channels
+    /// ([`h_whole_outputs`]), one for one channel ([`h_whole_levels`]).
+    #[target_feature(enable = "avx2")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pass's scratch rides along so every band of a pass reuses it"
+    )]
+    fn h_whole_band<const C: usize>(
+        src: &[u8],
+        kernel: &FixedKernel,
+        split: &SplitTaps,
+        in_w: usize,
+        out_w: usize,
+        y0: usize,
+        band: &mut [u8],
+        scratch: &mut BandScratch,
+    ) {
+        let row_in = in_w * C;
+        let row_out = out_w * C;
+        let reach = if C == 1 {
+            2 * split.pairs
+        } else {
+            4 * C * (split.pairs / 2 - 1) + 16
+        };
+        // The first output whose read passes the row, and the first pixel
+        // any output from it on reads.
+        let safe = kernel
+            .bounds
+            .iter()
+            .position(|&(x0, _)| x0 * C + reach > row_in)
+            .unwrap_or(out_w);
+        // The outputs before it that go four at a time, a row by itself.
+        let fours = safe - safe % 4;
+        // The outputs of them whose fours read the row under one bounds
+        // test ([`h_whole_fours_of`]).
+        let near = 4 * split
+            .fours
+            .iter()
+            .take(fours / 4)
+            .take_while(|four| four.base as usize + NEAR_STEPS + reach <= row_in)
+            .count();
+        let tail_from = kernel.bounds[safe..]
+            .iter()
+            .map(|&(x0, _)| x0)
+            .min()
+            .unwrap_or(in_w);
+        let kept = (in_w - tail_from) * C;
+        let tail_len = kept + reach;
+        let tails = scratch.bytes(2 * tail_len);
+        let (tail_a, tail_b) = tails.split_at_mut(tail_len);
+        // The zeros behind the copied pixels, so the kernel owes nothing to
+        // what the scratch held before this band.
+        tail_a[kept..].fill(0);
+        tail_b[kept..].fill(0);
+        let rows = if C == 1 { 1 } else { 2 };
+        let mut steps = band.chunks_exact_mut(rows * row_out);
+        let mut y = y0;
+        for step in steps.by_ref() {
+            let row_a = &src[y * row_in..(y + 1) * row_in];
+            tail_a[..kept].copy_from_slice(&row_a[tail_from * C..]);
+            if C == 1 {
+                let done = h_near_levels(row_a, near, kernel, split, step);
+                h_whole_levels(row_a, 0, done..safe, kernel, split, step);
+                h_whole_levels(tail_a, tail_from, safe..out_w, kernel, split, step);
+            } else {
+                let row_b = &src[(y + 1) * row_in..(y + 2) * row_in];
+                tail_b[..kept].copy_from_slice(&row_b[tail_from * C..]);
+                let (out_a, out_b) = step.split_at_mut(row_out);
+                h_whole_fours::<C>(row_a, 0..fours, near, kernel, split, out_a);
+                h_whole_fours::<C>(row_b, 0..fours, near, kernel, split, out_b);
+                h_whole_outputs::<C>(
+                    row_a,
+                    row_b,
+                    0,
+                    fours..safe,
+                    kernel,
+                    split,
+                    out_a,
+                    Some(out_b),
+                );
+                h_whole_outputs::<C>(
+                    tail_a,
+                    tail_b,
+                    tail_from * C,
+                    safe..out_w,
+                    kernel,
+                    split,
+                    out_a,
+                    Some(out_b),
+                );
+            }
+            y += rows;
+        }
+        let rest = steps.into_remainder();
+        if !rest.is_empty() {
+            let row_a = &src[y * row_in..(y + 1) * row_in];
+            tail_a[..kept].copy_from_slice(&row_a[tail_from * C..]);
+            h_whole_fours::<C>(row_a, 0..fours, near, kernel, split, rest);
+            h_whole_outputs::<C>(row_a, row_a, 0, fours..safe, kernel, split, rest, None);
+            h_whole_outputs::<C>(
+                tail_a,
+                tail_a,
+                tail_from * C,
+                safe..out_w,
+                kernel,
+                split,
+                rest,
+                None,
+            );
+        }
+    }
+
+    /// The byte shuffle that pairs pixels `2 * pair` and `2 * pair + 1` of a
+    /// sixteen-byte load of `C`-channel pixels channel by channel as 16-bit
+    /// lanes, the same in both 128-bit halves; `-1` zero-fills a lane's high
+    /// byte and the lanes of the channel three-channel pixels lack.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn paired<const C: usize>(pair: usize) -> __m256i {
+        let mut b = [-1_i8; 16];
+        for channel in 0..C {
+            b[4 * channel] = (2 * pair * C + channel) as i8;
+            b[4 * channel + 2] = ((2 * pair + 1) * C + channel) as i8;
+        }
+        let half = _mm_setr_epi8(
+            b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13],
+            b[14], b[15],
+        );
+        _mm256_set_m128i(half, half)
+    }
+
+    /// Outputs `outputs` of two rows of three- or four-channel pixels over
+    /// whole taps, into `out_a` and, when given, `out_b`: `row_a` and `row_b`
+    /// hold the rows' bytes from byte `origin` on. Every four source pixels
+    /// of the two rows load as one vector (a row per 128-bit half), two
+    /// shuffles pair the bytes of pixels (0, 1) and (2, 3) channel by
+    /// channel, and one multiply-add per pair against the taps `(t0, t1)`
+    /// and `(t2, t3)` sums them, each pair into an accumulator of its own.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "two rows, their outputs and the kernel's two forms of its taps"
+    )]
+    fn h_whole_outputs<const C: usize>(
+        row_a: &[u8],
+        row_b: &[u8],
+        origin: usize,
+        outputs: Range<usize>,
+        kernel: &FixedKernel,
+        split: &SplitTaps,
+        out_a: &mut [u8],
+        mut out_b: Option<&mut [u8]>,
+    ) {
+        let (first, second) = (paired::<C>(0), paired::<C>(1));
+        let half = _mm256_set1_epi32(kernel.half());
+        let shift = _mm_cvtsi32_si128(kernel.precision as i32);
+        let zero = _mm256_setzero_si256();
+        let reach = 4 * C * (split.pairs / 2 - 1) + 16;
+        for x in outputs {
+            let at = kernel.bounds[x].0 * C - origin;
+            let (window_a, window_b) = (&row_a[at..at + reach], &row_b[at..at + reach]);
+            let taps = &split.lo[x * split.pairs..(x + 1) * split.pairs];
+            let (mut sum01, mut sum23) = (half, zero);
+            for (group, pair) in taps.as_chunks::<2>().0.iter().enumerate() {
+                let (Some(a), Some(b)) = (
+                    window_a[group * 4 * C..].first_chunk::<16>(),
+                    window_b[group * 4 * C..].first_chunk::<16>(),
+                ) else {
+                    break;
+                };
+                let pixels = _mm256_set_m128i(load16(b), load16(a));
+                sum01 = _mm256_add_epi32(
+                    sum01,
+                    _mm256_madd_epi16(
+                        _mm256_shuffle_epi8(pixels, first),
+                        _mm256_set1_epi32(pair[0]),
+                    ),
+                );
+                sum23 = _mm256_add_epi32(
+                    sum23,
+                    _mm256_madd_epi16(
+                        _mm256_shuffle_epi8(pixels, second),
+                        _mm256_set1_epi32(pair[1]),
+                    ),
+                );
+            }
+            let shifted = _mm256_sra_epi32(_mm256_add_epi32(sum01, sum23), shift);
+            // Both packs saturate, as in `h_outputs`; each half's pixel sits
+            // in its low four bytes.
+            let bytes = _mm256_packus_epi16(_mm256_packs_epi32(shifted, shifted), zero);
+            store::<C>(
+                out_a,
+                x,
+                _mm_cvtsi128_si32(_mm256_castsi256_si128(bytes)).to_le_bytes(),
+            );
+            if let Some(out_b) = out_b.as_deref_mut() {
+                store::<C>(
+                    out_b,
+                    x,
+                    _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(bytes)).to_le_bytes(),
+                );
+            }
+        }
+    }
+
+    /// Outputs `outputs` (from an even output, four at a time) of one row of
+    /// three- or four-channel pixels over whole taps, into `out`. A vector
+    /// sums two outputs, one per 128-bit half, against their taps as
+    /// [`SplitTaps`] lays them `wide`; the sums of four outputs then take
+    /// one shift, one pack and one store between them
+    /// ([`h_whole_fours_of`]). A window of up to six groups of four taps
+    /// (what a downscale by up to twelve takes under the bilinear filter)
+    /// runs in the form built for its length; a longer one loops.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn h_whole_fours<const C: usize>(
+        row: &[u8],
+        outputs: Range<usize>,
+        near: usize,
+        kernel: &FixedKernel,
+        split: &SplitTaps,
+        out: &mut [u8],
+    ) {
+        match split.pairs / 2 {
+            1 => h_whole_fours_of::<C, 1>(row, outputs, near, kernel, split, out),
+            2 => h_whole_fours_of::<C, 2>(row, outputs, near, kernel, split, out),
+            3 => h_whole_fours_of::<C, 3>(row, outputs, near, kernel, split, out),
+            4 => h_whole_fours_of::<C, 4>(row, outputs, near, kernel, split, out),
+            5 => h_whole_fours_of::<C, 5>(row, outputs, near, kernel, split, out),
+            6 => h_whole_fours_of::<C, 6>(row, outputs, near, kernel, split, out),
+            _ => h_whole_fours_of::<C, 0>(row, outputs, near, kernel, split, out),
+        }
+    }
+
+    /// [`h_whole_fours`] over windows of `G` groups of four taps; `0` reads
+    /// the count from the taps and loops over it ([`pair_sums`]). With `G`
+    /// a constant a window's loads share one bounds test and its groups run
+    /// without a loop ([`pair_sums_of`]). The windows' bounds, the taps and
+    /// the place of the outputs are walked in step, so a turn indexes
+    /// nothing but the row.
+    ///
+    /// The outputs before `near` read the row by [`SplitTaps`]' `fours`:
+    /// one slice of the row holds the windows of four outputs, so the four
+    /// share one bounds test and a window costs the load of its distance.
+    /// The fours behind them, and every four where `G` is `0`, test each
+    /// window by itself.
+    ///
+    /// Rows of three- or four-channel pixels alone: a one-channel row takes
+    /// [`h_whole_levels`].
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn h_whole_fours_of<const C: usize, const G: usize>(
+        row: &[u8],
+        outputs: Range<usize>,
+        near: usize,
+        kernel: &FixedKernel,
+        split: &SplitTaps,
+        out: &mut [u8],
+    ) {
+        let shuffles = (paired::<C>(0), paired::<C>(1));
+        let half = _mm256_set1_epi32(kernel.half());
+        let shift = _mm_cvtsi32_si128(kernel.precision as i32);
+        let groups = if G == 0 { split.pairs / 2 } else { G };
+        let reach = 4 * C * (groups - 1) + 16;
+        let per_two = 16 * groups;
+        let mut taps = split.wide[outputs.start / 2 * per_two..outputs.end / 2 * per_two]
+            .chunks_exact(2 * per_two);
+        let mut place = &mut out[outputs.start * C..];
+        let near = if G == 0 {
+            outputs.start
+        } else {
+            near.clamp(outputs.start, outputs.end)
+        };
+        for (four, taps) in split.fours[outputs.start / 4..near / 4]
+            .iter()
+            .zip(taps.by_ref())
+        {
+            let (taps01, taps23) = taps.split_at(per_two);
+            let base = four.base as usize;
+            let read = &row[base..base + NEAR_STEPS + reach];
+            let window = |step: u8| &read[usize::from(step)..usize::from(step) + reach];
+            let [step1, step2, step3] = four.steps;
+            let sums01 = pair_sums_of::<C, G>(window(0), window(step1), taps01, shuffles, half);
+            let sums23 = pair_sums_of::<C, G>(window(step2), window(step3), taps23, shuffles, half);
+            place = put_four::<C>(place, four_pixels::<C>(sums01, sums23, shift));
+        }
+        for (bounds, taps) in kernel.bounds[near..outputs.end]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(taps)
+        {
+            let (taps01, taps23) = taps.split_at(per_two);
+            let window = |output: usize| {
+                let at = bounds[output].0 * C;
+                &row[at..at + reach]
+            };
+            let (sums01, sums23) = if G == 0 {
+                (
+                    pair_sums::<C>(window(0), window(1), taps01, shuffles, half),
+                    pair_sums::<C>(window(2), window(3), taps23, shuffles, half),
+                )
+            } else {
+                (
+                    pair_sums_of::<C, G>(window(0), window(1), taps01, shuffles, half),
+                    pair_sums_of::<C, G>(window(2), window(3), taps23, shuffles, half),
+                )
+            };
+            place = put_four::<C>(place, four_pixels::<C>(sums01, sums23, shift));
+        }
+    }
+
+    /// The bytes of four outputs from their sums, two outputs a vector
+    /// ([`pair_sums`]): one shift each, then one pack between them. Pixels of
+    /// three or four channels alone, as in [`h_whole_fours_of`].
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn four_pixels<const C: usize>(sums01: __m256i, sums23: __m256i, shift: __m128i) -> __m128i {
+        // Both packs saturate, as in `h_outputs`.
+        let words = _mm256_packs_epi32(
+            _mm256_sra_epi32(sums01, shift),
+            _mm256_sra_epi32(sums23, shift),
+        );
+        // The packs leave outputs (0, 2) in the low half and (1, 3) in the
+        // high one, a pixel per 32-bit lane.
+        let in_order = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        let pixels = _mm256_castsi256_si128(_mm256_permutevar8x32_epi32(
+            _mm256_packus_epi16(words, _mm256_setzero_si256()),
+            in_order,
+        ));
+        if C == 4 {
+            pixels
+        } else {
+            // Three-channel pixels close up over the byte each lane lacks.
+            let closed = _mm_setr_epi8(0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, -1, -1, -1, -1);
+            _mm_shuffle_epi8(pixels, closed)
+        }
+    }
+
+    /// Writes the `bytes` of four outputs ([`four_pixels`]) at the head of
+    /// `place` and answers the place of the next four.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn put_four<const C: usize>(place: &mut [u8], bytes: __m128i) -> &mut [u8] {
+        if let Some(sixteen) = place.first_chunk_mut::<16>() {
+            // The bytes past three-channel pixels fall on the place of the
+            // next outputs, which the pass writes after these.
+            store16(sixteen, bytes);
+        } else {
+            let mut last = [0_u8; 16];
+            store16(&mut last, bytes);
+            place[..4 * C].copy_from_slice(&last[..4 * C]);
+        }
+        &mut place[4 * C..]
+    }
+
+    /// [`pair_sums`] over windows of `G` groups: the caller's slices hold
+    /// `4 * C * (G - 1) + 16` bytes a window and sixteen lanes of `taps` a
+    /// group, lengths the compiler reads from the constant, so no load here
+    /// tests a bound and the groups run without a loop.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn pair_sums_of<const C: usize, const G: usize>(
+        window_a: &[u8],
+        window_b: &[u8],
+        taps: &[i32],
+        (first, second): (__m256i, __m256i),
+        half: __m256i,
+    ) -> __m256i {
+        let (mut sum01, mut sum23) = (half, _mm256_setzero_si256());
+        for group in 0..G {
+            let (Some(a), Some(b), Some(taps01), Some(taps23)) = (
+                window_a[group * 4 * C..].first_chunk::<16>(),
+                window_b[group * 4 * C..].first_chunk::<16>(),
+                taps[group * 16..].first_chunk::<8>(),
+                taps[group * 16 + 8..].first_chunk::<8>(),
+            ) else {
+                break;
+            };
+            let pixels = _mm256_set_m128i(load16(b), load16(a));
+            sum01 = _mm256_add_epi32(
+                sum01,
+                _mm256_madd_epi16(_mm256_shuffle_epi8(pixels, first), lanes(taps01)),
+            );
+            sum23 = _mm256_add_epi32(
+                sum23,
+                _mm256_madd_epi16(_mm256_shuffle_epi8(pixels, second), lanes(taps23)),
+            );
+        }
+        _mm256_add_epi32(sum01, sum23)
+    }
+
+    /// The sums of two outputs of one row over whole taps, an output per
+    /// 128-bit half and a channel per 32-bit lane, each from `half` on:
+    /// `window_a` and `window_b` hold the outputs' source bytes and `taps`
+    /// their pairs as [`SplitTaps`] lays them `wide`. Every four source
+    /// pixels of the two windows load as one vector, two shuffles pair the
+    /// bytes of pixels (0, 1) and (2, 3) channel by channel, and one
+    /// multiply-add per pair sums them against each output's own taps.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn pair_sums<const C: usize>(
+        window_a: &[u8],
+        window_b: &[u8],
+        taps: &[i32],
+        (first, second): (__m256i, __m256i),
+        half: __m256i,
+    ) -> __m256i {
+        let (mut sum01, mut sum23) = (half, _mm256_setzero_si256());
+        let groups = taps.as_chunks::<8>().0.as_chunks::<2>().0;
+        for (group, [taps01, taps23]) in groups.iter().enumerate() {
+            let (Some(a), Some(b)) = (
+                window_a[group * 4 * C..].first_chunk::<16>(),
+                window_b[group * 4 * C..].first_chunk::<16>(),
+            ) else {
+                break;
+            };
+            let pixels = _mm256_set_m128i(load16(b), load16(a));
+            sum01 = _mm256_add_epi32(
+                sum01,
+                _mm256_madd_epi16(_mm256_shuffle_epi8(pixels, first), lanes(taps01)),
+            );
+            sum23 = _mm256_add_epi32(
+                sum23,
+                _mm256_madd_epi16(_mm256_shuffle_epi8(pixels, second), lanes(taps23)),
+            );
+        }
+        _mm256_add_epi32(sum01, sum23)
+    }
+
+    /// Eight 32-bit lanes as they lie in memory.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn lanes(&[a, b, c, d, e, f, g, h]: &[i32; 8]) -> __m256i {
+        _mm256_setr_epi32(a, b, c, d, e, f, g, h)
+    }
+
+    /// Outputs `outputs` of one row of one-channel pixels over whole taps:
+    /// `row` holds the row's levels from level `origin` on. Sixteen levels
+    /// widen to 16-bit lanes and one multiply-add sums them against sixteen
+    /// taps, eight pairs as they lie in [`SplitTaps`]; the eight partial
+    /// sums fold to the output's one.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn h_whole_levels(
+        row: &[u8],
+        origin: usize,
+        outputs: Range<usize>,
+        kernel: &FixedKernel,
+        split: &SplitTaps,
+        out: &mut [u8],
+    ) {
+        let half = kernel.half();
+        let shift = _mm_cvtsi32_si128(kernel.precision as i32);
+        let halves = _mm256_set1_epi32(half);
+        let mut next = outputs.start;
+        // Four outputs fold as one: two rounds of adjacent sums leave each
+        // output's two half sums side by side, the halves add, and the four
+        // take one shift and the two saturating packs of `h_outputs`.
+        while next + 4 <= outputs.end {
+            let sums = |x: usize| level_sums(row, origin, x, kernel, split);
+            let folded = _mm256_hadd_epi32(
+                _mm256_hadd_epi32(sums(next), sums(next + 1)),
+                _mm256_hadd_epi32(sums(next + 2), sums(next + 3)),
+            );
+            out[next..next + 4].copy_from_slice(&four_levels(folded, halves, shift));
+            next += 4;
+        }
+        while next < outputs.end {
+            let sums = level_sums(row, origin, next, kernel, split);
+            let four = _mm_add_epi32(
+                _mm256_castsi256_si128(sums),
+                _mm256_extracti128_si256::<1>(sums),
+            );
+            let two = _mm_add_epi32(four, _mm_shuffle_epi32::<0b00_00_11_10>(four));
+            let one = _mm_add_epi32(two, _mm_shuffle_epi32::<0b00_00_00_01>(two));
+            out[next] = kernel.clip8(half + _mm_cvtsi128_si32(one));
+            next += 1;
+        }
+    }
+
+    /// The levels of four outputs from their sums as two rounds of adjacent
+    /// sums leave them (`folded`: each output's two half sums side by side):
+    /// the halves add, and the four take the rounding, one shift and the two
+    /// saturating packs of `h_outputs`.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn four_levels(folded: __m256i, halves: __m256i, shift: __m128i) -> [u8; 4] {
+        let four = _mm256_add_epi32(folded, _mm256_permute4x64_epi64::<0b01_00_11_10>(folded));
+        let shifted = _mm256_sra_epi32(_mm256_add_epi32(four, halves), shift);
+        let bytes =
+            _mm256_packus_epi16(_mm256_packs_epi32(shifted, shifted), _mm256_setzero_si256());
+        _mm_cvtsi128_si32(_mm256_castsi256_si128(bytes)).to_le_bytes()
+    }
+
+    /// Outputs `0..near` of one row of one-channel pixels over whole taps,
+    /// in the form built for the taps' count: up to four sixteens (what a
+    /// downscale by up to thirty-one takes under the bilinear filter).
+    /// Answers how many outputs it wrote: `near`, or none past four
+    /// sixteens, which [`h_whole_levels`] loops over.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn h_near_levels(
+        row: &[u8],
+        near: usize,
+        kernel: &FixedKernel,
+        split: &SplitTaps,
+        out: &mut [u8],
+    ) -> usize {
+        match split.pairs / 8 {
+            1 => h_near_levels_of::<1>(row, near, kernel, split, out),
+            2 => h_near_levels_of::<2>(row, near, kernel, split, out),
+            3 => h_near_levels_of::<3>(row, near, kernel, split, out),
+            4 => h_near_levels_of::<4>(row, near, kernel, split, out),
+            _ => return 0,
+        }
+        near
+    }
+
+    /// [`h_near_levels`] over windows of `L` sixteens, four outputs a turn:
+    /// one slice of the row holds their windows ([`SplitTaps`]' `fours`), so
+    /// the four share one bounds test; the taps and the place of the outputs
+    /// are walked in step, and with `L` a constant no load tests a bound and
+    /// the sixteens run without a loop.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn h_near_levels_of<const L: usize>(
+        row: &[u8],
+        near: usize,
+        kernel: &FixedKernel,
+        split: &SplitTaps,
+        out: &mut [u8],
+    ) {
+        let shift = _mm_cvtsi32_si128(kernel.precision as i32);
+        let halves = _mm256_set1_epi32(kernel.half());
+        let reach = 16 * L;
+        let fours = split.fours[..near / 4].iter();
+        let taps = split.lo[..near * 8 * L].chunks_exact(32 * L);
+        let places = out[..near].as_chunks_mut::<4>().0;
+        for ((four, taps), place) in fours.zip(taps).zip(places) {
+            let base = four.base as usize;
+            let read = &row[base..base + NEAR_STEPS + reach];
+            let sums = |output: usize, step: u8| {
+                let from = usize::from(step);
+                level_sums_of::<L>(
+                    &read[from..from + reach],
+                    &taps[output * 8 * L..(output + 1) * 8 * L],
+                )
+            };
+            let [step1, step2, step3] = four.steps;
+            let folded = _mm256_hadd_epi32(
+                _mm256_hadd_epi32(sums(0, 0), sums(1, step1)),
+                _mm256_hadd_epi32(sums(2, step2), sums(3, step3)),
+            );
+            *place = four_levels(folded, halves, shift);
+        }
+    }
+
+    /// The eight partial sums of one output over `L` sixteens of levels and
+    /// of taps, slices of that exact length.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn level_sums_of<const L: usize>(window: &[u8], taps: &[i32]) -> __m256i {
+        let mut sums = _mm256_setzero_si256();
+        for sixteen in 0..L {
+            let (Some(levels), Some(taps)) = (
+                window[16 * sixteen..].first_chunk::<16>(),
+                taps[8 * sixteen..].first_chunk::<8>(),
+            ) else {
+                break;
+            };
+            sums = _mm256_add_epi32(sums, _mm256_madd_epi16(widened(levels), lanes(taps)));
+        }
+        sums
+    }
+
+    /// The eight partial sums of output `x` of one row of one-channel pixels
+    /// over whole taps, sixteen levels and sixteen taps a multiply-add:
+    /// `row` holds the row's levels from level `origin` on.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn level_sums(
+        row: &[u8],
+        origin: usize,
+        x: usize,
+        kernel: &FixedKernel,
+        split: &SplitTaps,
+    ) -> __m256i {
+        let at = kernel.bounds[x].0 - origin;
+        let window = &row[at..at + 2 * split.pairs];
+        let taps = &split.lo[x * split.pairs..(x + 1) * split.pairs];
+        let mut sums = _mm256_setzero_si256();
+        for (levels, taps) in window
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .zip(taps.as_chunks::<8>().0)
+        {
+            sums = _mm256_add_epi32(sums, _mm256_madd_epi16(widened(levels), lanes(taps)));
+        }
+        sums
+    }
+
     /// `row` (`C`-channel pixels) as four bytes per pixel at the start of
-    /// `rgbx`, the fourth byte zero for three channels; the bytes past the
-    /// row keep the scratch's zeros.
+    /// `rgbx`, the bytes a pixel lacks zero (the fourth for three channels,
+    /// the last three for one); the bytes past the row keep the scratch's
+    /// zeros.
     #[target_feature(enable = "avx2")]
     #[inline]
     fn spread<const C: usize>(row: &[u8], rgbx: &mut [u8]) {
         if C == 4 {
             rgbx[..row.len()].copy_from_slice(row);
+            return;
+        }
+        if C == 1 {
+            // A level leads its word and the lanes of the channels a grey
+            // row lacks sum zeros; the scratch is resliced to the stores'
+            // exact length first, as below.
+            let (wide, _) = rgbx.split_at_mut(4 * row.len());
+            for (wide, &level) in wide.as_chunks_mut::<4>().0.iter_mut().zip(row) {
+                *wide = u32::from(level).to_le_bytes();
+            }
             return;
         }
         // Four pixels (12 bytes) spread to 16 per step; the step reads 16
@@ -1676,15 +2722,16 @@ mod avx2 {
     }
 
     /// Output `x`'s `C` bytes of `word` into its row: a four-byte write when
-    /// the next pixel's first byte follows (the next output writes it
-    /// again), else the last pixel's three.
+    /// the bytes behind the pixel's own are in the row (the next outputs
+    /// write them again), else the pixel's own `C` (a row's last pixel of
+    /// three channels, its last three of one).
     #[inline]
     fn store<const C: usize>(out_row: &mut [u8], x: usize, word: [u8; 4]) {
         let at = x * C;
         if C == 4 || at + 4 <= out_row.len() {
             out_row[at..at + 4].copy_from_slice(&word);
         } else {
-            out_row[at..at + 3].copy_from_slice(&word[..3]);
+            out_row[at..at + C].copy_from_slice(&word[..C]);
         }
     }
 
@@ -1730,6 +2777,27 @@ mod avx2 {
         y0: usize,
         band: &mut [u8],
     ) {
+        if split.whole {
+            v_rows::<true>(src, first_row, kernel, split, row_len, y0, band);
+        } else {
+            v_rows::<false>(src, first_row, kernel, split, row_len, y0, band);
+        }
+    }
+
+    /// [`v_band`] over the taps' split halves, or over `WHOLE` taps: one
+    /// multiply-add a pair of rows into the one accumulator, nothing to
+    /// recombine.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    fn v_rows<const WHOLE: bool>(
+        src: &[u8],
+        first_row: usize,
+        kernel: &FixedKernel,
+        split: &SplitTaps,
+        row_len: usize,
+        y0: usize,
+        band: &mut [u8],
+    ) {
         let half = _mm256_set1_epi32(kernel.half());
         let shift = _mm_cvtsi32_si128(kernel.precision as i32);
         let zero = _mm256_setzero_si256();
@@ -1737,8 +2805,14 @@ mod avx2 {
             let (start, n) = kernel.bounds[y0 + i];
             let start = start - first_row;
             let pairs = n.div_ceil(2);
-            let hi = &split.hi[i * split.pairs..i * split.pairs + pairs];
             let lo = &split.lo[i * split.pairs..i * split.pairs + pairs];
+            // Whole taps have no high halves: the pairs stand in for them
+            // and the loop never reads them.
+            let hi = if WHOLE {
+                lo
+            } else {
+                &split.hi[i * split.pairs..i * split.pairs + pairs]
+            };
             let (chunks, rest) = out_row.as_chunks_mut::<32>();
             for (x, out) in chunks.iter_mut().enumerate() {
                 let mut sums_hi = [zero; 4];
@@ -1763,12 +2837,19 @@ mod avx2 {
                     for ((sum_hi, sum_lo), columns) in
                         sums_hi.iter_mut().zip(&mut sums_lo).zip(columns)
                     {
-                        *sum_hi = _mm256_add_epi32(*sum_hi, _mm256_madd_epi16(columns, hi));
+                        if !WHOLE {
+                            *sum_hi = _mm256_add_epi32(*sum_hi, _mm256_madd_epi16(columns, hi));
+                        }
                         *sum_lo = _mm256_add_epi32(*sum_lo, _mm256_madd_epi16(columns, lo));
                     }
                 }
-                let [s0, s1, s2, s3] =
-                    std::array::from_fn(|q| recombined(sums_hi[q], sums_lo[q], shift));
+                let [s0, s1, s2, s3] = std::array::from_fn(|q| {
+                    if WHOLE {
+                        _mm256_sra_epi32(sums_lo[q], shift)
+                    } else {
+                        recombined(sums_hi[q], sums_lo[q], shift)
+                    }
+                });
                 // Both packs saturate (`i32 -> i16` keeps the shifted sums,
                 // `i16 -> u8` is the clamp); packing (0..4, 8..12) with (4..8,
                 // 12..16) puts a half's sixteen columns in order, the byte
@@ -1822,15 +2903,18 @@ mod avx512 {
     )]
 
     use std::arch::x86_64::{
-        __m128i, __m512i, __mmask64, _mm512_add_epi32, _mm512_dpbusd_epi32, _mm512_loadu_epi32,
-        _mm512_loadu_epi8, _mm512_mask_storeu_epi8, _mm512_maskz_loadu_epi8, _mm512_packus_epi16,
-        _mm512_packus_epi32, _mm512_permutex2var_epi8, _mm512_permutexvar_epi32, _mm512_set1_epi32,
-        _mm512_setr_epi32, _mm512_setzero_si512, _mm512_slli_epi32, _mm512_sra_epi32,
-        _mm512_storeu_epi32, _mm512_storeu_epi8, _mm512_unpackhi_epi16, _mm512_unpackhi_epi8,
-        _mm512_unpacklo_epi16, _mm512_unpacklo_epi8, _mm_cvtsi32_si128,
+        __m128i, __m512i, __mmask64, _mm256_add_epi32, _mm256_castsi256_si128,
+        _mm256_extracti128_si256, _mm512_add_epi32, _mm512_castsi512_si256, _mm512_cvtusepi32_epi8,
+        _mm512_dpbusd_epi32, _mm512_extracti64x4_epi64, _mm512_loadu_epi8, _mm512_mask_storeu_epi8,
+        _mm512_maskz_loadu_epi8, _mm512_max_epi32, _mm512_packus_epi16, _mm512_packus_epi32,
+        _mm512_permutex2var_epi8, _mm512_permutexvar_epi8, _mm512_set1_epi32, _mm512_setzero_si512,
+        _mm512_slli_epi32, _mm512_sra_epi32, _mm512_storeu_epi8, _mm512_unpackhi_epi16,
+        _mm512_unpackhi_epi8, _mm512_unpacklo_epi16, _mm512_unpacklo_epi8, _mm512_zextsi128_si512,
+        _mm_add_epi32, _mm_cvtsi128_si32, _mm_cvtsi32_si128, _mm_packs_epi32, _mm_packus_epi16,
+        _mm_set1_epi32, _mm_sra_epi32,
     };
 
-    use super::{ChunkTaps, FixedKernel, GroupTaps, CHUNK_BITS};
+    use super::{Avx512Taps, BandScratch, ChunkTaps, FixedKernel, GroupTaps, LongTaps, CHUNK_BITS};
 
     /// The processor reports every feature the arms enable.
     pub(super) fn detected() -> bool {
@@ -1847,9 +2931,42 @@ mod avx512 {
     const ROWS: usize = 4;
 
     /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass,
-    /// [`ROWS`] rows at a time by [`h_rows`] and the last rows one by one.
+    /// in the layout the axis takes: the gather's groups by
+    /// [`h_group_band`], long windows by [`h_long_band`].
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pass's scratch rides along so every band of a pass reuses it"
+    )]
     pub(super) fn h_band<const C: usize>(
+        src: &[u8],
+        kernel: &FixedKernel,
+        taps: &Avx512Taps,
+        in_w: usize,
+        out_w: usize,
+        y0: usize,
+        band: &mut [u8],
+        scratch: &mut BandScratch,
+    ) {
+        match taps {
+            Avx512Taps::Groups(groups) => {
+                h_group_band::<C>(src, kernel, groups, in_w, out_w, y0, band, scratch);
+            }
+            Avx512Taps::Long(long) => {
+                h_long_band::<C>(src, kernel, long, in_w, out_w, y0, band, scratch);
+            }
+        }
+    }
+
+    /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass
+    /// for an axis its gather carries ([`GroupTaps`]), [`ROWS`] rows at a
+    /// time by [`h_rows`] and the last rows one by one.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pass's scratch rides along so every band of a pass reuses it"
+    )]
+    fn h_group_band<const C: usize>(
         src: &[u8],
         kernel: &FixedKernel,
         groups: &GroupTaps,
@@ -1857,44 +2974,215 @@ mod avx512 {
         out_w: usize,
         y0: usize,
         band: &mut [u8],
+        scratch: &mut BandScratch,
     ) {
         let row_in = in_w * C;
         let row_out = out_w * C;
         let tail_len = groups.tail.min(row_in);
-        let mut tails = vec![0_u8; ROWS * (tail_len + GroupTaps::WINDOW)];
-        // A group's sixteen lanes land whole; the last group's lanes past the
-        // row and the narrowing's last loads stay inside a row's scratch.
-        let mut sums = vec![0_i32; ROWS * (row_out.next_multiple_of(64) + 16)];
+        let tails = scratch.bytes(ROWS * (tail_len + GroupTaps::WINDOW));
+        // Each tail row is read WINDOW bytes past its end as zeros; zero that
+        // padding here, so the kernel owes nothing to what the scratch held
+        // before this band.
+        for tail in tails.chunks_exact_mut(tail_len + GroupTaps::WINDOW) {
+            tail[tail_len..].fill(0);
+        }
         let mut blocks = band.chunks_exact_mut(ROWS * row_out);
         let mut y = y0;
+        let two_levels = groups.levels == 2;
         for block in blocks.by_ref() {
-            h_rows::<C, ROWS>(src, kernel, groups, row_in, y, block, &mut tails, &mut sums);
+            if two_levels {
+                h_rows::<C, ROWS, 2>(src, kernel, groups, row_in, y, block, tails);
+            } else {
+                h_rows::<C, ROWS, 3>(src, kernel, groups, row_in, y, block, tails);
+            }
             y += ROWS;
         }
         for out_row in blocks.into_remainder().chunks_exact_mut(row_out) {
-            h_rows::<C, 1>(
-                src, kernel, groups, row_in, y, out_row, &mut tails, &mut sums,
-            );
+            if two_levels {
+                h_rows::<C, 1, 2>(src, kernel, groups, row_in, y, out_row, tails);
+            } else {
+                h_rows::<C, 1, 3>(src, kernel, groups, row_in, y, out_row, tails);
+            }
             y += 1;
         }
     }
 
-    /// Output rows `[y0, y0 + R)` of the width pass into `out`, a group of
-    /// outputs per vector ([`GroupTaps`]): per step of four taps, each row's
-    /// two vectors from the group's window start are gathered by the group's
-    /// indices into every lane's four pixels and three dot products
-    /// accumulate them against the step's chunk lines; the windows of a
-    /// row's last groups read from a zero-padded copy of the row's end (one
-    /// per row in `tails`). A group's recombined and shifted sums go to the
-    /// row's scratch of 32-bit lanes in `sums`, which [`narrowed`] clamps
-    /// into the output row once the row's groups are done.
+    /// Output rows `[y0, y0 + band.len() / (out_w * C))` of the width pass
+    /// for an axis of long windows ([`LongTaps`]), [`ROWS`] rows at a time by
+    /// [`h_long_rows`] and the last rows one by one.
     #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
-    #[inline]
     #[expect(
         clippy::too_many_arguments,
-        reason = "the band's scratch buffers ride along so every block of rows reuses them"
+        reason = "the pass's scratch rides along so every band of a pass reuses it"
     )]
-    fn h_rows<const C: usize, const R: usize>(
+    fn h_long_band<const C: usize>(
+        src: &[u8],
+        kernel: &FixedKernel,
+        long: &LongTaps,
+        in_w: usize,
+        out_w: usize,
+        y0: usize,
+        band: &mut [u8],
+        scratch: &mut BandScratch,
+    ) {
+        let row_in = in_w * C;
+        let row_out = out_w * C;
+        let tail_len = long.tail.min(row_in);
+        let tails = scratch.bytes(ROWS * (tail_len + LongTaps::LOAD));
+        // Each tail row is read one load past its end as zeros; zero that
+        // padding here, as the gather's band does.
+        for tail in tails.chunks_exact_mut(tail_len + LongTaps::LOAD) {
+            tail[tail_len..].fill(0);
+        }
+        let two_levels = long.levels == 2;
+        let mut blocks = band.chunks_exact_mut(ROWS * row_out);
+        let mut y = y0;
+        for block in blocks.by_ref() {
+            if two_levels {
+                h_long_rows::<C, ROWS, 2>(src, kernel, long, row_in, y, block, tails);
+            } else {
+                h_long_rows::<C, ROWS, 3>(src, kernel, long, row_in, y, block, tails);
+            }
+            y += ROWS;
+        }
+        for out_row in blocks.into_remainder().chunks_exact_mut(row_out) {
+            if two_levels {
+                h_long_rows::<C, 1, 2>(src, kernel, long, row_in, y, out_row, tails);
+            } else {
+                h_long_rows::<C, 1, 3>(src, kernel, long, row_in, y, out_row, tails);
+            }
+            y += 1;
+        }
+    }
+
+    /// Output rows `[y0, y0 + R)` of the width pass into `out`, one output
+    /// per vector ([`LongTaps`]): per step of sixteen taps each row loads 64
+    /// bytes from the step's first tap, one permute lays them out in
+    /// quarters of four pixels channel by channel, and `L` dot products
+    /// accumulate them against the step's chunk lines. An output's four
+    /// quarters are then summed into one (a 32-bit lane per channel),
+    /// shifted and clamped into the row; the windows at a row's end read
+    /// from a zero-padded copy of it (one per row in `tails`).
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[inline]
+    fn h_long_rows<const C: usize, const R: usize, const L: usize>(
+        src: &[u8],
+        kernel: &FixedKernel,
+        long: &LongTaps,
+        row_in: usize,
+        y0: usize,
+        out: &mut [u8],
+        tails: &mut [u8],
+    ) {
+        let row_out = out.len() / R;
+        let tail_stride = tails.len() / ROWS;
+        let tail_len = tail_stride - LongTaps::LOAD;
+        // The rounding term once per channel: in the first quarter alone.
+        let half = _mm512_zextsi128_si512(_mm_set1_epi32(kernel.half()));
+        let shift = _mm_cvtsi32_si128(kernel.precision as i32);
+        let zero = _mm512_setzero_si512();
+        let mut order = [0_u8; 64];
+        for (at, index) in order.iter_mut().enumerate() {
+            let (quarter, channel, tap) = (at / 16, at % 16 / 4, at % 4);
+            if channel < C {
+                *index = ((4 * quarter + tap) * C + channel) as u8;
+            }
+        }
+        let order = load64(&order);
+        let mut rows: [&[u8]; R] = [&[]; R];
+        for (r, row) in rows.iter_mut().enumerate() {
+            *row = &src[(y0 + r) * row_in..(y0 + r + 1) * row_in];
+        }
+        for (tail, row) in tails.chunks_exact_mut(tail_stride).zip(&rows) {
+            tail[..tail_len].copy_from_slice(&row[row_in - tail_len..]);
+        }
+        let tails: &[u8] = tails;
+        let mut padded: [&[u8]; R] = [&[]; R];
+        for (r, padded) in padded.iter_mut().enumerate() {
+            *padded = &tails[r * tail_stride..(r + 1) * tail_stride];
+        }
+        for ((x, block), &(x0, n)) in long
+            .table
+            .chunks_exact(long.stride)
+            .enumerate()
+            .zip(&kernel.bounds)
+        {
+            let steps = n.div_ceil(LongTaps::TAPS).max(1);
+            let begin = x0 * C;
+            // The rows themselves while the output's last load ends inside
+            // them, else the padded copies of their ends.
+            let (sources, base) =
+                if begin + LongTaps::TAPS * C * (steps - 1) + LongTaps::LOAD <= row_in {
+                    (&rows, begin)
+                } else {
+                    (&padded, begin - (row_in - tail_len))
+                };
+            let mut acc = [[zero; L]; R];
+            for row in &mut acc {
+                row[0] = half;
+            }
+            for (s, levels) in block.chunks_exact(64 * L).take(steps).enumerate() {
+                let at = base + LongTaps::TAPS * C * s;
+                let mut chunks = [zero; L];
+                for (chunks, level) in chunks.iter_mut().zip(levels.as_chunks::<64>().0) {
+                    *chunks = load64(level);
+                }
+                for (source, acc) in sources.iter().zip(&mut acc) {
+                    let window = &source[at..at + LongTaps::LOAD].as_chunks::<64>().0[0];
+                    let pixels = _mm512_permutexvar_epi8(order, load64(window));
+                    for (sum, &chunks) in acc.iter_mut().zip(&chunks) {
+                        *sum = _mm512_dpbusd_epi32(*sum, pixels, chunks);
+                    }
+                }
+            }
+            for (acc, out_row) in acc.iter().zip(out.chunks_exact_mut(row_out)) {
+                let sum = folded(acc);
+                let halves = _mm256_add_epi32(
+                    _mm512_castsi512_si256(sum),
+                    _mm512_extracti64x4_epi64::<1>(sum),
+                );
+                let quarter = _mm_add_epi32(
+                    _mm256_castsi256_si128(halves),
+                    _mm256_extracti128_si256::<1>(halves),
+                );
+                // Both packs saturate: `i32 -> i16` keeps the shifted sums
+                // (below 2^10 in magnitude), `i16 -> u8` is the clamp to a
+                // byte; a channel's byte per lane, the pixel in the low four.
+                let shifted = _mm_sra_epi32(quarter, shift);
+                let narrow = _mm_packs_epi32(shifted, shifted);
+                let word = _mm_cvtsi128_si32(_mm_packus_epi16(narrow, narrow)).to_le_bytes();
+                out_row[x * C..(x + 1) * C].copy_from_slice(&word[..C]);
+            }
+        }
+    }
+
+    /// `(.. (levels[L - 1] << 8) + ..) << 8 + levels[0]`: the sums against a
+    /// tap's chunks recombined, lane by lane.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[inline]
+    fn folded<const L: usize>(levels: &[__m512i; L]) -> __m512i {
+        let mut sum = levels[L - 1];
+        for &level in levels[..L - 1].iter().rev() {
+            sum = _mm512_add_epi32(_mm512_slli_epi32::<CHUNK_BITS>(sum), level);
+        }
+        sum
+    }
+
+    /// Output rows `[y0, y0 + R)` of the width pass into `out`, a group of
+    /// outputs per vector ([`GroupTaps`]): per step of four taps, each row's
+    /// two vectors from the group's window start (one where every window of
+    /// the axis ends inside it, [`GroupTaps::narrow`]) are gathered by the
+    /// group's indices into every lane's four pixels and `L` dot products (the
+    /// chunk levels the kernel needs)
+    /// accumulate them against the step's chunk lines; the windows of a
+    /// row's last groups read from a zero-padded copy of the row's end (one
+    /// per row in `tails`). A group's recombined and shifted sums are clamped
+    /// to bytes (below zero by a maximum, above 255 by the narrowing's
+    /// unsigned saturation) and stored into the rows under a mask of the
+    /// group's lanes.
+    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
+    #[inline]
+    fn h_rows<const C: usize, const R: usize, const L: usize>(
         src: &[u8],
         kernel: &FixedKernel,
         groups: &GroupTaps,
@@ -1902,12 +3190,10 @@ mod avx512 {
         y0: usize,
         out: &mut [u8],
         tails: &mut [u8],
-        sums: &mut [i32],
     ) {
         let row_out = out.len() / R;
         let tail_stride = tails.len() / ROWS;
         let tail_len = tail_stride - GroupTaps::WINDOW;
-        let scratch = sums.len() / ROWS;
         let half = _mm512_set1_epi32(kernel.half());
         let shift = _mm_cvtsi32_si128(kernel.precision as i32);
         let zero = _mm512_setzero_si512();
@@ -1923,6 +3209,7 @@ mod avx512 {
         for (r, padded) in padded.iter_mut().enumerate() {
             *padded = &tails[r * tail_stride..(r + 1) * tail_stride];
         }
+        let narrow = groups.narrow;
         for ((g, block), &steps) in groups
             .table
             .chunks_exact(groups.stride)
@@ -1940,62 +3227,41 @@ mod avx512 {
             };
             let (indices, blocks) = block.split_at(64);
             let indices = load64(&indices.as_chunks::<64>().0[0]);
-            let (mut sum0, mut sum1, mut sum2) = ([half; R], [zero; R], [zero; R]);
-            for (s, levels) in blocks.as_chunks::<192>().0.iter().take(steps).enumerate() {
+            // A row's sums against the chunks of each level it carries.
+            let mut acc = [[zero; L]; R];
+            for row in &mut acc {
+                row[0] = half;
+            }
+            for (s, levels) in blocks.chunks_exact(64 * L).take(steps).enumerate() {
                 let at = base + 4 * C * s;
-                let levels = levels.as_chunks::<64>().0;
-                let (chunks0, chunks1, chunks2) =
-                    (load64(&levels[0]), load64(&levels[1]), load64(&levels[2]));
-                for (((source, sum0), sum1), sum2) in
-                    sources.iter().zip(&mut sum0).zip(&mut sum1).zip(&mut sum2)
-                {
+                let mut chunks = [zero; L];
+                for (chunks, level) in chunks.iter_mut().zip(levels.as_chunks::<64>().0) {
+                    *chunks = load64(level);
+                }
+                for (source, acc) in sources.iter().zip(&mut acc) {
                     let window = source[at..at + GroupTaps::WINDOW].as_chunks::<64>().0;
-                    let pixels =
-                        _mm512_permutex2var_epi8(load64(&window[0]), indices, load64(&window[1]));
-                    *sum0 = _mm512_dpbusd_epi32(*sum0, pixels, chunks0);
-                    *sum1 = _mm512_dpbusd_epi32(*sum1, pixels, chunks1);
-                    *sum2 = _mm512_dpbusd_epi32(*sum2, pixels, chunks2);
+                    let pixels = if narrow {
+                        _mm512_permutexvar_epi8(indices, load64(&window[0]))
+                    } else {
+                        _mm512_permutex2var_epi8(load64(&window[0]), indices, load64(&window[1]))
+                    };
+                    for (sum, &chunks) in acc.iter_mut().zip(&chunks) {
+                        *sum = _mm512_dpbusd_epi32(*sum, pixels, chunks);
+                    }
                 }
             }
+            // The group's bytes go straight into the rows, under a mask of
+            // its lanes: a scratch of 32-bit sums that a later pass read back
+            // was four wide stores per group in flight beside the rows'
+            // loads.
             let at = first * C;
-            for (r, ((&sum0, &sum1), &sum2)) in sum0.iter().zip(&sum1).zip(&sum2).enumerate() {
-                store16(
-                    &mut sums[r * scratch + at..r * scratch + at + 16]
-                        .as_chunks_mut::<16>()
-                        .0[0],
-                    recombined(sum0, sum1, sum2, shift),
+            let lanes = (groups.outputs * C).min(row_out - at);
+            for (acc, out_row) in acc.iter().zip(out.chunks_exact_mut(row_out)) {
+                let sums = _mm512_max_epi32(_mm512_sra_epi32(folded(acc), shift), zero);
+                store_masked(
+                    &mut out_row[at..at + lanes],
+                    _mm512_zextsi128_si512(_mm512_cvtusepi32_epi8(sums)),
                 );
-            }
-        }
-        for (sums, out_row) in sums
-            .chunks_exact(scratch)
-            .zip(out.chunks_exact_mut(row_out))
-        {
-            narrowed(sums, out_row);
-        }
-    }
-
-    /// `out`'s row of shifted sums (`sums`, at least as long rounded up to a
-    /// multiple of sixty-four) clamped to bytes, sixty-four at a time: both
-    /// packs saturate (`i32 -> u16` is the clamp below zero, `i16 -> u8` the
-    /// clamp above 255; a shifted sum is below 2^10 in magnitude) and leave
-    /// every 128-bit lane with four bytes of each of the four source
-    /// vectors, which one dword permute puts in order; the row's last
-    /// columns run under a mask.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
-    #[inline]
-    fn narrowed(sums: &[i32], out: &mut [u8]) {
-        let order = _mm512_setr_epi32(0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15);
-        for (sums, out) in sums.as_chunks::<64>().0.iter().zip(out.chunks_mut(64)) {
-            let quads = sums.as_chunks::<16>().0;
-            let bytes = _mm512_packus_epi16(
-                _mm512_packus_epi32(load16(&quads[0]), load16(&quads[1])),
-                _mm512_packus_epi32(load16(&quads[2]), load16(&quads[3])),
-            );
-            let bytes = _mm512_permutexvar_epi32(order, bytes);
-            match out.as_chunks_mut::<64>() {
-                ([full], []) => store64(full, bytes),
-                _ => store_masked(out, bytes),
             }
         }
     }
@@ -2161,41 +3427,34 @@ mod avx512 {
         // store writes no byte outside its mask.
         unsafe { _mm512_mask_storeu_epi8(out.as_mut_ptr().cast::<i8>(), mask64(out.len()), bytes) }
     }
-
-    /// Sixteen 32-bit lanes as one vector.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
-    #[inline]
-    fn load16(lanes: &[i32; 16]) -> __m512i {
-        // SAFETY: the array is exactly sixteen 32-bit lanes.
-        unsafe { _mm512_loadu_epi32(lanes.as_ptr()) }
-    }
-
-    /// Sixteen 32-bit lanes stored.
-    #[target_feature(enable = "avx512f,avx512bw,avx512vl,avx512vnni,avx512vbmi")]
-    #[inline]
-    fn store16(out: &mut [i32; 16], lanes: __m512i) {
-        // SAFETY: the array is exactly sixteen 32-bit lanes.
-        unsafe { _mm512_storeu_epi32(out.as_mut_ptr(), lanes) }
-    }
 }
 
 /// Every row of `src` (`rows` rows of `in_w` interleaved pixels of `C`
 /// channels) resampled along the width to `out_w` pixels; rows banded across
 /// the pool (an output row depends on its own input row alone, so the banding
-/// changes nothing).
+/// changes nothing). The output is one of `buffers`.
 fn pil_resample_horizontal<const C: usize>(
     src: &[u8],
     rows: usize,
     in_w: usize,
     out_w: usize,
     kernel: &FixedKernel,
+    buffers: Buffers,
 ) -> Vec<u8> {
     let row_out = out_w * C;
-    let mut out = plain_buffer(rows * row_out);
+    let mut out = buffers.output(rows * row_out);
     let pass = &WidthPass::new::<C>(kernel);
     let tasks = par_threads(out.len(), rows);
     if tasks <= 1 {
-        pass.rows::<C>(src, kernel, in_w, out_w, 0, &mut out);
+        pass.rows::<C>(
+            src,
+            kernel,
+            in_w,
+            out_w,
+            0,
+            &mut out,
+            &mut BandScratch::default(),
+        );
         return out;
     }
     let band_rows = rows.div_ceil(tasks);
@@ -2207,7 +3466,17 @@ fn pil_resample_horizontal<const C: usize>(
             let (band, tail) = rest.split_at_mut(n * row_out);
             rest = tail;
             let start = y0;
-            scope.spawn(move |_| pass.rows::<C>(src, kernel, in_w, out_w, start, band));
+            scope.spawn(move |_| {
+                pass.rows::<C>(
+                    src,
+                    kernel,
+                    in_w,
+                    out_w,
+                    start,
+                    band,
+                    &mut BandScratch::default(),
+                );
+            });
             y0 += n;
         }
     });
@@ -2215,15 +3484,17 @@ fn pil_resample_horizontal<const C: usize>(
 }
 
 /// `src` (rows of `width` interleaved pixels of `C` channels) resampled along
-/// the height to `out_h` rows; rows banded across the pool.
+/// the height to `out_h` rows; rows banded across the pool. The output is
+/// one of `buffers`.
 fn pil_resample_vertical<const C: usize>(
     src: &[u8],
     out_h: usize,
     width: usize,
     kernel: &FixedKernel,
+    buffers: Buffers,
 ) -> Vec<u8> {
     let row_len = width * C;
-    let mut out = plain_buffer(out_h * row_len);
+    let mut out = buffers.output(out_h * row_len);
     let pass = HeightPass::new();
     let tasks = par_threads(out.len(), out_h);
     if tasks <= 1 {
@@ -2275,14 +3546,26 @@ struct BandedPasses<'a, const C: usize> {
     width_pass: WidthPass,
     height_pass: HeightPass,
     band_bytes: usize,
+    buffers: Buffers,
 }
 
 impl<const C: usize> BandedPasses<'_, C> {
+    /// The most width-pass rows a band holds: its budget's, or the longest
+    /// window's where one row passes the budget, ended on a block and within
+    /// the source.
+    fn band_rows(&self) -> usize {
+        let window = self.height.bounds.iter().map(|&(_, taps)| taps).max();
+        let budget = self.band_bytes / (self.out_w * C);
+        let rows = window.unwrap_or(0).max(budget);
+        rows.saturating_add(PIL_WIDTH_ROWS - 1).min(self.in_h)
+    }
+
     /// Output rows `[y0, y0 + out.len() / (out_w * C))`, a band at a time.
     fn rows(&self, y0: usize, mut out: &mut [u8]) {
         let row_len = self.out_w * C;
         // The width-pass rows `mid` holds: source rows `[mid_start, mid_end)`.
-        let mut mid = Vec::new();
+        let mut mid = self.buffers.band(|| self.band_rows() * row_len);
+        let mut scratch = BandScratch::default();
         let (mut mid_start, mut mid_end) = (0, 0);
         let mut y = y0;
         let end = y0 + out.len() / row_len;
@@ -2322,6 +3605,7 @@ impl<const C: usize> BandedPasses<'_, C> {
                     self.out_w,
                     kept,
                     &mut mid[(kept - start) * row_len..],
+                    &mut scratch,
                 );
             }
             (mid_start, mid_end) = (start, stop);
@@ -2331,13 +3615,14 @@ impl<const C: usize> BandedPasses<'_, C> {
             out = rest;
             y = y1;
         }
+        self.buffers.release(mid);
     }
 }
 
 /// `src` (`in_w` x `in_h` interleaved pixels of `C` channels) resampled on
 /// both axes to `out_w` x `out_h` by [`BandedPasses`] in bands of about
 /// `band_bytes`; the output rows are banded across the pool, each task with a
-/// buffer of its own.
+/// buffer of its own. The output and those buffers are `buffers`'.
 fn pil_resample_both<const C: usize>(
     src: &[u8],
     (in_w, in_h): (usize, usize),
@@ -2345,9 +3630,10 @@ fn pil_resample_both<const C: usize>(
     width: &FixedKernel,
     height: &FixedKernel,
     band_bytes: usize,
+    buffers: Buffers,
 ) -> Vec<u8> {
     let row_len = out_w * C;
-    let mut out = plain_buffer(out_h * row_len);
+    let mut out = buffers.output(out_h * row_len);
     let passes = &BandedPasses::<C> {
         src,
         in_w,
@@ -2358,6 +3644,7 @@ fn pil_resample_both<const C: usize>(
         width_pass: WidthPass::new::<C>(width),
         height_pass: HeightPass::new(),
         band_bytes,
+        buffers,
     };
     let tasks = par_threads(out.len(), out_h);
     if tasks <= 1 {
@@ -2383,15 +3670,25 @@ fn pil_resample_both<const C: usize>(
 /// Pillow-exact BICUBIC resize (RGB8), matching
 /// `PIL.Image.resize(.., BICUBIC)`.
 pub fn resize_bicubic_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Bicubic)
+}
+
+/// `image` as RGB8 (read where it stands when it already is), resized the
+/// way Pillow resizes it with `filter`.
+fn resize_pil_image(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+    filter: PilResizeFilter,
+) -> DynamicImage {
+    let (in_w, in_h, rgb) = rgb_bytes(image);
     let output = resize_pil_bytes::<3>(
-        rgb.as_raw(),
-        in_w,
-        in_h,
+        &rgb,
+        in_w as u32,
+        in_h as u32,
         out_w,
         out_h,
-        PilResizeFilter::Bicubic,
+        filter,
         KernelQuantization::Pillow,
     );
     #[expect(
@@ -2408,7 +3705,7 @@ pub fn resize_bicubic_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
 /// Byte-for-byte equivalent of [`resize_bicubic_pil`] but for the raw-RGB video
 /// frame path (`preprocess_video_rgb`). Returns an `RgbImage` to drop straight
 /// into the existing [`resize_rgb_bytes`] call sites.
-pub fn resize_bicubic_pil_rgb(
+pub(crate) fn resize_bicubic_pil_rgb(
     data: &[u8],
     width: u32,
     height: u32,
@@ -2452,7 +3749,7 @@ pub fn resize_bicubic_pil_rgb(
 /// Pillow-exact BILINEAR resize over borrowed interleaved RGB bytes: the
 /// bytes of [`resize_bilinear_pil`], for a processor that resizes a decoded
 /// image's bytes more than once before it converts them.
-pub fn resize_bilinear_pil_rgb(
+pub(crate) fn resize_bilinear_pil_rgb(
     data: &[u8],
     width: u32,
     height: u32,
@@ -2554,24 +3851,7 @@ fn mul_div_255(value: u8, alpha: u8) -> u8 {
 /// Pillow-exact LANCZOS resize (RGB8), matching
 /// `PIL.Image.resize(.., LANCZOS)`.
 pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
-    let output = resize_pil_bytes::<3>(
-        rgb.as_raw(),
-        in_w,
-        in_h,
-        out_w,
-        out_h,
-        PilResizeFilter::Lanczos,
-        KernelQuantization::Pillow,
-    );
-    #[expect(
-        clippy::expect_used,
-        reason = "output is exactly out_w*out_h*3 bytes by construction"
-    )]
-    DynamicImage::ImageRgb8(
-        RgbImage::from_raw(out_w, out_h, output).expect("pil resize buffer size"),
-    )
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Lanczos)
 }
 
 /// Pillow-exact BILINEAR resize (RGB8), matching
@@ -2581,30 +3861,13 @@ pub fn resize_lanczos_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> Dynam
 /// interpolation, and so what an image processor that resizes the decoded
 /// image before converting it to a tensor runs.
 pub fn resize_bilinear_pil(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
-    let rgb = image.to_rgb8();
-    let (in_w, in_h) = rgb.dimensions();
-    let output = resize_pil_bytes::<3>(
-        rgb.as_raw(),
-        in_w,
-        in_h,
-        out_w,
-        out_h,
-        PilResizeFilter::Bilinear,
-        KernelQuantization::Pillow,
-    );
-    #[expect(
-        clippy::expect_used,
-        reason = "output is exactly out_w*out_h*3 bytes by construction"
-    )]
-    DynamicImage::ImageRgb8(
-        RgbImage::from_raw(out_w, out_h, output).expect("pil resize buffer size"),
-    )
+    resize_pil_image(image, out_w, out_h, PilResizeFilter::Bilinear)
 }
 
 /// `data` (`in_w` x `in_h` interleaved pixels of `C` channels) resampled to
 /// `out_w` x `out_h` with `filter`'s kernel in `quantization`: the width pass
 /// first, then the height pass, each skipped on an axis that keeps its size
-/// (Pillow's own order and skips). `C` is 3 or 4, the channel counts the
+/// (Pillow's own order and skips). `C` is 1, 3 or 4, the channel counts the
 /// vector arms' lane folds spread; the rule holds on every platform.
 fn resize_pil_bytes<const C: usize>(
     data: &[u8],
@@ -2615,10 +3878,23 @@ fn resize_pil_bytes<const C: usize>(
     filter: PilResizeFilter,
     quantization: KernelQuantization,
 ) -> Vec<u8> {
+    let kernel = (filter, quantization);
+    resize_pil_bytes_in::<C>(data, (in_w, in_h), (out_w, out_h), kernel, Buffers::Fresh)
+}
+
+/// [`resize_pil_bytes`] with the result and the passes' band buffers taken
+/// from `buffers`.
+fn resize_pil_bytes_in<const C: usize>(
+    data: &[u8],
+    (in_w, in_h): (u32, u32),
+    (out_w, out_h): (u32, u32),
+    (filter, quantization): (PilResizeFilter, KernelQuantization),
+    buffers: Buffers,
+) -> Vec<u8> {
     const {
         assert!(
-            C == 3 || C == 4,
-            "the Pillow-exact resample takes three or four channels"
+            C == 1 || C == 3 || C == 4,
+            "the Pillow-exact resample takes one, three or four channels"
         );
     }
     let (in_w, in_h, out_w, out_h) = (in_w as usize, in_h as usize, out_w as usize, out_h as usize);
@@ -2633,10 +3909,10 @@ fn resize_pil_bytes<const C: usize>(
         data.to_vec()
     } else if in_w == out_w {
         let kernel = FixedKernel::new(in_h, out_h, filter, quantization);
-        pil_resample_vertical::<C>(data, out_h, in_w, &kernel)
+        pil_resample_vertical::<C>(data, out_h, in_w, &kernel, buffers)
     } else if in_h == out_h {
         let kernel = FixedKernel::new(in_w, out_w, filter, quantization);
-        pil_resample_horizontal::<C>(data, in_h, in_w, out_w, &kernel)
+        pil_resample_horizontal::<C>(data, in_h, in_w, out_w, &kernel, buffers)
     } else {
         let width = FixedKernel::new(in_w, out_w, filter, quantization);
         let height = FixedKernel::new(in_h, out_h, filter, quantization);
@@ -2647,6 +3923,7 @@ fn resize_pil_bytes<const C: usize>(
             &width,
             &height,
             PIL_BAND_BYTES,
+            buffers,
         )
     }
 }
@@ -2682,6 +3959,7 @@ fn resize_pil_bytes_window<const C: usize>(
             in_w,
             w,
             &width(),
+            Buffers::Fresh,
         ),
         // The window's columns are the source's: their rows alone.
         (false, true) => pil_resample_vertical::<C>(
@@ -2689,6 +3967,7 @@ fn resize_pil_bytes_window<const C: usize>(
             h,
             w,
             &height(),
+            Buffers::Fresh,
         ),
         (true, true) => pil_resample_both::<C>(
             data,
@@ -2697,6 +3976,7 @@ fn resize_pil_bytes_window<const C: usize>(
             &width(),
             &height(),
             PIL_BAND_BYTES,
+            Buffers::Fresh,
         ),
     }
 }
@@ -2730,21 +4010,17 @@ fn resize_torch_uint8_rgb(
     out_w: u32,
     out_h: u32,
     filter: PilResizeFilter,
+    buffers: Buffers,
 ) -> Vec<u8> {
     #[cfg(target_arch = "x86_64")]
     {
-        resize_pil_bytes::<3>(
-            data,
-            in_w,
-            in_h,
-            out_w,
-            out_h,
-            filter,
-            KernelQuantization::TorchUint8,
-        )
+        let kernel = (filter, KernelQuantization::TorchUint8);
+        resize_pil_bytes_in::<3>(data, (in_w, in_h), (out_w, out_h), kernel, buffers)
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
+        // The rows of `torch_resample` allocate their own buffers.
+        let _ = buffers;
         super::torch_resample::resize_rgb(
             data,
             in_w as usize,
@@ -2791,8 +4067,15 @@ pub fn resize_bicubic_torch_aa_rgb(
             "torch bicubic RGB resize {width}x{height} -> {out_w}x{out_h} must be non-empty"
         )));
     }
-    let output =
-        resize_torch_uint8_rgb(data, width, height, out_w, out_h, PilResizeFilter::Bicubic);
+    let output = resize_torch_uint8_rgb(
+        data,
+        width,
+        height,
+        out_w,
+        out_h,
+        PilResizeFilter::Bicubic,
+        Buffers::Fresh,
+    );
     RgbImage::from_raw(out_w, out_h, output).ok_or_else(|| {
         TransformError::ShapeError(format!(
             "failed to build torch bicubic RGB image for {out_w}x{out_h}"
@@ -2805,7 +4088,7 @@ pub fn resize_bicubic_torch_aa_rgb(
 /// run for `InterpolationMode.LANCZOS` on the CPU): Pillow's Lanczos-3
 /// kernel in the torch `uint8` quantization of [`resize_bicubic_torch_aa_rgb`],
 /// interleaved RGB bytes in and out.
-pub fn resize_lanczos_torch_aa_rgb_bytes(
+pub(crate) fn resize_lanczos_torch_aa_rgb_bytes(
     data: &[u8],
     width: u32,
     height: u32,
@@ -2832,12 +4115,103 @@ pub fn resize_lanczos_torch_aa_rgb_bytes(
         out_w,
         out_h,
         PilResizeFilter::Lanczos,
+        Buffers::Fresh,
     ))
+}
+
+/// The torchvision `uint8` BILINEAR resize (`interpolate(.., mode="bilinear",
+/// antialias=True)` on a `uint8` tensor, where torchvision's `resize` sends a
+/// `uint8` image on a CPU with AVX2 and on AArch64; on any other CPU it
+/// resizes in `float32`, and some of its bytes stand one level off these):
+/// Pillow's triangle kernel in the torch `uint8` quantization of
+/// [`resize_bicubic_torch_aa_rgb`], interleaved RGB bytes in and out, for a
+/// decoded image's bytes and a planned, non-empty target. On x86-64 the
+/// result and the passes' band buffers are the crate's pool's: a caller done
+/// with the bytes hands them back ([`buffer_pool::recycle`]).
+pub(crate) fn resize_bilinear_torch_aa_rgb_bytes(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    out_w: u32,
+    out_h: u32,
+) -> Vec<u8> {
+    let filter = PilResizeFilter::Bilinear;
+    resize_torch_uint8_rgb(data, width, height, out_w, out_h, filter, Buffers::Pooled)
+}
+
+/// `levels` written three times each into `rgb`, three bytes a level.
+fn spread_grey(levels: &[u8], rgb: &mut [u8]) {
+    for (pixel, &level) in rgb.as_chunks_mut::<3>().0.iter_mut().zip(levels) {
+        *pixel = [level; 3];
+    }
+}
+
+/// [`resize_bilinear_torch_aa_rgb_bytes`] of `image`'s RGB bytes
+/// ([`rgb_bytes`]) to each of `targets`, for an image with no empty side. An
+/// 8-bit grey image is resized as its one channel and each resized level is
+/// written three times, so no RGB copy of the image (three bytes a source
+/// pixel beside its one) is made and the kernel sums a third of the samples.
+/// The bytes are the same: every sample is summed by itself in both passes,
+/// `clip8((half + Σ pixel · tap) >> precision)`, and the three channels of a
+/// grey image's RGB bytes are its levels. On x86-64 that is one kernel at
+/// one channel and at three; elsewhere the grey channel takes the portable
+/// rows and RGB the rows of `torch_resample`, two kernels that agree
+/// through that per-sample definition. An image of any other kind is
+/// converted whole, once for every target; an RGB8 image lends its bytes.
+/// The results are the pool's, as [`resize_bilinear_torch_aa_rgb_bytes`]'s.
+pub(crate) fn resize_bilinear_torch_aa_image<const N: usize>(
+    image: &DynamicImage,
+    targets: [(u32, u32); N],
+) -> [Vec<u8>; N] {
+    let (in_w, in_h) = image.dimensions();
+    if let DynamicImage::ImageLuma8(grey) = image {
+        let levels = &grey.as_raw()[..in_w as usize * in_h as usize];
+        let kernel = (PilResizeFilter::Bilinear, KernelQuantization::TorchUint8);
+        return targets.map(|target| {
+            let resized =
+                resize_pil_bytes_in::<1>(levels, (in_w, in_h), target, kernel, Buffers::Pooled);
+            let mut rgb = buffer_pool::take(3 * resized.len());
+            spread_grey(&resized, &mut rgb);
+            buffer_pool::recycle(resized);
+            rgb
+        });
+    }
+    let (_, _, rgb) = rgb_bytes(image);
+    targets.map(|(out_w, out_h)| resize_bilinear_torch_aa_rgb_bytes(&rgb, in_w, in_h, out_w, out_h))
+}
+
+/// Source pixels above which a colour image's
+/// [`resize_bilinear_torch_aa_image`] trails the generic resizer on the AVX2
+/// rows.
+const BILINEAR_TRAILS_ABOVE: u64 = 4_000_000;
+
+/// Whether [`resize_bilinear_torch_aa_image`] of `image` trails the generic
+/// resizer ([`resize`]) on this host: a colour image of more than four
+/// megapixels where the width pass runs its AVX2 rows. Timed for a caller
+/// that resizes an image to a canvas of tiles and to one tile: up to four
+/// megapixels the exact kernel is ahead on those rows at every aspect ratio
+/// tried, from five it is behind, by up to 30 percent at 48 megapixels. An
+/// 8-bit grey image is ahead at every size, and so is every image on the
+/// AVX-512 rows. A caller that keeps the generic resizer for such an image
+/// keeps that resizer's bytes, which are not the reference's.
+pub(crate) fn bilinear_torch_aa_trails_generic(image: &DynamicImage) -> bool {
+    let grey = matches!(image, DynamicImage::ImageLuma8(_));
+    let pixels = u64::from(image.width()) * u64::from(image.height());
+    trails_generic(WidthPass::runs_avx2_rows(), grey, pixels)
+}
+
+/// [`bilinear_torch_aa_trails_generic`] by its three facts.
+fn trails_generic(avx2_rows: bool, grey: bool, pixels: u64) -> bool {
+    avx2_rows && !grey && pixels > BILINEAR_TRAILS_ABOVE
 }
 
 /// The torchvision `uint8` BICUBIC resize of [`resize_bicubic_torch_aa_rgb`]
 /// for a decoded image.
-pub fn resize_bicubic_torch_aa(image: &DynamicImage, out_w: u32, out_h: u32) -> DynamicImage {
+pub(crate) fn resize_bicubic_torch_aa(
+    image: &DynamicImage,
+    out_w: u32,
+    out_h: u32,
+) -> DynamicImage {
     let (in_w, in_h, data) = rgb_bytes(image);
     let output = resize_torch_uint8_rgb(
         &data,
@@ -2846,6 +4220,7 @@ pub fn resize_bicubic_torch_aa(image: &DynamicImage, out_w: u32, out_h: u32) -> 
         out_w,
         out_h,
         PilResizeFilter::Bicubic,
+        Buffers::Fresh,
     );
     #[expect(
         clippy::expect_used,
@@ -2890,6 +4265,7 @@ pub(crate) fn resize_bicubic_torch_aa_cropped(
             out_w,
             out_h,
             PilResizeFilter::Bicubic,
+            Buffers::Fresh,
         );
         crop_bytes::<3>(
             &whole,
@@ -2909,6 +4285,90 @@ pub(crate) fn resize_bicubic_torch_aa_cropped(
     DynamicImage::ImageRgb8(
         RgbImage::from_raw(crop.0, crop.1, output).expect("torch resize window buffer size"),
     )
+}
+
+/// [`expand_to_square`] of an RGB image followed by [`resize_bicubic_torch_aa`]
+/// to `out` x `out`, with the square never built. The width pass reads a row
+/// alone, so the padding above and below a wide image is one resampled row of
+/// `background` repeated, and a tall image's rows are padded a band at a
+/// time; the height pass then reads the rows the square's width pass gives:
+/// the same bytes. `None` where the square is the road: an image that is
+/// square, empty or already `out` on its longer side, and every target but x86-64,
+/// whose torch rows resample the whole ([`resize_torch_uint8_rgb`]).
+pub(crate) fn resize_bicubic_torch_aa_squared(
+    rgb: &RgbImage,
+    background: Rgb<u8>,
+    out: u32,
+) -> Option<RgbImage> {
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    let (side, size) = (w.max(h), out as usize);
+    if !cfg!(target_arch = "x86_64") || w == h || side == size || size == 0 || w.min(h) == 0 {
+        return None;
+    }
+    // Both axes go from `side` to `out`: one kernel serves the two passes.
+    let kernel = &FixedKernel::new(
+        side,
+        size,
+        PilResizeFilter::Bicubic,
+        KernelQuantization::TorchUint8,
+    );
+    let pass = &WidthPass::new::<3>(kernel);
+    let data = &rgb.as_raw()[..w * h * 3];
+    let row = size * 3;
+    let mut rows = plain_buffer(side * row);
+    let (above, rest) = rows.split_at_mut((side - h) / 2 * row);
+    let (image, below) = rest.split_at_mut(h * row);
+    // The width pass of the image's rows from `start` on, as many as `dst`
+    // holds.
+    let width_rows = |start: usize, dst: &mut [u8], scratch: &mut BandScratch| {
+        if w > h {
+            return pass.rows::<3>(data, kernel, w, size, start, dst, scratch);
+        }
+        // The square's rows a band at a time: the padding of a row stays,
+        // the image's part of it is copied in.
+        let band_rows = (PIL_BAND_BYTES / (side * 3)).clamp(1, dst.len() / row);
+        let left = (side - w) / 2 * 3;
+        let mut band = background.0.repeat(side * band_rows);
+        for (src, dst) in data[start * w * 3..][..dst.len() / row * w * 3]
+            .chunks(band_rows * w * 3)
+            .zip(dst.chunks_mut(band_rows * row))
+        {
+            for (padded, line) in band.chunks_exact_mut(side * 3).zip(src.chunks_exact(w * 3)) {
+                padded[left..left + w * 3].copy_from_slice(line);
+            }
+            pass.rows::<3>(&band, kernel, side, size, 0, dst, scratch);
+        }
+    };
+    // A row of the width pass reads its own source row alone, so the rows are
+    // banded across the pool on an output the square's resize bands too.
+    let tasks = par_threads(size * row, h.min(size));
+    let scratch = &mut BandScratch::default();
+    if tasks <= 1 {
+        width_rows(0, image, scratch);
+    } else {
+        let task_rows = h.div_ceil(tasks);
+        parallel_scope(|scope| {
+            for (index, band) in image.chunks_mut(task_rows * row).enumerate() {
+                let width_rows = &width_rows;
+                scope.spawn(move |_| {
+                    width_rows(index * task_rows, band, &mut BandScratch::default());
+                });
+            }
+        });
+    }
+    if w > h {
+        let mut pad = plain_buffer(row);
+        let color = background.0.repeat(side);
+        pass.rows::<3>(&color, kernel, side, size, 0, &mut pad, scratch);
+        for line in above
+            .chunks_exact_mut(row)
+            .chain(below.chunks_exact_mut(row))
+        {
+            line.copy_from_slice(&pad);
+        }
+    }
+    let resized = pil_resample_vertical::<3>(&rows, size, size, kernel, Buffers::Fresh);
+    RgbImage::from_raw(out, out, resized)
 }
 
 /// Keys' cubic (`a = -0.5`) as torch's compiled CPU kernel evaluates it in
@@ -3025,12 +4485,29 @@ fn torch_aa_plain_until(count: usize) -> usize {
 /// `a = -0.5` widened by the downscale factor, with torch's `f32` weights and
 /// its compiled loop's order of roundings (`torch_aa_passes`), so an output is
 /// the reference's bit for bit; the width pass runs first.
-pub fn resize_bicubic_torch_aa_f32(
+pub(crate) fn resize_bicubic_torch_aa_f32(
     data: &[u8],
     width: u32,
     height: u32,
     out_w: u32,
     out_h: u32,
+) -> Result<Vec<f32>> {
+    resize_bicubic_torch_aa_f32_strips(data, width, height, out_w, out_h, out_h as usize, |_| ())
+}
+
+/// [`resize_bicubic_torch_aa_f32`] with its output a strip at a time: the
+/// rows are written into one buffer of `strip` rows, and `full` reads that
+/// buffer each time its rows are done. A `strip` that does not divide `out_h`
+/// is refused. The buffer is returned; it is the whole output when `strip` is
+/// `out_h`.
+pub(crate) fn resize_bicubic_torch_aa_f32_strips(
+    data: &[u8],
+    width: u32,
+    height: u32,
+    out_w: u32,
+    out_h: u32,
+    strip: usize,
+    full: impl FnMut(&[f32]),
 ) -> Result<Vec<f32>> {
     let (in_w, in_h, out_w, out_h) = (
         width as usize,
@@ -3050,14 +4527,19 @@ pub fn resize_bicubic_torch_aa_f32(
             "torch bicubic RGB resize {width}x{height} -> {out_w}x{out_h} must be non-empty"
         )));
     }
+    if strip == 0 || out_h % strip != 0 {
+        return Err(TransformError::ShapeError(format!(
+            "torch bicubic strip of {strip} rows must divide the output height {out_h}"
+        )));
+    }
     Ok(torch_aa_resize(
         data,
-        in_w,
-        in_h,
-        out_w,
-        out_h,
+        (in_w, in_h),
+        (out_w, out_h),
         TorchAaFilter::Bicubic,
         |_, byte| f32::from(byte),
+        strip,
+        full,
     ))
 }
 
@@ -3070,7 +4552,7 @@ pub fn resize_bicubic_torch_aa_f32(
 /// (`torch_aa_passes`), so an output is the reference's bit for bit; the
 /// width pass runs first, and reads the table instead of a normalized copy of
 /// the image.
-pub fn resize_bilinear_torch_aa_normalized(
+pub(crate) fn resize_bilinear_torch_aa_normalized(
     data: &[u8],
     width: u32,
     height: u32,
@@ -3098,12 +4580,12 @@ pub fn resize_bilinear_torch_aa_normalized(
     }
     Ok(torch_aa_resize(
         data,
-        in_w,
-        in_h,
-        out_w,
-        out_h,
+        (in_w, in_h),
+        (out_w, out_h),
         TorchAaFilter::Bilinear,
         |channel, byte| table[channel][usize::from(byte)],
+        out_h,
+        |_| (),
     ))
 }
 
@@ -3113,12 +4595,12 @@ pub fn resize_bilinear_torch_aa_normalized(
 /// where the processor has the instruction.
 fn torch_aa_resize(
     data: &[u8],
-    in_w: usize,
-    in_h: usize,
-    out_w: usize,
-    out_h: usize,
+    (in_w, in_h): (usize, usize),
+    (out_w, out_h): (usize, usize),
     filter: TorchAaFilter,
     sample: impl Fn(usize, u8) -> f32 + Copy,
+    strip: usize,
+    full: impl FnMut(&[f32]),
 ) -> Vec<f32> {
     let (x_bounds, x_weights) = torch_aa_weights(in_w, out_w, filter);
     let (y_bounds, y_weights) = torch_aa_weights(in_h, out_h, filter);
@@ -3126,15 +4608,19 @@ fn torch_aa_resize(
         bounds: &x_bounds,
         weights: &x_weights,
     };
-    let y = TorchAaAxis {
-        bounds: &y_bounds,
-        weights: &y_weights,
+    let mut y = TorchAaRows {
+        axis: TorchAaAxis {
+            bounds: &y_bounds,
+            weights: &y_weights,
+        },
+        strip,
+        full,
     };
     #[cfg(target_arch = "x86_64")]
-    if let Some(out) = torch_aa_passes_with_fma(data, in_w, &x, &y, sample) {
+    if let Some(out) = torch_aa_passes_with_fma(data, in_w, &x, &mut y, sample) {
         return out;
     }
-    torch_aa_passes(data, in_w, &x, &y, sample)
+    torch_aa_passes(data, in_w, &x, &mut y, sample)
 }
 
 /// One axis of the torch-style resize: per output sample the first source
@@ -3144,81 +4630,167 @@ struct TorchAaAxis<'a> {
     weights: &'a [Vec<f32>],
 }
 
+/// The height axis of the torch-style resize with where its rows go: one
+/// buffer of `strip` rows, which `full` reads each time its rows are done.
+struct TorchAaRows<'a, F> {
+    axis: TorchAaAxis<'a>,
+    strip: usize,
+    full: F,
+}
+
 /// The two passes of [`resize_bicubic_torch_aa_f32`] and
-/// [`resize_bilinear_torch_aa_normalized`]: every source row resampled along
-/// the width, then the rows along the height. A source byte enters as
-/// `sample(channel, byte)`, the float the reference's tensor holds for it.
+/// [`resize_bilinear_torch_aa_normalized`]: the source rows resampled along
+/// the width a band at a time into a window of rows, and each output row
+/// resampled along the height from that window once the band of its last tap
+/// is done. A source byte enters as `sample(channel, byte)`, the float the
+/// reference's tensor holds for it. The output rows go into one buffer of
+/// `strip` rows, which `full` reads each time its rows are done and which is
+/// returned: the whole output when `strip` is the output height.
 /// An output's taps add in the reference's three runs: the first tap is the
 /// bare product, the next [`torch_aa_plain_until`] taps add a rounded product
 /// in a second rounding, and the rest are fused multiply-adds. Inlined into
 /// its callers so that the fused taps compile to the caller's instruction
 /// set.
 #[inline(always)]
-fn torch_aa_passes(
+fn torch_aa_passes<F: FnMut(&[f32])>(
     data: &[u8],
     in_w: usize,
     x: &TorchAaAxis<'_>,
-    y: &TorchAaAxis<'_>,
+    y: &mut TorchAaRows<'_, F>,
     sample: impl Fn(usize, u8) -> f32 + Copy,
 ) -> Vec<f32> {
+    let &mut TorchAaRows {
+        axis: ref y,
+        strip,
+        ref mut full,
+    } = y;
     let (out_w, out_h) = (x.bounds.len(), y.bounds.len());
-    let in_h = data.len() / (in_w * 3);
+    debug_assert_eq!(out_h % strip, 0, "the output is whole strips");
 
-    let mut rows = plain_f32(in_h * out_w * 3);
-    for (src, dst) in data
-        .chunks_exact(in_w * 3)
-        .zip(rows.chunks_exact_mut(out_w * 3))
-    {
-        let (pixels, _) = src.as_chunks::<3>();
-        let (outs, _) = dst.as_chunks_mut::<3>();
-        for (out, (&(start, count), weights)) in outs.iter_mut().zip(x.bounds.iter().zip(x.weights))
+    // The width pass takes the source rows a band at a time. A tap has one
+    // weight and one offset for every row, so with the rows of a band side by
+    // side a tap is a few vector steps over all of them, and a byte goes
+    // through `sample` once instead of once a tap. `band` holds one source
+    // pixel of every row, each as RGB and a fourth value that stays zero:
+    // three values a pixel take fewer instructions and less memory, but
+    // measured slower on downscales. A last band of fewer rows leaves the
+    // rows past its own as the band before filled them; those are summed
+    // and never copied out. A value still adds its own taps in the order
+    // above, so no bit moves.
+    const BAND: usize = 8;
+    // The height pass reads a source row only while the taps of an output
+    // row cover it, and an output row's taps never start or end before those
+    // of the row above. So the width pass keeps a window of `kept` rows, the
+    // longest run of whole bands one output row reads, not the image: a
+    // source row stands in it at its index modulo `kept`.
+    let kept = y
+        .bounds
+        .iter()
+        .map(|&(start, count)| (start + count).next_multiple_of(BAND) - start / BAND * BAND)
+        .fold(BAND, usize::max);
+    debug_assert!(
+        y.bounds
+            .windows(2)
+            .all(|w| w[0].0 + w[0].1 <= w[1].0 + w[1].1),
+        "an output row's taps end no earlier than those of the row above"
+    );
+    let mut rows = plain_f32(kept * out_w * 3);
+    let mut band = plain_f32(in_w * BAND * 4);
+    let (band, _) = band.as_chunks_mut::<4>();
+    let (band, _) = band.as_chunks_mut::<BAND>();
+    let mut sums = plain_f32(out_w * BAND * 4);
+    let (sums, _) = sums.as_chunks_mut::<4>();
+    let (sums, _) = sums.as_chunks_mut::<BAND>();
+    let mut out = plain_f32(strip * out_w * 3);
+    // The output rows done, and how many of them the strip holds.
+    let (mut written, mut in_strip) = (0, 0);
+    for (index, src) in data.chunks(BAND * in_w * 3).enumerate() {
+        let dst = &mut rows[(index * BAND % kept) * out_w * 3..][..src.len() / in_w * out_w];
+        for (src, row) in src.chunks_exact(in_w * 3).zip(0..BAND) {
+            let (pixels, _) = src.as_chunks::<3>();
+            for (values, pixel) in band.iter_mut().zip(pixels) {
+                for (channel, (value, &byte)) in values[row].iter_mut().zip(pixel).enumerate() {
+                    *value = sample(channel, byte);
+                }
+            }
+        }
+        for (sum, (&(start, count), weights)) in sums.iter_mut().zip(x.bounds.iter().zip(x.weights))
         {
-            let mut taps = weights[..count].iter().zip(&pixels[start..start + count]);
-            let mut acc = [0.0_f32; 3];
-            if let Some((&weight, pixel)) = taps.next() {
-                for (channel, (sum, &byte)) in acc.iter_mut().zip(pixel).enumerate() {
-                    *sum = weight * sample(channel, byte);
+            let mut taps = weights[..count].iter().zip(&band[start..start + count]);
+            let mut acc = [[0.0_f32; 4]; BAND];
+            if let Some((&weight, values)) = taps.next() {
+                for (a, &v) in acc.as_flattened_mut().iter_mut().zip(values.as_flattened()) {
+                    *a = weight * v;
                 }
             }
-            for (&weight, pixel) in taps.by_ref().take(torch_aa_plain_until(count)) {
-                for (channel, (sum, &byte)) in acc.iter_mut().zip(pixel).enumerate() {
-                    *sum += weight * sample(channel, byte);
+            for (&weight, values) in taps.by_ref().take(torch_aa_plain_until(count)) {
+                for (a, &v) in acc.as_flattened_mut().iter_mut().zip(values.as_flattened()) {
+                    *a += weight * v;
                 }
             }
-            for (&weight, pixel) in taps {
-                for (channel, (sum, &byte)) in acc.iter_mut().zip(pixel).enumerate() {
-                    *sum = weight.mul_add(sample(channel, byte), *sum);
+            for (&weight, values) in taps {
+                for (a, &v) in acc.as_flattened_mut().iter_mut().zip(values.as_flattened()) {
+                    *a = weight.mul_add(v, *a);
                 }
             }
-            *out = acc;
+            *sum = acc;
         }
-    }
+        for (dst, row) in dst.chunks_exact_mut(out_w * 3).zip(0..BAND) {
+            let (outs, _) = dst.as_chunks_mut::<3>();
+            for (out, sum) in outs.iter_mut().zip(sums.iter()) {
+                let [r, g, b, _] = sum[row];
+                *out = [r, g, b];
+            }
+        }
 
-    let mut out = plain_f32(out_h * out_w * 3);
-    let row = out_w * 3;
-    for (dst, (&(start, count), weights)) in out
-        .chunks_exact_mut(row)
-        .zip(y.bounds.iter().zip(y.weights))
-    {
-        let mut taps = weights[..count]
-            .iter()
-            .zip(rows[start * row..(start + count) * row].chunks_exact(row));
-        if let Some((&weight, src)) = taps.next() {
-            for (d, &v) in dst.iter_mut().zip(src) {
-                *d = weight * v;
+        // The output rows whose last tap this band holds are written now; a
+        // row without taps waits for no source row.
+        let row = out_w * 3;
+        let held = index * BAND + src.len() / (in_w * 3);
+        while let Some(&(start, count)) = y.bounds.get(written) {
+            if count != 0 && start + count > held {
+                break;
             }
-        }
-        for (&weight, src) in taps.by_ref().take(torch_aa_plain_until(count)) {
-            for (d, &v) in dst.iter_mut().zip(src) {
-                *d += weight * v;
+            let dst = &mut out[in_strip * row..][..row];
+            // The taps' rows run to the window's end and on from its start.
+            let first = start % kept;
+            let wrapped = (first + count).saturating_sub(kept);
+            let mut taps = y.weights[written][..count].iter().zip(
+                rows[first * row..(first + count - wrapped) * row]
+                    .chunks_exact(row)
+                    .chain(rows[..wrapped * row].chunks_exact(row)),
+            );
+            match taps.next() {
+                Some((&weight, src)) => {
+                    for (d, &v) in dst.iter_mut().zip(src) {
+                        *d = weight * v;
+                    }
+                }
+                // A strip holds the rows of the strip before.
+                None => dst.fill(0.0),
             }
-        }
-        for (&weight, src) in taps {
-            for (d, &v) in dst.iter_mut().zip(src) {
-                *d = weight.mul_add(v, *d);
+            for (&weight, src) in taps.by_ref().take(torch_aa_plain_until(count)) {
+                for (d, &v) in dst.iter_mut().zip(src) {
+                    *d += weight * v;
+                }
+            }
+            for (&weight, src) in taps {
+                for (d, &v) in dst.iter_mut().zip(src) {
+                    *d = weight.mul_add(v, *d);
+                }
+            }
+            written += 1;
+            in_strip += 1;
+            if in_strip == strip {
+                full(&out);
+                in_strip = 0;
             }
         }
     }
+    debug_assert_eq!(
+        written, out_h,
+        "every output row's taps lie inside the source"
+    );
     out
 }
 
@@ -3229,11 +4801,11 @@ fn torch_aa_passes(
 /// such processors.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "fma")]
-fn torch_aa_passes_fma(
+fn torch_aa_passes_fma<F: FnMut(&[f32])>(
     data: &[u8],
     in_w: usize,
     x: &TorchAaAxis<'_>,
-    y: &TorchAaAxis<'_>,
+    y: &mut TorchAaRows<'_, F>,
     sample: impl Fn(usize, u8) -> f32 + Copy,
 ) -> Vec<f32> {
     torch_aa_passes(data, in_w, x, y, sample)
@@ -3247,11 +4819,11 @@ fn torch_aa_passes_fma(
     unsafe_code,
     reason = "the target-feature function runs only after this function detected its feature"
 )]
-fn torch_aa_passes_with_fma(
+fn torch_aa_passes_with_fma<F: FnMut(&[f32])>(
     data: &[u8],
     in_w: usize,
     x: &TorchAaAxis<'_>,
-    y: &TorchAaAxis<'_>,
+    y: &mut TorchAaRows<'_, F>,
     sample: impl Fn(usize, u8) -> f32 + Copy,
 ) -> Option<Vec<f32>> {
     if !std::arch::is_x86_feature_detected!("fma") {
@@ -3262,27 +4834,10 @@ fn torch_aa_passes_with_fma(
     Some(unsafe { torch_aa_passes_fma(data, in_w, x, y, sample) })
 }
 
-/// Resize image preserving aspect ratio, fitting within max dimensions.
-pub fn resize_to_fit(
-    image: &DynamicImage,
-    max_width: u32,
-    max_height: u32,
-    filter: FilterType,
-) -> DynamicImage {
-    let (w, h) = image.dimensions();
-    let ratio = (max_width as f64 / w as f64).min(max_height as f64 / h as f64);
-    if ratio >= 1.0 {
-        return image.clone();
-    }
-    let new_w = ((w as f64 * ratio).round() as u32).max(1);
-    let new_h = ((h as f64 * ratio).round() as u32).max(1);
-    resize(image, new_w, new_h, filter)
-}
-
 /// Center crop image to specified dimensions.
 ///
 /// If the crop size is larger than the image, the image is returned unchanged.
-pub fn center_crop(image: &DynamicImage, crop_w: u32, crop_h: u32) -> DynamicImage {
+pub(crate) fn center_crop(image: &DynamicImage, crop_w: u32, crop_h: u32) -> DynamicImage {
     let (w, h) = image.dimensions();
     if crop_w >= w && crop_h >= h {
         return image.clone();
@@ -3297,6 +4852,14 @@ pub fn center_crop(image: &DynamicImage, crop_w: u32, crop_h: u32) -> DynamicIma
         }
         other => other.crop_imm(left, top, actual_w, actual_h),
     }
+}
+
+/// The pixel bytes of `image`, exactly `3 * width * height` of them: a
+/// container may be longer than its image (`ImageBuffer::from_raw` takes any
+/// that is long enough), and the bytes behind the pixels are not the image.
+pub(crate) fn rgb_pixels(image: &RgbImage) -> &[u8] {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    &image.as_raw()[..3 * width * height]
 }
 
 /// The `width` x `height` crop of `image` at (`x`, `y`), clipped to the
@@ -3325,6 +4888,40 @@ pub(crate) fn crop_rgb(image: &RgbImage, x: u32, y: u32, width: u32, height: u32
         reason = "data holds exactly width * height * 3 bytes by construction"
     )]
     RgbImage::from_raw(width, height, data).expect("crop buffer size")
+}
+
+/// The columns of the image that one pass of [`transpose_rgb`] moves: their
+/// pixels of an image row and the output rows they go to stay in the cache.
+const TRANSPOSE_BLOCK: usize = 32;
+
+/// `image` flipped over its main diagonal (PIL's `Image.TRANSPOSE`): the
+/// pixel at (`x`, `y`) goes to (`y`, `x`), so the result is `height` wide and
+/// `width` high. The generic way, a horizontal flip and then a quarter turn,
+/// copies the image twice, pixel by pixel. Here a block of columns at a time
+/// is gathered in a scratch block that stays in the cache, each image row
+/// giving one pixel to each of its output rows, and joins the output whole.
+pub(crate) fn transpose_rgb(image: &RgbImage) -> RgbImage {
+    let (width, height) = (image.width() as usize, image.height() as usize);
+    // A zero-sized image has no rows; a chunk size of 0 would panic.
+    let (stride, out_stride) = ((width * 3).max(1), (height * 3).max(1));
+    let mut data = Vec::with_capacity(width * height * 3);
+    let mut block = vec![0_u8; TRANSPOSE_BLOCK.min(width) * height * 3];
+    for first in (0..width).step_by(TRANSPOSE_BLOCK) {
+        let columns = TRANSPOSE_BLOCK.min(width - first);
+        let block = &mut block[..columns * height * 3];
+        for (y, row) in rgb_pixels(image).chunks_exact(stride).enumerate() {
+            let (pixels, _) = row[first * 3..(first + columns) * 3].as_chunks::<3>();
+            for (out_row, pixel) in block.chunks_exact_mut(out_stride).zip(pixels) {
+                out_row[y * 3..y * 3 + 3].copy_from_slice(pixel);
+            }
+        }
+        data.extend_from_slice(block);
+    }
+    #[expect(
+        clippy::expect_used,
+        reason = "data holds exactly height * width * 3 bytes by construction"
+    )]
+    RgbImage::from_raw(image.height(), image.width(), data).expect("transpose buffer size")
 }
 
 /// `image` pasted at (`x`, `y`) on a `width` x `height` canvas of
@@ -3379,7 +4976,7 @@ pub(crate) fn paste_rgb(
 ///
 /// This is used by LLaVA models which expect square inputs. The image is
 /// centered and padded with the mean color on the shorter dimension.
-pub fn expand_to_square(image: &DynamicImage, background: Rgb<u8>) -> DynamicImage {
+pub(crate) fn expand_to_square(image: &DynamicImage, background: Rgb<u8>) -> DynamicImage {
     let (w, h) = image.dimensions();
     if w == h {
         return image.clone();
@@ -3402,19 +4999,10 @@ pub fn expand_to_square(image: &DynamicImage, background: Rgb<u8>) -> DynamicIma
     }
 }
 
-/// Pillow-exact `ImageOps.pad` with default centering (0.5, 0.5):
-/// aspect-preserving BICUBIC `contain` fit into `(out_w, out_h)`, then a
-/// centered paste onto a `color` canvas. Matches Pillow 12.x source: `contain`
-/// adjusts at most one dimension using Python `round()` (exact
-/// round-half-to-even, so `471.49999999999994` rounds to 471 like Python and
-/// not up like an epsilon tie test would) and `pad` pastes at
-/// `round((size - resized) * 0.5)` along the padded axis.
-///
-/// The image is treated as RGB (`to_rgb8`): an alpha channel is dropped, not
-/// premultiplied; callers that need Pillow's RGBA behaviour must flatten
-/// first. An aspect ratio so extreme that the contained dimension rounds to
-/// zero is an error, as it is in Pillow (`height and width must be > 0`).
-pub fn pad_to_size_pil(
+/// [`pad_to_size_pil_rgb`] over a decoded image, which is treated as RGB
+/// (`to_rgb8`): an alpha channel is dropped, not premultiplied.
+#[cfg(test)]
+fn pad_to_size_pil(
     image: &DynamicImage,
     out_w: u32,
     out_h: u32,
@@ -3424,10 +5012,20 @@ pub fn pad_to_size_pil(
     pad_to_size_pil_rgb(&data, w as u32, h as u32, out_w, out_h, color).map(DynamicImage::ImageRgb8)
 }
 
-/// [`pad_to_size_pil`] over interleaved RGB bytes (`width` x `height`): the
-/// same geometry, the contained image resized once and its rows copied into
-/// the canvas (the paste of an opaque image is a copy).
-pub fn pad_to_size_pil_rgb(
+/// Pillow-exact `ImageOps.pad` with default centering (0.5, 0.5) over
+/// interleaved RGB bytes (`width` x `height`): aspect-preserving BICUBIC
+/// `contain` fit into `(out_w, out_h)`, then a centered paste onto a `color`
+/// canvas. Matches Pillow 12.x source: `contain` adjusts at most one dimension
+/// using Python `round()` (exact round-half-to-even, so `471.49999999999994`
+/// rounds to 471 like Python and not up like an epsilon tie test would) and
+/// `pad` pastes at `round((size - resized) * 0.5)` along the padded axis.
+///
+/// The contained image is resized once. When the fit leaves room on one axis,
+/// its rows are copied into the canvas (the paste of an opaque image is a
+/// copy); when it fills the target, it is returned without a canvas. An aspect
+/// ratio so extreme that the contained dimension rounds to zero is an error,
+/// as it is in Pillow (`height and width must be > 0`).
+pub(crate) fn pad_to_size_pil_rgb(
     data: &[u8],
     width: u32,
     height: u32,
@@ -3505,10 +5103,8 @@ pub fn pad_to_size_pil_rgb(
 /// Stack multiple [C, H, W] tensors into [B, C, H, W].
 ///
 /// All tensors must have the same shape.
-pub fn stack_batch(tensors: &[Array3<f32>]) -> Result<Array4<f32>> {
-    if tensors.is_empty() {
-        return Err(TransformError::EmptyBatch);
-    }
+pub(crate) fn stack_batch(tensors: &[Array3<f32>]) -> Result<Array4<f32>> {
+    TransformError::if_empty(tensors)?;
 
     let shape = tensors[0].shape();
     let (c, h, w) = (shape[0], shape[1], shape[2]);
@@ -3549,7 +5145,7 @@ pub fn stack_batch(tensors: &[Array3<f32>]) -> Result<Array4<f32>> {
 /// - 3: BICUBIC
 /// - 4: BOX
 /// - 5: HAMMING
-pub fn pil_to_filter(resampling: Option<usize>) -> FilterType {
+pub(crate) fn pil_to_filter(resampling: Option<usize>) -> FilterType {
     match resampling {
         Some(0) => FilterType::Nearest,
         Some(1) => FilterType::Lanczos3,
@@ -3561,139 +5157,14 @@ pub fn pil_to_filter(resampling: Option<usize>) -> FilterType {
     }
 }
 
-/// Calculate mean color of an image as RGB.
-pub fn calculate_mean_color(image: &DynamicImage) -> Rgb<u8> {
-    let rgb = image.to_rgb8();
-    let (w, h) = (rgb.width() as u64, rgb.height() as u64);
-    let total_pixels = w * h;
-
-    if total_pixels == 0 {
-        return Rgb([128, 128, 128]);
-    }
-
-    let (mut r_sum, mut g_sum, mut b_sum) = (0u64, 0u64, 0u64);
-    for pixel in rgb.pixels() {
-        r_sum += pixel[0] as u64;
-        g_sum += pixel[1] as u64;
-        b_sum += pixel[2] as u64;
-    }
-
-    Rgb([
-        (r_sum / total_pixels) as u8,
-        (g_sum / total_pixels) as u8,
-        (b_sum / total_pixels) as u8,
-    ])
-}
-
 /// Convert normalized mean values [0, 1] to RGB bytes, truncated like the
 /// reference's `int(x * 255)` (the CLIP mean fills with 122, 116, 104).
-pub fn mean_to_rgb(mean: &[f64; 3]) -> Rgb<u8> {
+pub(crate) fn mean_to_rgb(mean: &[f64; 3]) -> Rgb<u8> {
     Rgb([
         (mean[0] * 255.0) as u8,
         (mean[1] * 255.0) as u8,
         (mean[2] * 255.0) as u8,
     ])
-}
-
-/// Cubic interpolation weight function (Keys bicubic kernel with a=-0.5).
-///
-/// This matches PyTorch's bicubic interpolation used in
-/// `torch.nn.functional.interpolate(mode='bicubic')`.
-#[inline]
-pub fn cubic_weight(x: f32) -> f32 {
-    let x = x.abs();
-    if x < 1.0 {
-        (1.5 * x - 2.5) * x * x + 1.0
-    } else if x < 2.0 {
-        ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0
-    } else {
-        0.0
-    }
-}
-
-/// Perform bicubic interpolation at a single point in a tensor.
-///
-/// Uses a 4x4 kernel with Keys bicubic weights (a=-0.5) to match PyTorch's
-/// `torch.nn.functional.interpolate(mode='bicubic')`.
-///
-/// # Arguments
-/// * `tensor` - Input tensor of shape [C, H, W]
-/// * `c` - Channel index
-/// * `src_y` - Source Y coordinate (can be fractional)
-/// * `src_x` - Source X coordinate (can be fractional)
-/// * `h` - Height of the tensor
-/// * `w` - Width of the tensor
-///
-/// # Returns
-/// The interpolated value at the specified position.
-pub fn bicubic_interpolate(
-    tensor: &Array3<f32>,
-    c: usize,
-    src_y: f32,
-    src_x: f32,
-    h: usize,
-    w: usize,
-) -> f32 {
-    let y_int = src_y.floor() as i32;
-    let x_int = src_x.floor() as i32;
-    let y_frac = src_y - y_int as f32;
-    let x_frac = src_x - x_int as f32;
-
-    let mut result = 0.0f32;
-
-    // Sample 4x4 neighborhood
-    for dy in -1..=2 {
-        let y_idx = (y_int + dy).clamp(0, h as i32 - 1) as usize;
-        let y_weight = cubic_weight(y_frac - dy as f32);
-
-        for dx in -1..=2 {
-            let x_idx = (x_int + dx).clamp(0, w as i32 - 1) as usize;
-            let x_weight = cubic_weight(x_frac - dx as f32);
-
-            result += tensor[[c, y_idx, x_idx]] * y_weight * x_weight;
-        }
-    }
-
-    result
-}
-
-/// Resize a tensor using bicubic interpolation.
-///
-/// This matches PyTorch's `torch.nn.functional.interpolate(mode='bicubic', align_corners=False)`.
-///
-/// # Arguments
-/// * `tensor` - Input tensor of shape [C, H, W]
-/// * `target_h` - Target height
-/// * `target_w` - Target width
-///
-/// # Returns
-/// Resized tensor of shape [C, target_h, target_w].
-pub fn bicubic_resize(tensor: &Array3<f32>, target_h: usize, target_w: usize) -> Array3<f32> {
-    let (c, h, w) = (tensor.shape()[0], tensor.shape()[1], tensor.shape()[2]);
-
-    if h == target_h && w == target_w {
-        return tensor.clone();
-    }
-
-    let mut result = Array3::<f32>::zeros((c, target_h, target_w));
-
-    // PyTorch align_corners=False coordinate mapping
-    let scale_h = h as f32 / target_h as f32;
-    let scale_w = w as f32 / target_w as f32;
-
-    for ch in 0..c {
-        for y in 0..target_h {
-            for x in 0..target_w {
-                // PyTorch align_corners=False: src = (dst + 0.5) * scale - 0.5
-                let src_y = (y as f32 + 0.5) * scale_h - 0.5;
-                let src_x = (x as f32 + 0.5) * scale_w - 0.5;
-
-                result[[ch, y, x]] = bicubic_interpolate(tensor, ch, src_y, src_x, h, w);
-            }
-        }
-    }
-
-    result
 }
 
 // ---------------------------------------------------------------------------
@@ -3800,10 +5271,14 @@ fn torch_cubic_passes_fma(
 /// kernel's order of roundings (`torch_cubic_dot`); verified against the
 /// kernel on whole outputs at the integer scales of the tiling processors
 /// and at ratios whose fractions are not dyadic (the pinned 5:3, 13:7,
-/// 448:336 and 640:336 among them). The Keys kernel of
-/// [`bicubic_resize`] (`a = -0.5`, a single summation) differs from it by
-/// up to a fifth of the normalized scale on a 2x downscale.
-pub fn resize_bicubic_torch_f32(tensor: &Array3<f32>, out_h: usize, out_w: usize) -> Array3<f32> {
+/// 448:336 and 640:336 among them). A Keys kernel with `a = -0.5` and a
+/// single summation differs from it by up to a fifth of the normalized
+/// scale on a 2x downscale.
+pub(crate) fn resize_bicubic_torch_f32(
+    tensor: &Array3<f32>,
+    out_h: usize,
+    out_w: usize,
+) -> Array3<f32> {
     let (h, w) = (tensor.shape()[1], tensor.shape()[2]);
     if out_h == 0 || out_w == 0 || h == 0 || w == 0 {
         return Array3::zeros((tensor.shape()[0], out_h, out_w));
@@ -3832,6 +5307,89 @@ mod tests {
     use crate::test_support::{
         assert_same_bytes, create_test_image, gradient_rgb, hex, lcg_bytes, lcg_rgb_image,
     };
+
+    /// An 8-bit grey image's RGB bytes are the image library's conversion:
+    /// each of the 256 levels as the conversion writes it, and a container
+    /// longer than its pixels gives the image alone.
+    #[test]
+    fn a_grey_image_gives_its_rgb_conversion() {
+        let levels = image::GrayImage::from_raw(16, 16, (0..=255).collect()).expect("image size");
+        let levels = DynamicImage::ImageLuma8(levels);
+        let (width, height, rgb) = rgb_bytes(&levels);
+        assert_eq!((width, height), (16, 16));
+        assert_same_bytes(&rgb, levels.to_rgb8().as_raw(), "every grey level");
+        let long = image::GrayImage::from_raw(2, 2, vec![1, 2, 3, 4, 5, 6]).expect("image size");
+        let long = DynamicImage::ImageLuma8(long);
+        let (_, _, rgb) = rgb_bytes(&long);
+        assert_same_bytes(
+            &rgb,
+            &[1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4],
+            "a longer container",
+        );
+    }
+
+    /// An 8-bit grey image resized as its one channel holds the bytes of the
+    /// resize of its whole RGB conversion, to four targets (down, up, down
+    /// its width and up its height, its width kept), and so does a wide one
+    /// whose rows fill the vector arms' groups. An image of another kind
+    /// (grey with alpha, RGBA, 16-bit RGB) is converted whole and holds the
+    /// same bytes.
+    #[test]
+    fn a_grey_image_resizes_to_its_rgb_conversions_bytes() {
+        fn check(kind: &str, image: &DynamicImage, targets: [(u32, u32); 4]) {
+            let (w, h) = image.dimensions();
+            let (_, _, rgb) = rgb_bytes(image);
+            let whole = targets
+                .map(|(out_w, out_h)| resize_bilinear_torch_aa_rgb_bytes(&rgb, w, h, out_w, out_h));
+            let entry = resize_bilinear_torch_aa_image(image, targets);
+            for ((entry, whole), (out_w, out_h)) in entry.iter().zip(&whole).zip(targets) {
+                assert_same_bytes(entry, whole, &format!("{kind} to {out_w}x{out_h}"));
+            }
+        }
+        let (w, h) = (11, 7);
+        let pixels = (w * h) as usize;
+        let wide: Vec<u16> = lcg_bytes(3 * pixels, 11)
+            .into_iter()
+            .map(|byte| u16::from(byte) * 251 + 13)
+            .collect();
+        let images = [
+            (
+                "grey",
+                DynamicImage::ImageLuma8(
+                    image::GrayImage::from_raw(w, h, lcg_bytes(pixels, 3)).expect("image size"),
+                ),
+            ),
+            (
+                "grey with alpha",
+                DynamicImage::ImageLumaA8(
+                    image::GrayAlphaImage::from_raw(w, h, lcg_bytes(2 * pixels, 5))
+                        .expect("image size"),
+                ),
+            ),
+            (
+                "rgba",
+                DynamicImage::ImageRgba8(
+                    image::RgbaImage::from_raw(w, h, lcg_bytes(4 * pixels, 7)).expect("image size"),
+                ),
+            ),
+            (
+                "16-bit rgb",
+                DynamicImage::ImageRgb16(
+                    image::ImageBuffer::from_raw(w, h, wide).expect("image size"),
+                ),
+            ),
+        ];
+        for (kind, image) in &images {
+            check(kind, image, [(5, 3), (16, 10), (4, 9), (11, 3)]);
+        }
+        let (w, h) = (301, 43);
+        let wide = image::GrayImage::from_raw(w, h, lcg_bytes((w * h) as usize, 9));
+        check(
+            "a wide grey",
+            &DynamicImage::ImageLuma8(wide.expect("image size")),
+            [(97, 13), (40, 43), (301, 9), (640, 90)],
+        );
+    }
 
     /// Pillow's BILINEAR output on three images of generator bytes (12x5 to
     /// 5x3: a downscale on both axes; 9x4 to 4x4: the width pass alone; 6x7
@@ -3877,6 +5435,33 @@ mod tests {
                 expected,
                 &format!("{w}x{h} -> {out_w}x{out_h}"),
             );
+        }
+    }
+
+    /// Golden bits from HF's fused rescale-and-normalize (transformers 5.10.1,
+    /// torch 2.12). With mean = std = 0.5, byte 127 sits next to a bf16
+    /// rounding tie, so any other f32 formula can cast to a different bf16.
+    #[test]
+    fn to_tensor_and_normalize_is_bit_exact_with_hf() {
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(3, 2, Rgb([127, 128, 1])));
+        let clip_mean = [0.48145466, 0.4578275, 0.40821073];
+        let clip_std = [0.26862954, 0.26130258, 0.27577711];
+        for (mean, std, golden) in [
+            (
+                [0.5; 3],
+                [0.5; 3],
+                [0xbb80_8081_u32, 0x3b80_8081, 0xbf7d_fdfe],
+            ),
+            (clip_mean, clip_std, [0x3d7c_e08c, 0x3e2c_f360, 0xbfbb_a5e2]),
+        ] {
+            let tensor = to_tensor_and_normalize(&image, &mean, &std);
+            for (c, bits) in golden.into_iter().enumerate() {
+                assert_eq!(
+                    tensor[[c, 1, 2]].to_bits(),
+                    bits,
+                    "mean {mean:?}, channel {c}"
+                );
+            }
         }
     }
 
@@ -4274,6 +5859,14 @@ mod tests {
     const QUANTIZATIONS: [KernelQuantization; 2] =
         [KernelQuantization::Pillow, KernelQuantization::TorchUint8];
 
+    /// The kernels the bound sweeps run: bicubic and Lanczos at Pillow's
+    /// taps, bilinear at the torch `uint8` resampler's.
+    const BOUND_SWEEP_KERNELS: [(PilResizeFilter, KernelQuantization); 3] = [
+        (PilResizeFilter::Bicubic, KernelQuantization::Pillow),
+        (PilResizeFilter::Lanczos, KernelQuantization::Pillow),
+        (PilResizeFilter::Bilinear, KernelQuantization::TorchUint8),
+    ];
+
     /// The passes' parity cases: up- and downscales, identity axes, extreme
     /// aspects, row lengths that leave vector tails, odd row counts (the
     /// vector width pass's lone last row), a large image, and the vector
@@ -4314,9 +5907,19 @@ mod tests {
             .collect()
     }
 
-    /// Every byte of the 32-bit passes, three and four channels, bicubic and
-    /// Lanczos, both tap quantizations, over [`PIL_PASS_CASES`], equals the
-    /// per-sample `i64` computation.
+    /// `w` by `h` one-channel bytes that vary with the position and `seed`.
+    fn gradient_grey(w: usize, h: usize, seed: usize) -> Vec<u8> {
+        gradient_rgb(w, h, seed)
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|&[level, _, _]| level)
+            .collect()
+    }
+
+    /// Every byte of the 32-bit passes, one, three and four channels, bicubic,
+    /// Lanczos and bilinear, both tap quantizations, over [`PIL_PASS_CASES`],
+    /// equals the per-sample `i64` computation.
     #[test]
     fn pil_passes_equal_the_per_sample_i64_reference() {
         fn check<const C: usize>(
@@ -4370,6 +5973,13 @@ mod tests {
                     );
                     check::<4>(
                         &gradient_rgba(in_w, in_h, seed),
+                        case,
+                        filter,
+                        quantization,
+                        &what,
+                    );
+                    check::<1>(
+                        &gradient_grey(in_w, in_h, seed),
                         case,
                         filter,
                         quantization,
@@ -4450,6 +6060,32 @@ mod tests {
         }
     }
 
+    /// The squared entry point equals the square followed by the resize, at a
+    /// target the pool bands: a wide image, a tall one of several bands whose
+    /// last is short, and a tall one of a single band. Off x86-64 it leaves
+    /// the square to its caller.
+    #[test]
+    fn the_squared_torch_resize_equals_the_square_and_the_resize() {
+        let background = Rgb([122, 116, 104]);
+        for (seed, &(w, h)) in [(1920, 1079), (1079, 1920), (22, 47)].iter().enumerate() {
+            let data = gradient_rgb(w as usize, h as usize, seed * 11 + 5);
+            let rgb = RgbImage::from_raw(w, h, data).unwrap();
+            let squared = resize_bicubic_torch_aa_squared(&rgb, background, 672);
+            if cfg!(target_arch = "x86_64") {
+                let square = expand_to_square(&DynamicImage::ImageRgb8(rgb), background);
+                assert_same_bytes(
+                    squared.unwrap().as_raw(),
+                    resize_bicubic_torch_aa(&square, 672, 672)
+                        .into_rgb8()
+                        .as_raw(),
+                    &format!("{w}x{h} -> 672x672"),
+                );
+            } else {
+                assert!(squared.is_none(), "{w}x{h}");
+            }
+        }
+    }
+
     /// The torch `uint8` entry points carry the per-sample bytes of the torch
     /// taps on every case, whichever rows this target runs them on (the
     /// Pillow-exact passes on x86-64, the torch module's rows elsewhere), and
@@ -4481,6 +6117,19 @@ mod tests {
                 &format!("torch bicubic of the decoded image, {what}"),
             );
             assert_same_bytes(
+                &resize_bilinear_torch_aa_rgb_bytes(&data, w, h, ow, oh),
+                &per_sample_reference_channels::<3>(
+                    &data,
+                    in_w,
+                    in_h,
+                    out_w,
+                    out_h,
+                    PilResizeFilter::Bilinear,
+                    KernelQuantization::TorchUint8,
+                ),
+                &format!("torch bilinear, {what}"),
+            );
+            assert_same_bytes(
                 &resize_lanczos_torch_aa_rgb_bytes(&data, w, h, ow, oh).unwrap(),
                 &per_sample_reference_channels::<3>(
                     &data,
@@ -4498,7 +6147,7 @@ mod tests {
 
     /// The portable arm and every vector arm the host can build (the
     /// detected one, and on x86-64 each of AVX2 and AVX-512 the processor
-    /// reports) write the same bytes on every case, three and four channels,
+    /// reports) write the same bytes on every case, one, three and four channels,
     /// both tap quantizations (on a processor without a vector unit every arm
     /// is the portable loop).
     #[test]
@@ -4512,7 +6161,15 @@ mod tests {
         ) {
             let kernel = FixedKernel::new(in_w, out_w, filter, quantization);
             let mut portable = vec![0_u8; in_h * out_w * C];
-            WidthPass::Portable.rows::<C>(data, &kernel, in_w, out_w, 0, &mut portable);
+            WidthPass::Portable.rows::<C>(
+                data,
+                &kernel,
+                in_w,
+                out_w,
+                0,
+                &mut portable,
+                &mut BandScratch::default(),
+            );
             #[cfg_attr(
                 not(target_arch = "x86_64"),
                 expect(unused_mut, reason = "only the x86-64 arms are pushed")
@@ -4521,18 +6178,30 @@ mod tests {
             #[cfg(target_arch = "x86_64")]
             {
                 if std::arch::is_x86_feature_detected!("avx2") {
-                    let split = SplitTaps::new(&kernel, 0, kernel.bounds.len(), 4);
+                    let split = SplitTaps::of_width::<C>(&kernel);
                     arms.push(("avx2", WidthPass::Avx2(split)));
                 }
                 if avx512::detected() {
                     if let Some(groups) = GroupTaps::new::<C>(&kernel) {
-                        arms.push(("avx512", WidthPass::Avx512(groups)));
+                        arms.push(("avx512", WidthPass::Avx512(Avx512Taps::Groups(groups))));
                     }
+                    // The long-window layout on every case, whichever layout
+                    // the axis would take by itself.
+                    let long = LongTaps::new::<C>(&kernel);
+                    arms.push(("avx512 long", WidthPass::Avx512(Avx512Taps::Long(long))));
                 }
             }
             for (name, arm) in &arms {
                 let mut detected = vec![0_u8; in_h * out_w * C];
-                arm.rows::<C>(data, &kernel, in_w, out_w, 0, &mut detected);
+                arm.rows::<C>(
+                    data,
+                    &kernel,
+                    in_w,
+                    out_w,
+                    0,
+                    &mut detected,
+                    &mut BandScratch::default(),
+                );
                 assert_same_bytes(
                     &detected,
                     &portable,
@@ -4594,9 +6263,41 @@ mod tests {
                         quantization,
                         &what,
                     );
+                    check::<1>(
+                        &gradient_grey(in_w, in_h, seed),
+                        case,
+                        filter,
+                        quantization,
+                        &what,
+                    );
                 }
             }
         }
+    }
+
+    /// The images that keep the generic resizer: colour, more than four
+    /// megapixels, on the AVX2 rows; and those rows are the width
+    /// pass's own pick.
+    #[test]
+    fn a_large_colour_image_on_the_avx2_rows_trails_the_generic_resizer() {
+        let above = BILINEAR_TRAILS_ABOVE + 1;
+        assert!(trails_generic(true, false, above));
+        assert!(!trails_generic(true, false, BILINEAR_TRAILS_ABOVE));
+        assert!(!trails_generic(true, true, above));
+        assert!(!trails_generic(false, false, above));
+        #[cfg(target_arch = "x86_64")]
+        {
+            let kernel = FixedKernel::new(
+                8,
+                4,
+                PilResizeFilter::Bilinear,
+                KernelQuantization::TorchUint8,
+            );
+            let picked = matches!(WidthPass::new::<3>(&kernel), WidthPass::Avx2(_));
+            assert_eq!(WidthPass::runs_avx2_rows(), picked);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        assert!(!WidthPass::runs_avx2_rows());
     }
 
     /// The banded passes write the per-sample reference's bytes whatever the
@@ -4640,11 +6341,27 @@ mod tests {
                     &width,
                     &height,
                     band_bytes,
+                    Buffers::Fresh,
                 );
                 assert_same_bytes(
                     &actual,
                     &expected,
                     &format!("{C} channels, {what}, bands of {band_bytes} bytes"),
+                );
+                // The pool's buffers: the same bytes, every one written.
+                let pooled = pil_resample_both::<C>(
+                    data,
+                    (in_w, in_h),
+                    (out_w, out_h),
+                    &width,
+                    &height,
+                    band_bytes,
+                    Buffers::Pooled,
+                );
+                assert_same_bytes(
+                    &pooled,
+                    &expected,
+                    &format!("{C} channels, {what}, pooled bands of {band_bytes} bytes"),
                 );
             }
         }
@@ -4680,22 +6397,29 @@ mod tests {
                         quantization,
                         &what,
                     );
+                    check::<1>(
+                        &gradient_grey(in_w, in_h, seed),
+                        case,
+                        filter,
+                        quantization,
+                        &what,
+                    );
                 }
             }
         }
     }
 
     /// The bound the 32-bit accumulators rest on, checked over a sweep of
-    /// axis sizes for both filters: the rounding term plus the largest
-    /// possible pixel contribution (`255 · Σ|tap|`) of any output index stays
-    /// inside `i32`.
+    /// axis sizes for [`BOUND_SWEEP_KERNELS`]: the rounding term plus the
+    /// largest possible pixel contribution (`255 · Σ|tap|`) of any output
+    /// index stays inside `i32`.
     #[test]
     fn pil_kernel_sums_fit_32_bits() {
         let sizes = [1usize, 2, 3, 5, 7, 16, 100, 1000, 4096];
-        for filter in [PilResizeFilter::Bicubic, PilResizeFilter::Lanczos] {
+        for (filter, quantization) in BOUND_SWEEP_KERNELS {
             for &in_size in &sizes {
                 for &out_size in &sizes {
-                    let k = FixedKernel::new(in_size, out_size, filter, KernelQuantization::Pillow);
+                    let k = FixedKernel::new(in_size, out_size, filter, quantization);
                     let half = 1_i64 << (k.precision - 1);
                     let worst = k
                         .taps
@@ -4713,7 +6437,7 @@ mod tests {
     }
 
     /// The split the 16-bit vector arms rest on, checked over the same sweep
-    /// for both filters: every tap is `hi · 2^11 + lo` with `lo` in
+    /// for the same kernels: every tap is `hi · 2^11 + lo` with `lo` in
     /// `[-2^10, 2^10)` and both halves inside a 16-bit lane (so a
     /// multiply-add's pair of products is far inside `i32`), and over any
     /// output's window each partial sum stays inside `i32` for every pixel
@@ -4725,10 +6449,10 @@ mod tests {
     fn pil_split_taps_fit_the_16_bit_lanes_and_32_bit_sums() {
         let sizes = [1usize, 2, 3, 5, 7, 16, 100, 1000, 4096];
         let (max, min) = (i64::from(i32::MAX), i64::from(i32::MIN));
-        for filter in [PilResizeFilter::Bicubic, PilResizeFilter::Lanczos] {
+        for (filter, quantization) in BOUND_SWEEP_KERNELS {
             for &in_size in &sizes {
                 for &out_size in &sizes {
-                    let k = FixedKernel::new(in_size, out_size, filter, KernelQuantization::Pillow);
+                    let k = FixedKernel::new(in_size, out_size, filter, quantization);
                     let half = 1_i64 << (k.precision - 1);
                     for taps in &k.taps {
                         // The positive and the negative coefficient sums of each half.
@@ -4768,7 +6492,7 @@ mod tests {
     }
 
     /// The byte chunks the AVX-512 arms rest on, checked over the same sweep
-    /// for both filters: every tap is `c2 · 2^16 + c1 · 2^8 + c0` with each
+    /// for the same kernels: every tap is `c2 · 2^16 + c1 · 2^8 + c0` with each
     /// chunk a signed byte, and over any output's window every stage of the
     /// arms' sums stays inside `i32` for every pixel assignment: each level's
     /// own sum, the top level shifted and added to the middle one, that
@@ -4779,10 +6503,10 @@ mod tests {
     fn pil_tap_chunks_fit_the_bytes_and_32_bit_sums() {
         let sizes = [1usize, 2, 3, 5, 7, 16, 100, 1000, 4096];
         let (max, min) = (i64::from(i32::MAX), i64::from(i32::MIN));
-        for filter in [PilResizeFilter::Bicubic, PilResizeFilter::Lanczos] {
+        for (filter, quantization) in BOUND_SWEEP_KERNELS {
             for &in_size in &sizes {
                 for &out_size in &sizes {
-                    let k = FixedKernel::new(in_size, out_size, filter, KernelQuantization::Pillow);
+                    let k = FixedKernel::new(in_size, out_size, filter, quantization);
                     let half = 1_i64 << (k.precision - 1);
                     for taps in &k.taps {
                         // Per stage, the positive and the negative coefficient sums.
@@ -4817,11 +6541,280 @@ mod tests {
         }
     }
 
-    /// The AVX-512 width arm takes an axis only while its output groups
+    /// The AVX-512 width pass carries two chunk levels where every tap fits
+    /// two signed bytes (the torch quantization's 16-bit taps) and three as
+    /// soon as one does not (Pillow's 22-bit taps).
+    #[test]
+    fn pil_chunk_levels_follow_the_taps() {
+        let levels = |tap: i32| {
+            chunk_levels(&FixedKernel {
+                bounds: vec![(0, 2)],
+                taps: vec![vec![1, tap]],
+                precision: 15,
+            })
+        };
+        // Two signed bytes reach from -32896 to 32639; one tap past either
+        // end brings the third level back for the whole kernel.
+        assert_eq!(
+            [-32_897, -32_896, 0, 32_639, 32_640].map(levels),
+            [3, 2, 2, 2, 3]
+        );
+        for (in_size, out_size) in [(8000, 1344), (8000, 336), (4032, 336), (1024, 336)] {
+            let filter = PilResizeFilter::Bilinear;
+            let torch = FixedKernel::new(in_size, out_size, filter, KernelQuantization::TorchUint8);
+            let pillow = FixedKernel::new(in_size, out_size, filter, KernelQuantization::Pillow);
+            assert_eq!(
+                (chunk_levels(&torch), chunk_levels(&pillow)),
+                (2, 3),
+                "{in_size} to {out_size}"
+            );
+        }
+    }
+
+    /// An axis whose gather would carry two outputs or fewer takes one
+    /// output per vector, and so does one no gather fits.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pil_long_windows_leave_the_gather() {
+        if !avx512::detected() {
+            return;
+        }
+        let arm = |in_size, out_size| {
+            let kernel = FixedKernel::new(
+                in_size,
+                out_size,
+                PilResizeFilter::Bilinear,
+                KernelQuantization::TorchUint8,
+            );
+            match WidthPass::new::<3>(&kernel) {
+                WidthPass::Avx512(Avx512Taps::Groups(groups)) => groups.outputs,
+                WidthPass::Avx512(Avx512Taps::Long(_)) => 1,
+                _ => 0,
+            }
+        };
+        assert_eq!(
+            [(8000, 1344), (4032, 336), (8000, 336), (20_000, 336)].map(|(i, o)| arm(i, o)),
+            [5, 4, 1, 1]
+        );
+    }
+
+    /// The torch quantization's taps each fit a 16-bit lane, so the width
+    /// pass takes them whole: one multiply-add per pair, nothing split, and
+    /// one channel pads its windows to sixteen taps. Pillow's 22-bit taps
+    /// keep the split.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pil_whole_taps_take_one_multiply_add() {
+        // PyTorch scales its taps to `int16`: every one fits a 16-bit lane,
+        // nothing is split, and one channel pads its windows to sixteen taps.
+        let torch = FixedKernel::new(
+            1024,
+            336,
+            PilResizeFilter::Bilinear,
+            KernelQuantization::TorchUint8,
+        );
+        let rgb = SplitTaps::of_width::<3>(&torch);
+        assert!(rgb.whole && rgb.hi.is_empty() && rgb.pairs.is_multiple_of(2));
+        for (pairs, taps) in rgb.lo.chunks_exact(rgb.pairs).zip(&torch.taps) {
+            for (k, pair) in pairs.iter().enumerate() {
+                let [a, b, c, d] = pair.to_le_bytes();
+                let tap = |at: usize| taps.get(at).copied().unwrap_or(0);
+                assert_eq!(i32::from(i16::from_le_bytes([a, b])), tap(2 * k));
+                assert_eq!(i32::from(i16::from_le_bytes([c, d])), tap(2 * k + 1));
+            }
+        }
+        let grey = SplitTaps::of_width::<1>(&torch);
+        assert!(grey.whole && grey.pairs.is_multiple_of(8));
+        // Pillow's 22-bit taps do not fit a lane: the split stands.
+        let pillow = FixedKernel::new(
+            1024,
+            336,
+            PilResizeFilter::Bilinear,
+            KernelQuantization::Pillow,
+        );
+        let split = SplitTaps::of_width::<3>(&pillow);
+        assert!(!split.whole && split.hi.len() == split.lo.len());
+    }
+
+    /// Whole taps lie a second time for two outputs a vector: each output's
+    /// pairs four times in its half, the half an odd axis lacks zero, and
+    /// nothing for one channel or for split taps.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pil_whole_taps_lie_wide_for_two_outputs() {
+        let torch = FixedKernel::new(
+            1024,
+            337,
+            PilResizeFilter::Bilinear,
+            KernelQuantization::TorchUint8,
+        );
+        let rgb = SplitTaps::of_width::<3>(&torch);
+        let per_two = 8 * rgb.pairs;
+        assert_eq!(rgb.wide.len(), 337_usize.div_ceil(2) * per_two);
+        for (two, wide) in rgb.wide.chunks_exact(per_two).enumerate() {
+            for (pair, lanes) in wide.as_chunks::<8>().0.iter().enumerate() {
+                let even = rgb.lo[2 * two * rgb.pairs + pair];
+                let odd = rgb
+                    .lo
+                    .get((2 * two + 1) * rgb.pairs + pair)
+                    .copied()
+                    .unwrap_or(0);
+                assert_eq!(*lanes, [even, even, even, even, odd, odd, odd, odd]);
+            }
+        }
+        assert!(SplitTaps::of_width::<1>(&torch).wide.is_empty());
+        let pillow = FixedKernel::new(
+            1024,
+            337,
+            PilResizeFilter::Bilinear,
+            KernelQuantization::Pillow,
+        );
+        assert!(SplitTaps::of_width::<3>(&pillow).wide.is_empty());
+    }
+
+    /// Every four outputs of a width pass over whole taps stand with the
+    /// first byte they read and the distance of the other three windows
+    /// from it; a pass whose windows lie further apart than a byte counts
+    /// holds none, so its kernel tests every window by itself.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pil_fours_start_within_a_byte_of_their_first() {
+        let torch = |in_w, out_w| {
+            FixedKernel::new(
+                in_w,
+                out_w,
+                PilResizeFilter::Bilinear,
+                KernelQuantization::TorchUint8,
+            )
+        };
+        let kernel = torch(671, 61);
+        let split = SplitTaps::of_width::<3>(&kernel);
+        assert_eq!(split.fours.len(), 61 / 4);
+        for (four, bounds) in split.fours.iter().zip(kernel.bounds.as_chunks::<4>().0) {
+            assert_eq!(four.base as usize, bounds[0].0 * 3);
+            for (step, (x0, _)) in four.steps.iter().zip(&bounds[1..]) {
+                assert_eq!(four.base as usize + usize::from(*step), x0 * 3);
+            }
+        }
+        // One channel: the distances are levels.
+        let grey = SplitTaps::of_width::<1>(&kernel);
+        assert_eq!(grey.fours.len(), 61 / 4);
+        for (four, bounds) in grey.fours.iter().zip(kernel.bounds.as_chunks::<4>().0) {
+            assert_eq!(four.base as usize, bounds[0].0);
+            assert_eq!(four.base as usize + usize::from(four.steps[2]), bounds[3].0);
+        }
+        // Forty source pixels an output: the fourth window begins 360 bytes
+        // behind the first.
+        let far = SplitTaps::of_width::<3>(&torch(2440, 61));
+        assert!(far.whole && !far.wide.is_empty());
+        assert!(far.fours.is_empty());
+        // The last distance a byte holds, the first it does not, and a
+        // window before its four's first.
+        assert_eq!(
+            four_starts::<3>(&[(1, 4), (29, 4), (57, 4), (86, 4)]),
+            [FourStarts {
+                base: 3,
+                steps: [84, 168, 255],
+            }]
+        );
+        assert!(four_starts::<3>(&[(1, 4), (29, 4), (57, 4), (87, 4)]).is_empty());
+        assert!(four_starts::<3>(&[(5, 4), (4, 4), (6, 4), (7, 4)]).is_empty());
+    }
+
+    /// The AVX2 width pass over whole taps writes the portable bytes at
+    /// every window length: one to six groups of four taps, each in the
+    /// form built for its length, and seven, which loop.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pil_whole_fours_agree_at_every_window_length() {
+        fn check<const C: usize>(in_w: usize, out_w: usize) -> usize {
+            let kernel = FixedKernel::new(
+                in_w,
+                out_w,
+                PilResizeFilter::Bilinear,
+                KernelQuantization::TorchUint8,
+            );
+            let split = SplitTaps::of_width::<C>(&kernel);
+            assert!(split.whole, "{in_w} -> {out_w}");
+            let groups = split.pairs / 2;
+            // Three rows: a step of two and the row left over.
+            let rows = 3;
+            let data: Vec<u8> = (0..in_w * rows * C)
+                .map(|i| (i * 131 + i / 7) as u8)
+                .collect();
+            let mut portable = vec![0_u8; rows * out_w * C];
+            WidthPass::Portable.rows::<C>(
+                &data,
+                &kernel,
+                in_w,
+                out_w,
+                0,
+                &mut portable,
+                &mut BandScratch::default(),
+            );
+            let mut vector = vec![0_u8; rows * out_w * C];
+            WidthPass::Avx2(split).rows::<C>(
+                &data,
+                &kernel,
+                in_w,
+                out_w,
+                0,
+                &mut vector,
+                &mut BandScratch::default(),
+            );
+            assert_same_bytes(
+                &vector,
+                &portable,
+                &format!("{C} channels, {in_w} -> {out_w}, {groups} groups"),
+            );
+            groups
+        }
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        // A downscale by `s` takes about `2 s` taps an output.
+        let seen: std::collections::BTreeSet<usize> = [
+            73, 122, 183, 244, 305, 366, 427, 488, 549, 610, 671, 732, 793,
+        ]
+        .into_iter()
+        .map(|in_w| {
+            let groups = check::<3>(in_w, 61);
+            assert_eq!(check::<4>(in_w, 61), groups);
+            groups
+        })
+        .collect();
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7]);
+        // One channel takes sixteen taps a group: one to four groups run in
+        // the form built for their count, five loop.
+        let levels = [4, 12, 20, 28, 36].map(|scale| check::<1>(183 * scale, 183));
+        assert_eq!(levels, [4, 8, 12, 16, 20]);
+    }
+
+    /// An axis whose every group ends inside one vector of its gather loads
+    /// one vector per step and row, a wider one two.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn pil_short_spans_take_one_load() {
+        let narrow = |in_size, out_size| {
+            let kernel = FixedKernel::new(
+                in_size,
+                out_size,
+                PilResizeFilter::Bilinear,
+                KernelQuantization::TorchUint8,
+            );
+            GroupTaps::new::<3>(&kernel).map(|groups| groups.narrow)
+        };
+        assert_eq!(
+            [(1920, 1680), (4032, 1344), (4032, 336), (8000, 1344)].map(|(i, o)| narrow(i, o)),
+            [Some(true), Some(true), Some(false), Some(false)]
+        );
+    }
+
+    /// The AVX-512 gather takes an axis only while its output groups
     /// gather their four-tap windows from one 128-byte window: five RGB
     /// outputs per vector (four RGBA) on the usual downscales, fewer as the
-    /// scale grows, none past about thirty, where the axis keeps the
-    /// split-tap arm.
+    /// scale grows, none past about thirty (about 124 at one channel); the
+    /// long-window arm takes the axis from two outputs per vector down.
     #[cfg(target_arch = "x86_64")]
     #[test]
     fn pil_group_taps_take_only_windows_that_fit_the_gather() {
@@ -4938,6 +6931,7 @@ mod tests {
                 src_w as usize,
                 out_w as usize,
                 &horizontal_kernel,
+                Buffers::Fresh,
             );
             let vertical_kernel = FixedKernel::new(
                 src_h as usize,
@@ -4950,6 +6944,7 @@ mod tests {
                 out_h as usize,
                 out_w as usize,
                 &vertical_kernel,
+                Buffers::Fresh,
             );
             let actual = resize_bicubic_pil_rgb(&data, src_w, src_h, out_w, out_h)
                 .unwrap()
@@ -5098,16 +7093,6 @@ mod tests {
     }
 
     #[test]
-    fn test_rescale() {
-        let mut tensor = Array3::<f32>::from_elem((3, 2, 2), 255.0);
-        rescale(&mut tensor, 1.0 / 255.0);
-
-        for val in &tensor {
-            assert!((val - 1.0).abs() < 1e-6);
-        }
-    }
-
-    #[test]
     fn test_resize() {
         let img = create_test_image(100, 50, Rgb([128, 128, 128]));
         let resized = resize(&img, 50, 25, FilterType::Triangle);
@@ -5225,6 +7210,48 @@ mod tests {
             paste_rgb(&empty, 24, 24, 3, 2, [127, 10, 250]).as_raw(),
             expected.as_raw()
         );
+    }
+
+    /// The one-pass transpose makes the image that the flip and the quarter
+    /// turn make, on sizes around its block of columns and over a container
+    /// longer than the pixels.
+    #[test]
+    fn transpose_rgb_is_the_flip_and_the_quarter_turn() {
+        let sizes = [
+            (1, 1),
+            (1, 7),
+            (7, 1),
+            (31, 5),
+            (32, 33),
+            (33, 32),
+            (65, 97),
+            (200, 130),
+        ];
+        for (width, height) in sizes {
+            let image = lcg_rgb_image(width, height, 11);
+            let rgb = image.to_rgb8();
+            let generic = image.fliph().rotate270().to_rgb8();
+            let fast = transpose_rgb(&rgb);
+            assert_eq!(fast.dimensions(), (height, width), "{width}x{height}");
+            assert_eq!(fast.as_raw(), generic.as_raw(), "{width}x{height}");
+
+            let mut container = rgb.into_raw();
+            container.extend_from_slice(&[0xAB; 7]);
+            let longer = RgbImage::from_raw(width, height, container).expect("longer container");
+            let fast_of_longer = transpose_rgb(&longer);
+            assert_eq!(fast_of_longer.as_raw(), fast.as_raw(), "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn transpose_rgb_stays_total_on_an_empty_image() {
+        // No row to chunk and no block to fill: the result is the empty
+        // image with its two sides swapped.
+        for (width, height) in [(0, 7), (7, 0), (0, 0)] {
+            let transposed = transpose_rgb(&RgbImage::new(width, height));
+            assert_eq!(transposed.dimensions(), (height, width), "{width}x{height}");
+            assert!(transposed.as_raw().is_empty(), "{width}x{height}");
+        }
     }
 
     #[test]
@@ -5419,6 +7446,90 @@ mod tests {
         assert_eq!(out.dimensions(), (4, 4));
     }
 
+    /// The reference's blend of one pixel over a background level: float32,
+    /// truncated.
+    fn reference_blend(px: [u8; 4], bg: u8) -> [u8; 3] {
+        let a = f32::from(px[3]) / 255.0;
+        [px[0], px[1], px[2]].map(|c| (a * f32::from(c) + (1.0 - a) * f32::from(bg)) as u8)
+    }
+
+    /// Every channel value at every alpha, 65,536 pixels, over each flat
+    /// level and over three chessboards, one whose squares divide the width
+    /// and two whose squares do not: the fill is the reference's blend over
+    /// the reference's board.
+    #[test]
+    fn fill_transparent_bg_blends_every_value_at_every_alpha() {
+        let rgba = image::RgbaImage::from_fn(256, 256, |value, alpha| {
+            Rgba([value as u8, !(value as u8), value as u8 ^ 0x5a, alpha as u8])
+        });
+        let flat = |pattern| TransparentBgConfig {
+            pattern,
+            ..Default::default()
+        };
+        let patterns = [
+            (flat(TransparentBgPattern::Black), Some(0)),
+            (flat(TransparentBgPattern::Gray), Some(128)),
+            (flat(TransparentBgPattern::White), Some(255)),
+            (chessboard(16, true), None),
+            (chessboard(17, true), None),
+            (chessboard(3, false), None),
+        ];
+        let image = DynamicImage::from(rgba.clone());
+        for (config, level) in patterns {
+            let out = fill_transparent_bg(&image, config);
+            assert_eq!(out.dimensions(), (256, 256));
+            for (x, y, px) in rgba.enumerate_pixels() {
+                let bg = level.unwrap_or_else(|| reference_board(config, x, y));
+                assert_eq!(
+                    out.get_pixel(x, y).0,
+                    reference_blend(px.0, bg),
+                    "{config:?} at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// Two pixels in a container two rows and three bytes longer than the
+    /// image: the fill ends at the image's own pixels.
+    #[test]
+    fn fill_transparent_bg_ends_at_the_images_pixels() {
+        let mut container = vec![200, 100, 50, 64, 200, 100, 50, 192];
+        container.extend_from_slice(&[9; 19]);
+        let rgba = image::RgbaImage::from_raw(2, 1, container).expect("2x1 RGBA");
+        let image = DynamicImage::from(rgba.clone());
+        for config in [TransparentBgConfig::default(), chessboard(1, true)] {
+            let out = fill_transparent_bg(&image, config);
+            assert_eq!(out.as_raw().len(), 6, "{config:?}");
+            for (x, y, px) in rgba.enumerate_pixels() {
+                let bg = match config.pattern {
+                    TransparentBgPattern::Chessboard => reference_board(config, x, y),
+                    _ => 0,
+                };
+                assert_eq!(
+                    out.get_pixel(x, y).0,
+                    reference_blend(px.0, bg),
+                    "{config:?}"
+                );
+            }
+        }
+    }
+
+    /// A layout with alpha other than RGBA8 converts first: a grey pixel with
+    /// alpha blends as that grey in three channels.
+    #[test]
+    fn fill_transparent_bg_converts_another_layout_with_alpha() {
+        let grey = image::GrayAlphaImage::from_raw(2, 1, vec![200, 64, 50, 192]).expect("2x1 LA");
+        let config = chessboard(1, false);
+        let out = fill_transparent_bg(&DynamicImage::ImageLumaA8(grey), config);
+        for (x, [luma, alpha]) in [(0u32, [200u8, 64]), (1, [50, 192])] {
+            let bg = reference_board(config, x, 0);
+            assert_eq!(
+                out.get_pixel(x, 0).0,
+                reference_blend([luma, luma, luma, alpha], bg)
+            );
+        }
+    }
+
     #[test]
     fn transparent_bg_config_fills_missing_fields() {
         // A model may ship only `pattern`; the rest must fall back rather than
@@ -5459,26 +7570,22 @@ mod tests {
     }
 
     #[test]
-    fn paint_rgb_onto_planes_by_table_maps_through_the_table_and_fills_the_margin_with_its_zero() {
-        // A 2x2 image on a 3x2 canvas: the right column is margin. The table
-        // tells the channels and the levels apart, and no multiply-add
-        // produces it.
-        let rgb: [u8; 12] = [10, 20, 30, 40, 50, 60, 70, 80, 90, 100, 110, 120];
-        let table: [[f32; 256]; 3] = std::array::from_fn(|c| {
-            std::array::from_fn(|level| {
-                let sign = if level % 2 == 0 { 1.0 } else { -1.0 };
-                (level as f32 * 0.5 + 1.0) * sign + (c as f32 + 1.0) * 1000.0
-            })
-        });
+    fn paint_rgb_onto_planes_by_table_matches_to_tensor_and_normalize() {
+        // A 2x2 image on a 3x2 canvas: the right column is normalized black.
+        let image = DynamicImage::ImageRgb8(RgbImage::from_pixel(2, 2, Rgb([127, 128, 1])));
+        let (mean, std) = ([0.5; 3], [0.5; 3]);
+        let expected = to_tensor_and_normalize(&image, &mean, &std);
+        let (w, h, raw) = rgb_bytes(&image);
         let mut planes = vec![f32::NAN; 3 * 3 * 2];
-        paint_rgb_onto_planes_by_table(&rgb, (2, 2), (3, 2), &table, &mut planes);
+        let table = to_tensor_and_normalize_table(&mean, &std);
+        paint_rgb_onto_planes_by_table(&raw, (w, h), (3, 2), &table, &mut planes);
         for c in 0..3 {
             for y in 0..2 {
                 for x in 0..3 {
-                    let level = if x < 2 { rgb[(y * 2 + x) * 3 + c] } else { 0 };
+                    let value = if x < 2 { expected[[c, y, x]] } else { -1.0 };
                     assert_eq!(
                         planes[c * 6 + y * 3 + x].to_bits(),
-                        table[c][usize::from(level)].to_bits(),
+                        value.to_bits(),
                         "channel {c} at ({x}, {y})"
                     );
                 }
@@ -5512,6 +7619,34 @@ mod tests {
             .all(|(s, b)| s.to_bits() == b.to_bits()));
         assert_eq!(serial[0].to_bits(), table[0][0].to_bits());
         assert_eq!(serial[pixels].to_bits(), table[1][1].to_bits());
+    }
+
+    #[test]
+    fn extend_planes_by_table_appends_each_image_after_the_last() {
+        // Two images of odd pixel counts appended to one buffer; the serial
+        // kernel is the oracle for each one's planes.
+        let table: [[f32; 256]; 3] =
+            std::array::from_fn(|c| std::array::from_fn(|level| (level * 3 + c) as f32 / 7.0));
+        let mut appended = Vec::new();
+        let mut expected = Vec::new();
+        for (pixels, offset) in [(1027_usize, 0_usize), (333, 97)] {
+            let rgb: Vec<u8> = (0..pixels * 3)
+                .map(|i| ((i + offset) % 251) as u8)
+                .collect();
+            let mut planes = vec![0.0_f32; 3 * pixels];
+            {
+                let (r, rest) = planes.split_at_mut(pixels);
+                let (g, b) = rest.split_at_mut(pixels);
+                deinterleave_contiguous_by_table(&rgb, r, g, b, &table);
+            }
+            expected.extend(planes);
+            extend_planes_by_table(&mut appended, &rgb, &table);
+        }
+        assert_eq!(appended.len(), expected.len());
+        assert!(appended
+            .iter()
+            .zip(&expected)
+            .all(|(a, e)| a.to_bits() == e.to_bits()));
     }
 
     #[test]
@@ -5636,13 +7771,17 @@ mod tests {
                 bounds: &x_bounds,
                 weights: &x_weights,
             };
-            let y = TorchAaAxis {
-                bounds: &y_bounds,
-                weights: &y_weights,
+            let mut y = TorchAaRows {
+                axis: TorchAaAxis {
+                    bounds: &y_bounds,
+                    weights: &y_weights,
+                },
+                strip: out_h as usize,
+                full: |_: &[f32]| (),
             };
             let bytes_as_floats = |_: usize, byte: u8| f32::from(byte);
             #[cfg(target_arch = "x86_64")]
-            let fma = torch_aa_passes_with_fma(&data, width as usize, &x, &y, bytes_as_floats);
+            let fma = torch_aa_passes_with_fma(&data, width as usize, &x, &mut y, bytes_as_floats);
             #[cfg(not(target_arch = "x86_64"))]
             let fma: Option<Vec<f32>> = None;
             let bodies = [
@@ -5656,7 +7795,7 @@ mod tests {
                         &data,
                         width as usize,
                         &x,
-                        &y,
+                        &mut y,
                         bytes_as_floats,
                     )),
                 ),
@@ -5681,6 +7820,17 @@ mod tests {
                     "{width}x{height} -> {out_w}x{out_h} through {body}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_torch_bicubic_strip_that_does_not_divide_the_height_is_refused() {
+        for strip in [0, 3] {
+            let got = resize_bicubic_torch_aa_f32_strips(&[0; 48], 4, 4, 2, 4, strip, |_| ());
+            assert!(
+                matches!(got, Err(TransformError::ShapeError(_))),
+                "a strip of {strip} rows"
+            );
         }
     }
 
@@ -5845,9 +7995,13 @@ mod tests {
                 bounds: &x_bounds,
                 weights: &x_weights,
             };
-            let y = TorchAaAxis {
-                bounds: &y_bounds,
-                weights: &y_weights,
+            let mut y = TorchAaRows {
+                axis: TorchAaAxis {
+                    bounds: &y_bounds,
+                    weights: &y_weights,
+                },
+                strip: out_h as usize,
+                full: |_: &[f32]| (),
             };
             let bodies = [
                 (
@@ -5857,7 +8011,7 @@ mod tests {
                 ),
                 (
                     "the generic body",
-                    torch_aa_passes(&data, width as usize, &x, &y, |channel, byte| {
+                    torch_aa_passes(&data, width as usize, &x, &mut y, |channel, byte| {
                         table[channel][usize::from(byte)]
                     }),
                 ),

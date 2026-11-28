@@ -1,5 +1,6 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, time::Duration};
 
+use clap::ValueEnum;
 pub use llm_multimodal::jpeg_turbo::TurboJpegPolicy;
 use openai_protocol::worker::HealthCheckConfig as ProtocolHealthCheckConfig;
 pub use openai_protocol::worker::{MmProcessingMode, TransportMode};
@@ -8,16 +9,28 @@ use serde::{de, Deserialize, Deserializer, Serialize};
 pub use smg_data_connector::{
     HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig, SchemaConfig,
 };
+use smg_grand_central::document::PolicySpec;
+use smg_service_discovery::Roles;
+pub use smg_service_discovery::{
+    deserialize_discovery, ConsulDiscoveryConfig, DiscoveryConfig, FileDiscoveryConfig,
+    KubernetesDiscoveryConfig, SlurmDiscoveryConfig, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+};
+// The worker's settings vocabulary lives in the worker crate.
+pub use smg_worker::settings::{
+    PdPairingMode, RetryConfig, UnhealthyRemovalScope, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+};
+use smg_worker::{
+    health::overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
+    identity::{
+        basic::{ConnectionMode, RuntimeType},
+        endpoint::Endpoint,
+    },
+};
 
 use super::{validation::ConfigValidator, ConfigResult};
 use crate::{
     routers::common::pd_admission::DEFAULT_PD_ADMISSION_WAIT_SECS,
     tenant::DEFAULT_TENANT_HEADER_NAME,
-    worker::{
-        endpoint::Endpoint,
-        overload::{DEFAULT_TOKEN_USAGE_CEILING, DEFAULT_WAITING_REQUESTS},
-        ConnectionMode, RuntimeType,
-    },
 };
 
 /// The parser name that reads a model with the table its tokenizer's `response_template`
@@ -36,9 +49,11 @@ pub enum ParserChoice {
     Legacy,
     /// Symphony's tables, the default, by one precedence per model
     /// (`routers::grpc::regular::symphony::names::reads`):
-    /// the table its worker labels select, when they select anything; else the registry's table
-    /// for a model it knows; else the one the `--tool-call-parser` and `--reasoning-parser` flags
-    /// select, for a model the registry does not know. Names select a table when it answers to
+    /// the table its worker labels select, when they select anything; else the one the
+    /// `--tool-call-parser` and `--reasoning-parser` flags select, when they select anything; else
+    /// the registry's table for a model it knows. A reasoning name alone in the flags that a table
+    /// answers to comes after the registry: its table reads only the models the registry does not
+    /// know. Names select a table when it answers to
     /// them: its own name, a legacy parser's that reads its format (`qwen` for `qwen3`, `qwen_xml`
     /// for `qwen3_tagged`), or a launcher's for a family whose table has no older parser (`muse`
     /// for `muse_spark`); `hf` selects the model's response template's table; a reasoning name
@@ -81,9 +96,11 @@ pub struct RouterConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_worker_runtime_type: Option<RuntimeType>,
     /// DP engines per startup ZMQ worker: each `--worker-urls` ZMQ worker
-    /// becomes a grouped worker whose handshake awaits this many engines on
-    /// one socket set (`dp_size` on the worker spec, no rank). `None`/1 keeps
-    /// today's one-engine workers; HTTP/gRPC workers ignore this field.
+    /// given a count above one registers as one worker per engine, which
+    /// share one socket set whose handshake awaits that many engines
+    /// (`dp_size` on the worker spec). `None`/1 keeps one worker per URL: a
+    /// one-engine worker, or a grouped worker where its engines declare
+    /// several at the handshake. HTTP/gRPC workers ignore this field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zmq_engine_count: Option<usize>,
     pub policy: PolicyConfig,
@@ -95,15 +112,14 @@ pub struct RouterConfig {
     /// Per-request sticky-session routing (header keys, rid-lineage fallback).
     #[serde(default, alias = "sticky_sessions")]
     pub routing_key_override: RoutingKeyOverrideConfig,
+    /// Whether, and how, a request's sticky key pins it to one engine of a
+    /// grouped data-parallel worker; see [`GroupedDpSticky`].
+    #[serde(default)]
+    pub grouped_dp_sticky: GroupedDpSticky,
     /// How strictly PD placement pairs a prefill with a decode on their KV
     /// transfer protocol; see [`PdPairingMode`].
     #[serde(default)]
     pub pd_pairing_mode: PdPairingMode,
-    /// Which implementation decides worker selection (`--policy-engine`):
-    /// the policies over worker handles, or the policy engine over its
-    /// bounded view. The switch of the migration and its rollback.
-    #[serde(default)]
-    pub policy_engine: PolicyEngineMode,
     pub host: String,
     pub port: u16,
     /// Dedicated port for the isolated Kubernetes liveness/readiness/health
@@ -150,9 +166,11 @@ pub struct RouterConfig {
     pub max_payload_size: usize,
     /// Most bytes the router may hold for a request it buffers only to keep
     /// it retryable; a larger eligible request streams to the worker verbatim
-    /// and forfeits router-level retries. `0` never buffers for retries.
-    /// Requests the router must parse buffer regardless, bounded by
-    /// `max_payload_size`.
+    /// and forfeits router-level retries. Requests the router must parse buffer
+    /// regardless, bounded by `max_payload_size`. This also bounds the
+    /// transcription audio held for one resend after a pre-response connection
+    /// failure and for the retries that take a failed transcription to another
+    /// worker; `0` disables both kinds of buffering.
     #[serde(default = "default_max_buffered_request_bytes")]
     pub max_buffered_request_bytes: u64,
     /// Abort a streamed request body once the upstream sender has waited on
@@ -185,10 +203,12 @@ pub struct RouterConfig {
     /// a TLS handshake and upgraded connections included). A connection
     /// beyond the bound is closed at once, before any TLS handshake and
     /// without a response, and counted in
-    /// `smg_http_connections_rejected_total`. The admin listener
-    /// (`admin_port`) and the probe listener (`health_check_port`) are
-    /// outside the bound, so the control plane and the probes stay reachable
-    /// while the data plane is saturated. `0` is no bound.
+    /// `smg_http_connections_rejected_total`. Probes on the data port fall
+    /// under the bound like any connection; `health_check_port` is the
+    /// listener no bound covers. The admin listener (`admin_port`) is outside
+    /// this bound, so the control plane stays reachable while the data plane
+    /// is saturated, and inside its own, `admin_max_connections`. `0` is no
+    /// bound.
     #[serde(default)]
     pub max_connections: usize,
     /// Seconds a request may take: the read of its body overall (`408` past
@@ -218,6 +238,12 @@ pub struct RouterConfig {
     /// backend HTTP server's keep-alive timeout (the engines default to
     /// 5s), or the pool hands out connections the server has already closed
     /// and non-idempotent sends fail. `0` keeps idle connections forever.
+    /// While a nonzero value is below the interval the load monitor polls a
+    /// worker at ([`Self::load_monitor_interval`], unless a worker of its
+    /// group sets `WorkerSpec.load_monitor_interval_secs`), an idle HTTP
+    /// worker is connected anew for every load poll; where the server's
+    /// keep-alive can be raised above that interval, a value between the two
+    /// keeps the connection.
     #[serde(default = "default_upstream_pool_idle_timeout_secs")]
     pub upstream_pool_idle_timeout_secs: u64,
     pub worker_startup_timeout_secs: u64,
@@ -247,6 +273,12 @@ pub struct RouterConfig {
     pub job_queue_concurrency: usize,
     #[serde(default = "default_load_monitor_interval_secs")]
     pub load_monitor_interval_secs: u64,
+    /// The load monitor's interval in milliseconds, 100 at the least. When
+    /// set it is the interval, and `load_monitor_interval_secs` is not read
+    /// for it. The overload shed's Retry-After stays whole seconds: this
+    /// value raised to the next one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_monitor_interval_ms: Option<u64>,
     /// Seconds without any contact from a worker (a load poll, a health probe,
     /// a KV event, a response) after which a transport failure excludes it
     /// from routing; the first successful contact re-admits it.
@@ -357,8 +389,9 @@ pub struct RouterConfig {
     #[serde(default)]
     pub engine_metrics: bool,
     /// Global multimodal tensor transport mode (`inline` | `shm` | `auto` | `rdma`).
-    /// Per-worker `WorkerSpec.multimodal_tensor_transport` overrides this; when
-    /// unset, falls back to `SMG_MM_TENSOR_TRANSPORT`, then `inline`.
+    /// Per-worker `WorkerSpec.multimodal_tensor_transport` overrides this, but
+    /// only this setting (or the legacy `mm_pixel_rdma`) turns the RDMA lane
+    /// on; when unset, falls back to `SMG_MM_TENSOR_TRANSPORT`, then `inline`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multimodal_tensor_transport: Option<TransportMode>,
     /// Global minimum multimodal tensor size (bytes) before SHM transport is used.
@@ -432,6 +465,10 @@ pub struct RouterConfig {
     /// `SMG_LOG_MM_TIMING`.
     #[serde(default)]
     pub log_mm_timing: bool,
+    /// Deprecated, accepted and ignored: every registration reads an
+    /// engine's data-parallel size and registers one worker per rank, with
+    /// this set or not. Start-up warns when it is set.
+    #[serde(default)]
     pub dp_aware: bool,
     #[serde(default)]
     pub dp_minimum_tokens_scheduler: bool,
@@ -589,7 +626,9 @@ pub struct RouterConfig {
     /// Bounds of the memory history backend (`history_backend = "memory"`):
     /// the most stored responses and conversation items it keeps and how long
     /// it keeps a record; unset = the defaults (10,000 responses, 100,000
-    /// items, one day).
+    /// items, one day). The Messages route's thread store, in memory under
+    /// every backend, keeps at most `max_responses` turns for the same
+    /// retention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryConfig>,
     /// For reasoning models (e.g., deepseek-r1, qwen3)
@@ -636,14 +675,28 @@ pub struct RouterConfig {
     /// When set, wraps all storage backends with hook-based interceptors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_hook_wasm_path: Option<String>,
+    /// Select Grand Central for this process. The classic policies
+    /// are the default. Written where it is on.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub grand_central: bool,
+    /// Path to the policy document the controller runs in place of the one
+    /// the routing settings mean. Requires Grand Central.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_spec_path: Option<String>,
+    /// The policy document the controller runs. The builder loads it from
+    /// `policy_spec_path`; a host may set it directly. Requires Grand
+    /// Central.
+    #[serde(skip)]
+    pub policy_spec: Option<PolicySpec>,
 }
 
 /// Capacity threshold for one PD role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReadinessRoleConfig {
-    /// Desired fleet size used as the stable percentage denominator. Has no
-    /// effect unless `min_healthy_percent` is also set.
+    /// Desired fleet size used as the stable percentage denominator. It
+    /// enables no percentage gate unless `min_healthy_percent` is also set.
+    /// `min_healthy_workers` may not exceed it.
     pub expected_workers: Option<usize>,
     /// Absolute safety floor, independent of the percentage threshold.
     pub min_healthy_workers: usize,
@@ -868,10 +921,6 @@ fn default_worker_stall_secs() -> u64 {
     2
 }
 
-/// The default per-stage silence bound of a ZMQ engine's startup handshake:
-/// an hour, since it alone covers the engine's init between HELLO and READY.
-pub const DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS: u64 = 3600;
-
 fn default_zmq_startup_timeout_secs() -> u64 {
     DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS
 }
@@ -1023,6 +1072,19 @@ pub enum RoutingMode {
 }
 
 impl RoutingMode {
+    /// The worker roles a discovery provider fills under this mode. `None`
+    /// for a mode with no worker pools to fill.
+    pub fn discovery_roles(&self) -> Option<Roles> {
+        match self {
+            RoutingMode::Regular { .. } => Some(Roles::Regular),
+            RoutingMode::PrefillDecode { .. } => Some(Roles::PrefillDecode),
+            RoutingMode::EncodePrefillDecode { .. } => Some(Roles::EncodePrefillDecode),
+            RoutingMode::OpenAI { .. }
+            | RoutingMode::Anthropic { .. }
+            | RoutingMode::Gemini { .. } => None,
+        }
+    }
+
     /// This mode with every worker URL masked like [`Endpoint::redacted`]:
     /// what the start-up lines and the configuration view show.
     pub fn redacted(&self) -> Self {
@@ -1213,80 +1275,6 @@ pub enum ManualAssignmentMode {
     Delegate,
 }
 
-/// Which implementation decides worker selection (`--policy-engine`): the
-/// policies over worker handles, or the policy engine over its bounded
-/// view. `legacy` until the migration flips the default; the flag is the
-/// rollback. Under `engine` the validator refuses a policy whose stages the
-/// engine does not carry in this build.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum PolicyEngineMode {
-    #[default]
-    Legacy,
-    Engine,
-}
-
-impl PolicyEngineMode {
-    /// Parse the CLI spelling (`legacy` / `engine`).
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "legacy" => Some(Self::Legacy),
-            "engine" => Some(Self::Engine),
-            _ => None,
-        }
-    }
-}
-
-/// How strictly PD placement pairs a prefill with a decode on their KV
-/// transfer protocol (#2483). A descriptor component an engine does not report
-/// is "unknown".
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum PdPairingMode {
-    /// Pair on nothing: placement behaves as if no descriptor existed.
-    Off,
-    /// A known difference in runtime, transport or KV layout refuses the
-    /// pair; unknown components and engine versions pair with anything.
-    #[default]
-    Lenient,
-    /// Runtime, transport and KV layout must be known on both sides and
-    /// agree, and reported engine versions must match.
-    Strict,
-}
-
-impl PdPairingMode {
-    /// Number of modes, for per-mode caches.
-    pub const COUNT: usize = 3;
-
-    /// A dense index for per-mode caches.
-    pub const fn index(self) -> usize {
-        match self {
-            Self::Off => 0,
-            Self::Lenient => 1,
-            Self::Strict => 2,
-        }
-    }
-
-    /// Parse the CLI spelling (`off` / `lenient` / `strict`).
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "off" => Some(Self::Off),
-            "lenient" => Some(Self::Lenient),
-            "strict" => Some(Self::Strict),
-            _ => None,
-        }
-    }
-
-    /// The CLI spelling.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Off => "off",
-            Self::Lenient => "lenient",
-            Self::Strict => "strict",
-        }
-    }
-}
-
 /// Per-request sticky-routing override: when a sticky key is present, any
 /// eligible policy routes via manual sticky-map semantics. Reuses the manual
 /// policy knobs for the sticky map; eviction defaults match the manual policy so
@@ -1338,6 +1326,72 @@ impl Default for RoutingKeyOverrideConfig {
             assignment_mode: default_override_assignment_mode(),
             headers: default_routing_key_headers(),
         }
+    }
+}
+
+/// How a request with a sticky key is placed on the engines (data-parallel
+/// ranks) of a grouped worker: one worker URL whose socket set several
+/// engines dial, as many as they declare at the handshake. A group given a
+/// count (`--zmq-engine-count` above one, or `dp_size` on its spec) is
+/// registered as one worker per engine and is not a grouped worker: there
+/// the routing policy's pick is the rank, and this setting does nothing.
+/// Routing policies see the group as one worker, and its
+/// connection otherwise sends each request to its least-loaded engine,
+/// which scatters one conversation's turns over the engines' separate
+/// prefix caches. The key is the one sticky routing reads: the first valid
+/// routing-key header, or the body `rid` under the routing-key override.
+/// Only a single generate request is pinned: one without a key, a batch's
+/// prompts and an embedding keep the connection's pick under every mode, and
+/// so does a request whose rank is not among the ranks, counted from 0, that
+/// its connection places a pin on (on vLLM, the engine indices from 0 up to
+/// the first the group lacks). On a disaggregated pair the pin is the
+/// bootstrap room of a single TokenSpeed request: a grouped prefill worker
+/// places the request on the rank its room's residue names, modulo the
+/// engines its connection connected, so the room is moved into the residue
+/// class of the key's rank, and the decode side takes the same room. A
+/// batched or EPD request, or one on another runtime, keeps its random room.
+///
+/// The flag and the configuration file take one spelling, and so does a
+/// caller that parses the setting from a string: the flag's values are this
+/// enum's clap [`ValueEnum`] names, serde writes the same ones, and
+/// [`FromStr`](std::str::FromStr) reads them as clap does.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupedDpSticky {
+    /// No pinning: every request goes to the connection's least-loaded
+    /// engine.
+    #[default]
+    Off,
+    /// Every request of a key to its hash engine, `xxh3(key) % ranks` (the
+    /// worker's engines; on a disaggregated pair, the engines the prefill
+    /// connection connected): the same engine across requests, gateway
+    /// restarts and replicas, however unevenly the keys fall.
+    Hash,
+}
+
+impl GroupedDpSticky {
+    /// The spelling of the flag and the configuration file.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Hash => "hash",
+        }
+    }
+}
+
+impl std::str::FromStr for GroupedDpSticky {
+    type Err = String;
+
+    /// The flag's spelling, matched exactly as clap matches it, so a caller
+    /// outside clap refuses what the CLI refuses.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        <Self as ValueEnum>::from_str(value, false).map_err(|_| {
+            let known: Vec<&str> = Self::value_variants()
+                .iter()
+                .map(|sticky| sticky.as_str())
+                .collect();
+            format!("expected one of {}", known.join(", "))
+        })
     }
 }
 
@@ -1497,7 +1551,7 @@ pub enum PolicyConfig {
     /// with the lower expected wait, scored like `least_load`
     /// (`(queued_tokens + inflight_tokens) / throughput + kv_pressure_weight * k/(1-k)`).
     /// The worker loads it reads are polled at the gateway's one cadence,
-    /// `load_monitor_interval_secs`.
+    /// `load_monitor_interval_secs`, or `load_monitor_interval_ms` where set.
     #[serde(rename = "power_of_two")]
     PowerOfTwo {
         #[serde(default)]
@@ -1679,8 +1733,9 @@ fn default_least_load_throughput() -> f64 {
 }
 
 /// The per-policy poll interval of earlier releases. The load monitor has one
-/// cadence, `load_monitor_interval_secs`; a policy configuration that still
-/// sets this key is refused with that knob named, never silently ignored.
+/// cadence, `load_monitor_interval_secs` or `load_monitor_interval_ms` where
+/// set; a policy configuration that still sets this key is refused with the
+/// seconds knob named, never silently ignored.
 pub const RETIRED_POLICY_INTERVAL_KEY: &str = "load_check_interval_secs";
 
 /// least_load's per-worker waiting-queue cap of earlier releases. The router's
@@ -1769,256 +1824,6 @@ impl PolicyConfig {
     }
 }
 
-/// Worker discovery: the one provider that finds this router's workers, and
-/// that provider's settings. Presence means discovery is on; there is no
-/// `enabled` flag.
-///
-/// Serialized as a `provider` tag beside the provider's own flat fields:
-///
-/// ```yaml
-/// discovery:
-///   provider: kubernetes
-///   selector: { app: sglang }
-///   port: 8000
-/// ```
-///
-/// [`RouterConfig::discovery`] also reads the flat Kubernetes object that
-/// predates the tag; see [`deserialize_discovery`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "provider", rename_all = "snake_case")]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one per router, built at startup; boxing the Kubernetes variant would complicate every construction and match to save a few hundred bytes"
-)]
-pub enum DiscoveryConfig {
-    Kubernetes(KubernetesDiscoveryConfig),
-    File(FileDiscoveryConfig),
-    Slurm(SlurmDiscoveryConfig),
-    Consul(ConsulDiscoveryConfig),
-}
-
-impl From<KubernetesDiscoveryConfig> for DiscoveryConfig {
-    fn from(config: KubernetesDiscoveryConfig) -> Self {
-        Self::Kubernetes(config)
-    }
-}
-
-impl From<FileDiscoveryConfig> for DiscoveryConfig {
-    fn from(config: FileDiscoveryConfig) -> Self {
-        Self::File(config)
-    }
-}
-
-impl From<SlurmDiscoveryConfig> for DiscoveryConfig {
-    fn from(config: SlurmDiscoveryConfig) -> Self {
-        Self::Slurm(config)
-    }
-}
-
-impl From<ConsulDiscoveryConfig> for DiscoveryConfig {
-    fn from(config: ConsulDiscoveryConfig) -> Self {
-        Self::Consul(config)
-    }
-}
-
-/// Deserialize [`RouterConfig::discovery`] from either shape it has had.
-///
-/// The flat Kubernetes object that predates the `provider` tag has no tag and
-/// carries an `enabled` flag. A missing tag means Kubernetes, the only
-/// provider that object could describe. `enabled: false` becomes `None` here,
-/// at deserialization, because canonical output has no `enabled` to carry the
-/// `false`: a disabled config that is read and written back must stay
-/// disabled.
-///
-/// Fields are read only after the object is buffered to find its tag, so a
-/// YAML scalar keeps the type YAML gave it: a label value that looks like a
-/// number or boolean must be quoted (`version: "1"`), as in a Kubernetes
-/// manifest. The flat struct once read such values as strings.
-///
-/// Public so every input surface — the Python binding's `discovery` mapping
-/// included — reads discovery by the same rules.
-pub fn deserialize_discovery<'de, D>(deserializer: D) -> Result<Option<DiscoveryConfig>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let Some(mut value) = Option::<serde_json::Value>::deserialize(deserializer)? else {
-        return Ok(None);
-    };
-    if let Some(fields) = value.as_object_mut() {
-        match fields.remove("enabled") {
-            None | Some(serde_json::Value::Bool(true)) => {}
-            Some(serde_json::Value::Bool(false)) => return Ok(None),
-            Some(other) => {
-                return Err(de::Error::custom(format!(
-                    "discovery.enabled must be a boolean, got {other}"
-                )));
-            }
-        }
-        fields
-            .entry("provider")
-            .or_insert_with(|| serde_json::Value::from("kubernetes"));
-    }
-    DiscoveryConfig::deserialize(value)
-        .map(Some)
-        .map_err(de::Error::custom)
-}
-
-/// Kubernetes worker discovery: Pods matching a selector become workers.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct KubernetesDiscoveryConfig {
-    /// None = all namespaces
-    pub namespace: Option<String>,
-    pub port: u16,
-    pub check_interval_secs: u64,
-    /// Regular mode
-    pub selector: HashMap<String, String>,
-    /// EPD mode encode
-    #[serde(default)]
-    pub encode_selector: HashMap<String, String>,
-    /// PD mode prefill
-    pub prefill_selector: HashMap<String, String>,
-    /// PD mode decode
-    pub decode_selector: HashMap<String, String>,
-    pub bootstrap_port_annotation: String,
-    /// Annotation listing a pod's worker data ports (comma-separated).
-    /// Absent on a pod = single worker at `port`.
-    #[serde(default = "default_worker_ports_annotation")]
-    pub worker_ports_annotation: String,
-    #[serde(default = "default_kv_connector_annotation")]
-    pub kv_connector_annotation: String,
-    #[serde(default = "default_kv_engine_id_annotation")]
-    pub kv_engine_id_annotation: String,
-    /// Router node discovery for HA (Kubernetes label selector)
-    #[serde(default)]
-    pub router_selector: HashMap<String, String>,
-    /// Annotation key to read mesh port from Router Pods
-    #[serde(default = "default_router_mesh_port_annotation")]
-    pub router_mesh_port_annotation: String,
-    /// Source for per-worker model_id override: `namespace`, `label:<key>`, or `annotation:<key>`
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model_id_source: Option<String>,
-}
-
-fn default_router_mesh_port_annotation() -> String {
-    "sglang.ai/mesh-port".to_string()
-}
-
-fn default_worker_ports_annotation() -> String {
-    "smg.ai/worker-ports".to_string()
-}
-
-fn default_kv_connector_annotation() -> String {
-    "smg.ai/kv-connector".to_string()
-}
-
-fn default_kv_engine_id_annotation() -> String {
-    "smg.ai/kv-engine-id".to_string()
-}
-
-impl Default for KubernetesDiscoveryConfig {
-    fn default() -> Self {
-        Self {
-            namespace: None,
-            port: 8000,
-            check_interval_secs: 120,
-            selector: HashMap::new(),
-            encode_selector: HashMap::new(),
-            prefill_selector: HashMap::new(),
-            decode_selector: HashMap::new(),
-            bootstrap_port_annotation: "sglang.ai/bootstrap-port".to_string(),
-            worker_ports_annotation: default_worker_ports_annotation(),
-            kv_connector_annotation: default_kv_connector_annotation(),
-            kv_engine_id_annotation: default_kv_engine_id_annotation(),
-            router_selector: HashMap::new(),
-            router_mesh_port_annotation: default_router_mesh_port_annotation(),
-            model_id_source: None,
-        }
-    }
-}
-
-/// The interval of a discovery provider's periodic pass when none is given,
-/// the same for every provider. Kubernetes, file and Consul discovery apply a
-/// change as it happens and use the pass to retry what earlier ones left
-/// undone; Slurm discovery polls on it. ([`KubernetesDiscoveryConfig`] keeps its own
-/// default, 120, for programmatic and serialized configuration.)
-pub const DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS: u64 = 30;
-
-fn default_discovery_check_interval_secs() -> u64 {
-    DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS
-}
-
-/// File worker discovery: the workers listed in a JSON manifest on disk.
-///
-/// The manifest is reread in full whenever it changes, and every
-/// `check_interval_secs` in case a change went unreported. It may be absent at
-/// startup: discovery reads it once a writer creates it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FileDiscoveryConfig {
-    pub path: PathBuf,
-    #[serde(default = "default_discovery_check_interval_secs")]
-    pub check_interval_secs: u64,
-}
-
-/// Slurm worker discovery: one worker on every node of each running job whose
-/// name maps to a worker type.
-///
-/// Every `check_interval_secs`, `squeue` lists the running jobs with a mapped
-/// name, scoped to `user` (by default, the user the gateway runs as) and, when
-/// given, to `account` and `partition`. `scontrol` resolves each job's nodes,
-/// and every node serves one inference server on `port`.
-///
-/// Names map to worker types by the field that lists them: `job_names` are
-/// regular workers, the others the pools of disaggregated routing. A name maps
-/// to one type only.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SlurmDiscoveryConfig {
-    #[serde(default)]
-    pub job_names: Vec<String>,
-    #[serde(default)]
-    pub encode_job_names: Vec<String>,
-    #[serde(default)]
-    pub prefill_job_names: Vec<String>,
-    #[serde(default)]
-    pub decode_job_names: Vec<String>,
-    /// The port of every discovered server.
-    pub port: u16,
-    /// The bootstrap port of the encode and prefill workers.
-    #[serde(default)]
-    pub bootstrap_port: Option<u16>,
-    /// The user whose jobs are discovered; by default, the user `squeue`
-    /// runs as.
-    #[serde(default)]
-    pub user: Option<String>,
-    #[serde(default)]
-    pub account: Option<String>,
-    #[serde(default)]
-    pub partition: Option<String>,
-    #[serde(default = "default_discovery_check_interval_secs")]
-    pub check_interval_secs: u64,
-}
-
-/// Consul worker discovery: the instances of one Consul service whose health
-/// checks all pass, each configured by its `smg_*` service metadata.
-///
-/// Consul is read with blocking queries, so a change applies as soon as
-/// Consul reports it; every `check_interval_secs` the last good list is
-/// reconciled again. `address` is Consul's HTTP API, by default
-/// `CONSUL_HTTP_ADDR` or `127.0.0.1:8500`; `datacenter` is by default
-/// the agent's own. The ACL token and the TLS settings come from Consul's own
-/// environment variables, never from this configuration.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ConsulDiscoveryConfig {
-    pub service: String,
-    #[serde(default)]
-    pub address: Option<String>,
-    #[serde(default)]
-    pub datacenter: Option<String>,
-    #[serde(default = "default_discovery_check_interval_secs")]
-    pub check_interval_secs: u64,
-}
-
-pub use smg_external_router::RetryConfig;
-
 /// Health check configuration for worker monitoring. The four counts and
 /// periods are at least 1 (checked at configuration validation): none of
 /// them has a meaning at 0, and a zero interval would make the checker a
@@ -2053,21 +1858,6 @@ pub struct HealthCheckConfig {
 
 fn default_drain_settle_secs() -> u64 {
     5
-}
-
-/// Which Failed workers the health checker removes. Mesh-imported workers
-/// are never removed under any scope: their owner manages them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnhealthyRemovalScope {
-    /// None: a Failed worker stays registered and probed, and rejoins in
-    /// place when its engine answers again.
-    Disabled,
-    /// The workers a discovery provider registered, which it registers again
-    /// once their engine returns. Static and API-added workers stay.
-    DiscoveryOwned,
-    /// Every local worker, static and API-added ones included, though
-    /// nothing re-adds those.
-    AllLocal,
 }
 
 /// Resolve `--worker-auto-recovery` into the removal scope. An explicit
@@ -2200,8 +1990,8 @@ impl Default for RouterConfig {
             policy: PolicyConfig::Random,
             cache_boundaries: Vec::new(),
             routing_key_override: RoutingKeyOverrideConfig::default(),
+            grouped_dp_sticky: GroupedDpSticky::default(),
             pd_pairing_mode: PdPairingMode::default(),
-            policy_engine: PolicyEngineMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
             pd_readiness: None,
@@ -2227,6 +2017,7 @@ impl Default for RouterConfig {
             job_queue_capacity: default_job_queue_capacity(),
             job_queue_concurrency: default_job_queue_concurrency(),
             load_monitor_interval_secs: 10,
+            load_monitor_interval_ms: None,
             worker_stall_secs: default_worker_stall_secs(),
             worker_wedge_secs: default_worker_wedge_secs(),
             worker_stale_secs: default_worker_stale_secs(),
@@ -2317,6 +2108,9 @@ impl Default for RouterConfig {
             mcp_config: None,
             enable_wasm: false,
             storage_hook_wasm_path: None,
+            grand_central: false,
+            policy_spec_path: None,
+            policy_spec: None,
             server_cert: None,
             server_key: None,
             server_key_path: None,
@@ -2338,6 +2132,40 @@ impl RouterConfig {
     /// Validate the configuration
     pub fn validate(&self) -> ConfigResult<()> {
         ConfigValidator::validate(self)
+    }
+
+    /// The load monitor's interval: `load_monitor_interval_ms` where it is
+    /// set, `load_monitor_interval_secs` where it is not.
+    pub fn load_monitor_interval(&self) -> Duration {
+        match self.load_monitor_interval_ms {
+            Some(millis) => Duration::from_millis(millis),
+            None => Duration::from_secs(self.load_monitor_interval_secs),
+        }
+    }
+
+    /// Connection attempts per health-check success stamped on a worker
+    /// named at startup or an external API endpoint.
+    pub(crate) const CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS: u32 = 10;
+
+    /// Connection attempts per health-check success stamped on a worker a
+    /// discovery provider registers: twice a configured worker's, since a
+    /// discovered engine is often published while it is still loading.
+    pub(crate) const DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS: u32 = 20;
+
+    /// The value the gateway stamps on `WorkerSpec::max_connection_attempts`
+    /// for a worker it registers itself (named at startup, an external API
+    /// endpoint, published by a discovery provider): `attempts_per_success`
+    /// for each health-check success the worker must then show, one success
+    /// counted at least, with the path's own multiplier
+    /// ([`Self::CONFIGURED_WORKER_ATTEMPTS_PER_SUCCESS`],
+    /// [`Self::DISCOVERED_WORKER_ATTEMPTS_PER_SUCCESS`]). A worker added
+    /// through the worker API keeps the spec's default instead. The value
+    /// rides on the spec and shows in the connection-detection step's debug
+    /// line; the step's retries follow the registration workflow's retry
+    /// policy, whose attempt count comes from the worker startup timeout and
+    /// check interval, so no behaviour reads this value today.
+    pub(crate) fn connection_attempt_budget(&self, attempts_per_success: u32) -> u32 {
+        self.health_check.success_threshold.max(1) * attempts_per_success
     }
 
     /// Which Failed workers the health checker removes: the setting as
@@ -2401,26 +2229,46 @@ impl RouterConfig {
 mod tests {
     use super::*;
 
-    /// The switch reads the CLI's two spellings, any case, and nothing else;
-    /// a configuration without the field is the legacy path.
     #[test]
-    fn policy_engine_mode_parses_its_two_spellings_and_defaults_to_legacy() {
-        assert_eq!(
-            PolicyEngineMode::parse("engine"),
-            Some(PolicyEngineMode::Engine)
-        );
-        assert_eq!(
-            PolicyEngineMode::parse(" Legacy "),
-            Some(PolicyEngineMode::Legacy)
-        );
-        assert_eq!(PolicyEngineMode::parse("remote"), None);
-        assert_eq!(
-            RouterConfig::default().policy_engine,
-            PolicyEngineMode::Legacy
-        );
-        let parsed: RouterConfig =
-            serde_json::from_value(serde_json::to_value(RouterConfig::default()).unwrap()).unwrap();
-        assert_eq!(parsed.policy_engine, PolicyEngineMode::Legacy);
+    fn the_switch_is_written_where_it_is_on() {
+        let config = RouterConfig::default();
+        let form = serde_json::to_value(&config).expect("a config serializes");
+        assert!(form.get("grand_central").is_none());
+        let restored: RouterConfig = serde_json::from_value(form).expect("a config reads back");
+        assert!(!restored.grand_central);
+
+        let config = RouterConfig {
+            grand_central: true,
+            ..config
+        };
+        let form = serde_json::to_value(&config).expect("a config serializes");
+        assert_eq!(form["grand_central"], true);
+        let restored: RouterConfig = serde_json::from_value(form).expect("a config reads back");
+        assert!(restored.grand_central);
+    }
+
+    #[test]
+    fn a_document_path_round_trips_and_its_document_does_not() {
+        let config = RouterConfig::default();
+        let form = serde_json::to_value(&config).expect("a config serializes");
+        assert!(form.get("policy_spec_path").is_none());
+        let restored: RouterConfig = serde_json::from_value(form).expect("a config without a path");
+        assert!(restored.policy_spec_path.is_none());
+
+        let config = RouterConfig {
+            grand_central: true,
+            policy_spec_path: Some("routing.yaml".to_owned()),
+            policy_spec: Some(config.policy_document().expect("the default document")),
+            ..config
+        };
+        let mut form = serde_json::to_value(&config).expect("a config with a document serializes");
+        assert_eq!(form["policy_spec_path"], "routing.yaml");
+        assert!(form.get("policy_spec").is_none());
+        form["policy_spec"] =
+            serde_json::to_value(config.policy_spec).expect("a document serializes");
+        let restored: RouterConfig = serde_json::from_value(form).expect("a config with a path");
+        assert_eq!(restored.policy_spec_path.as_deref(), Some("routing.yaml"));
+        assert!(restored.policy_spec.is_none());
     }
 
     /// The mode is in the gateway's start-up lines: a worker URL's secret is
@@ -2450,6 +2298,41 @@ mod tests {
             "{shown}"
         );
         assert!(!shown.contains("secret"), "{shown}");
+    }
+
+    /// A mode with worker pools names the roles a discovery provider fills.
+    /// A mode with none names no roles, and a provider refuses it.
+    #[test]
+    fn a_routing_mode_names_the_roles_discovery_fills() {
+        use crate::config::test_support::{
+            epd_routing_mode, pd_routing_mode, regular_routing_mode,
+        };
+
+        assert_eq!(
+            regular_routing_mode().discovery_roles(),
+            Some(Roles::Regular)
+        );
+        assert_eq!(
+            pd_routing_mode().discovery_roles(),
+            Some(Roles::PrefillDecode)
+        );
+        assert_eq!(
+            epd_routing_mode().discovery_roles(),
+            Some(Roles::EncodePrefillDecode)
+        );
+        for mode in [
+            RoutingMode::OpenAI {
+                worker_urls: vec![],
+            },
+            RoutingMode::Anthropic {
+                worker_urls: vec![],
+            },
+            RoutingMode::Gemini {
+                worker_urls: vec![],
+            },
+        ] {
+            assert_eq!(mode.discovery_roles(), None, "{mode:?}");
+        }
     }
 
     #[test]
@@ -2594,6 +2477,42 @@ mod tests {
         assert!(json.contains("health_check_port"));
         let with: RouterConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(with.health_check_port, Some(8081));
+    }
+
+    /// The load monitor's interval in milliseconds is unset by default and
+    /// stays out of a serialized configuration, and a configuration written
+    /// before the key reads as unset. Where it is set it is the interval
+    /// over the seconds, which stand beside it. Where it is not, the
+    /// seconds are the interval.
+    #[test]
+    fn the_load_monitor_interval_in_milliseconds_wins_over_the_seconds() {
+        let config = RouterConfig::default();
+        assert_eq!(config.load_monitor_interval_ms, None);
+        assert_eq!(config.load_monitor_interval(), Duration::from_secs(10));
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("load_monitor_interval_ms"));
+        let without: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(without.load_monitor_interval_ms, None);
+
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .load_monitor_interval_secs(5)
+            .load_monitor_interval_ms(Some(250))
+            .build_unchecked();
+        assert_eq!(config.load_monitor_interval(), Duration::from_millis(250));
+        let json = serde_json::to_string(&config).unwrap();
+        let with: RouterConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(with.load_monitor_interval_secs, 5);
+        assert_eq!(with.load_monitor_interval_ms, Some(250));
+
+        let seconds_alone = RouterConfig {
+            load_monitor_interval_secs: 5,
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            seconds_alone.load_monitor_interval(),
+            Duration::from_secs(5)
+        );
     }
 
     #[test]
@@ -3044,6 +2963,38 @@ mod tests {
     }
 
     #[test]
+    fn grouped_dp_sticky_is_off_unless_configured_and_spelled_as_the_flag() {
+        // A configuration file that leaves the key out pins nothing.
+        let mut json = serde_json::to_value(RouterConfig::default()).unwrap();
+        assert_eq!(json["grouped_dp_sticky"], "off");
+        json.as_object_mut().unwrap().remove("grouped_dp_sticky");
+        let read: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(read.grouped_dp_sticky, GroupedDpSticky::Off);
+
+        // One spelling everywhere: the flag's values are the file's, and a
+        // parse outside clap takes them as the flag does, exactly.
+        let flag_values: Vec<String> = GroupedDpSticky::value_variants()
+            .iter()
+            .filter_map(GroupedDpSticky::to_possible_value)
+            .map(|value| value.get_name().to_owned())
+            .collect();
+        assert_eq!(flag_values, ["off", "hash"]);
+        for &sticky in GroupedDpSticky::value_variants() {
+            let json = serde_json::to_value(sticky).unwrap();
+            assert_eq!(json, sticky.as_str());
+            assert_eq!(
+                serde_json::from_value::<GroupedDpSticky>(json).unwrap(),
+                sticky
+            );
+            assert_eq!(sticky.as_str().parse::<GroupedDpSticky>(), Ok(sticky));
+        }
+        for refused in ["least_load", "HASH", " hash", ""] {
+            assert!(refused.parse::<GroupedDpSticky>().is_err(), "{refused:?}");
+        }
+        assert!(serde_json::from_value::<GroupedDpSticky>(serde_json::json!("sticky")).is_err());
+    }
+
+    #[test]
     fn test_routing_mode_is_pd_mode() {
         let regular = RoutingMode::Regular {
             worker_urls: vec!["http://worker1".to_string()],
@@ -3430,6 +3381,7 @@ mod tests {
         assert_eq!(config.bootstrap_port_annotation, "sglang.ai/bootstrap-port");
         assert_eq!(config.kv_connector_annotation, "smg.ai/kv-connector");
         assert_eq!(config.kv_engine_id_annotation, "smg.ai/kv-engine-id");
+        assert_eq!(config.pairing_protocol_label, "smg.ai/pairing-protocol");
     }
 
     #[test]
@@ -3450,6 +3402,7 @@ mod tests {
             worker_ports_annotation: "smg.ai/worker-ports".to_string(),
             kv_connector_annotation: "custom.io/kv-connector".to_string(),
             kv_engine_id_annotation: "custom.io/kv-engine-id".to_string(),
+            pairing_protocol_label: "custom.io/pairing-protocol".to_string(),
             router_selector: HashMap::new(),
             router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
             model_id_source: None,
@@ -3929,6 +3882,7 @@ discovery:
                     worker_ports_annotation: "smg.ai/worker-ports".to_string(),
                     kv_connector_annotation: "smg.ai/kv-connector".to_string(),
                     kv_engine_id_annotation: "smg.ai/kv-engine-id".to_string(),
+                    pairing_protocol_label: "smg.ai/pairing-protocol".to_string(),
                     router_selector: HashMap::new(),
                     router_mesh_port_annotation: "sglang.ai/mesh-port".to_string(),
                     model_id_source: None,

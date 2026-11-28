@@ -27,33 +27,32 @@ use rand::RngExt;
 use smg_grpc_client::{
     common_proto, tokenspeed_encoder::tokenspeed_encoder_proto as tokenspeed_encoder,
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerLoadGuard};
 use tracing::error;
 use uuid::Uuid;
 
 use super::{helpers::bootstrap_rendezvous, pd_protocol::EncodeHandoff, PipelineStage};
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            backend_client::{
-                send_tokenspeed_encode_frame, send_tokenspeed_encode_rpc, BackendClient,
-            },
-            client::GrpcClient,
-            context::{ClientSelection, EncodeOutputs, RequestContext, WorkerSelection},
-            multimodal::{
-                assemble_tokenspeed_for_encode, assembly_error_response,
-                ec_push::{push_destination, ImageFanout, PushEncodePlan},
-                mm_rdma_exporter, worker_supports_ec_transfer, MultimodalIntermediate,
-            },
-            proto_wrapper::{
-                cleanup_mm_shm_handles, cleanup_tokenspeed_items_encoder_shm,
-                collect_tokenspeed_multimodal_inputs_shm_handles, stage_tokenspeed_tensor_rdma,
-                EncodeItemBootstrapInfo, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
-            },
-            zmq_client::EncodeRendezvous,
+use crate::routers::{
+    error,
+    grpc::{
+        backend_client::{
+            backend_client_if_initialized, send_tokenspeed_encode_frame,
+            send_tokenspeed_encode_rpc, BackendClient,
         },
+        client::GrpcClient,
+        context::{ClientSelection, EncodeOutputs, RequestContext, WorkerSelection},
+        multimodal::{
+            assemble_tokenspeed_for_encode, assembly_error_response,
+            ec_push::{push_destination, ImageFanout, PushEncodePlan},
+            mm_rdma_exporter, worker_supports_ec_transfer, MultimodalIntermediate,
+        },
+        proto_wrapper::{
+            cleanup_mm_shm_handles, cleanup_tokenspeed_items_encoder_shm,
+            collect_tokenspeed_multimodal_inputs_shm_handles, stage_tokenspeed_tensor_rdma,
+            EncodeItemBootstrapInfo, TokenSpeedMultimodalData, TokenSpeedMultimodalItem,
+        },
+        zmq_client::EncodeRendezvous,
     },
-    worker::{ConnectionMode, RuntimeType, Worker},
 };
 
 /// No-op unless the request is multimodal and worker selection produced encode
@@ -142,21 +141,21 @@ pub(crate) struct EncodeDispatchPlan {
 pub(crate) struct PreparedEncodeJob {
     item: PreparedEncodeItem,
     target: EncodeTarget,
+    /// The encode worker the job is assigned to: the send goes to it, and
+    /// its load counts the send.
+    worker: Arc<dyn Worker>,
     bootstrap_room: i64,
 }
 
-/// The encode worker a job goes to, by the transport that reaches it.
+/// The transport that reaches the encode worker of a job.
 pub(crate) enum EncodeTarget {
     /// A gRPC encode worker, by its URL.
-    Grpc(String),
-    /// A TokenSpeed encode server on the direct ZMQ lane: its worker, whose
-    /// connection carries the request, and the rendezvous the request names
+    Grpc,
+    /// A TokenSpeed encode server on the direct ZMQ lane: the worker's
+    /// connection carries the request, with the rendezvous the request names
     /// (the server's own bootstrap address, which the prefill side pulls the
     /// embedding from).
-    Zmq {
-        worker: Arc<dyn Worker>,
-        rendezvous: EncodeRendezvous,
-    },
+    Zmq { rendezvous: EncodeRendezvous },
 }
 
 impl EncodePlan {
@@ -189,7 +188,12 @@ impl EncodeDispatchPlan {
 
 impl PreparedEncodeJob {
     pub(crate) async fn dispatch(self) -> std::result::Result<(), String> {
-        self.item.dispatch(self.target, self.bootstrap_room).await
+        // Booked on its encode worker until the send ends, as a generate
+        // call is on its worker.
+        let _load = WorkerLoadGuard::with_key(Arc::clone(&self.worker), None);
+        self.item
+            .dispatch(self.worker.as_ref(), self.target, self.bootstrap_room)
+            .await
     }
 }
 
@@ -214,6 +218,7 @@ impl PreparedEncodeItem {
 
     pub(crate) async fn dispatch(
         mut self,
+        worker: &dyn Worker,
         target: EncodeTarget,
         bootstrap_room: i64,
     ) -> std::result::Result<(), String> {
@@ -231,7 +236,7 @@ impl PreparedEncodeItem {
                 // Stage with bootstrap_room as the slot key (load-bearing), so
                 // into_proto(false) below does not re-stage with a random key.
                 // The ZMQ lane carries the tensor inline, never a remote pull.
-                if let (EncodeTarget::Grpc(_), Some(exporter)) = (&target, mm_rdma_exporter()) {
+                if let (EncodeTarget::Grpc, Some(exporter)) = (&target, mm_rdma_exporter()) {
                     item.encoder_input =
                         stage_tokenspeed_tensor_rdma(exporter, bootstrap_room, item.encoder_input);
                 }
@@ -254,11 +259,11 @@ impl PreparedEncodeItem {
                     .unwrap_or_default();
                 let _shm_guard = TokenSpeedShmCleanupGuard(shm_handles);
                 match target {
-                    EncodeTarget::Grpc(endpoint) => {
-                        send_tokenspeed_encode_rpc(endpoint, request).await
+                    EncodeTarget::Grpc => {
+                        send_tokenspeed_encode_rpc(worker.url().to_string(), request).await
                     }
-                    EncodeTarget::Zmq { worker, rendezvous } => {
-                        send_tokenspeed_encode_frame(worker.as_ref(), &rendezvous, request).await
+                    EncodeTarget::Zmq { rendezvous } => {
+                        send_tokenspeed_encode_frame(worker, &rendezvous, request).await
                     }
                 }
             }
@@ -394,7 +399,7 @@ fn build_plan(
         let bootstrap_room = rand::rng().random_range(0..i64::MAX);
 
         let worker = &assignment.worker;
-        let backend = worker.backend_client_if_initialized();
+        let backend = backend_client_if_initialized(worker.as_ref())?;
         let (bootstrap_host, bootstrap_port) = bootstrap_rendezvous(
             worker.bootstrap_host(),
             worker.bootstrap_port(),
@@ -410,19 +415,17 @@ fn build_plan(
         });
         let target = match worker.connection_mode() {
             ConnectionMode::Zmq => EncodeTarget::Zmq {
-                worker: Arc::clone(worker),
                 rendezvous: EncodeRendezvous {
                     bootstrap_host: bootstrap_host.to_string(),
                     bootstrap_port: i32::from(bootstrap_port),
                 },
             },
-            ConnectionMode::Grpc | ConnectionMode::Http => {
-                EncodeTarget::Grpc(worker.url().to_string())
-            }
+            ConnectionMode::Grpc | ConnectionMode::Http => EncodeTarget::Grpc,
         };
         jobs.push(PreparedEncodeJob {
             item,
             target,
+            worker: Arc::clone(worker),
             bootstrap_room,
         });
     }
@@ -498,385 +501,5 @@ fn backend_name(client: &BackendClient) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::routers::grpc::context::EncodeWorkerAssignment;
-
-    fn ec_worker(url: &str, role: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
-        let mut builder = crate::worker::BasicWorkerBuilder::new(url)
-            .runtime_type(RuntimeType::Vllm)
-            .label("ec_role", role)
-            .label("ec_connector", "ECMooncakeConnector");
-        for (key, value) in labels {
-            builder = builder.label(*key, *value);
-        }
-        Arc::new(builder.build())
-    }
-
-    fn push_selection(encoders: Vec<Arc<dyn Worker>>, prefill: Arc<dyn Worker>) -> WorkerSelection {
-        WorkerSelection::Disaggregated {
-            encode_assignments: Some(
-                encoders
-                    .into_iter()
-                    .enumerate()
-                    .map(|(item_index, worker)| EncodeWorkerAssignment { item_index, worker })
-                    .collect(),
-            ),
-            decode: Arc::clone(&prefill),
-            prefill,
-            runtime_type: RuntimeType::Vllm,
-        }
-    }
-
-    const CONSUMER: [(&str, &str); 2] = [
-        ("supports_ec_transfer", "true"),
-        ("ec_zmq_addrs", r#"["tcp://127.0.0.1:9101"]"#),
-    ];
-
-    /// A push handoff plans the one encoder and the consumer's destination;
-    /// a pull connector plans no destination.
-    #[test]
-    fn a_push_handoff_plans_one_encoder_and_the_consumers_destination() {
-        let encoder = ec_worker("grpc://127.0.0.1:9000", "ec_producer", &[]);
-        let consumer = ec_worker("grpc://127.0.0.1:9001", "ec_consumer", &CONSUMER);
-        let plan = plan_push(1, &push_selection(vec![encoder], consumer), None).expect("a plan");
-        assert_eq!(plan.encoder.url(), "grpc://127.0.0.1:9000");
-        assert_eq!(plan.destination.as_deref(), Some("tcp://127.0.0.1:9101"));
-        assert!(plan.fanout.is_none());
-
-        let pull = ec_worker(
-            "grpc://127.0.0.1:9002",
-            "ec_consumer",
-            &[
-                ("supports_ec_transfer", "true"),
-                ("ec_connector", "ECCPUConnector"),
-            ],
-        );
-        let encoder = ec_worker("grpc://127.0.0.1:9000", "ec_producer", &[]);
-        let plan = plan_push(1, &push_selection(vec![encoder], pull), None).expect("a plan");
-        assert!(plan.destination.is_none());
-    }
-
-    /// The push arm refuses what the handoff cannot carry: more than one
-    /// sample, more than one encoder without an anchor to fan out on, a
-    /// consumer without the transfer; under an anchor the encoders are the
-    /// fan-out.
-    #[test]
-    fn a_push_handoff_refuses_what_it_cannot_carry() {
-        use axum::http::StatusCode;
-        let producer = || ec_worker("grpc://127.0.0.1:9000", "ec_producer", &[]);
-        let consumer = ec_worker("grpc://127.0.0.1:9001", "ec_consumer", &CONSUMER);
-        let refused = |n, encoders, prefill, anchor| {
-            plan_push(n, &push_selection(encoders, prefill), anchor)
-                .err()
-                .expect("refused")
-                .status()
-        };
-        assert_eq!(
-            refused(2, vec![producer()], Arc::clone(&consumer), None),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            refused(1, vec![producer(), producer()], Arc::clone(&consumer), None),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-        let no_transfer = ec_worker("grpc://127.0.0.1:9003", "ec_consumer", &[]);
-        assert_eq!(
-            refused(1, vec![producer()], no_transfer, None),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
-        let fanned = plan_push(
-            1,
-            &push_selection(vec![producer(), producer()], consumer),
-            Some(7),
-        )
-        .expect("a fan-out plan");
-        assert_eq!(
-            fanned.fanout.map(|fanout| fanout.assignments.len()),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn empty_plan_is_empty_and_yields_no_jobs() {
-        let plan = EncodePlan {
-            bootstrap_info: Vec::new(),
-            dispatch: EncodeDispatchPlan::new(Vec::new()),
-        };
-        assert!(plan.is_empty());
-        let (bootstrap_info, dispatch) = plan.into_parts();
-        assert!(bootstrap_info.is_empty());
-        assert_eq!(dispatch.len(), 0);
-        assert!(dispatch.into_jobs().is_empty());
-    }
-
-    /// An EPD plan whose encode server is on the direct ZMQ lane assembles
-    /// its items inline (no /dev/shm), targets the server over its own
-    /// connection with the rendezvous its engine declared, and the dispatch
-    /// sends the encode frame on that connection with the rendezvous in it;
-    /// a prefill side on the same lane takes the TokenSpeed items.
-    #[tokio::test]
-    async fn a_zmq_encode_server_takes_its_items_inline_at_its_declared_rendezvous() {
-        use std::time::Duration;
-
-        use engine_zmq_client::{
-            mock_engine::{connect_to_frontend, default_ready_response},
-            protocol::{
-                handshake::EngineCoreReadyResponse, tokenspeed::request::TokenSpeedRequestType,
-            },
-            EngineId,
-        };
-
-        use crate::{
-            routers::grpc::{
-                context::EncodeWorkerAssignment,
-                multimodal::single_image_intermediate,
-                proto_wrapper::TokenSpeedTensorStorage,
-                zmq_client::{EosTokenIds, ZmqEngineClient},
-            },
-            worker::{BasicWorkerBuilder, WorkerType},
-        };
-
-        let dir = tempfile::tempdir().unwrap();
-        // A rank that declared `ready`, behind a direct-ZMQ worker of `role`,
-        // the backend injected as the connect driver leaves it.
-        let connected = |name: &'static str, role: WorkerType, ready: EngineCoreReadyResponse| {
-            let dir = dir.path().join(name);
-            async move {
-                std::fs::create_dir_all(&dir).unwrap();
-                let ep = |socket: &str| format!("ipc://{}", dir.join(socket).display());
-                let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-                let (client, rank) = tokio::join!(
-                    ZmqEngineClient::connect(
-                        &handshake,
-                        &input,
-                        &output,
-                        1,
-                        "m".to_string(),
-                        EosTokenIds::default(),
-                        RuntimeType::TokenSpeed,
-                        Duration::from_secs(10)
-                    ),
-                    connect_to_frontend(&handshake, EngineId::from_engine_index(0), ready),
-                );
-                let client = BackendClient::Zmq(client.expect("adapter connect"));
-                let worker = BasicWorkerBuilder::new(ep("worker.ipc"))
-                    .connection_mode(ConnectionMode::Zmq)
-                    .runtime_type(RuntimeType::TokenSpeed)
-                    .worker_type(role)
-                    .build();
-                worker
-                    .backend_client
-                    .load_full()
-                    .set(Arc::new(client.clone()))
-                    .ok()
-                    .expect("cell empty");
-                (
-                    Arc::new(worker) as Arc<dyn Worker>,
-                    client,
-                    rank.expect("mock engine"),
-                )
-            }
-        };
-        let encoder_ready = EngineCoreReadyResponse {
-            request_types: vec!["encode".to_string()],
-            disaggregation_mode: Some("encode".to_string()),
-            bootstrap_host: Some("10.0.0.9".to_string()),
-            bootstrap_port: Some(8998),
-            ..default_ready_response()
-        };
-        let (encoder, _, mut encoder_rank) =
-            connected("encode", WorkerType::Encode, encoder_ready).await;
-        let (prefill, prefill_client, _prefill_rank) =
-            connected("prefill", WorkerType::Prefill, default_ready_response()).await;
-        let (decode, decode_client, _decode_rank) =
-            connected("decode", WorkerType::Decode, default_ready_response()).await;
-        let workers = WorkerSelection::Disaggregated {
-            encode_assignments: Some(vec![EncodeWorkerAssignment {
-                item_index: 0,
-                worker: Arc::clone(&encoder),
-            }]),
-            prefill,
-            decode,
-            runtime_type: RuntimeType::TokenSpeed,
-        };
-        let clients = ClientSelection::Disaggregated {
-            prefill: prefill_client,
-            decode: decode_client,
-        };
-        let intermediate =
-            MultimodalIntermediate::try_new(vec![single_image_intermediate()]).unwrap();
-
-        let plan = build_plan(&intermediate, Some(&clients), Some(&workers)).expect("the plan");
-        let (bootstrap_info, dispatch) = plan.into_parts();
-        assert_eq!(bootstrap_info.len(), 1);
-        assert_eq!(
-            (
-                bootstrap_info[0].item_index,
-                bootstrap_info[0].bootstrap_host.as_str(),
-                bootstrap_info[0].bootstrap_port
-            ),
-            (0, "10.0.0.9", 8998)
-        );
-        let mut jobs = dispatch.into_jobs();
-        assert_eq!(jobs.len(), 1);
-        let job = jobs.pop().unwrap();
-        assert_eq!(job.bootstrap_room, bootstrap_info[0].bootstrap_room);
-        match &job.target {
-            EncodeTarget::Zmq { worker, rendezvous } => {
-                assert_eq!(worker.url(), encoder.url());
-                assert_eq!(
-                    (
-                        rendezvous.bootstrap_host.as_str(),
-                        rendezvous.bootstrap_port
-                    ),
-                    ("10.0.0.9", 8998)
-                );
-            }
-            EncodeTarget::Grpc(endpoint) => panic!("a gRPC target {endpoint}"),
-        }
-        let PreparedEncodeItem::TokenSpeed {
-            item: Some(item),
-            shm_enabled,
-            ..
-        } = &job.item
-        else {
-            panic!("an item")
-        };
-        assert!(!*shm_enabled, "inline on the ZMQ lane");
-        assert!(matches!(
-            item.encoder_input.storage,
-            TokenSpeedTensorStorage::Inline(_)
-        ));
-
-        let (sent, frames) = tokio::join!(job.dispatch(), encoder_rank.recv_request());
-        sent.expect("the frame left on the server's connection");
-        let frames = frames.unwrap();
-        assert_eq!(
-            TokenSpeedRequestType::from_frame(frames[0].as_ref()),
-            Some(TokenSpeedRequestType::Encode)
-        );
-        assert!(
-            frames[1].windows(8).any(|window| window == b"10.0.0.9"),
-            "the rendezvous rides the frame"
-        );
-    }
-
-    /// Real `/dev/shm` segments back the encode jobs, so these run only on
-    /// Linux. They prove the encode jobs' SHM Drop guards move with the owning
-    /// state: dropping it before dispatch reclaims the segment, while a
-    /// dispatched item transfers ownership off the guard.
-    #[cfg(target_os = "linux")]
-    mod shm_lifecycle {
-        use std::collections::HashMap;
-
-        use smg_grpc_client::common_proto::ShmHandle;
-
-        use super::*;
-        use crate::routers::grpc::{
-            context::{EncodeOutputs, ProcessingState},
-            proto_wrapper::{
-                mm_shm_dev_writable, write_tokenspeed_shm_with, TokenSpeedModality,
-                TokenSpeedTensor,
-            },
-        };
-
-        fn shm_path(name: &str) -> std::path::PathBuf {
-            std::path::PathBuf::from("/dev/shm").join(name)
-        }
-
-        /// Build a `PreparedEncodeItem` whose encoder input is a freshly-created
-        /// `/dev/shm` segment, plus the path to that segment. The item's `Drop`
-        /// (cleanup_on_drop=true) is expected to unlink the segment.
-        fn tokenspeed_item_backed_by_shm() -> (PreparedEncodeItem, std::path::PathBuf) {
-            let payload = vec![7u8; 4096];
-            let handle: ShmHandle = write_tokenspeed_shm_with(payload.len(), |out| {
-                out.copy_from_slice(&payload);
-                Ok(())
-            })
-            .expect("write /dev/shm segment");
-            let path = shm_path(&handle.name);
-            assert!(path.exists(), "SHM segment must exist after creation");
-
-            let item = TokenSpeedMultimodalItem {
-                modality: TokenSpeedModality::Image,
-                encoder_input: TokenSpeedTensor::shm(handle, vec![1, 4096], "float32".to_string()),
-                model_specific_tensors: HashMap::new(),
-                placeholder_token_id: None,
-                mm_placeholders: Vec::new(),
-                content_hash: vec![1, 2, 3],
-            };
-            (
-                PreparedEncodeItem::tokenspeed(
-                    item, /*shm_enabled=*/ true, /*shm_min_bytes=*/ 0,
-                ),
-                path,
-            )
-        }
-
-        /// Dropping the owning `ProcessingState` (as a `RequestContext` drop
-        /// would, on early return / cancellation) before dispatch must reclaim
-        /// the encode jobs' `/dev/shm` segments via `PreparedEncodeItem`'s `Drop`.
-        #[test]
-        fn dropping_state_before_dispatch_reclaims_encode_shm() {
-            if !mm_shm_dev_writable() {
-                // Linux container without a usable /dev/shm; skip rather than fail.
-                return;
-            }
-
-            let (item, path) = tokenspeed_item_backed_by_shm();
-            let dispatch = EncodeDispatchPlan::new(vec![PreparedEncodeJob {
-                item,
-                target: EncodeTarget::Grpc("http://encode-worker:9000".to_string()),
-                bootstrap_room: 42,
-            }]);
-            assert!(!dispatch.is_empty());
-
-            let state = ProcessingState {
-                encode_outputs: Some(EncodeOutputs::Rendezvous {
-                    bootstrap_info: Vec::new(),
-                    dispatch,
-                }),
-                ..ProcessingState::default()
-            };
-
-            // Segment is still live while the state owns the plan.
-            assert!(
-                path.exists(),
-                "SHM segment must stay live until the owning state drops"
-            );
-
-            // Drop the state without ever dispatching (cancellation / early return).
-            drop(state);
-
-            assert!(
-                !path.exists(),
-                "dropping the owning state before dispatch must unlink the encode SHM segment"
-            );
-        }
-
-        /// dispatch() disarms the item's own Drop (cleanup_on_drop=false) and
-        /// hands cleanup to the send-path guard, which reclaims the segment after
-        /// the send attempt — so even a failed dispatch reclaims exactly once
-        /// (no leak, and the disarmed Drop cannot double-unlink).
-        #[tokio::test]
-        async fn dispatch_reclaims_shm_via_send_path_guard() {
-            if !mm_shm_dev_writable() {
-                return;
-            }
-
-            let (item, path) = tokenspeed_item_backed_by_shm();
-
-            // Bogus endpoint: the encode RPC fails, but the send-path guard still
-            // reclaims the segment when dispatch() returns.
-            let _ = item
-                .dispatch(EncodeTarget::Grpc("http://127.0.0.1:1".to_string()), 7)
-                .await;
-
-            assert!(
-                !path.exists(),
-                "dispatch must reclaim the encode SHM segment (no leak, no double-unlink)"
-            );
-        }
-    }
-}
+#[path = "../../../../../tests/unit/routers/grpc/common/stages/encode/tests.rs"]
+mod tests;

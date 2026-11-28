@@ -174,6 +174,9 @@ mod tests {
 
     use super::*;
 
+    // The timed cases run on tokio's paused clock: time moves only when every
+    // task waits, so a host that stalls the test's thread cannot run a bound
+    // out.
     const SILENCE: Duration = Duration::from_millis(80);
 
     /// An engine that stays alive: a sign of life every quarter silence.
@@ -184,7 +187,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn silence_fails_the_wait_at_the_bound() {
         let clock = StartupClock::new(SILENCE);
         let started = Instant::now();
@@ -196,7 +199,7 @@ mod tests {
         assert!(started.elapsed() >= SILENCE);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn signs_of_life_keep_a_silent_wait_alive() {
         let liveness = EngineLiveness::new();
         let clock = StartupClock::new(StartupBudget {
@@ -218,7 +221,7 @@ mod tests {
         assert!(started.elapsed() >= 4 * SILENCE);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_ceiling_bounds_a_wait_however_alive_the_engine_is() {
         let liveness = EngineLiveness::new();
         let ceiling = 3 * SILENCE;
@@ -242,7 +245,7 @@ mod tests {
     /// A bound too large for an `Instant` is no bound, not a panic: the
     /// handshake runs in a background task whose panic would leave the link
     /// neither connected nor failed.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn bounds_beyond_the_clock_never_come() {
         let clock = StartupClock::new(StartupBudget {
             silence: Duration::MAX,

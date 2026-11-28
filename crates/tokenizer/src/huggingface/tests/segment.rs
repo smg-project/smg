@@ -12,6 +12,7 @@ use tokenizers::{
 };
 
 use super::super::*;
+use crate::chat_template::developer_messages_as_system;
 
 /// The V4.1 control tokens a small vocabulary needs for the renderer's
 /// prompts: the special ones and the added ones matched after
@@ -665,8 +666,8 @@ fn the_recorded_prompts_of_the_real_vocabulary_encode_the_same_by_segments() {
         // encoder tests pin that); they are rendered as the system path
         // they describe, through the crate's own fold as the encoder's
         // replay of the same recordings does.
-        let messages = crate::chat_template::developer_messages_as_system(&case.messages)
-            .unwrap_or_else(|| case.messages.clone());
+        let messages =
+            developer_messages_as_system(&case.messages).unwrap_or_else(|| case.messages.clone());
         let marked = tok
             .render_marked(&messages, params)
             .map(|(marked, _)| marked)

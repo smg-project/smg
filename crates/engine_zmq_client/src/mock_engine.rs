@@ -74,11 +74,13 @@ impl IpcNamespace {
 /// A default post-init ready response for mock engines.
 pub fn default_ready_response() -> EngineCoreReadyResponse {
     EngineCoreReadyResponse {
+        sglang_managed: None,
         max_model_len: 1024 * 1024,
         num_gpu_blocks: 0,
         block_size: 16,
         dp_stats_address: None,
         dtype: ModelDtype::Float32,
+        multimodal_encoder_dtype: None,
         vllm_version: "test-vllm-version".to_string(),
         world_size: 1,
         data_parallel_size: 1,
@@ -105,6 +107,8 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         spatial_merge_size: None,
         image_token_id: None,
         video_token_id: None,
+        vision_patch_size: None,
+        vision_downsample_ratio: None,
     }
 }
 

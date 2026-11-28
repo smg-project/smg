@@ -90,7 +90,10 @@ async fn fetch_image_from_data_url() {
     );
 
     let frame = connector
-        .fetch_image(MediaSource::DataUrl(data_url), ImageFetchConfig::default())
+        .fetch_image(
+            MediaSource::DataUrl(data_url.into()),
+            ImageFetchConfig::default(),
+        )
         .await
         .expect("data url");
     assert_eq!(frame.size().width, 1);
@@ -136,6 +139,68 @@ async fn fetch_audio_from_inline_bytes_decodes_samples() {
     assert!((clip.decoded().samples[1] - 0.5).abs() < 1e-4);
     assert!((clip.decoded().samples[2] + 0.5).abs() < 1e-4);
     assert!(matches!(clip.source(), AudioSource::InlineBytes));
+}
+
+#[tokio::test]
+async fn raw_image_fetch_can_be_decoded_later() {
+    let connector = test_connector(None);
+    let bytes = tiny_png_bytes();
+    let data_url = format!("data:image/png;base64,{}", BASE64_STANDARD.encode(&bytes));
+    let raw = connector
+        .fetch_image_bytes(MediaSource::DataUrl(data_url.into()))
+        .await
+        .expect("raw data URL");
+
+    assert_eq!(raw.bytes, bytes);
+    assert!(matches!(&raw.source, ImageSource::DataUrl));
+    let frame = MediaConnector::decode_image(
+        raw.bytes,
+        llm_multimodal::ImageDetail::Auto,
+        None,
+        llm_multimodal::TransparencyPolicy::KeepAlpha,
+        raw.source,
+    )
+    .expect("decode raw image");
+    assert_eq!(frame.size().width, 1);
+    assert_eq!(frame.raw_bytes(), bytes.as_slice());
+}
+
+#[tokio::test]
+async fn raw_audio_fetch_can_be_decoded_later() {
+    let connector = test_connector(None);
+    let bytes = wav_i16_mono(16_000, &[0, 16_384, -16_384]);
+    let raw = connector
+        .fetch_audio_bytes(MediaSource::InlineBytes(bytes.clone()))
+        .await
+        .expect("raw inline audio");
+
+    assert_eq!(raw.bytes, bytes);
+    assert!(matches!(&raw.source, AudioSource::InlineBytes));
+    let clip = connector
+        .decode_audio(raw.bytes, raw.source)
+        .await
+        .expect("decode raw audio");
+    assert_eq!(clip.decoded().sample_rate, 16_000);
+    assert_eq!(clip.decoded().samples.len(), 3);
+}
+
+#[tokio::test]
+async fn raw_video_fetch_does_not_decode_input() {
+    let connector = test_connector(None);
+    let raw = connector
+        .fetch_video_bytes(MediaSource::InlineBytes(b"not a video".to_vec()))
+        .await
+        .expect("raw fetch must not decode the invalid video");
+
+    assert_eq!(raw.bytes, b"not a video".as_slice());
+    assert!(matches!(
+        &raw.source,
+        llm_multimodal::VideoSource::InlineBytes
+    ));
+    connector
+        .decode_video(raw.bytes, Default::default(), raw.source)
+        .await
+        .expect_err("decoding the same bytes must fail");
 }
 
 #[tokio::test]

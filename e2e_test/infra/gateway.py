@@ -250,6 +250,7 @@ class Gateway:
                     f"EPD gateway ({len(encodes)} encode, "
                     f"{len(prefills)} prefill, {len(decodes)} decode)"
                 ),
+                worker_urls=self._fleet_urls(mode_args),
                 workers=fleet,
             )
         elif is_pd_mode:
@@ -279,6 +280,7 @@ class Gateway:
                 extra_args=extra_args,
                 num_workers=len(fleet) or None,
                 log_msg=f"PD gateway ({len(prefills)} prefill, {len(decodes)} decode)",
+                worker_urls=self._fleet_urls(mode_args),
                 workers=fleet,
             )
         elif is_cloud_mode:
@@ -416,6 +418,17 @@ class Gateway:
         if not tail:
             return f"its output file {self.log_path} is empty"
         return f"last {len(tail)} lines of {self.log_path}:\n" + "\n".join(tail)
+
+    @staticmethod
+    def _fleet_urls(mode_args: list[str]) -> list[str]:
+        """The worker URLs a disaggregated launch names: the token after each
+        ``--encode``, ``--prefill`` and ``--decode`` flag, which the readiness
+        wait takes as its registration gate."""
+        return [
+            mode_args[i + 1]
+            for i, arg in enumerate(mode_args[:-1])
+            if arg in ("--encode", "--prefill", "--decode")
+        ]
 
     def _launch(
         self,
@@ -606,6 +619,34 @@ class Gateway:
             resp = httpx.get(f"{self.base_url}/health", timeout=timeout)
             return resp.status_code == 200
         except (httpx.RequestError, httpx.TimeoutException):
+            return False
+
+    def flush_cache(self, timeout: float = 30.0) -> bool:
+        """Best-effort KV cache flush across workers connected to this gateway.
+
+        Issues ``POST /flush_cache`` and returns ``True`` when the gateway
+        confirms HTTP 200. Engines or gateway modes that do not support cache
+        flushing (or transient transport errors) log and return ``False``
+        without raising.
+        """
+        try:
+            resp = httpx.post(f"{self.base_url}/flush_cache", timeout=timeout)
+            if resp.status_code == 200:
+                logger.info("Flushed worker KV cache via gateway %s", self.base_url)
+                return True
+            logger.warning(
+                "Gateway %s /flush_cache returned %d (%s); skipping cache flush",
+                self.base_url,
+                resp.status_code,
+                resp.text[:200],
+            )
+            return False
+        except (httpx.RequestError, httpx.TimeoutException) as exc:
+            logger.warning(
+                "Gateway %s /flush_cache failed (%s); skipping cache flush",
+                self.base_url,
+                exc,
+            )
             return False
 
     def _worker_from_api_response(self, w: dict) -> WorkerInfo:

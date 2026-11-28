@@ -5,18 +5,16 @@ use std::sync::Arc;
 use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{common::InputIds, generate::GenerateRequest};
-use tracing::error;
+use tracing::{error, warn};
 
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            context::{PreparationOutput, RequestContext},
-            regular::stages::token_ids::{reject_unknown_token_id, reported_embedding_rows},
-            utils,
-        },
+use crate::routers::{
+    common::snapshot::WorkerRegistry,
+    error,
+    grpc::{
+        context::{PreparationOutput, RequestContext},
+        regular::stages::token_ids::{reject_unknown_token_id, reported_embedding_rows},
+        utils::{self, PromptError},
     },
-    worker::WorkerRegistry,
 };
 
 /// Generate preparation stage
@@ -24,6 +22,8 @@ use crate::{
 /// Extracts generate-specific preparation logic from the old unified PreparationStage.
 /// This is a direct extraction without architectural changes.
 pub(crate) struct GeneratePreparationStage;
+
+const FUNCTION: &str = "GeneratePreparationStage::prepare_generate";
 
 impl GeneratePreparationStage {
     /// The stage's work. The chat+generate dispatcher calls this directly, so
@@ -42,9 +42,26 @@ impl GeneratePreparationStage {
         ctx: &mut RequestContext,
         request: &GenerateRequest,
     ) -> Result<(), Response> {
+        // The route declares media fields, and the paths that forward the
+        // body as given carry them to the engine; this pipeline sends text
+        // and token ids only. A request that names media is refused as the
+        // chat route refuses media no worker takes, instead of being served
+        // without it.
+        let media = request.media_fields();
+        if !media.is_empty() {
+            return Err(error::bad_request(
+                "multimodal_not_supported",
+                format!(
+                    "media input ({}) is not supported on the generate route over the gateway's \
+                     gRPC path: the route carries text and token ids to the engine, no media; send \
+                     media through the chat route",
+                    media.join(", ")
+                ),
+            ));
+        }
+
         // Resolve tokenizer from registry (cached for reuse in response processing)
-        let tokenizer = utils::resolve_tokenizer(ctx, "GeneratePreparationStage::prepare_generate")
-            .map_err(|e| *e)?;
+        let tokenizer = utils::resolve_tokenizer(ctx, FUNCTION).map_err(|e| *e)?;
 
         let (original_text, token_ids) = match self
             .resolve_generate_input(
@@ -56,9 +73,22 @@ impl GeneratePreparationStage {
             .await
         {
             Ok(res) => res,
-            Err(msg) => {
-                error!(function = "GeneratePreparationStage::execute", error = %msg, "Failed to resolve generate input");
-                return Err(error::bad_request("resolve_input_failed", msg));
+            Err(e) => {
+                // As in the chat preparation: one WARN and the mark only for
+                // a refusal typed as the request's own; a text the tokenizer
+                // could not encode keeps ERROR and stays unmarked.
+                let refused = e.is_refusal();
+                if refused {
+                    warn!(function = FUNCTION, error = %e, "Failed to resolve generate input");
+                } else {
+                    error!(function = FUNCTION, error = %e, "Failed to resolve generate input");
+                }
+                let answer = error::bad_request("resolve_input_failed", String::from(e));
+                return Err(if refused {
+                    utils::reported(answer)
+                } else {
+                    answer
+                });
             }
         };
 
@@ -90,15 +120,11 @@ impl GeneratePreparationStage {
         tokenizer: &Arc<dyn Tokenizer>,
         worker_registry: &WorkerRegistry,
         model_id: &str,
-    ) -> Result<(Option<String>, Vec<u32>), String> {
-        if let Some(text) = &request.text {
-            return self
-                .tokenize_single_text(tokenizer, text)
-                .await
-                .map(|(original, ids)| (Some(original), ids));
-        }
-
-        // Handle input_ids - validate and convert
+    ) -> Result<(Option<String>, Vec<u32>), PromptError> {
+        // The engine's order: the ids before the text, so a body that carries
+        // both is served from the ids as the engine serves it (the text rode
+        // along for the client's own reading); a text-first read dropped the
+        // ids without a word.
         if let Some(input_ids) = &request.input_ids {
             return match input_ids {
                 InputIds::Single(ids) => {
@@ -106,19 +132,32 @@ impl GeneratePreparationStage {
                         .iter()
                         .map(|&id| u32::try_from(id))
                         .collect::<Result<Vec<u32>, _>>()
-                        .map_err(|_| "input_ids must be non-negative".to_string())?;
+                        .map_err(|_| {
+                            PromptError::Refused("input_ids must be non-negative".to_string())
+                        })?;
                     reject_unknown_token_id(tokenizer.as_ref(), &converted, "input_ids", || {
                         reported_embedding_rows(worker_registry, model_id)
-                    })?;
+                    })
+                    .map_err(PromptError::Refused)?;
                     Ok((None, converted))
                 }
-                InputIds::Batch(_) => {
-                    Err("Batch input_ids are not supported over gRPC generate yet".to_string())
-                }
+                InputIds::Batch(_) => Err(PromptError::Refused(
+                    "Batch input_ids are not supported over gRPC generate yet".to_string(),
+                )),
             };
         }
 
-        Err("Either `text` or `input_ids` must be provided".to_string())
+        if let Some(text) = &request.text {
+            return self
+                .tokenize_single_text(tokenizer, text)
+                .await
+                .map(|(original, ids)| (Some(original), ids))
+                .map_err(PromptError::Failed);
+        }
+
+        Err(PromptError::Refused(
+            "Either `text` or `input_ids` must be provided".to_string(),
+        ))
     }
 
     async fn tokenize_single_text(

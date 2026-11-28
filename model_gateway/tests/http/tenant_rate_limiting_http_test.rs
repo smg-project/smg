@@ -51,6 +51,7 @@ use openai_protocol::{
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     messages::{CountMessageTokensRequest, CreateMessageRequest},
+    model_card::ModelCard,
     rerank::RerankRequest,
     responses::ResponsesRequest,
     worker::HealthCheckConfig,
@@ -59,14 +60,15 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg::{
     app_context::AppContext,
-    config::{PolicyConfig, RetryConfig, RouterConfig},
+    config::{PolicyConfig, RetryConfig, RouterConfig, RouterConfigBuilder},
     middleware::TenantRequestMeta,
     rate_limit::{
         RateLimitBackend, RateLimitManager, ReserveOutcome, ReserveRequest, UsageSettlement,
     },
-    routers::{http::router::Router as HttpRouter, RouterTrait},
+    routers::{
+        grpc::backend_client::BasicWorkerBuilder, http::router::Router as HttpRouter, RouterTrait,
+    },
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ModelCard},
 };
 use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt;
@@ -127,7 +129,7 @@ async fn answer(State(state): State<WorkerState>, body: Bytes) -> Response {
     state.requests.fetch_add(1, Ordering::SeqCst);
     if state
         .failures
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
         .is_ok()
     {
         return (StatusCode::SERVICE_UNAVAILABLE, "overloaded").into_response();
@@ -291,9 +293,33 @@ pub(super) async fn limited_context_with_policy(
     retries: bool,
     policy: PolicyConfig,
 ) -> (Arc<AppContext>, Option<tempfile::TempDir>) {
-    let mut builder = RouterConfig::builder()
-        .regular_mode(vec![])
-        .policy(policy)
+    let regular = RouterConfig::builder().regular_mode(vec![]).policy(policy);
+    limited_context_over(regular, limiter, retries).await
+}
+
+/// [`limited_context_with_policy`] for a gateway of prefill and decode
+/// pairs: the configuration says pair mode, as the configuration of a
+/// gateway that builds a pair router does, and each side routes by
+/// `policy`.
+pub(super) async fn limited_pair_context_with_policy(
+    limiter: Limiter,
+    retries: bool,
+    policy: PolicyConfig,
+) -> (Arc<AppContext>, Option<tempfile::TempDir>) {
+    let pair = RouterConfig::builder()
+        .prefill_decode_mode(vec![], vec![])
+        .policy(policy);
+    limited_context_over(pair, limiter, retries).await
+}
+
+/// The context of the configuration `routing` states the mode and the
+/// policy of, under `limiter`, its retries on or off.
+async fn limited_context_over(
+    routing: RouterConfigBuilder,
+    limiter: Limiter,
+    retries: bool,
+) -> (Arc<AppContext>, Option<tempfile::TempDir>) {
+    let mut builder = routing
         .host("127.0.0.1")
         .port(0)
         .max_payload_size(1024 * 1024)
@@ -431,7 +457,9 @@ impl Endpoint {
                     "messages": [{"role": "user", "content": PROMPT_TEXT}],
                     "stream": stream,
                 }));
-                router.route_chat(None, &tenant, body, MODEL).await
+                router
+                    .route_chat(None, &tenant, Arc::new(body), MODEL)
+                    .await
             }
             Self::Completion => {
                 let body = request::<CompletionRequest>(json!({
@@ -446,7 +474,9 @@ impl Endpoint {
                     "max_tokens": 32,
                     "stream": stream,
                 }));
-                router.route_messages(None, &tenant, body, MODEL).await
+                router
+                    .route_messages(None, &tenant, Arc::new(body), MODEL)
+                    .await
             }
             Self::Embeddings => {
                 let body = request::<EmbeddingRequest>(json!({
@@ -620,7 +650,9 @@ async fn every_input_the_request_carries_is_reserved() {
             }]},
         ],
     }));
-    router.route_chat(None, &tenant, tool_call, MODEL).await;
+    router
+        .route_chat(None, &tenant, Arc::new(tool_call), MODEL)
+        .await;
 
     worker.answer(Endpoint::Messages.usage_body(1, 1));
     let tool_result = request::<CreateMessageRequest>(json!({
@@ -632,7 +664,7 @@ async fn every_input_the_request_carries_is_reserved() {
         ]}],
     }));
     router
-        .route_messages(None, &tenant, tool_result, MODEL)
+        .route_messages(None, &tenant, Arc::new(tool_result), MODEL)
         .await;
 
     // Ten words of instructions and two of input: ceil(12 * 1.3). Two words

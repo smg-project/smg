@@ -1,15 +1,17 @@
 //! Which encoder serves a Hugging Face tokenizer's encodes.
 //!
 //! The choice is made once per load, in order of preference: the opt-in
-//! `tokenizers` v1 pipeline (feature `tokenizers-v1`), the crate's direct
-//! byte-level encoder (`native`), and `tokenizers` 0.23 itself. Each of the
-//! first two takes the tokenizers whose configuration it reproduces and
-//! declines the rest with a reason (`Declined`); the load logs the path it
-//! ended on and those reasons, once. After the choice an input can still
-//! leave the direct encoder for `tokenizers` (`Fallback`), which costs the
-//! work done up to that point. A tiktoken vocabulary takes the direct
-//! encoder too when its ranks and pattern fit it (`tiktoken`), and counts
-//! as a load of that path; one that does not keeps its own encoder.
+//! `tokenizers` v1 pipeline (feature `tokenizers-v1`), one of the crate's
+//! direct encoders (`native` for byte-level BPE, `wordpiece` for
+//! WordPiece), and `tokenizers` 0.23 itself. Each path before the last
+//! takes the tokenizers whose configuration it reproduces and declines the
+//! rest with a reason (`Declined`); the load logs the path it ended on and
+//! those reasons, once. After the choice an input can still leave the
+//! direct byte-level encoder for `tokenizers` (`Fallback`), which costs the
+//! work done up to that point; the direct WordPiece encoder gives up no
+//! input. A tiktoken vocabulary takes the direct byte-level encoder too
+//! when its ranks and pattern fit it (`tiktoken`), and counts as a load of
+//! that path; one that does not keeps its own encoder.
 //!
 //! The process-lifetime totals here have the shape of `cache::activity`:
 //! fixed-size snapshots, no locks, never reset, read through
@@ -27,7 +29,8 @@ use std::{
 pub enum EncodePath {
     /// The opt-in `tokenizers` v1 pipeline.
     V1,
-    /// The crate's direct byte-level encoder.
+    /// One of the crate's direct encoders: the byte-level one or the
+    /// WordPiece one.
     Native,
     /// `tokenizers` 0.23, the reference implementation.
     Tokenizers,
@@ -84,8 +87,8 @@ impl fmt::Display for Declined {
     }
 }
 
-/// Why one input left the direct encoder for `tokenizers` after the load's
-/// choice.
+/// Why one input left the direct byte-level encoder for `tokenizers` after
+/// the load's choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Fallback {
     /// The model declined a piece (a vocabulary whose `unk_token` is not in

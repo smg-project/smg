@@ -3,9 +3,10 @@
 //! the OpenAI-shape readers every one of them uses, the message read
 //! (`Turn`) with the two refusals every dialect spells the same way, the
 //! last-user index predicates, the quick-instruction task tokens, the
-//! tools-and-response-format section of a system or developer turn, and the
+//! tools-and-response-format section of a system or developer turn, the
+//! drop-thinking filter every revision runs with its own kept roles, and the
 //! V4 family's message preprocessing
-//! (tool-message merging, tool-result sorting, drop-thinking, DSML argument
+//! (tool-message merging, tool-result sorting, DSML argument
 //! rendering, the tools template), which V4 and V4.1 run with their own DSML
 //! tag strings (V4 bare `invoke`/`parameter`; V4.1 ` invoke`/` parameter`
 //! with a leading space).
@@ -24,6 +25,7 @@ use super::{
     marks::{self, control},
     truthy,
 };
+use crate::json_dumps;
 
 // ---------------------------------------------------------------------------
 // The family's special tokens, shared by the V3.2, V4 and V4.1 renderers (each
@@ -375,24 +377,36 @@ pub(super) fn sort_tool_results_by_call_order(messages: Vec<Value>) -> Vec<Value
     out
 }
 
+/// The roles V4 and V4.1 keep whole in [`drop_thinking_messages`].
+pub(super) const KEPT_ROLES: &[&str] = &[
+    "user",
+    "system",
+    "tool",
+    "latest_reminder",
+    "direct_search_results",
+];
+
 /// Drop reasoning_content from earlier assistant turns and remove non-essential
 /// developer messages before the last user.
 ///
-/// `last_user_idx` is passed in rather than recomputed because the two
-/// revisions disagree on what the "last user turn" is: V4 counts only
+/// `last_user_idx` is passed in rather than recomputed because the
+/// revisions disagree on what the "last user turn" is: V3.2 and V4 count only
 /// user/developer messages ([`find_last_user_index`]), while V4.1 also counts
-/// mid-conversation system messages. The filtering itself is identical.
+/// mid-conversation system messages.
+///
+/// `kept_roles` are the roles a revision keeps whole wherever they stand:
+/// [`KEPT_ROLES`] for V4 and V4.1; V3.2 has no reminder and search-result
+/// roles and drops such a message before the last user turn. The rest of the
+/// filtering is the same for every revision.
 pub(super) fn drop_thinking_messages(
     messages: &[Value],
     last_user_idx: Option<usize>,
+    kept_roles: &[&str],
 ) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::with_capacity(messages.len());
     for (idx, msg) in messages.iter().enumerate() {
         let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        let always_keep = matches!(
-            role,
-            "user" | "system" | "tool" | "latest_reminder" | "direct_search_results"
-        ) || at_or_after_last_user(idx, last_user_idx);
+        let always_keep = kept_roles.contains(&role) || at_or_after_last_user(idx, last_user_idx);
         if always_keep {
             out.push(msg.clone());
             continue;
@@ -463,7 +477,7 @@ pub(super) fn encode_arguments_to_dsml(arguments: &Value, tags: &DsmlTags) -> St
 /// separators and raw UTF-8. Compact `serde_json::to_string` would change the
 /// prompt bytes the model was trained on.
 pub(super) fn to_json(value: &Value) -> String {
-    crate::json_dumps::to_string(value)
+    json_dumps::to_string(value)
 }
 
 /// `[tool["function"] for tool in tools]`
@@ -644,6 +658,23 @@ pub(super) fn push_tools_and_response_format(
             to_json(schema)
         );
     }
+}
+
+/// A system message: its content (the families' `system_msg_template` is
+/// "{content}"), then the tools and the response format it carries;
+/// `render_tools` is the dialect's tools template.
+pub(super) fn render_system_message(
+    prompt: &mut String,
+    turn: &Turn<'_>,
+    render_tools: fn(&[Value]) -> String,
+) {
+    prompt.push_str(turn.content);
+    push_tools_and_response_format(
+        prompt,
+        turn.tools.as_deref(),
+        turn.response_format,
+        render_tools,
+    );
 }
 
 /// The renderer-level pin the three renderers share: a history tool call

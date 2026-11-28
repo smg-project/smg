@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(arguments_of(&events, 1), r#"{"artist": "Maroon 5"}"#);
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::ToolCallEnd { index: 1, source } if source.text == "</invoke>"
+            Event::ToolCallEnd { index: 1, source, .. } if source.text == "</invoke>"
         )));
         assert!(malformed(&events).is_empty());
     }

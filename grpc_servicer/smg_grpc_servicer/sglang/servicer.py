@@ -8,12 +8,13 @@ for orchestration without tokenization.
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from collections.abc import AsyncIterator
 from contextlib import aclosing
 from datetime import datetime, timezone
-from pathlib import Path
+from traceback import format_exc as get_exception_traceback
 
 import grpc
 import msgspec
@@ -25,7 +26,6 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.disaggregation.kv_events import (
     KVEventsConfig,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.managers.io_struct import (
     FlushCacheReqInput,
     ProfileReq,
@@ -33,22 +33,20 @@ from sglang.srt.managers.io_struct import (
     TokenizedEmbeddingReqInput,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
 from sglang.srt.sampling.sampling_params import SamplingParams as SGLSamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_bool_env_var
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
-from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
 from smg_grpc_servicer.engine_status import abort_for_constraint_failure
 from smg_grpc_servicer.health_probe import await_probe
-from smg_grpc_servicer.sglang.config_view import EngineConfigView
+from smg_grpc_servicer.sglang.compat import (
+    get_disaggregation_types,
+    get_multimodal_types,
+    get_tokenizer,
+)
+from smg_grpc_servicer.sglang.config_view import EngineConfigView, v41_vision
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.hidden_states import (
     refuse_hidden_states_above_server_mode,
@@ -61,6 +59,8 @@ from smg_grpc_servicer.sglang.loads import (
     load_record,
     ranks_with_a_window,
 )
+from smg_grpc_servicer.sglang.lora import PreloadedLoras
+from smg_grpc_servicer.sglang.model_artifacts import tokenizer_dir_for
 from smg_grpc_servicer.sglang.request_manager import (
     GrpcRequestManager,
     _validate_token_ids_logprobs,
@@ -75,18 +75,142 @@ from smg_grpc_servicer.tensor_wire import tensor_from_parts
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 
 from ..constrained_decoding import (
+    SGLANG_SCHEMA_BACKENDS,
+    answer_schema_in_place_of_tag,
     grammar_backend_entry,
     grammar_start_labels,
     sglang_constrained_decoding_start,
     sglang_grammar_backend,
+    structural_tag_vocabulary_entry,
 )
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
+
+DisaggregationMode, FAKE_BOOTSTRAP_HOST = get_disaggregation_types()
+
+Modality, MultimodalDataItem, MultimodalProcessorOutput = get_multimodal_types()
 
 logger = logging.getLogger(__name__)
 HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 # Profile round-trips include trace serialization, which can take minutes.
 PROFILE_COMM_TIMEOUT = 600.0
+
+
+# The grid only the Router's DeepSeek-V4.1 preprocessor sends with an image
+# batch; GLM-5.3 Flash sends ``patches_per_image`` as well.
+V41_MARKER = "vit_grid"
+V41_PREFIX = "DeepSeek-V4.1 image batch:"
+
+
+def _v41_image_tokens(height: int, width: int, ratio: int) -> int:
+    """How many prompt positions SGLang's V4.1 model fills for a patch grid: the
+    length of its ``image_token_types`` for the downsampled grid, a start token,
+    each line's tokens and a newline, and an end token."""
+    lines, tokens_per_line = (height + ratio - 1) // ratio, (width + ratio - 1) // ratio
+    return lines * (tokens_per_line + 1) + 2
+
+
+def _deepseek_v41_items(feature, tensors: dict, offsets: list, vision=None) -> list:
+    """One item per image, the shape SGLang's own DeepSeek-V4.1 processor builds.
+
+    The Router sends every image's patches in one tensor, with each image's
+    patch grid (``vit_grid``), patch count and token count alongside. SGLang's
+    V4.1 model encodes one image per item and reads its grid as ``n_vit_h`` /
+    ``n_vit_w``; a batch whose counts disagree is refused here, before the
+    scheduler, where it would stop the engine. With the served model's patch
+    size and downsample ratio (``vision``, from ``v41_vision``), so is a batch
+    whose patch rows or spans do not fit that model.
+    """
+    prefix = V41_PREFIX
+    if "patches_per_image" not in tensors:
+        raise ValueError(f"{prefix} no patches_per_image")
+    counts = {}
+    for name in ("vit_grid", "patches_per_image", "types_per_image"):
+        tensor = tensors.get(name)
+        if tensor is None:
+            continue
+        if tensor.is_floating_point() or tensor.is_complex():
+            raise ValueError(f"{prefix} {name} is {tensor.dtype}, not an integer tensor")
+        counts[name] = tensor.reshape(-1).tolist()
+    grid_values = counts["vit_grid"]
+    if len(grid_values) % 2:
+        raise ValueError(
+            f"{prefix} vit_grid holds {len(grid_values)} values, not (height, width) pairs"
+        )
+    grids = list(zip(grid_values[0::2], grid_values[1::2]))
+    patches = counts["patches_per_image"]
+    tokens = counts.get("types_per_image")
+    images = len(grids)
+    if images == 0:
+        raise ValueError(f"{prefix} no images")
+    for name, count in (
+        ("placeholders", len(offsets)),
+        ("patch counts", len(patches)),
+        ("token counts", images if tokens is None else len(tokens)),
+    ):
+        if count != images:
+            raise ValueError(f"{prefix} {images} images but {count} {name}")
+    # A patch row holds at least one value.
+    if len(feature.shape) < 2 or 0 in feature.shape[1:]:
+        raise ValueError(
+            f"{prefix} pixel_values has shape {list(feature.shape)}, not rows of patches"
+        )
+    rows = feature.shape[0]
+    if sum(patches) != rows:
+        raise ValueError(f"{prefix} {sum(patches)} patches but the pixel tensor has {rows} rows")
+    if vision is not None:
+        patch_size = vision[0]
+        # The model's patch embedding is a Linear(3 * patch_size**2, ...) over
+        # each flattened row.
+        row_values = math.prod(feature.shape[1:])
+        if row_values != 3 * patch_size**2:
+            raise ValueError(
+                f"{prefix} each patch row holds {row_values} values, but the model's "
+                f"{patch_size}x{patch_size} patches take 3x{patch_size}x{patch_size} = "
+                f"{3 * patch_size**2}"
+            )
+    items = []
+    start = 0
+    previous_last = None
+    for index, ((height, width), count, (first, last)) in enumerate(zip(grids, patches, offsets)):
+        if height < 1 or width < 1 or height * width != count:
+            raise ValueError(
+                f"{prefix} image {index} has a {height}x{width} grid but {count} patches"
+            )
+        # SGLang writes the items' embeddings over the placeholders in prompt
+        # order, so the ranges must be in prompt order and must not overlap.
+        if previous_last is not None and first <= previous_last:
+            raise ValueError(
+                f"{prefix} image {index}'s placeholder {first}..={last} does not start "
+                f"after image {index - 1}'s, which ends at {previous_last}"
+            )
+        previous_last = last
+        span = last - first + 1
+        if tokens is not None and span != tokens[index]:
+            raise ValueError(
+                f"{prefix} image {index} fills {span} prompt positions but has "
+                f"{tokens[index]} tokens"
+            )
+        if vision is not None:
+            grid_tokens = _v41_image_tokens(height, width, vision[1])
+            if span != grid_tokens:
+                raise ValueError(
+                    f"{prefix} image {index} fills {span} prompt positions but its "
+                    f"{height}x{width} grid makes {grid_tokens} tokens"
+                )
+        pixels = feature[start : start + count]
+        items.append(
+            MultimodalDataItem(
+                modality=Modality.IMAGE,
+                # The scheduler receives the item pickled, and a view would
+                # carry every image's patches with it.
+                feature=pixels if images == 1 else pixels.clone(),
+                model_specific_data={"n_vit_h": int(height), "n_vit_w": int(width)},
+                offsets=[(first, last)],
+            )
+        )
+        start += count
+    return items
 
 
 def _aggregate_communicator_results(results: list, ok_message: str) -> tuple[bool, str]:
@@ -146,6 +270,11 @@ def _scheduler_abort_detail(finish_reason: dict) -> str:
     )
 
 
+def _reads_cache_partition() -> bool:
+    """Whether the installed proto package declares ``GenerateRequest.cache_partition``."""
+    return "cache_partition" in sglang_scheduler_pb2.GenerateRequest.DESCRIPTOR.fields_by_name
+
+
 class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer):
     """
     Standalone gRPC service implementation using GrpcRequestManager.
@@ -169,11 +298,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """Initialize the standalone gRPC service."""
         self.request_manager = request_manager
         self.server_args = server_args
+        # Read once: the grammar backend the scheduler was started with, which
+        # decides how an answer's structural tag is sent.
+        self._grammar_backend = sglang_grammar_backend(server_args)
         self.model_config = model_config
         self.model_info = model_info
         self.scheduler_info = scheduler_info
         self.start_time = time.time()
         self.health_servicer = health_servicer
+        self.loras = PreloadedLoras(server_args)
         # SamplingParams.normalize requires a tokenizer whenever string stops
         # are used; the scheduler matches them with its own tokenizer.
         if server_args.skip_tokenizer_init:
@@ -218,6 +351,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         self.request_manager.auto_create_handle_loop()
 
         logger.info("gRPC scheduler servicer initialized")
+
+    async def ListLoadedLoRAAdapters(
+        self,
+        request: sglang_scheduler_pb2.ListLoadedLoRAAdaptersRequest,
+        context: grpc.aio.ServicerContext,
+    ) -> sglang_scheduler_pb2.ListLoadedLoRAAdaptersResponse:
+        return sglang_scheduler_pb2.ListLoadedLoRAAdaptersResponse(
+            loaded_adapters=self.loras.adapters
+        )
 
     async def Generate(
         self,
@@ -590,6 +732,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 return str(obj)
 
         serializable_args = make_serializable(server_args_dict)
+        from smg_grpc_servicer.sglang.mm_defaults import encoder_dtype
+
+        serializable_args["multimodal_encoder_dtype"] = encoder_dtype(
+            None, lambda: self.model_config.dtype
+        )
         # The operator's PD pairing protocol rides with the server args, so
         # the gateway reads it as the worker's `pairing_protocol` label.
         pairing_protocol = pairing_protocol_from_env()
@@ -601,6 +748,10 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         item_limits = sglang_item_limits(self.server_args)
         if item_limits:
             serializable_args[MM_ITEM_LIMITS_KEY] = item_limits
+        # The fields of `GenerateRequest.cache_partition` that this servicer
+        # gives to the scheduler.
+        if _reads_cache_partition():
+            serializable_args["cache_partition_fields"] = "cache_salt,extra_key"
         # The engine's reasoning parser and where it starts a grammar on a
         # thinking prompt (after the thought with a parser, from the first
         # token without), for the gateway to shape a forced tool call's
@@ -612,7 +763,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         )
         # The grammar backend the scheduler runs, resolved (the raw argument
         # is None unless set), under the same key the Rust servicer reads.
-        grammar_backend_entry(serializable_args, sglang_grammar_backend(self.server_args))
+        grammar_backend = sglang_grammar_backend(self.server_args)
+        grammar_backend_entry(serializable_args, grammar_backend)
+        # The vocabulary of structural-tag nodes that backend takes, as the
+        # Rust launcher reports it: the Router spells an older xgrammar's
+        # structural tags in the older vocabulary.
+        structural_tag_vocabulary_entry(serializable_args, grammar_backend)
         # The gateway reads this worker's running window (its PD admission
         # bound, its share of the fleet's capacity) from `max_running_requests`
         # here, which is None unless the operator set the flag: the scheduler
@@ -861,13 +1017,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """
         logger.info("Receive GetTokenizer request")
 
-        tokenizer_path = self.server_args.tokenizer_path
-        if not tokenizer_path:
+        try:
+            tokenizer_dir = await asyncio.to_thread(tokenizer_dir_for, self.server_args)
+        except Exception as e:
+            logger.exception("Failed to resolve tokenizer metadata")
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
+        if tokenizer_dir is None:
             await context.abort(
                 grpc.StatusCode.FAILED_PRECONDITION,
-                "Tokenizer path is not configured on this server.",
+                "No local tokenizer metadata is available on this server.",
             )
-        tokenizer_dir = Path(tokenizer_path)
 
         # Reading and compressing the tokenizer directory is file I/O and CPU
         # measured in hundreds of milliseconds: the shared bundle builds it in
@@ -985,6 +1144,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Parse multimodal inputs if present
         mm_inputs = None
+        if (
+            grpc_req.HasField("mm_inputs")
+            and not grpc_req.mm_inputs.HasField("pixel_values")
+            and V41_MARKER in grpc_req.mm_inputs.model_specific_tensors
+        ):
+            # Grids without the pixels they describe would drop the images unseen.
+            raise ValueError(f"{V41_PREFIX} no pixel_values to cut its per-image items from")
         if grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField("pixel_values"):
             mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs, extra_mm_inputs, len(input_ids))
 
@@ -995,6 +1161,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             # servicer's own answer: hidden states are served by the Rust one.
             refuse_hidden_states_above_server_mode()
             refuse_hidden_states_on_this_servicer()
+
+        # An empty string is unset. SGLang's tokenizer manager applies that
+        # rule, and a request on this path does not pass through it.
+        extra_key = cache_salt = None
+        if _reads_cache_partition():
+            extra_key = grpc_req.cache_partition.extra_key or None
+            cache_salt = grpc_req.cache_partition.cache_salt or None
 
         return TokenizedGenerateReqInput(
             rid=grpc_req.request_id,
@@ -1010,7 +1183,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             ),
             top_logprobs_num=grpc_req.top_logprobs_num or 0,
             stream=grpc_req.stream or False,
-            lora_id=grpc_req.lora_id if grpc_req.lora_id else None,
+            lora_id=self.loras.resolve(grpc_req.lora_id) if grpc_req.lora_id else None,
             token_ids_logprob=(
                 list(grpc_req.token_ids_logprob) if grpc_req.token_ids_logprob else None
             ),
@@ -1018,6 +1191,8 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             bootstrap_port=bootstrap_port,
             bootstrap_room=bootstrap_room,
             require_reasoning=require_reasoning,
+            extra_key=extra_key,
+            cache_salt=cache_salt,
         )
 
     @staticmethod
@@ -1066,14 +1241,30 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                     "failed to find the placeholder token in input_ids. "
                     "Check that placeholder_token_id matches the tokenized image token."
                 )
+            feature = self._decode_tensor_data(batch.pixel_values)
+            tensors = {
+                key: self._decode_tensor_data(value)
+                for key, value in batch.model_specific_tensors.items()
+            }
+            if modality != Modality.IMAGE and V41_MARKER in tensors:
+                # Only an image batch is cut into V4.1 items. Under the video
+                # label the batch would go on as a video item, which SGLang's
+                # V4.1 model has no embedder for.
+                raise ValueError(f"{V41_PREFIX} vit_grid on a video batch")
+            if modality == Modality.IMAGE and V41_MARKER in tensors:
+                if token is None:
+                    # SGLang pads the image positions only when the id is set.
+                    # Without it the model finds no position for the items'
+                    # embeddings and fails in the scheduler.
+                    raise ValueError(f"{V41_PREFIX} no im_token_id")
+                vision = v41_vision(self.model_config.hf_config)
+                mm_items.extend(_deepseek_v41_items(feature, tensors, offsets, vision))
+                continue
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
-                    feature=self._decode_tensor_data(batch.pixel_values),
-                    model_specific_data={
-                        key: self._decode_tensor_data(value)
-                        for key, value in batch.model_specific_tensors.items()
-                    },
+                    feature=feature,
+                    model_specific_data=tensors,
                     offsets=offsets or None,
                 )
             )
@@ -1132,6 +1323,18 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             ebnf_grammar = grpc_params.ebnf_grammar
         elif grpc_params.HasField("structural_tag"):
             structural_tag = grpc_params.structural_tag
+            # A tag that is a JSON answer's schema alone goes as that schema
+            # to a backend the tag is not spelled for (llguidance, outlines).
+            schema = answer_schema_in_place_of_tag(
+                structural_tag, self._grammar_backend, SGLANG_SCHEMA_BACKENDS
+            )
+            if schema is not None:
+                logger.debug(
+                    "a structural tag that is a JSON answer's schema alone goes to the "
+                    "%s grammar backend as that schema",
+                    self._grammar_backend,
+                )
+                json_schema, structural_tag = schema, None
 
         # Handle optional parameters conversion
         custom_params = (

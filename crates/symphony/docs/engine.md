@@ -36,7 +36,22 @@ What the engine decides for every format, and what it leaves open:
 - A terminal with no transition from the current state is text, as the model wrote it:
   `</think>` in content is content. A terminal inside a code fence, or inside a string in a
   call's arguments, is a terminal, as for every parser that reads markers: `</tool_call>` in an
-  argument's text ends the call there. Bellwether #16 is where that policy is judged.
+  argument's text ends the call there. Bellwether #16 is where that policy is judged. A JSON
+  answer is the one exception: under `Engine::reads_json_answer`, the option the gateway sets
+  for a `json_object` or `json_schema` response format, the engine reads the quote state over
+  the text of a content state and over the arguments of a call whose syntax is JSON (fresh at
+  every row into one, never in a thought, a thought the request keeps in the content included,
+  a tagged or shaped call or the template's wrapping; in a call's arguments over the bytes of
+  the call's JSON value alone: not a named call's header before its marker, not a list's text
+  between calls, after its `]` or where a malformed list should be, not the surplus after an
+  object),
+  and a terminal that arrives inside one of the answer's strings takes no row, counts no marker
+  out of place and is the answer's text, the terminals the table ignores and a tail the end
+  would cut included; a model held to a JSON answer may spell a marker in a key or a value, in
+  the answer and in a call's arguments alike, which the family's own parsers keep under their
+  JSON mode. The scanner's
+  hold-back of a half-arrived marker is unchanged, so a stream reads as the whole does. Without
+  the option a request pays one branch per text piece and reads as before.
 - A terminal the table ignores (MiniMax M3's separator token, Inkling's end-of-sampling token)
   is `Dropped { Wrapper }` wherever it stands and moves nothing. Inside a call whose assembler
   holds bytes (a header until its marker, a word until it is spelled) it is placed where it
@@ -101,7 +116,9 @@ The prompt decides where the output starts: its terminals are replayed over the 
 initial state, and the output begins in the state they leave. The replay starts at the last turn
 opener the table names (`<|im_start|>assistant` for ChatML), so a marker quoted in an earlier turn,
 a `<tool_call>` in the user's question or a `<think>` inside an earlier call's arguments, moves
-nothing; a table that names no opener is replayed from the prompt's start. Qwen 3.5's template opens
+nothing; a table that names no opener is replayed from the prompt's start, and one whose opener the
+model writes at every message (Inkling's `<|message_model|>`) from the opener of the message the
+prompt left open. Qwen 3.5's template opens
 `<think>` in the generation prompt, so the output starts inside the thought, with `ReasoningStart`
 pushed for the prompt, and its first `</think>` closes it; Qwen3 writes its own `<think>`; and a
 prompt that disables thinking ends with `<think>\n\n</think>\n\n`, which leaves the engine in
@@ -128,6 +145,22 @@ is a later step).
   any finish but `Stop` is cut as before; a driver hands a stop sequence of the request's that
   matched inside the call over as such a finish, so that it never completes the call (the stop
   row in `format`).
+- Each `ToolCallEnd` says which of the three endings closed its call (`CallEnd`, the event's
+  `ended`): `closed` for the model's own end of the call (its closing terminal, what the syntax
+  reads as its end, or the stop where the table's stop row stands for the marker), `stop` for a
+  call the model's stop found open in a state with no stop row, `cut` for one a cut found open.
+  The engine writes it where the region ends (`Engine::close_call`); an assembler ends every call
+  as closed, since only the engine knows how the region ended. One syntax has no delimiter to
+  close its call, the forced arguments, which are the whole output: the output's end is that
+  call's own end where its value is whole there (a number or a literal the bytes end on), which
+  the assembler says when asked (`CallAssembler::ends_with_the_output`), and the end is then
+  `closed`, as it is for the object that closed at its brace: at the model's stop for either,
+  and at a cut for a literal alone, since a cut may have taken a number's next digit (`12` of
+  `123`), so a number the cut found is a call the cut found open, its bytes delivered. The
+  events and their order are what they were, so a driver that does not read the field sees no
+  change. One that must not hand on a call the model did not finish reads it there. A block
+  that named no call has no end to carry the word: the output's end that found it open refuses
+  its bytes in that last step, before the `Finish`.
 - A table can say that the template discards the text of a state (`Format::framing`): Hugging
   Face's null sink, the space around a response template's fields. Every byte of text there, a
   terminal with no row from the state and what the scanner held at the end included, is

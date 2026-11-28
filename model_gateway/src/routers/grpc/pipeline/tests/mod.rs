@@ -1,11 +1,15 @@
 mod alias_pipeline;
 mod build_parity;
 mod chat_logit_bias;
+mod embeddings;
 mod generate_body;
 mod glm53;
 mod model_label;
+mod outcome;
+mod pair_outcome;
 mod pretokenized;
 mod rate_limit_reserve;
+mod refusal_lines;
 
 use std::{
     path::{Path, PathBuf},
@@ -32,9 +36,17 @@ use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage, ResponseId,
 };
 use smg_grpc_client::{
-    common_proto as common, constraint_failed_status, tokenspeed_proto as ts, vllm_proto,
+    common_proto as common, constraint_failed_status, engine_labels::ModelInfo,
+    tokenspeed_proto as ts, vllm_proto,
 };
 use smg_mcp::{McpConfig, McpOrchestrator};
+use smg_worker::{
+    health::circuit_breaker::{CircuitBreakerConfig, CircuitState},
+    identity::basic::{
+        BasicWorker, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType,
+    },
+    labels::SUPPORTS_VISION_LABEL,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -46,34 +58,30 @@ use super::*;
 use crate::{
     config::types::PolicyConfig,
     routers::{
-        common::{openai_bridge::FormatRegistry, test_support::fast_retry_config},
+        common::{
+            openai_bridge::FormatRegistry, prefill_admission::test_support::select_worker,
+            test_support::fast_retry_config,
+        },
         grpc::{
-            client::ModelInfo,
+            backend_client::BasicWorkerBuilder,
             common::responses::{
                 background::{queued_response, store_record},
                 BackgroundResponses, BackgroundStream,
             },
             harmony::serve_harmony_responses_stream,
-            multimodal::{
-                MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
-                SUPPORTS_VISION_LABEL,
-            },
+            multimodal::{MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings},
             proto_wrapper::ENGINE_ERROR_MESSAGE,
             regular::{
                 responses::{route_responses, route_responses_background_stream},
                 symphony::template::Templates,
             },
             test_engine::serve_on_loopback,
+            testing::unreadable_model_dir,
             tokenizer_cache,
             utils::tonic_ext::TonicStatusExt,
         },
     },
     tenant::TenantKey,
-    worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        test_support::select_worker,
-        BasicWorkerBuilder, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerType,
-    },
 };
 
 const MODEL: &str = "request-release-test-model";
@@ -134,6 +142,27 @@ struct GatedScheduler {
     fail_always: bool,
     fail_internal: bool,
     fail_mid_stream: bool,
+    /// The call of this place, counted from zero, ends its stream with the
+    /// engine's own error a pace behind its first frame: the calls beside
+    /// it have ended by then.
+    fail_late: Option<usize>,
+    /// The call of this place, counted from zero, is refused as
+    /// `fail_first` refuses the first: UNAVAILABLE, and no stream.
+    fail_call: Option<usize>,
+    /// The call of the fan-out's sample of this index is refused the same
+    /// way, whenever it arrives: its request's id ends with the index.
+    fail_sample: Option<u32>,
+    /// The call of the fan-out's sample of this index ends its stream with
+    /// UNAVAILABLE a pace behind its last message: every sample's last
+    /// message has been read by then.
+    fail_behind_last: Option<u32>,
+    /// Every call is refused as `fail_always` refuses it, behind this wait:
+    /// a refusal that lands behind the answer of a call sent beside it.
+    fail_after: Option<Duration>,
+    /// Every call waits where it arrived until the flag is set, then
+    /// answers: a call whose answer the test times itself.
+    call_gate: Option<Arc<AtomicBool>>,
+    started: Arc<AtomicUsize>,
     fail_constraint: bool,
     fail_engine_report: bool,
     /// Send the first frame, then hold the stream open with nothing on
@@ -279,7 +308,27 @@ impl TokenSpeedScheduler for GatedScheduler {
                     })
                     .unwrap_or_default(),
             );
-        if self.fail_always || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0) {
+        let place = self.started.fetch_add(1, Ordering::SeqCst);
+        // A fan-out names each sample's request by the sample's index.
+        let of_sample = |index: Option<u32>| {
+            index.is_some_and(|index| request.request_id.ends_with(&format!("-{index}")))
+        };
+        let fail_sample = of_sample(self.fail_sample);
+        let fail_behind_last = of_sample(self.fail_behind_last);
+        if let Some(wait) = self.fail_after {
+            tokio::time::sleep(wait).await;
+            return Err(Status::unavailable("release-test induced late failure"));
+        }
+        if let Some(gate) = &self.call_gate {
+            while !gate.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+        if self.fail_always
+            || self.fail_call == Some(place)
+            || fail_sample
+            || (self.fail_first && self.calls.fetch_add(1, Ordering::SeqCst) == 0)
+        {
             return Err(Status::unavailable("release-test induced failure"));
         }
         if self.fail_internal {
@@ -315,7 +364,8 @@ impl TokenSpeedScheduler for GatedScheduler {
         let probe = (!self.gate_rpc).then(|| self.probe.clone()).flatten();
         let released = Arc::clone(&self.released);
         let frame_gap = self.frame_gap;
-        let fail_mid_stream = self.fail_mid_stream;
+        let fail_late = self.fail_late == Some(place);
+        let fail_mid_stream = self.fail_mid_stream || fail_late;
         let hold_after_first = self.hold_after_first;
         let gate_after_first = self.gate_after_first.clone();
         tokio::spawn(async move {
@@ -328,6 +378,9 @@ impl TokenSpeedScheduler for GatedScheduler {
             {
                 if let Some(gap) = frame_gap {
                     tokio::time::sleep(gap).await;
+                }
+                if fail_late && index == 1 {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
                 }
                 let frame = if fail_mid_stream && index == 1 {
                     Err(Status::internal(ENGINE_ERROR_MESSAGE))
@@ -348,6 +401,11 @@ impl TokenSpeedScheduler for GatedScheduler {
                         tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 }
+            }
+            if fail_behind_last {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                let failure = Status::unavailable("release-test induced failure behind the end");
+                let _ = tx.send(Err(failure)).await;
             }
         });
         Ok(TonicResponse::new(Box::pin(ReceiverStream::new(rx))))
@@ -547,7 +605,7 @@ fn register_worker_with_breaker(
 }
 
 async fn components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {
-    components_with_multimodal(worker_registry, false).await
+    components_with_multimodal(worker_registry, None).await
 }
 
 /// Components over `tokenizer_registry` and `worker_registry` with the
@@ -586,31 +644,34 @@ fn shared_components(
     })
 }
 
-/// [`shared_components`] over the mock tokenizer (no model directory).
+/// [`shared_components`] over the mock tokenizer. `model_dir` adds the
+/// multimodal bundle and is the tokenizer's source, so the bundle's config
+/// lookup stays on this disk; without it the source is no model directory.
 async fn components_with_multimodal(
     worker_registry: Arc<WorkerRegistry>,
-    with_multimodal: bool,
+    model_dir: Option<&Path>,
 ) -> Arc<SharedComponents> {
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
     let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+    let source = model_dir.map_or("test", |dir| dir.to_str().expect("utf-8 path"));
     tokenizer_registry
         .load(
             "tokenizer-id",
             MODEL,
-            "test",
+            source,
             || async move { Ok(tokenizer) },
         )
         .await
         .expect("load mock tokenizer");
-    shared_components(tokenizer_registry, worker_registry, with_multimodal)
+    shared_components(tokenizer_registry, worker_registry, model_dir.is_some())
 }
 
 /// A worker whose servicer left `supports_vision` unset (the SGLang and
 /// TokenSpeed protos carry the field; only vLLM's servicer sets it on
 /// purpose) is not a language-model-only worker: its labels carry no
 /// vision verdict, and an image request goes on past the refusal into
-/// multimodal processing (here, to the config lookup the mock tokenizer
-/// cannot satisfy) instead of a `multimodal_not_supported`.
+/// multimodal processing (here, to the config lookup the test's model
+/// directory cannot satisfy) instead of a `multimodal_not_supported`.
 #[tokio::test]
 async fn image_to_a_worker_without_a_vision_verdict_is_not_refused() {
     let labels = labels_of(&ModelInfo::Sglang(Box::default()));
@@ -618,13 +679,18 @@ async fn image_to_a_worker_without_a_vision_verdict_is_not_refused() {
         labels.iter().all(|(key, _)| key != SUPPORTS_VISION_LABEL),
         "{labels:?}"
     );
-    let (pipeline, components, _) =
-        chat_pipeline_over(RuntimeType::TokenSpeed, &label_pairs(&labels)).await;
+    let model_dir = unreadable_model_dir();
+    let (pipeline, components, _) = chat_pipeline_over(
+        RuntimeType::TokenSpeed,
+        &label_pairs(&labels),
+        model_dir.path(),
+    )
+    .await;
     let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
-    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
     assert_eq!(
-        body["error"]["code"], "invalid_multimodal_request",
+        body["error"]["code"], "multimodal_processing_failed",
         "{body}"
     );
 }
@@ -639,9 +705,7 @@ async fn image_to_a_worker_without_a_vision_verdict_is_not_refused() {
 async fn image_to_an_sglang_worker_that_carries_no_media_is_refused_before_dispatch() {
     use std::collections::BTreeMap;
 
-    use smg_grpc_client::sglang_proto;
-
-    use crate::routers::grpc::client::ServerInfo;
+    use smg_grpc_client::{engine_labels::ServerInfo, sglang_proto};
 
     let mut merged = ModelInfo::Sglang(Box::default()).to_labels();
     merged.extend(
@@ -666,8 +730,13 @@ async fn image_to_an_sglang_worker_that_carries_no_media_is_refused_before_dispa
             .any(|(key, value)| key == SUPPORTS_VISION_LABEL && value == "false"),
         "{labels:?}"
     );
-    let (pipeline, components, seen_ids) =
-        chat_pipeline_over(RuntimeType::TokenSpeed, &label_pairs(&labels)).await;
+    let model_dir = unreadable_model_dir();
+    let (pipeline, components, seen_ids) = chat_pipeline_over(
+        RuntimeType::TokenSpeed,
+        &label_pairs(&labels),
+        model_dir.path(),
+    )
+    .await;
     let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
     assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
@@ -684,8 +753,13 @@ async fn image_to_an_sglang_worker_that_carries_no_media_is_refused_before_dispa
 /// schedules it, which the client saw as a hang).
 #[tokio::test]
 async fn image_to_a_language_model_only_pool_is_refused_before_dispatch() {
-    let (pipeline, components, seen_ids) =
-        chat_pipeline_over(RuntimeType::TokenSpeed, LANGUAGE_MODEL_ONLY).await;
+    let model_dir = unreadable_model_dir();
+    let (pipeline, components, seen_ids) = chat_pipeline_over(
+        RuntimeType::TokenSpeed,
+        LANGUAGE_MODEL_ONLY,
+        model_dir.path(),
+    )
+    .await;
     let started = Instant::now();
     let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
     assert!(
@@ -727,10 +801,12 @@ fn one_pixel_image_chat() -> serde_json::Value {
 }
 
 /// The chat pipeline over one stub worker typed as `runtime` that carries
-/// `labels`, and the ids the stub saw.
+/// `labels`, and the ids the stub saw. The mock tokenizer's source is
+/// `model_dir`.
 async fn chat_pipeline_over(
     runtime: RuntimeType,
     labels: &[(&str, &str)],
+    model_dir: &Path,
 ) -> (
     RequestPipeline,
     Arc<SharedComponents>,
@@ -753,20 +829,19 @@ async fn chat_pipeline_over(
     );
     let pipeline =
         RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
-    let components = components_with_multimodal(worker_registry, true).await;
+    let components = components_with_multimodal(worker_registry, Some(model_dir)).await;
     (pipeline, components, seen_ids)
 }
 
-/// The error body of a chat request the pipeline answered within its
-/// budget.
-async fn chat_error_body(
+/// The chat pipeline's answer to `request`, within its budget.
+async fn chat_response(
     pipeline: &RequestPipeline,
     components: Arc<SharedComponents>,
     request: serde_json::Value,
-) -> (http::StatusCode, serde_json::Value) {
+) -> Response {
     let request: Arc<ChatCompletionRequest> =
         Arc::new(serde_json::from_value(request).expect("chat request"));
-    let response = tokio::time::timeout(
+    tokio::time::timeout(
         Duration::from_secs(10),
         pipeline.execute_chat(
             request,
@@ -780,7 +855,17 @@ async fn chat_error_body(
         ),
     )
     .await
-    .expect("the pipeline answers within its budget");
+    .expect("the pipeline answers within its budget")
+}
+
+/// The error body of a chat request the pipeline answered within its
+/// budget.
+async fn chat_error_body(
+    pipeline: &RequestPipeline,
+    components: Arc<SharedComponents>,
+    request: serde_json::Value,
+) -> (http::StatusCode, serde_json::Value) {
+    let response = chat_response(pipeline, components, request).await;
     let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
@@ -805,7 +890,9 @@ async fn video_to_a_pool_whose_engine_takes_no_video_is_refused_before_any_media
         serde_json::json!({"url": "data:video/mp4;base64,invalid", "fps": 0.5}),
         serde_json::json!({"url": "data:video/mp4;base64,invalid"}),
     ] {
-        let (pipeline, components, seen_ids) = chat_pipeline_over(RuntimeType::Trtllm, &[]).await;
+        let model_dir = unreadable_model_dir();
+        let (pipeline, components, seen_ids) =
+            chat_pipeline_over(RuntimeType::Trtllm, &[], model_dir.path()).await;
         let started = Instant::now();
         let (status, body) = chat_error_body(
             &pipeline,
@@ -845,16 +932,19 @@ async fn video_to_a_pool_whose_engine_takes_no_video_is_refused_before_any_media
 }
 
 /// An image to the same worker is not the matrix's refusal: it goes on
-/// into multimodal processing (here, to the config lookup the mock
-/// tokenizer cannot satisfy, as for the worker without a vision verdict).
+/// into multimodal processing (here, to the config lookup the test's
+/// model directory cannot satisfy, as for the worker without a vision
+/// verdict).
 #[tokio::test]
 async fn image_to_a_pool_whose_engine_takes_images_goes_on_into_media_processing() {
-    let (pipeline, components, _) = chat_pipeline_over(RuntimeType::Sglang, &[]).await;
+    let model_dir = unreadable_model_dir();
+    let (pipeline, components, _) =
+        chat_pipeline_over(RuntimeType::Sglang, &[], model_dir.path()).await;
     let (status, body) = chat_error_body(&pipeline, components, one_pixel_image_chat()).await;
-    assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
     assert_eq!(
-        body["error"]["code"], "invalid_multimodal_request",
+        body["error"]["code"], "multimodal_processing_failed",
         "{body}"
     );
 }
@@ -882,6 +972,7 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
             ]
         }],
     });
+    let model_dir = unreadable_model_dir();
     for (runtime, refused) in [(RuntimeType::Mlx, true), (RuntimeType::Sglang, false)] {
         let seen_ids = Arc::new(Mutex::new(Vec::new()));
         let port = spawn_stub(GatedScheduler {
@@ -900,13 +991,15 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
         );
         let pipeline = RequestPipeline::build(Endpoint::Messages, Mode::Regular, &deps)
             .expect("messages pipeline");
-        let components = components_with_multimodal(worker_registry, true).await;
+        let components = components_with_multimodal(worker_registry, Some(model_dir.path())).await;
         let request: Arc<CreateMessageRequest> =
             Arc::new(serde_json::from_value(request.clone()).expect("messages request"));
+        let tools = MessagesTools::from(&*request);
         let response = tokio::time::timeout(
             Duration::from_secs(10),
             pipeline.execute_messages(
                 request,
+                tools,
                 None,
                 MODEL.to_string(),
                 components,
@@ -922,15 +1015,22 @@ async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_
             .await
             .expect("drain body");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
-        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         if refused {
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
             assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
             assert_eq!(
                 body["error"]["message"], "backend mlx does not support image inputs",
                 "{body}"
             );
         } else {
-            assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
+            // Past the matrix the request goes on into media resolution, to
+            // the config lookup the test's model directory cannot satisfy:
+            // the deployment's fault, answered in the server's class.
+            assert_eq!(status, http::StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+            assert_eq!(
+                body["error"]["code"], "multimodal_processing_failed",
+                "{body}"
+            );
         }
         assert!(
             seen_ids
@@ -1017,6 +1117,81 @@ async fn a_pinned_retry_moves_to_another_engine_after_an_unavailable_start() {
 
     // Keys hash to either engine; the first one owned by the refusing
     // engine is the case under test (the others succeed in one call).
+    for key in (0..64).map(|i| format!("session-{i}")) {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("x-smg-routing-key", key.parse().unwrap());
+        let refused_before = calls(&seen_refusing);
+        let served_before = calls(&seen_serving);
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                Some(headers),
+                MODEL.to_string(),
+                Arc::clone(&components),
+                None,
+                None,
+                Some(&retry),
+            )
+            .await;
+        assert_eq!(response.status(), http::StatusCode::OK, "key {key}");
+        let refused_now = calls(&seen_refusing) - refused_before;
+        let served_now = calls(&seen_serving) - served_before;
+        if refused_now == 0 {
+            assert_eq!(served_now, 1, "a key owned by the serving engine: one call");
+            continue;
+        }
+        assert_eq!(
+            refused_now, 1,
+            "the refusing engine sees the request once, not once per retry"
+        );
+        assert_eq!(served_now, 1, "the retry landed on the other engine");
+        return;
+    }
+    panic!("no key hashed to the refusing engine");
+}
+
+/// PD twin: a request pinned by a routing key whose prefill engine cannot
+/// start it (UNAVAILABLE) is retried on another prefill engine, not replayed
+/// on the one that just refused: one call there, one on the other prefill,
+/// 200.
+#[tokio::test]
+async fn a_pinned_pd_retry_moves_to_another_prefill_after_an_unavailable_start() {
+    let seen_refusing = Arc::new(Mutex::new(Vec::new()));
+    let seen_serving = Arc::new(Mutex::new(Vec::new()));
+    let refusing_port = spawn_stub(GatedScheduler {
+        fail_always: true,
+        seen_request_ids: Arc::clone(&seen_refusing),
+        ..Default::default()
+    })
+    .await;
+    let serving_port = spawn_stub(GatedScheduler {
+        seen_request_ids: Arc::clone(&seen_serving),
+        ..Default::default()
+    })
+    .await;
+    let decode_port = spawn_stub(GatedScheduler::default()).await;
+    let calls =
+        |seen: &Mutex<Vec<String>>| seen.lock().unwrap_or_else(PoisonError::into_inner).len();
+
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    register_worker(&worker_registry, refusing_port, WorkerType::Prefill);
+    register_worker(&worker_registry, serving_port, WorkerType::Prefill);
+    register_worker(&worker_registry, decode_port, WorkerType::Decode);
+    let deps = PipelineDeps::pair(
+        worker_registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::ConsistentHashing)),
+        None,
+        None,
+        Duration::from_secs(60),
+    );
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::PrefillDecode, &deps)
+        .expect("completion pipeline");
+    let components = components(worker_registry).await;
+    let retry = fast_retry_config(3);
+
+    // Keys hash to either prefill engine; the first one owned by the
+    // refusing engine is the case under test (the others succeed in one
+    // call).
     for key in (0..64).map(|i| format!("session-{i}")) {
         let mut headers = http::HeaderMap::new();
         headers.insert("x-smg-routing-key", key.parse().unwrap());
@@ -2415,11 +2590,20 @@ async fn responses_context_over(
         None,
         Duration::from_secs(60),
     );
-    let pipeline = RequestPipeline::build(endpoint, mode, &deps)
+    responses_context_with_deps(endpoint, mode, &deps, background_slots).await
+}
+
+async fn responses_context_with_deps(
+    endpoint: Endpoint,
+    mode: Mode,
+    deps: &PipelineDeps,
+    background_slots: usize,
+) -> ResponsesContext {
+    let pipeline = RequestPipeline::build(endpoint, mode, deps)
         .unwrap_or_else(|| panic!("a {endpoint:?} pipeline in {mode:?} mode"));
     ResponsesContext::new(
         Arc::new(pipeline),
-        components(Arc::clone(worker_registry)).await,
+        components(Arc::clone(&deps.worker_registry)).await,
         Arc::new(MemoryResponseStorage::new()),
         Arc::new(MemoryConversationStorage::new()),
         Arc::new(MemoryConversationItemStorage::new()),
@@ -2709,6 +2893,83 @@ async fn a_harmony_responses_request_s_stop_sequences_reach_the_engine() {
         .unwrap_or_else(PoisonError::into_inner)
         .clone();
     assert_eq!(seen, vec![vec!["STOP".to_string(), "\n\n".to_string()]]);
+}
+
+/// The tool loop's saving rests on one fact: when an iteration's run
+/// returns, nothing else holds the loop's request, so the loop takes it
+/// back by a move (`owned_request`). This pins that fact for the
+/// non-streamed iteration: the iteration runs to its result over the stub,
+/// so the build stage's spec did hold a share of the request, and a later
+/// holder of the request past the run fails here instead of silently
+/// restoring the per-turn deep copy.
+#[tokio::test]
+async fn a_harmony_responses_iteration_releases_its_share_of_the_request_when_it_returns() {
+    let scheduler = GatedScheduler::default();
+    let port = spawn_stub(scheduler.clone()).await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let _worker = register_worker(&worker_registry, port, WorkerType::Regular);
+    let ctx = responses_context_over(Endpoint::Harmony, Mode::Regular, &worker_registry, 0).await;
+
+    let request: Arc<ResponsesRequest> = Arc::new(
+        serde_json::from_value(serde_json::json!({
+            "model": MODEL,
+            "input": "hi",
+            "stream": false,
+        }))
+        .expect("responses request"),
+    );
+    // The iteration must have been built and dispatched: only then did the
+    // build stage's spec hold a share of the request for this test to see
+    // released. The result stays alive through the count, as the loop's
+    // does when it takes the request back.
+    let _result = ctx
+        .pipeline
+        .execute_harmony_responses(&request, &ctx, None)
+        .await
+        .expect("the non-streamed iteration runs to its result");
+    assert_eq!(
+        scheduler
+            .seen_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len(),
+        1,
+        "the iteration reached the engine"
+    );
+    assert_eq!(
+        Arc::strong_count(&request),
+        1,
+        "the iteration's context released its share when the run returned"
+    );
+}
+
+/// The streamed twin: the iteration's context let go of the request when
+/// the run returned, and nothing the result carries past it (the engine
+/// stream, the load guards, the reservation, the stop obligations) holds a
+/// share either, so once the stream is read to its end the loop moves the
+/// request as the non-streamed loop does.
+#[tokio::test]
+async fn a_streaming_harmony_responses_iteration_releases_its_share_once_its_stream_is_drained() {
+    let port = spawn_stub(GatedScheduler::default()).await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    let _worker = register_worker(&worker_registry, port, WorkerType::Regular);
+    let ctx = responses_context_over(Endpoint::Harmony, Mode::Regular, &worker_registry, 0).await;
+
+    let request = responses_request(false);
+    let (execution_result, _load_guards, _reservation, _router_stops) = ctx
+        .pipeline
+        .execute_harmony_responses_streaming(&request, &ctx, None, None)
+        .await
+        .expect("the iteration dispatches");
+    match execution_result {
+        ExecutionResult::Single { mut stream, .. } => while stream.next().await.is_some() {},
+        _ => panic!("a regular worker answers with one stream"),
+    }
+    assert_eq!(
+        Arc::strong_count(&request),
+        1,
+        "the iteration's context released its share once its stream was drained"
+    );
 }
 
 /// Harmony Responses over the gRPC PD path: the same client leaves while
@@ -3667,7 +3928,8 @@ fn a_refusal_for_a_drained_pool_is_counted_as_unavailable_not_as_a_backend_error
 /// The gateway's request timeout on a gRPC worker, in the shapes the
 /// issue's reproduction had: a streamed completion whose engine takes
 /// the request and says nothing ends at the deadline with the HTTP
-/// path's `stream_error` event under the timeout's message and `[DONE]`,
+/// path's `stream_error` event under the timeout's code and message and
+/// `[DONE]`,
 /// the engine receives the abort for that request before the client
 /// reads the event, and the worker's load goes with the body.
 #[tokio::test]
@@ -3701,6 +3963,10 @@ async fn a_streamed_request_to_a_silent_worker_ends_at_the_request_timeout_and_i
         "ended after {elapsed:?}: {body}"
     );
     assert!(body.contains("\"type\":\"stream_error\""), "{body}");
+    assert!(
+        body.contains("\"code\":\"call_upstream_timeout\""),
+        "the event names the timeout as the 504 does: {body}"
+    );
     assert!(body.contains("request timed out after 300ms"), "{body}");
     assert!(body.trim_end().ends_with("data: [DONE]"), "{body}");
     assert_aborted_and_released(&scheduler, &worker).await;
@@ -3733,6 +3999,68 @@ async fn a_non_streamed_request_to_a_silent_worker_is_the_504_at_the_request_tim
     assert_aborted_and_released(&scheduler, &worker).await;
 }
 
+/// A non-streamed request cut at the request timeout is one failure for its
+/// worker's circuit breaker, as a streamed one is. So is the decode side of a
+/// prefill and decode pair, for the decode worker.
+#[tokio::test]
+async fn a_non_streamed_request_cut_at_the_request_timeout_counts_against_the_workers_breaker() {
+    let (single, worker, _scheduler, single_components) =
+        silent_worker_pipeline(SilentShape::Stream, REQUEST_TIMEOUT).await;
+
+    let prefill_port = spawn_stub(GatedScheduler::default()).await;
+    let decode_port = spawn_stub(GatedScheduler {
+        frame_gap: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    })
+    .await;
+    let registry = Arc::new(WorkerRegistry::new());
+    register_worker(&registry, prefill_port, WorkerType::Prefill);
+    let decode = register_worker(&registry, decode_port, WorkerType::Decode);
+    let deps = PipelineDeps::pair(
+        registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .with_request_timeout(REQUEST_TIMEOUT);
+    let pair = RequestPipeline::build(Endpoint::Completion, Mode::PrefillDecode, &deps)
+        .expect("completion pipeline");
+    let pair_components = components(Arc::clone(&registry)).await;
+
+    let mut failures = Vec::new();
+    for (pipeline, components, cut) in [
+        (single, single_components, worker),
+        (pair, pair_components, decode),
+    ] {
+        let response = tokio::time::timeout(
+            CASE_CAP,
+            pipeline.execute_completion(
+                completion(false),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the request timeout answers");
+        assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+        let cut = cut
+            .as_any()
+            .downcast_ref::<BasicWorker>()
+            .expect("a basic worker");
+        failures.push(cut.circuit_breaker.load().total_failures());
+    }
+    assert_eq!(
+        failures,
+        [1, 1],
+        "the single worker, then the pair's decode worker"
+    );
+}
+
 /// A worker that never answers the call that opens the stream (the
 /// request never admitted, the servicer wedged before its first frame)
 /// is bounded by the same deadline: the call is dropped at the deadline,
@@ -3759,6 +4087,37 @@ async fn a_call_the_worker_never_answers_is_the_504_at_the_request_timeout() {
     let elapsed = started.elapsed();
     assert_timeout_response(response, elapsed).await;
     assert_eq!(worker.load(), 0, "the slot goes with the answer");
+}
+
+/// A worker that takes every call and answers nothing is taken out at its
+/// breaker's threshold when the requests come one after another: the call
+/// it took is no success for it, so the cut requests are failures in a row.
+#[tokio::test]
+async fn streamed_requests_one_after_another_to_a_silent_worker_open_its_breaker() {
+    let (pipeline, worker, _scheduler, components) =
+        silent_worker_pipeline(SilentShape::Stream, REQUEST_TIMEOUT).await;
+    for _ in 0..CircuitBreakerConfig::default().failure_threshold {
+        let response = pipeline
+            .execute_completion(
+                completion(true),
+                None,
+                MODEL.to_string(),
+                Arc::clone(&components),
+                None,
+                None,
+                None,
+            )
+            .await;
+        // A streamed answer fails inside its body: it is read to its end.
+        tokio::time::timeout(
+            CASE_CAP,
+            axum::body::to_bytes(response.into_body(), usize::MAX),
+        )
+        .await
+        .expect("the request timeout ends the body")
+        .expect("drain body");
+    }
+    assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
 }
 
 /// A worker that answers within the timeout is not touched by it: the
@@ -3810,6 +4169,127 @@ async fn a_request_that_completes_before_the_request_timeout_is_unchanged() {
         "a completed request sends no abort"
     );
     assert_eq!(worker.load(), 0);
+}
+
+/// A streamed Harmony Responses request to a silent worker ends at the
+/// deadline with an `error` event under the timeout's code, the one the 504
+/// and the other streams name.
+#[tokio::test]
+async fn a_harmony_responses_stream_to_a_silent_worker_names_the_request_timeout() {
+    let port = spawn_stub(GatedScheduler {
+        frame_gap: Some(Duration::from_secs(3600)),
+        ..Default::default()
+    })
+    .await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    register_worker(&worker_registry, port, WorkerType::Regular);
+    let deps = PipelineDeps::pair(
+        worker_registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    )
+    .with_request_timeout(REQUEST_TIMEOUT);
+    let ctx = responses_context_with_deps(Endpoint::Harmony, Mode::Regular, &deps, 0).await;
+    let response = serve_harmony_responses_stream(
+        &ctx,
+        Arc::unwrap_or_clone(responses_request(false)),
+        anonymous(),
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = tokio::time::timeout(
+        CASE_CAP,
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("the request timeout ends the body")
+    .expect("drain body");
+    let body = String::from_utf8_lossy(&body);
+    assert!(
+        body.contains("\"code\":\"call_upstream_timeout\""),
+        "the event names the timeout as the 504 does: {body}"
+    );
+}
+
+/// A worker whose process is gone refuses the dial under the next call. The
+/// client's answer is that failure without the worker's address; the
+/// gateway's own line names the worker.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_dial_is_answered_without_the_workers_address() {
+    use smg_worker::test_support::RefusedAddress;
+    use tokio::sync::oneshot;
+
+    use crate::routers::grpc::test_engine::serve_until;
+
+    // The worker comes up on a port that stays taken after it: the port
+    // refuses again once the worker's listener is gone.
+    let address = RefusedAddress::reserve_shared();
+    let router =
+        Server::builder().add_service(TokenSpeedSchedulerServer::new(GatedScheduler::default()));
+    let (stop, stopped) = oneshot::channel();
+    let server = serve_until(router, address.listen_shared(), stopped);
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    register_worker(&worker_registry, address.port(), WorkerType::Regular);
+    let deps = PipelineDeps::pair(
+        worker_registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+        None,
+        None,
+        Duration::from_secs(60),
+    );
+    let pipeline = RequestPipeline::build(Endpoint::Completion, Mode::Regular, &deps)
+        .expect("completion pipeline");
+    let components = components(Arc::clone(&worker_registry)).await;
+    let request = || {
+        pipeline.execute_completion(
+            completion(false),
+            None,
+            MODEL.to_string(),
+            Arc::clone(&components),
+            None,
+            None,
+            None,
+        )
+    };
+
+    // The worker serves a request: the gateway holds its connection from
+    // here on.
+    assert_eq!(request().await.status(), http::StatusCode::OK);
+    // The worker goes away: it stops listening and closes that connection
+    // with a GOAWAY. Its task ends after the gateway's side has answered the
+    // ping the worker sends behind that frame, so the gateway has read the
+    // GOAWAY when the next request starts, and that request dials.
+    stop.send(())
+        .expect("the worker serves until it is stopped");
+    tokio::time::timeout(CASE_CAP, server)
+        .await
+        .expect("the worker closes its connection")
+        .expect("the worker's task ends");
+
+    let response = request().await;
+    assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("drain body");
+    let error: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+    assert_eq!(error["error"]["code"], "start_generation_failed", "{error}");
+    let message = error["error"]["message"].as_str().expect("a message");
+    assert!(
+        message.starts_with("Failed to start generation: "),
+        "{message}"
+    );
+    assert!(
+        message.contains("refused"),
+        "the answer says how the dial failed: {message}"
+    );
+    assert!(
+        !message.contains("127.0.0.1") && !message.contains(&address.port().to_string()),
+        "the answer names the worker's address: {message}"
+    );
 }
 
 /// The request timeout under test and the cap a gateway without it fails at.
@@ -3926,4 +4406,281 @@ async fn assert_aborted_and_released(scheduler: &GatedScheduler, worker: &Arc<dy
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+/// Media the request got wrong as it sent it is refused under the media
+/// stage's own `invalid_multimodal_request`, a 400 with the connector's
+/// words, and nothing reaches the worker: a data URL that is not base64, one
+/// with no comma, one in the non-base64 form, a payload that is not an
+/// image, a URL that does not parse, a host the policy refuses, and a
+/// `max_long_side_pixel` out of range. Before, every one of these was a
+/// `media_fetch_failed` with nothing fetched.
+#[tokio::test]
+async fn deepseek_v41_media_refused_as_sent_answers_the_media_stages_code() {
+    let Some(dir) = deepseek_v41_model_dir().await else {
+        skip_no_tokenizer();
+        return;
+    };
+    let corn = format!("data:image/png;base64,{}", BASE64.encode(V41_CORN_PNG));
+    let cases = [
+        (
+            "not base64",
+            serde_json::json!({"url": "data:image/png;base64,!!!"}),
+            "base64 decode error",
+        ),
+        (
+            "no comma",
+            serde_json::json!({"url": "data:image/png;base64"}),
+            "missing comma in data url",
+        ),
+        (
+            "not the base64 form",
+            serde_json::json!({"url": "data:image/svg+xml,<svg/>"}),
+            "only base64 encoded data URLs are supported",
+        ),
+        (
+            "not an image",
+            serde_json::json!({"url": "data:application/pdf;base64,JVBERi0xLjQK"}),
+            "image decode error",
+        ),
+        (
+            "not a URL",
+            serde_json::json!({"url": "not a url"}),
+            "invalid media URL",
+        ),
+        (
+            "a loopback host",
+            serde_json::json!({"url": "http://127.0.0.1:9/x.png"}),
+            "loopback",
+        ),
+        (
+            "a cap out of range",
+            serde_json::json!({"url": corn, "max_long_side_pixel": 0}),
+            "max_long_side_pixel",
+        ),
+    ];
+    for (name, image_url, words) in cases {
+        let (status, body, ids, _) = v41_run_chat(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this picture?"},
+                        {"type": "image_url", "image_url": image_url}
+                    ]
+                }],
+                "chat_template_kwargs": {"thinking": false},
+                "max_tokens": 1,
+            }),
+            true,
+        )
+        .await;
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON envelope");
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{name}: {body}");
+        assert_eq!(
+            body["error"]["code"], "invalid_multimodal_request",
+            "{name}: {body}"
+        );
+        assert_eq!(
+            body["error"]["type"], "invalid_request_error",
+            "{name}: {body}"
+        );
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains(words), "{name}: {body}");
+        assert!(ids.is_empty(), "{name}: nothing reaches the worker");
+    }
+}
+
+/// A generate request in another runtime's message type than the client's
+/// is refused by the dispatch with both runtimes named, where it used to
+/// panic the request's task: the status of a call the wire does not have, a
+/// 501 for the client. Every message type against every other runtime's
+/// client.
+#[tokio::test]
+async fn a_request_of_another_runtime_is_refused_by_the_dispatch_by_name() {
+    use smg_grpc_client::{mlx_proto, sglang_proto, trtllm_proto};
+
+    use crate::routers::grpc::{client::GrpcClient, proto_wrapper::ProtoGenerateRequest};
+
+    /// A default request of one message type.
+    type Make = fn() -> ProtoGenerateRequest;
+
+    // A transport listener is enough: the dispatch refuses before any RPC.
+    let scheduler = GatedScheduler::default();
+    let calls = Arc::clone(&scheduler.calls);
+    let port = spawn_stub(scheduler).await;
+    let url = format!("http://127.0.0.1:{port}");
+    let requests: [(&str, Make); 5] = [
+        ("sglang", || {
+            ProtoGenerateRequest::Sglang(Box::<sglang_proto::GenerateRequest>::default())
+        }),
+        ("vllm", || {
+            ProtoGenerateRequest::Vllm(Box::<vllm_proto::GenerateRequest>::default())
+        }),
+        ("trtllm", || {
+            ProtoGenerateRequest::Trtllm(Box::<trtllm_proto::GenerateRequest>::default())
+        }),
+        ("mlx", || {
+            ProtoGenerateRequest::Mlx(Box::<mlx_proto::GenerateRequest>::default())
+        }),
+        ("tokenspeed", || {
+            ProtoGenerateRequest::TokenSpeed(Box::<ts::GenerateRequest>::default())
+        }),
+    ];
+    for (of, request) in requests {
+        for (to, _) in requests.iter().filter(|(to, _)| *to != of) {
+            let mut client = GrpcClient::connect(&url, to)
+                .await
+                .expect("the stub's listener connects");
+            let Err(status) = client.generate(request()).await else {
+                panic!("a {of} request was dispatched to a {to} worker");
+            };
+            assert_eq!(status.code(), tonic::Code::Unimplemented, "{of} to {to}");
+            assert_eq!(
+                status.message(),
+                format!("a {of} request cannot be sent to a {to} worker")
+            );
+            assert_eq!(
+                status.http_status(),
+                http::StatusCode::NOT_IMPLEMENTED,
+                "{of} to {to}"
+            );
+        }
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "nothing reaches the worker"
+    );
+}
+
+/// No worker receives a refused request, so the dispatch unlinks the
+/// shared-memory segment its multimodal input rides in, as the arms that
+/// fail to send unlink theirs: in each message type whose payloads ride
+/// shared memory.
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn a_refused_request_leaves_no_shared_memory_segment_behind() {
+    use crate::routers::grpc::{
+        client::GrpcClient,
+        proto_wrapper::{write_tokenspeed_shm_with, ProtoGenerateRequest},
+    };
+
+    let port = spawn_stub(GatedScheduler::default()).await;
+    let url = format!("http://127.0.0.1:{port}");
+    let segment = || {
+        write_tokenspeed_shm_with(4, |bytes| {
+            bytes.copy_from_slice(&[1, 2, 3, 4]);
+            Ok(())
+        })
+        .expect("a segment is written")
+    };
+    let (in_vllm, in_tokenspeed) = (segment(), segment());
+    let names = [in_vllm.name.clone(), in_tokenspeed.name.clone()];
+    // Where the transport keeps its segments.
+    let on_file = |name: &String| Path::new("/dev/shm").join(name).exists();
+    assert!(
+        names.iter().all(on_file),
+        "the segments are on file before the dispatch"
+    );
+    // Each request with a client of another runtime.
+    let refused = [
+        (
+            "tokenspeed",
+            ProtoGenerateRequest::Vllm(Box::new(vllm_proto::GenerateRequest {
+                mm_inputs: Some(vllm_proto::MultimodalInputs {
+                    pixel_values: Some(vllm_proto::TensorData {
+                        payload: Some(vllm_proto::tensor_data::Payload::Shm(in_vllm)),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+        ),
+        (
+            "sglang",
+            ProtoGenerateRequest::TokenSpeed(Box::new(ts::GenerateRequest {
+                mm_inputs: Some(ts::MultimodalInputs {
+                    items: vec![ts::MultimodalItem {
+                        encoder_input: Some(ts::TensorData {
+                            payload: Some(ts::tensor_data::Payload::Shm(in_tokenspeed)),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                }),
+                ..Default::default()
+            })),
+        ),
+    ];
+    for (runtime, request) in refused {
+        let mut client = GrpcClient::connect(&url, runtime)
+            .await
+            .expect("the stub's listener connects");
+        assert!(client.generate(request).await.is_err(), "{runtime}");
+    }
+    assert!(
+        !names.iter().any(on_file),
+        "the refused requests' segments are unlinked"
+    );
+}
+
+/// The embedding dispatch answers a request in another runtime's message
+/// type as the generate dispatch does, where it used to panic the request's
+/// task: each message type against each client that has an embedding call
+/// of another type or none of its own.
+#[tokio::test]
+async fn an_embedding_request_of_another_runtime_is_refused_by_the_dispatch_by_name() {
+    use smg_grpc_client::sglang_proto;
+
+    use crate::routers::grpc::{client::GrpcClient, proto_wrapper::ProtoEmbedRequest};
+
+    /// A default request of one message type.
+    type Make = fn() -> ProtoEmbedRequest;
+
+    let scheduler = GatedScheduler::default();
+    let calls = Arc::clone(&scheduler.calls);
+    let port = spawn_stub(scheduler).await;
+    let url = format!("http://127.0.0.1:{port}");
+    let requests: [(&str, Make); 2] = [
+        ("sglang", || {
+            ProtoEmbedRequest::Sglang(Box::<sglang_proto::EmbedRequest>::default())
+        }),
+        ("vllm", || {
+            ProtoEmbedRequest::Vllm(Box::<vllm_proto::EmbedRequest>::default())
+        }),
+    ];
+    for (of, request) in requests {
+        for to in ["sglang", "vllm", "trtllm", "mlx", "tokenspeed"]
+            .into_iter()
+            .filter(|to| *to != of)
+        {
+            let client = GrpcClient::connect(&url, to)
+                .await
+                .expect("the stub's listener connects");
+            let Err(status) = client.embed(request()).await else {
+                panic!("a {of} embedding request was dispatched to a {to} worker");
+            };
+            let words = match to {
+                "mlx" => "MLX backend does not support embedding".to_string(),
+                "tokenspeed" => "TokenSpeed backend does not support embedding".to_string(),
+                _ => format!("a {of} embedding request cannot be sent to a {to} worker"),
+            };
+            assert_eq!(status.code(), tonic::Code::Unimplemented, "{of} to {to}");
+            assert_eq!(status.message(), words);
+            assert_eq!(
+                status.http_status(),
+                http::StatusCode::NOT_IMPLEMENTED,
+                "{of} to {to}"
+            );
+        }
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "nothing reaches the worker"
+    );
 }

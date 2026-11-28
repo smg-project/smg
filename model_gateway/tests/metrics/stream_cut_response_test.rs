@@ -9,10 +9,7 @@
 //! before and after: the cut stream lands on the head's 200 with
 //! `stream_error`, the stream that completes on the clean row.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -22,29 +19,36 @@ use http_body_util::BodyExt;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{model_card::ModelCard, worker::WorkerStatus};
 use serde_json::{json, Value};
+use serial_test::serial;
 use smg::{
-    health::ProbeState,
-    middleware::AuthConfig,
+    app_context::AppContext,
+    config::RouterConfigBuilder,
+    middleware::{AdmissionQueue, AuthConfig},
     routers::RouterFactory,
-    server::{build_app, AppState},
-    worker::{RuntimeType, Worker, WorkerType},
+    server::{build_app, health::ProbeState, AppState},
 };
 use smg_test_harness::{
-    grpc_harness::{free_port, grpc_router_config, grpc_test_context_with_tokenizer, grpc_worker},
+    grpc_harness::{grpc_router_config, grpc_test_context_with_tokenizer, grpc_worker},
     scripted_tokenizer::ScriptedTokenizer,
 };
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 use tower::ServiceExt;
+
+use crate::metrics::recorder;
 
 const MODEL: &str = "stream-cut-count-test-model";
 /// The streamed routes the count covers, each with a request of its own: the
 /// chat and text completions, the Messages route and the native generate
 /// route all end a cut stream with an error event (the first three then
 /// `[DONE]`; Messages ends on its `error` event). The last flag says whether
-/// this test alone writes the route's clean `200` row in this binary: the
+/// no other test writes the route's clean `200` row while this one runs: the
 /// worker request counter test sends non-streamed `/generate` requests
 /// through the same recorder, so on that route only the `stream_error` row,
-/// which no other test writes, is read.
+/// which no other test writes, is read. The chat cases of the dispatch wait
+/// tests answer chat requests through it too; they run under this test's
+/// `serial` key, never beside it. Their multipart case answers a
+/// transcription, a route this count leaves out, and runs under no key.
 fn routes() -> Vec<(&'static str, Value, bool, bool)> {
     let prompt = "count to twenty";
     vec![
@@ -77,8 +81,8 @@ fn routes() -> Vec<(&'static str, Value, bool, bool)> {
 
 /// An in-process realistic mock engine with its admin API, both stopped
 /// when the test ends.
-struct MockEngine {
-    port: u16,
+pub(super) struct MockEngine {
+    pub(super) port: u16,
     admin_port: u16,
     name: String,
     client: reqwest::Client,
@@ -93,12 +97,20 @@ impl MockEngine {
         reason = "test helper: the serve tasks end with their stop signals, which the fixture \
                   sends when it is dropped; a fixture that does not come up fails the test"
     )]
-    async fn start() -> Self {
+    pub(super) async fn start(model: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the mock engine");
         let port = listener.local_addr().expect("mock engine address").port();
-        let admin_port = free_port().await;
+        // Bound here and handed to the admin server below, as the engine's
+        // listener is: the port is never released for another test to take.
+        let admin_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the mock engine's admin API");
+        let admin_port = admin_listener
+            .local_addr()
+            .expect("admin API address")
+            .port();
         let cfg = Arc::new(mock_worker::config::Config {
             admin_port: None,
             context_length: 32768,
@@ -110,8 +122,8 @@ impl MockEngine {
             zmq_handshake: None,
             zmq_count: 0,
             zmq_start_index: 0,
-            model_id: MODEL.to_string(),
-            tokenizer_path: MODEL.to_string(),
+            model_id: model.to_string(),
+            tokenizer_path: model.to_string(),
             gen_delay: Duration::ZERO,
             output_tokens: 16,
             realistic: true,
@@ -129,10 +141,11 @@ impl MockEngine {
             },
         ));
         let (stop_admin, admin_stopped) = oneshot::channel();
-        let admin = tokio::spawn(mock_worker::admin::serve_until(
+        // The listener is bound and queuing connections already: the first
+        // admin call needs no wait for the server to come up.
+        let admin = tokio::spawn(mock_worker::admin::serve_with_listener_until(
             cfg,
-            "127.0.0.1".to_string(),
-            admin_port,
+            admin_listener,
             async move {
                 let _ = admin_stopped.await;
             },
@@ -141,21 +154,35 @@ impl MockEngine {
             .no_proxy()
             .build()
             .expect("test client");
-        let engine = Self {
+        let name = format!("grpc:{port}");
+        // The engine joins the process fleet when its serve task starts,
+        // which can be after the spawn above returns: until then the admin
+        // API has no engine under the name and a fault call answers 404.
+        let known = format!("http://127.0.0.1:{admin_port}/admin/fault/{name}");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !client
+                .get(&known)
+                .send()
+                .await
+                .is_ok_and(|response| response.status().is_success())
+            {
+                assert!(
+                    !served.is_finished(),
+                    "the mock engine's serve task ended before it joined the fleet"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the mock engine joins the fleet");
+        Self {
             port,
             admin_port,
-            name: format!("grpc:{port}"),
+            name,
             client,
             stop: Some((stop, stop_admin)),
             served: Some((served, admin)),
-        };
-        let health = format!("http://127.0.0.1:{admin_port}/admin/health");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while engine.client.get(&health).send().await.is_err() {
-            assert!(Instant::now() < deadline, "the admin API did not come up");
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        engine
     }
 
     /// Arm a fault hook of the engine through its admin API.
@@ -181,7 +208,7 @@ impl MockEngine {
         );
     }
 
-    async fn stop(mut self) {
+    pub(super) async fn stop(mut self) {
         if let Some((stop, stop_admin)) = self.stop.take() {
             let _ = stop.send(());
             let _ = stop_admin.send(());
@@ -194,27 +221,57 @@ impl MockEngine {
 }
 
 /// The gateway's HTTP app (every layer of the edge, the metrics layer at
-/// its outside) over a gRPC regular router with the one worker at `port`.
+/// its outside) over a gRPC regular router with the one worker at `port`,
+/// which serves `model`.
+pub(super) async fn gateway_app(port: u16, model: &str) -> axum::Router {
+    gateway_app_over(grpc_router_config(), port, model).await.0
+}
+
+/// [`gateway_app`] over `config` (its mode, policy and retries are set
+/// here), with the context the app is built from. A configuration that
+/// bounds the requests in flight gets the admission queue it names, as the
+/// server builds it.
+pub(super) async fn gateway_app_over(
+    config: RouterConfigBuilder,
+    port: u16,
+    model: &str,
+) -> (axum::Router, Arc<AppContext>) {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(ScriptedTokenizer::from_chunks(
+        (0..32).map(|i| format!("w{i} ")).collect(),
+    ));
+    gateway_app_with(config, port, model, tokenizer).await
+}
+
+/// [`gateway_app_over`] with `tokenizer` as the one the gateway reads
+/// `model` with.
 #[expect(
     clippy::expect_used,
     reason = "test helper: an app that does not build fails the fixture"
 )]
-async fn gateway_app(port: u16) -> axum::Router {
-    let config = grpc_router_config()
+pub(super) async fn gateway_app_with(
+    config: RouterConfigBuilder,
+    port: u16,
+    model: &str,
+    tokenizer: Arc<dyn Tokenizer>,
+) -> (axum::Router, Arc<AppContext>) {
+    let config = config
         .regular_mode(vec![])
         .random_policy()
         .disable_retries()
         .build_unchecked();
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(ScriptedTokenizer::from_chunks(
-        (0..32).map(|i| format!("w{i} ")).collect(),
-    ));
-    let app_context = grpc_test_context_with_tokenizer(config, MODEL, tokenizer).await;
+    let (queue_size, queue_timeout) = (
+        config.queue_size,
+        Duration::from_secs(config.queue_timeout_secs),
+    );
+    let app_context = grpc_test_context_with_tokenizer(config, model, tokenizer).await;
+    let admission_queue = (app_context.rate_limiter.is_some() && queue_size > 0)
+        .then(|| Arc::new(AdmissionQueue::new(queue_size, queue_timeout)));
     let worker: Arc<dyn Worker> = Arc::new(
         grpc_worker(
             port,
             WorkerType::Regular,
             RuntimeType::TokenSpeed,
-            ModelCard::new(MODEL),
+            ModelCard::new(model),
         )
         .build(),
     );
@@ -229,15 +286,15 @@ async fn gateway_app(port: u16) -> axum::Router {
     let app_state = Arc::new(AppState {
         router: Arc::from(router),
         probe_state: ProbeState::new(app_context.inflight_tracker.clone()),
-        context: app_context,
-        admission_queue: None,
+        context: Arc::clone(&app_context),
+        admission_queue,
         gateway: None,
         mesh_handler: None,
         mesh_adapters: None,
         secret_sources: Default::default(),
         secrets: None,
     });
-    build_app(
+    let app = build_app(
         app_state,
         AuthConfig::new(None),
         AuthConfig::new(None),
@@ -246,7 +303,8 @@ async fn gateway_app(port: u16) -> axum::Router {
         vec!["x-request-id".to_string()],
         vec![],
     )
-    .expect("the gateway app")
+    .expect("the gateway app");
+    (app, app_context)
 }
 
 /// One streamed request of `body` to `path` through `app`, read to its end:
@@ -280,7 +338,7 @@ fn label<'a>(line: &'a str, name: &str) -> Option<&'a str> {
 /// The `smg_http_responses_total` samples of `path` in this binary's
 /// recorder, as `(status_code, error_code, count)`, sorted.
 fn responses_of_path(path: &str) -> Vec<(String, String, u64)> {
-    let rendered = crate::metrics::recorder().render();
+    let rendered = recorder().render();
     let mut samples: Vec<(String, String, u64)> = rendered
         .lines()
         .filter(|line| {
@@ -308,9 +366,10 @@ fn count(samples: &[(String, String, u64)], status_code: &str, error_code: &str)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial(chat_response_row)]
 async fn a_stream_the_engine_cut_counts_as_a_body_that_failed() {
-    let engine = MockEngine::start().await;
-    let app = gateway_app(engine.port).await;
+    let engine = MockEngine::start(MODEL).await;
+    let app = gateway_app(engine.port, MODEL).await;
 
     for (path, body, ends_with_done, clean_row_is_ours) in routes() {
         let before = responses_of_path(path);

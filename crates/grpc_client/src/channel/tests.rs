@@ -22,8 +22,8 @@ use super::{
         drive, open, Connection, End, CONNECTION_WINDOW, KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT,
         STREAM_WINDOW,
     },
-    is_transport_failure, normalize_grpc_endpoint, testing, BoxError, Channel, RecvBody, Shared,
-    DEFAULT_CONNECT_TIMEOUT,
+    dial_failure_without_peer, is_keep_alive_timeout, is_transport_failure,
+    normalize_grpc_endpoint, testing, BoxError, Channel, RecvBody, Shared, DEFAULT_CONNECT_TIMEOUT,
 };
 use crate::{tokenspeed_proto, TokenSpeedSchedulerClient};
 
@@ -667,10 +667,11 @@ async fn a_peer_that_answers_before_reading_the_request_is_heard() {
 // (`max(window / 2, 25_600)`), which is what turns a backlog of streamed
 // token frames into `GOAWAY ENHANCE_YOUR_CALM too_many_data_frames`.
 
-/// Read `SETTINGS_INITIAL_WINDOW_SIZE` from the client's first frame.
-/// `None` means the client omitted it, which h2 does at the 65535 default.
+/// Read `SETTINGS_INITIAL_WINDOW_SIZE` and `SETTINGS_HEADER_TABLE_SIZE` from
+/// the client's first frame. `None` means the client omitted one, which h2
+/// does at its default (65535, 4096).
 #[tokio::test]
-async fn the_channel_advertises_its_stream_window() {
+async fn the_channel_advertises_its_stream_window_and_header_table() {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind loopback");
@@ -692,11 +693,14 @@ async fn the_channel_advertises_its_stream_window() {
     connected.expect("connect");
 
     let (entries, _) = payload.as_chunks::<6>();
-    let advertised = entries
-        .iter()
-        .find(|e| u16::from_be_bytes([e[0], e[1]]) == 0x4)
-        .map(|e| u32::from_be_bytes([e[2], e[3], e[4], e[5]]));
-    assert_eq!(advertised, Some(STREAM_WINDOW));
+    let advertised = |id: u16| {
+        entries
+            .iter()
+            .find(|e| u16::from_be_bytes([e[0], e[1]]) == id)
+            .map(|e| u32::from_be_bytes([e[2], e[3], e[4], e[5]]))
+    };
+    assert_eq!(advertised(0x4), Some(STREAM_WINDOW));
+    assert_eq!(advertised(0x1), Some(1024));
 }
 
 #[derive(Debug)]
@@ -1111,6 +1115,37 @@ async fn a_refused_dial_names_the_peer_in_its_error() {
         status.message().contains(&peer),
         "the refusal does not name the peer {peer}: {status:?}"
     );
+}
+
+/// The same refusal reads without the peer for an answer to a client: the
+/// failure as the dial worded it, less the address.
+#[tokio::test]
+async fn a_refused_dial_reads_without_the_peer_for_a_client() {
+    let (peer, status) = a_refused_dial().await;
+    let without_peer = dial_failure_without_peer(&status).expect("a dial's failure");
+    assert!(
+        status
+            .message()
+            .ends_with(&format!("{peer}: {without_peer}")),
+        "the message less the peer is not {without_peer}: {status:?}"
+    );
+    let port = peer.rsplit(':').next().expect("the peer's port");
+    assert!(
+        !without_peer.contains("127.0.0.1") && !without_peer.contains(port),
+        "the peer is left in: {without_peer}"
+    );
+}
+
+/// A status the channel did not make of a failed dial has no such form: the
+/// worker's own answer is read whole.
+#[test]
+fn a_status_that_is_no_failed_dial_has_no_form_without_a_peer() {
+    for status in [
+        tonic::Status::unavailable("the engine is draining"),
+        tonic::Status::internal("the engine failed the request"),
+    ] {
+        assert_eq!(dial_failure_without_peer(&status), None, "{status:?}");
+    }
 }
 
 /// A loopback peer that accepts the connect, reads the client's
@@ -1745,6 +1780,12 @@ async fn callers_behind_a_refused_dial_each_end_unavailable_at_once() {
         let status = answer.expect_err("nothing listens");
         assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
         assert!(!is_transport_failure(&status), "{status:?}");
+        // The callers that queued behind the dial get its failure again, the
+        // peer still apart from its words.
+        assert!(
+            dial_failure_without_peer(&status).is_some_and(|text| !text.contains("127.0.0.1")),
+            "{status:?}"
+        );
     }
     assert!(
         started.elapsed() < Duration::from_secs(2),
@@ -1848,12 +1889,20 @@ async fn a_keep_alive_timeout_under_a_call_is_unavailable() {
     assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
     assert_eq!(status.message(), "keep-alive timed out");
     assert!(!is_transport_failure(&status), "{status:?}");
+    // The timeout is the status's source. A worker's `UNAVAILABLE` in the
+    // same words has none.
+    assert!(is_keep_alive_timeout(&status), "{status:?}");
+    assert!(!is_keep_alive_timeout(&tonic::Status::unavailable(
+        "keep-alive timed out"
+    )));
     assert!(pings.load(Ordering::SeqCst) >= 1, "a ping was sent");
 }
 
 /// A subscriber that keeps the message of every event this crate logs, for
 /// the tests that read what the channel says. The connection's task runs
-/// on the test's current-thread runtime, so a thread-local default sees it.
+/// on the test's current-thread runtime, so a thread-local default sees it
+/// while a second dispatcher is alive beside it. Installed alone, it misses
+/// a callsite that another test's thread reaches first.
 struct Capture(Arc<Mutex<Vec<String>>>);
 
 impl tracing::Subscriber for Capture {
@@ -1909,8 +1958,16 @@ async fn logged(logs: &Mutex<Vec<String>>, text: &str) {
 /// dial's timeout as the caller reads it in the status).
 #[tokio::test]
 async fn diagnostics_name_the_peer_without_the_url_userinfo() {
+    use tracing::subscriber::NoSubscriber;
+
     let logs = Arc::new(Mutex::new(Vec::new()));
     let _subscriber = tracing::subscriber::set_default(Capture(Arc::clone(&logs)));
+    // While one dispatcher is registered, tracing decides whether a callsite
+    // is wanted by asking the default of the thread that reaches it first,
+    // and keeps the answer. Another test's thread has no subscriber, so its
+    // "nobody" would drop this thread's line. A second dispatcher, alive for
+    // the case, makes tracing ask every registered one.
+    let _second = tracing::Dispatch::new(NoSubscriber::default());
     let without_userinfo = |message: &str| !message.contains("secret") && !message.contains("user");
     let url = a_peer_that_ends_the_socket(SocketEnd::Close).await;
     let with_secret = url.replacen("http://", "grpc://user:secret@", 1);
@@ -1946,6 +2003,11 @@ async fn diagnostics_name_the_peer_without_the_url_userinfo() {
         assert!(
             status.message().contains("no connection to 127.0.0.1:"),
             "the connect timeout names the peer: {status:?}"
+        );
+        assert_eq!(
+            dial_failure_without_peer(&status),
+            Some("no connection within 300ms"),
+            "the connect timeout reads without the peer for a client: {status:?}"
         );
         assert!(
             without_userinfo(status.message()),

@@ -209,6 +209,8 @@ impl EngineProtocol for TokenSpeedProtocol {
             num_running: batch.num_running,
             num_waiting: batch.num_waiting,
             kv_cache_usage: batch.kv_active_pages as f64 / batch.kv_total_pages as f64,
+            num_resident_tokens: batch.num_resident_tokens,
+            num_waiting_uncached_tokens: batch.num_waiting_uncached_tokens,
         });
         let outputs = batch.into_outputs()?;
         // TokenSpeed has no out-of-band finish channel: every finish is carried
@@ -242,6 +244,7 @@ mod tests {
                 resolve_array_bytes, TensorFields, WireArrayData, WireTensor, TENSOR_AUX_MIN_BYTES,
             },
         },
+        mock_engine::default_ready_response,
         protocol::tokenspeed::{
             multimodal::{
                 mm_pad_value, TokenSpeedWireMmInputs, TokenSpeedWireMmItem, TokenSpeedWireModality,
@@ -480,6 +483,7 @@ mod tests {
                 num_running: 2,
                 num_waiting: 5,
                 kv_cache_usage: 0.25,
+                ..EngineLoad::default()
             })
         );
     }
@@ -646,8 +650,6 @@ mod tests {
     /// a scheduler that declares nothing passes (it takes no control calls).
     #[test]
     fn check_layouts_pins_the_control_replys_field_order() {
-        use crate::mock_engine::default_ready_response;
-
         let ready = |fields: &[&str]| {
             let mut ready = default_ready_response();
             ready.positional_layouts.insert(
@@ -680,7 +682,7 @@ mod tests {
         use crate::protocol::tokenspeed::output::{
             BASE_COLUMN_NAMES, FINISHED_MESSAGES, FINISHED_STATUS_CODES,
         };
-        let mut ready = crate::mock_engine::default_ready_response();
+        let mut ready = default_ready_response();
         assert_eq!(
             TokenSpeedProtocol::read_layout(&ready),
             SlimOutputLayout::default()

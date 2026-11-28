@@ -73,7 +73,7 @@ impl MuseSparkAudioParams {
     /// config's `audio_config.patch_sizes` multiply to the samples per token
     /// as well, since the tower folds exactly that many. A checkpoint that
     /// states both must agree, or its audio cannot be encoded as it asks.
-    pub fn from_configs(
+    pub(crate) fn from_configs(
         model_config: &Value,
         preprocessor_config: &PreProcessorConfig,
     ) -> Result<Self, MuseSparkAudioConfigError> {
@@ -171,12 +171,12 @@ impl Default for MuseSparkAudioProcessor {
 }
 
 impl MuseSparkAudioProcessor {
-    pub fn new(params: MuseSparkAudioParams) -> Self {
+    pub(crate) fn new(params: MuseSparkAudioParams) -> Self {
         Self { params }
     }
 
     /// The processor a checkpoint's configs describe.
-    pub fn from_configs(
+    pub(crate) fn from_configs(
         model_config: &Value,
         preprocessor_config: &PreProcessorConfig,
     ) -> Result<Self, MuseSparkAudioConfigError> {
@@ -189,7 +189,7 @@ impl MuseSparkAudioProcessor {
 
     /// Tokens the tower emits for `samples` samples at its rate: the clip
     /// padded up to whole tokens.
-    pub fn token_count(&self, samples: usize) -> usize {
+    pub(crate) fn token_count(&self, samples: usize) -> usize {
         samples.div_ceil(self.params.samples_per_token)
     }
 
@@ -202,9 +202,7 @@ impl MuseSparkAudioProcessor {
         &self,
         clips: &[DecodedAudio],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if clips.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(clips)?;
         let samples_per_token = self.params.samples_per_token;
         let mut samples: Vec<f32> = Vec::new();
         let mut token_counts = Vec::with_capacity(clips.len());

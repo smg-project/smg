@@ -16,6 +16,11 @@
 //!   old placement stays intact;
 //! - same key, different placement: MOVE (old placement removed).
 
+#![expect(
+    clippy::expect_used,
+    reason = "test model: a broken step ends the test"
+)]
+
 use std::{
     collections::{BTreeMap, HashMap},
     rc::Rc,
@@ -316,6 +321,5 @@ impl Model {
     }
 
     /// Keep the compiler honest about BTreeMap being intentional.
-    #[allow(dead_code)]
     fn _uses(_: &BTreeMap<usize, u32>) {}
 }

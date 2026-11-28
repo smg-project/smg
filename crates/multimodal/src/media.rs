@@ -27,12 +27,19 @@ use tokio::{fs, io::AsyncReadExt, process::Command, task, time};
 use tracing::{info, warn};
 use url::Url;
 
+#[cfg(feature = "opencv-video")]
+use crate::opencv_buffer::{open_capture, BufferedCapture, RgbOutputBuffer};
 use crate::{
     audio::decode_audio_mono_f32,
+    buffer_pool,
+    data_url::{base64_payload, data_url_payload},
     fetch_policy::{MediaHostPolicy, MediaHostResolver},
-    types::TransparencyPolicy,
+    hasher::{hash_audio, hash_image_with_transparency, hash_video_with_sampling},
+    jpeg_turbo::{decode_jpeg_rgb, end_is_served, is_jpeg},
+    types::{ImageSize, TransparencyPolicy},
     video_seek::{FrameTable, SeekPlan, SeekSegment},
     vision::{orientation::oriented, transforms::resize_catmull_rom_rgb},
+    webp_native::decode_webp,
 };
 
 const DEFAULT_VIDEO_PROCESS_TIMEOUT: Duration = Duration::from_secs(30);
@@ -60,6 +67,9 @@ const DEFAULT_VIDEO_MAX_DECODE_PIXELS: u64 = 1_000_000_000_000;
 /// overhead of frames to itself, so a denser sampling is not looked into.
 const SEEK_PLAN_MIN_FRAMES: usize = 1024;
 const SEEK_PLAN_MIN_FRAMES_PER_PICK: usize = 128;
+/// What is kept of a decoder or probe command's diagnostics, and what is
+/// read of a command that answers on standard output in a short text.
+const VIDEO_COMMAND_TEXT_BYTES: usize = 1024 * 1024;
 const DEFAULT_AUDIO_MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
 const _: () = assert!(DEFAULT_VIDEO_MAX_INPUT_BYTES < DEFAULT_VIDEO_MAX_DECODED_BYTES);
 static VIDEO_DECODE_BACKEND: OnceLock<Option<String>> = OnceLock::new();
@@ -71,6 +81,9 @@ static VIDEO_MAX_DECODED_BYTES: OnceLock<usize> = OnceLock::new();
 static VIDEO_MAX_DECODE_PIXELS: OnceLock<u64> = OnceLock::new();
 static AUDIO_MAX_INPUT_BYTES: OnceLock<usize> = OnceLock::new();
 static FFMPEG_PASSTHROUGH_FLAG: OnceLock<[&'static str; 2]> = OnceLock::new();
+/// What keeps this process from decoding video, probed once (see
+/// [`missing_video_decoder`]).
+static VIDEO_DECODER_GAP: OnceLock<Option<String>> = OnceLock::new();
 static ACTIVE_VIDEO_DECODES: AtomicUsize = AtomicUsize::new(0);
 static AVAILABLE_DECODE_CPUS: OnceLock<usize> = OnceLock::new();
 const MAX_DECODER_THREADS: usize = 8;
@@ -308,10 +321,33 @@ impl Default for VideoFetchConfig {
     }
 }
 
+/// Encoded media bytes and the source metadata needed to decode them with
+/// the same identity as the fused fetch path.
+#[derive(Debug, Clone)]
+pub struct RawMedia<S> {
+    pub bytes: Bytes,
+    pub source: S,
+}
+
+#[derive(Debug)]
+enum RawFetchSource {
+    Url(String),
+    DataUrl,
+    InlineBytes,
+    File(PathBuf),
+}
+
 #[derive(Debug, Clone)]
 pub enum MediaSource {
-    Url(String),
-    DataUrl(String),
+    /// A URL fetched over the network, shared with the request.
+    Url(Arc<String>),
+    /// A `data:` URL, shared with the request.
+    DataUrl(Arc<String>),
+    /// Base64 text with its media type, read in place as a data URL's payload.
+    Base64 {
+        media_type: String,
+        data: Arc<String>,
+    },
     InlineBytes(Vec<u8>),
     File(PathBuf),
 }
@@ -320,12 +356,60 @@ pub enum MediaSource {
 /// it per fetch so later parts of the same request can be compared against
 /// it for deduplication, while the task reads it in place; inline bytes
 /// become `Bytes` so the frame keeps them without a copy.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 pub(crate) enum FetchSource {
-    Url(String),
-    DataUrl(String),
+    Url(Arc<String>),
+    DataUrl(Arc<String>),
+    /// A base64 source: one payload with the data URL it stands for, so the
+    /// two forms compare, hash and measure alike.
+    Base64 {
+        media_type: String,
+        data: Arc<String>,
+    },
     InlineBytes(Bytes),
     File(PathBuf),
+}
+
+impl PartialEq for FetchSource {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Url(a), Self::Url(b)) | (Self::DataUrl(a), Self::DataUrl(b)) => a == b,
+            (Self::InlineBytes(a), Self::InlineBytes(b)) => a == b,
+            (Self::File(a), Self::File(b)) => a == b,
+            (
+                Self::Base64 {
+                    media_type: a_type,
+                    data: a_data,
+                },
+                Self::Base64 {
+                    media_type: b_type,
+                    data: b_data,
+                },
+            ) => a_type == b_type && a_data == b_data,
+            (Self::DataUrl(url), Self::Base64 { media_type, data })
+            | (Self::Base64 { media_type, data }, Self::DataUrl(url)) => {
+                base64_is_data_url(media_type, data, url)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The head of a data URL and the marker before its base64 payload.
+const DATA_URL_HEAD: &str = "data:";
+const DATA_URL_BASE64: &str = ";base64,";
+
+/// Whether the data URL `url` carries exactly `data` under `media_type`: the
+/// two forms of one payload.
+fn base64_is_data_url(media_type: &str, data: &str, url: &str) -> bool {
+    // A `,` in the media type would move the delimiter a data URL parser
+    // splits on: such a source is no twin of any data URL.
+    !media_type.contains(',')
+        && url
+            .strip_prefix(DATA_URL_HEAD)
+            .and_then(|rest| rest.strip_prefix(media_type))
+            .and_then(|rest| rest.strip_prefix(DATA_URL_BASE64))
+            .is_some_and(|payload| payload == data)
 }
 
 impl From<MediaSource> for FetchSource {
@@ -333,6 +417,7 @@ impl From<MediaSource> for FetchSource {
         match source {
             MediaSource::Url(url) => Self::Url(url),
             MediaSource::DataUrl(url) => Self::DataUrl(url),
+            MediaSource::Base64 { media_type, data } => Self::Base64 { media_type, data },
             MediaSource::InlineBytes(bytes) => Self::InlineBytes(Bytes::from(bytes)),
             MediaSource::File(path) => Self::File(path),
         }
@@ -340,30 +425,55 @@ impl From<MediaSource> for FetchSource {
 }
 
 impl FetchSource {
-    /// Which kind of source this is, as a small tag.
+    /// Which kind of source this is, as a small tag; a base64 source is the
+    /// data URL it stands for, unless its media type carries a `,`: that one
+    /// is no data URL's twin and keeps a kind of its own, so the fetch key
+    /// never puts the two in one bucket.
     pub(crate) fn kind(&self) -> u8 {
         match self {
             Self::Url(_) => 0,
-            Self::DataUrl(_) => 1,
+            Self::Base64 { media_type, .. } if media_type.contains(',') => 4,
+            Self::DataUrl(_) | Self::Base64 { .. } => 1,
             Self::InlineBytes(_) => 2,
             Self::File(_) => 3,
         }
     }
 
-    /// Length of the payload a part names (the URL, the data URL, the bytes,
-    /// or the path).
+    /// Length of the payload a part names (the URL, the data URL carried or
+    /// stood for, the bytes, or the path).
     pub(crate) fn len(&self) -> usize {
-        self.payload().len()
+        match self {
+            Self::Url(url) | Self::DataUrl(url) => url.len(),
+            Self::Base64 { media_type, data } => {
+                DATA_URL_HEAD.len() + media_type.len() + DATA_URL_BASE64.len() + data.len()
+            }
+            Self::InlineBytes(bytes) => bytes.len(),
+            Self::File(path) => path.as_os_str().len(),
+        }
     }
 
-    /// The payload a part names, as bytes: the URL, the data URL, the bytes,
-    /// or the path.
-    pub(crate) fn payload(&self) -> &[u8] {
+    /// The digest of the payload a part names, a base64 source digested as
+    /// its data URL without building it.
+    pub(crate) fn digest(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
         match self {
-            Self::Url(url) | Self::DataUrl(url) => url.as_bytes(),
-            Self::InlineBytes(bytes) => bytes,
-            Self::File(path) => path.as_os_str().as_encoded_bytes(),
+            Self::Url(url) | Self::DataUrl(url) => {
+                hasher.update(url.as_bytes());
+            }
+            Self::Base64 { media_type, data } => {
+                hasher.update(DATA_URL_HEAD.as_bytes());
+                hasher.update(media_type.as_bytes());
+                hasher.update(DATA_URL_BASE64.as_bytes());
+                hasher.update(data.as_bytes());
+            }
+            Self::InlineBytes(bytes) => {
+                hasher.update(bytes);
+            }
+            Self::File(path) => {
+                hasher.update(path.as_os_str().as_encoded_bytes());
+            }
         }
+        hasher.finalize().into()
     }
 }
 
@@ -413,6 +523,115 @@ impl MediaConnector {
         })
     }
 
+    /// Fetch encoded image bytes without parsing the image header or pixels.
+    pub async fn fetch_image_bytes(
+        &self,
+        source: MediaSource,
+    ) -> Result<RawMedia<ImageSource>, MediaConnectorError> {
+        let (bytes, source) = self
+            .fetch_raw_bytes(source, self.fetch_timeout, image_max_input_bytes(), "image")
+            .await?;
+        let source = match source {
+            RawFetchSource::Url(url) => ImageSource::Url { url },
+            RawFetchSource::DataUrl => ImageSource::DataUrl,
+            RawFetchSource::InlineBytes => ImageSource::InlineBytes,
+            RawFetchSource::File(path) => ImageSource::File { path },
+        };
+        Ok(RawMedia { bytes, source })
+    }
+
+    /// Fetch encoded video bytes without decoding or sampling its frames.
+    pub async fn fetch_video_bytes(
+        &self,
+        source: MediaSource,
+    ) -> Result<RawMedia<VideoSource>, MediaConnectorError> {
+        let (bytes, source) = self
+            .fetch_raw_bytes(
+                source,
+                self.video_fetch_timeout,
+                video_max_input_bytes(),
+                "video",
+            )
+            .await?;
+        let source = match source {
+            RawFetchSource::Url(url) => VideoSource::Url { url },
+            RawFetchSource::DataUrl => VideoSource::DataUrl,
+            RawFetchSource::InlineBytes => VideoSource::InlineBytes,
+            RawFetchSource::File(path) => VideoSource::File { path },
+        };
+        Ok(RawMedia { bytes, source })
+    }
+
+    /// Fetch encoded audio bytes without decoding its samples.
+    pub async fn fetch_audio_bytes(
+        &self,
+        source: MediaSource,
+    ) -> Result<RawMedia<AudioSource>, MediaConnectorError> {
+        let (bytes, source) = self
+            .fetch_raw_bytes(source, self.fetch_timeout, audio_max_input_bytes(), "audio")
+            .await?;
+        let source = match source {
+            RawFetchSource::Url(url) => AudioSource::Url { url },
+            RawFetchSource::DataUrl => AudioSource::DataUrl,
+            RawFetchSource::InlineBytes => AudioSource::InlineBytes,
+            RawFetchSource::File(path) => AudioSource::File { path },
+        };
+        Ok(RawMedia { bytes, source })
+    }
+
+    /// The canonical form of a local media path. Refused when no local root is
+    /// configured or the path resolves outside it.
+    async fn allowed_local_path(&self, path: &Path) -> Result<PathBuf, MediaConnectorError> {
+        let allowed_root = self
+            .allowed_local_media_path
+            .as_ref()
+            .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
+        let canonical = fs::canonicalize(path)
+            .await
+            .map_err(MediaConnectorError::Io)?;
+        if !canonical.starts_with(allowed_root) {
+            return Err(MediaConnectorError::DisallowedLocalPath(
+                path.display().to_string(),
+            ));
+        }
+        Ok(canonical)
+    }
+
+    async fn fetch_raw_bytes(
+        &self,
+        source: MediaSource,
+        budget: Duration,
+        limit: usize,
+        media: &'static str,
+    ) -> Result<(Bytes, RawFetchSource), MediaConnectorError> {
+        match source {
+            MediaSource::Url(url) => {
+                let parsed = Url::parse(url.as_str())
+                    .map_err(|_| MediaConnectorError::InvalidUrl(url.to_string()))?;
+                let bytes = self.fetch_http_bytes(&parsed, budget, limit, media).await?;
+                Ok((bytes, RawFetchSource::Url(parsed.to_string())))
+            }
+            MediaSource::DataUrl(data_url) => {
+                let bytes =
+                    decode_base64_with_limit(data_url_payload(&data_url)?.trim(), limit, media)?;
+                Ok((bytes.into(), RawFetchSource::DataUrl))
+            }
+            MediaSource::Base64 { data, .. } => {
+                let bytes = decode_base64_with_limit(data.trim(), limit, media)?;
+                Ok((bytes.into(), RawFetchSource::DataUrl))
+            }
+            MediaSource::InlineBytes(bytes) => {
+                ensure_input_byte_limit(bytes.len(), limit, media)?;
+                Ok((bytes.into(), RawFetchSource::InlineBytes))
+            }
+            MediaSource::File(path) => {
+                let canonical = self.allowed_local_path(&path).await?;
+                let bytes = read_file_with_limit(&canonical, limit, media).await?;
+                Ok((bytes, RawFetchSource::File(canonical)))
+            }
+        }
+    }
+
     pub async fn fetch_image(
         &self,
         source: MediaSource,
@@ -429,6 +648,7 @@ impl MediaConnector {
         match source {
             FetchSource::Url(url) => self.fetch_http_image(url, cfg).await,
             FetchSource::DataUrl(data_url) => Self::fetch_data_url(data_url, cfg),
+            FetchSource::Base64 { data, .. } => Self::fetch_base64(data, cfg),
             FetchSource::InlineBytes(bytes) => Self::decode_image(
                 bytes.clone(),
                 cfg.detail,
@@ -456,6 +676,7 @@ impl MediaConnector {
         match source {
             FetchSource::Url(url) => self.fetch_http_video(url, cfg).await,
             FetchSource::DataUrl(data_url) => self.fetch_video_data_url(data_url, cfg).await,
+            FetchSource::Base64 { data, .. } => self.fetch_video_base64(data, cfg).await,
             FetchSource::InlineBytes(bytes) => {
                 self.decode_video(bytes.clone(), cfg, VideoSource::InlineBytes)
                     .await
@@ -478,6 +699,7 @@ impl MediaConnector {
         match source {
             FetchSource::Url(url) => self.fetch_http_audio(url).await,
             FetchSource::DataUrl(data_url) => self.fetch_audio_data_url(data_url).await,
+            FetchSource::Base64 { data, .. } => self.fetch_audio_base64(data).await,
             FetchSource::InlineBytes(bytes) => {
                 self.decode_audio(bytes.clone(), AudioSource::InlineBytes)
                     .await
@@ -517,18 +739,17 @@ impl MediaConnector {
         data_url: &str,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        let (metadata, data) = data_url
-            .split_once(',')
-            .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
+        Self::fetch_base64(data_url_payload(data_url)?, cfg)
+    }
 
-        if !metadata.ends_with(";base64") {
-            return Err(MediaConnectorError::DataUrl(
-                "only base64 encoded data URLs are supported".into(),
-            ));
-        }
-
-        let data = data.trim();
-        let decoded = decode_base64_with_limit(data, image_max_input_bytes(), "image")?;
+    /// An image from its base64 text, a data URL's payload or a base64
+    /// source: one bounded decode for both forms.
+    fn fetch_base64(
+        data: &str,
+        cfg: ImageFetchConfig,
+    ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
+        let decoded =
+            decode_base64_with_limit(base64_payload(data)?, image_max_input_bytes(), "image")?;
         Self::decode_image(
             decoded.into(),
             cfg.detail,
@@ -543,18 +764,17 @@ impl MediaConnector {
         data_url: &str,
         cfg: VideoFetchConfig,
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
-        let (metadata, data) = data_url
-            .split_once(',')
-            .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
+        self.fetch_video_base64(data_url_payload(data_url)?, cfg)
+            .await
+    }
 
-        if !metadata.ends_with(";base64") {
-            return Err(MediaConnectorError::DataUrl(
-                "only base64 encoded data URLs are supported".into(),
-            ));
-        }
-
-        let data = data.trim();
-        let decoded = decode_base64_with_limit(data, video_max_input_bytes(), "video")?;
+    async fn fetch_video_base64(
+        &self,
+        data: &str,
+        cfg: VideoFetchConfig,
+    ) -> Result<Arc<VideoClip>, MediaConnectorError> {
+        let decoded =
+            decode_base64_with_limit(base64_payload(data)?, video_max_input_bytes(), "video")?;
         self.decode_video(decoded.into(), cfg, VideoSource::DataUrl)
             .await
     }
@@ -563,18 +783,12 @@ impl MediaConnector {
         &self,
         data_url: &str,
     ) -> Result<Arc<AudioClip>, MediaConnectorError> {
-        let (metadata, data) = data_url
-            .split_once(',')
-            .ok_or_else(|| MediaConnectorError::DataUrl("missing comma in data url".into()))?;
+        self.fetch_audio_base64(data_url_payload(data_url)?).await
+    }
 
-        if !metadata.ends_with(";base64") {
-            return Err(MediaConnectorError::DataUrl(
-                "only base64 encoded data URLs are supported".into(),
-            ));
-        }
-
-        let data = data.trim();
-        let decoded = decode_base64_with_limit(data, audio_max_input_bytes(), "audio")?;
+    async fn fetch_audio_base64(&self, data: &str) -> Result<Arc<AudioClip>, MediaConnectorError> {
+        let decoded =
+            decode_base64_with_limit(base64_payload(data)?, audio_max_input_bytes(), "audio")?;
         self.decode_audio(decoded.into(), AudioSource::DataUrl)
             .await
     }
@@ -584,20 +798,7 @@ impl MediaConnector {
         path: &Path,
         cfg: ImageFetchConfig,
     ) -> Result<Arc<ImageFrame>, MediaConnectorError> {
-        let allowed_root = self
-            .allowed_local_media_path
-            .as_ref()
-            .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
-
-        let canonical = fs::canonicalize(path)
-            .await
-            .map_err(MediaConnectorError::Io)?;
-        if !canonical.starts_with(allowed_root) {
-            return Err(MediaConnectorError::DisallowedLocalPath(
-                path.display().to_string(),
-            ));
-        }
-
+        let canonical = self.allowed_local_path(path).await?;
         let bytes = read_file_with_limit(&canonical, image_max_input_bytes(), "image").await?;
         Self::decode_image(
             bytes,
@@ -660,13 +861,13 @@ impl MediaConnector {
     /// in either phase (before the headers, or while the body arrives) is
     /// reported as the timeout it is, with the URL and the budget.
     ///
-    /// Every hop is admitted under the host policy before it is connected:
-    /// the URL the request named and each redirect target, by name against
-    /// the allow-list and by address against the address policy, with the
-    /// checked addresses pinned for the client's resolver while the hop
-    /// connects. A redirect the policy refuses is reported with its target;
-    /// the chain is followed at most [`MAX_REDIRECTS`] times, under the one
-    /// budget.
+    /// Every hop is held to the connector's scheme rule and admitted under
+    /// the host policy before it is connected: the URL the request named and
+    /// each redirect target, by name against the allow-list and by address
+    /// against the address policy, with the checked addresses pinned for the
+    /// client's resolver while the hop connects. A redirect the policy
+    /// refuses is reported with its target; the chain is followed at most
+    /// [`MAX_REDIRECTS`] times, under the one budget.
     async fn fetch_http_bytes(
         &self,
         url: &Url,
@@ -674,6 +875,14 @@ impl MediaConnector {
         limit: usize,
         media: &'static str,
     ) -> Result<Bytes, MediaConnectorError> {
+        // The scheme rule before any client is built for the URL: a scheme
+        // the connector does not fetch is refused in its own words, as a
+        // redirect to one is, not in the client library's.
+        if !fetched_scheme(url.scheme()) {
+            return Err(MediaConnectorError::UnsupportedScheme(
+                url.scheme().to_string(),
+            ));
+        }
         let started = Instant::now();
         let timed_out = || MediaConnectorError::Timeout {
             url: url.to_string(),
@@ -754,46 +963,20 @@ impl MediaConnector {
         path: &Path,
         cfg: VideoFetchConfig,
     ) -> Result<Arc<VideoClip>, MediaConnectorError> {
-        let allowed_root = self
-            .allowed_local_media_path
-            .as_ref()
-            .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
-
-        let canonical = fs::canonicalize(path)
-            .await
-            .map_err(MediaConnectorError::Io)?;
-        if !canonical.starts_with(allowed_root) {
-            return Err(MediaConnectorError::DisallowedLocalPath(
-                path.display().to_string(),
-            ));
-        }
-
+        let canonical = self.allowed_local_path(path).await?;
         let bytes = read_file_with_limit(&canonical, video_max_input_bytes(), "video").await?;
         self.decode_video(bytes, cfg, VideoSource::File { path: canonical })
             .await
     }
 
     async fn fetch_audio_file(&self, path: &Path) -> Result<Arc<AudioClip>, MediaConnectorError> {
-        let allowed_root = self
-            .allowed_local_media_path
-            .as_ref()
-            .ok_or_else(|| MediaConnectorError::DisallowedLocalPath(path.display().to_string()))?;
-
-        let canonical = fs::canonicalize(path)
-            .await
-            .map_err(MediaConnectorError::Io)?;
-        if !canonical.starts_with(allowed_root) {
-            return Err(MediaConnectorError::DisallowedLocalPath(
-                path.display().to_string(),
-            ));
-        }
-
+        let canonical = self.allowed_local_path(path).await?;
         let bytes = read_file_with_limit(&canonical, audio_max_input_bytes(), "audio").await?;
         self.decode_audio(bytes, AudioSource::File { path: canonical })
             .await
     }
 
-    fn decode_image(
+    pub fn decode_image(
         bytes: Bytes,
         detail: ImageDetail,
         max_long_side_pixel: Option<u32>,
@@ -805,31 +988,31 @@ impl MediaConnector {
         // The cap and the transparency policy change the decoded pixels, so
         // both are part of the identity the pixel cache and the backend's mm
         // cache key off.
-        let hash =
-            crate::hasher::hash_image_with_transparency(&bytes, max_long_side_pixel, transparency);
+        let hash = hash_image_with_transparency(&bytes, max_long_side_pixel, transparency);
         // The header is enough to plan the request by; the pixels are decoded
         // when preprocessing first asks for them, which a pixel-cache hit
         // never does.
-        let size = encoded_image_size(&bytes, max_long_side_pixel)?;
+        let (size, orientation) = encoded_image_size(&bytes, max_long_side_pixel)?;
 
         Ok(Arc::new(
             ImageFrame::encoded(bytes, detail, source, hash, size, max_long_side_pixel)
-                .with_transparency(transparency),
+                .with_transparency(transparency)
+                .with_header_orientation(Some(orientation)),
         ))
     }
 
-    async fn decode_audio(
+    pub async fn decode_audio(
         &self,
         bytes: Bytes,
         source: AudioSource,
     ) -> Result<Arc<AudioClip>, MediaConnectorError> {
         ensure_input_byte_limit(bytes.len(), audio_max_input_bytes(), "audio")?;
-        let hash = crate::hasher::hash_audio(&bytes);
+        let hash = hash_audio(&bytes);
         let decoded = decode_audio_mono_f32(bytes.clone()).await?;
         Ok(Arc::new(AudioClip::new(bytes, decoded, source, hash)))
     }
 
-    async fn decode_video(
+    pub async fn decode_video(
         &self,
         bytes: Bytes,
         cfg: VideoFetchConfig,
@@ -860,7 +1043,7 @@ impl MediaConnector {
 
         // The sampling rate and the per-frame cap both change the decoded
         // frames, so they belong in the identity the caches key off.
-        let hash = crate::hasher::hash_video_with_sampling(
+        let hash = hash_video_with_sampling(
             &bytes,
             cfg.sample_fps,
             cfg.max_long_side_pixel,
@@ -929,9 +1112,9 @@ fn redirect_target(response: &reqwest::Response) -> Option<Result<Url, RefusedRe
             reason: "the redirect location is not a URL".to_string(),
         }));
     };
-    if !matches!(target.scheme(), "http" | "https") {
+    if !fetched_scheme(target.scheme()) {
         return Some(Err(RefusedRedirect {
-            reason: format!("unsupported media scheme: {}", target.scheme()),
+            reason: MediaConnectorError::UnsupportedScheme(target.scheme().to_string()).to_string(),
             target: target.to_string(),
         }));
     }
@@ -1013,6 +1196,12 @@ async fn collect_http_body_with_limit(
         body.extend_from_slice(&chunk);
     }
     Ok(body.freeze())
+}
+
+/// Whether the connector fetches URLs of `scheme`: the request's own URL and
+/// every redirect target are held to the same two.
+fn fetched_scheme(scheme: &str) -> bool {
+    matches!(scheme, "http" | "https")
 }
 
 fn checked_payload_length(
@@ -1113,25 +1302,14 @@ async fn decode_video_frames(
                 })
                 .await
                 .map_err(MediaConnectorError::Blocking)?;
-                match result {
-                    Ok(frames) => Ok(frames),
-                    Err(error) => {
-                        if log_video_decode_timing_enabled() {
-                            info!(
-                                error = %error,
-                                "smg_mm_timing video_decode_opencv_buffer_fallback"
-                            );
-                        }
-                        decode_video_bytes_with_tempfile(bytes, cfg)
-                            .await
-                            .map_err(|fallback_error| {
-                                let message = format!(
-                                    "buffered OpenCV decode failed: {error}; tempfile OpenCV fallback failed: {fallback_error}"
-                                );
-                                fallback_failed(error, fallback_error, message)
-                            })
-                    }
-                }
+                opencv_frames_or_fallback(
+                    result,
+                    "smg_mm_timing video_decode_opencv_buffer_fallback",
+                    "buffered OpenCV decode",
+                    "tempfile OpenCV fallback",
+                    decode_video_bytes_with_tempfile(bytes, cfg),
+                )
+                .await
             }
             #[cfg(not(feature = "opencv-video"))]
             {
@@ -1152,25 +1330,14 @@ async fn decode_video_frames(
                 })
                 .await
                 .map_err(MediaConnectorError::Blocking)?;
-                match opencv_result {
-                    Ok(frames) => Ok(frames),
-                    Err(opencv_error) => {
-                        if log_video_decode_timing_enabled() {
-                            info!(
-                                error = %opencv_error,
-                                "smg_mm_timing video_decode_auto_opencv_fallback"
-                            );
-                        }
-                        decode_video_bytes_with_tempfile(bytes, cfg)
-                            .await
-                            .map_err(|fallback_error| {
-                                let message = format!(
-                                    "buffered OpenCV decode failed: {opencv_error}; tempfile fallback failed: {fallback_error}"
-                                );
-                                fallback_failed(opencv_error, fallback_error, message)
-                            })
-                    }
-                }
+                opencv_frames_or_fallback(
+                    opencv_result,
+                    "smg_mm_timing video_decode_auto_opencv_fallback",
+                    "buffered OpenCV decode",
+                    "tempfile fallback",
+                    decode_video_bytes_with_tempfile(bytes, cfg),
+                )
+                .await
             }
             #[cfg(not(feature = "opencv-video"))]
             {
@@ -1193,6 +1360,32 @@ async fn decode_video_bytes_with_tempfile(
             .map_err(MediaConnectorError::Blocking)??
     };
     decode_video_frames_from_path(input_file.path(), input_bytes, cfg).await
+}
+
+/// An OpenCV loader's frames, or `fallback`'s where the loader failed. A
+/// reservation the loader was refused ([`is_out_of_memory`]) starts no
+/// fallback: a second decode would ask a process just refused memory for the
+/// clip again, and its verdict would stand over this process's own.
+#[cfg(any(feature = "opencv-video", test))]
+async fn opencv_frames_or_fallback(
+    loaded: Result<DecodedVideoFrames, MediaConnectorError>,
+    event: &'static str,
+    first: &'static str,
+    second: &'static str,
+    fallback: impl std::future::Future<Output = Result<DecodedVideoFrames, MediaConnectorError>>,
+) -> Result<DecodedVideoFrames, MediaConnectorError> {
+    let error = match loaded {
+        Ok(frames) => return Ok(frames),
+        Err(error) if is_out_of_memory(&error) => return Err(error),
+        Err(error) => error,
+    };
+    if log_video_decode_timing_enabled() {
+        info!(error = %error, "{event}");
+    }
+    fallback.await.map_err(|fallback_error| {
+        let message = format!("{first} failed: {error}; {second} failed: {fallback_error}");
+        fallback_failed(error, fallback_error, message)
+    })
 }
 
 /// The error of a video decode whose fallback failed too, with both
@@ -1269,27 +1462,14 @@ async fn decode_video_frames_from_path(
                 .await
                 .map_err(MediaConnectorError::Blocking)?;
 
-                match opencv_result {
-                    Ok(frames) => Ok(frames),
-                    Err(opencv_error) => {
-                        if log_video_decode_timing_enabled() {
-                            info!(
-                                error = %opencv_error,
-                                "smg_mm_timing video_decode_auto_opencv_fallback"
-                            );
-                        }
-
-                        match decode_video_with_ffmpeg(input_path, input_bytes, cfg).await {
-                            Ok(frames) => Ok(frames),
-                            Err(ffmpeg_error) => {
-                                let message = format!(
-                                    "OpenCV decode failed: {opencv_error}; ffmpeg fallback failed: {ffmpeg_error}"
-                                );
-                                Err(fallback_failed(opencv_error, ffmpeg_error, message))
-                            }
-                        }
-                    }
-                }
+                opencv_frames_or_fallback(
+                    opencv_result,
+                    "smg_mm_timing video_decode_auto_opencv_fallback",
+                    "OpenCV decode",
+                    "ffmpeg fallback",
+                    decode_video_with_ffmpeg(input_path, input_bytes, cfg),
+                )
+                .await
             }
 
             #[cfg(not(feature = "opencv-video"))]
@@ -1338,6 +1518,74 @@ fn decode_video_with_opencv_bytes_logged(
         }
     }
     result
+}
+
+/// What keeps this process from decoding video, if anything, probed once:
+/// without the `opencv-video` feature a clip is decoded by the `ffmpeg`
+/// executable on PATH (`ffprobe` is optional: the metadata and duration
+/// probes fall back to `ffmpeg`), and `SMG_VIDEO_DECODE_BACKEND` may name a
+/// backend this build does not have. `None` when video decodes here. A
+/// gateway reads it at start-up (one log line) and refuses a video part up
+/// front, the request's own answer, instead of failing the request's decode
+/// with a server error on every clip; a worker-side pipeline reads it the
+/// same way. The binaries on PATH do not change underneath a process.
+pub fn missing_video_decoder() -> Option<&'static str> {
+    VIDEO_DECODER_GAP
+        .get_or_init(|| probe_video_decoder_gap(executable_starts))
+        .as_deref()
+}
+
+/// The probe behind [`missing_video_decoder`], with the "does this program
+/// start" question injected so a test can answer it without a PATH.
+fn probe_video_decoder_gap(starts: impl Fn(&str) -> std::io::Result<()>) -> Option<String> {
+    match video_decode_backend_override() {
+        Some("opencv") => {
+            if cfg!(feature = "opencv-video") {
+                return None;
+            }
+            return Some(
+                "SMG_VIDEO_DECODE_BACKEND=opencv requires the opencv-video feature".to_string(),
+            );
+        }
+        Some("ffmpeg") => {}
+        Some(backend) => {
+            return Some(format!(
+                "unsupported SMG_VIDEO_DECODE_BACKEND={backend}; expected auto, opencv, or ffmpeg"
+            ));
+        }
+        None => {
+            if cfg!(feature = "opencv-video") {
+                return None;
+            }
+        }
+    }
+    // ffmpeg alone decodes a clip; ffprobe is never required.
+    match starts("ffmpeg") {
+        Ok(()) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(
+            "ffmpeg executable not found; install ffmpeg to decode video_url inputs".to_string(),
+        ),
+        Err(e) => Some(format!("ffmpeg could not be started: {e}")),
+    }
+}
+
+/// Whether `program -version` starts from PATH and exits successfully (a
+/// blocking probe, run once at start-up); the error says why not, split as
+/// the decode path's own spawn is: `NotFound` apart from a binary that is
+/// there but cannot run, a non-zero exit (a missing shared library, for
+/// one) among the latter.
+fn executable_starts(program: &str) -> std::io::Result<()> {
+    let status = std::process::Command::new(program)
+        .arg("-version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!("exited with {status}")))
+    }
 }
 
 fn video_decode_backend_override() -> Option<&'static str> {
@@ -1452,7 +1700,7 @@ impl OpenCvCaptureOwner for videoio::VideoCapture {
 }
 
 #[cfg(feature = "opencv-video")]
-impl OpenCvCaptureOwner for crate::opencv_buffer::BufferedCapture {
+impl OpenCvCaptureOwner for BufferedCapture {
     fn capture_mut(&mut self) -> &mut videoio::VideoCapture {
         self.capture_mut()
     }
@@ -1511,7 +1759,7 @@ where
     let mut rgb_output = None;
     let mut frames = Vec::new();
     frames.try_reserve(frame_indices.len()).map_err(|e| {
-        MediaConnectorError::VideoDecode(format!(
+        out_of_memory(format!(
             "failed to reserve {} decoded video frame records: {e}",
             frame_indices.len()
         ))
@@ -1580,10 +1828,7 @@ where
                 )
             })?;
             ensure_decoded_byte_limit(decoded_bytes)?;
-            rgb_output = Some(
-                crate::opencv_buffer::RgbOutputBuffer::with_capacity(decoded_bytes)
-                    .map_err(MediaConnectorError::VideoDecode)?,
-            );
+            rgb_output = Some(RgbOutputBuffer::with_capacity(decoded_bytes)?);
         }
         let output = rgb_output.as_mut().ok_or_else(|| {
             MediaConnectorError::VideoDecode("missing OpenCV RGB output buffer".to_string())
@@ -1595,9 +1840,7 @@ where
             )
         })?;
         ensure_decoded_byte_limit(new_len)?;
-        let (offset, len) = output
-            .push_bgr(&bgr_frame, decoded_width, decoded_height)
-            .map_err(MediaConnectorError::VideoDecode)?;
+        let (offset, len) = output.push_bgr(&bgr_frame, decoded_width, decoded_height)?;
         let frame = DecodedRgbFrame {
             width: decoded_width,
             height: decoded_height,
@@ -1650,8 +1893,8 @@ where
 fn open_opencv_video_capture_from_buffer(
     bytes: Bytes,
     decoder_threads: i32,
-) -> Result<crate::opencv_buffer::BufferedCapture, MediaConnectorError> {
-    crate::opencv_buffer::open_capture(bytes, decoder_threads).map_err(|error| {
+) -> Result<BufferedCapture, MediaConnectorError> {
+    open_capture(bytes, decoder_threads).map_err(|error| {
         MediaConnectorError::VideoDecode(format!("OpenCV could not open video buffer: {error}"))
     })
 }
@@ -2548,8 +2791,9 @@ async fn decode_video_with_ffmpeg(
     // ends right after its last pick, so a seek that lands elsewhere costs
     // its own segment and comes back short at once. The sequential decode
     // answers that, and anything else that goes wrong with the seeks, but a
-    // run past the process budget: the plan is at most half the sequential
-    // decode's work, so that would run past it as well. A probe that states
+    // run past the process budget (the plan is at most half the sequential
+    // decode's work, so that would run past it as well) and a run refused
+    // its memory, which ends the decode by rule. A probe that states
     // no size (ffprobe's `0x0` for a stream whose codec parameters it could
     // not find) frames nothing for the seek runner, as for the headed and
     // raw ones: such a clip takes the sequential route, where the runner
@@ -2597,6 +2841,9 @@ async fn decode_video_with_ffmpeg(
                         probed,
                         plan.decoded_frames(),
                     ));
+                }
+                if is_out_of_memory(&error) {
+                    return Err(error);
                 }
             }
         }
@@ -2664,6 +2911,9 @@ async fn decode_video_with_ffmpeg(
                 {
                     Ok(decoded) => return Ok(decoded),
                     Err(error) => {
+                        if is_out_of_memory(&error) {
+                            return Err(error);
+                        }
                         if log_video_decode_timing_enabled() {
                             info!(
                                 error = %error,
@@ -3144,7 +3394,8 @@ const VIDEO_MAX_DECODE_PIXELS_KNOB: &str = "SMG_VIDEO_MAX_DECODE_PIXELS";
 /// refusals: the bytes it would decode to, the frame list its picks need) or
 /// its work (named in the decoder's message), or ended for its time: a budget
 /// no other runner over the same stream, and no resampling of it, can answer,
-/// so it ends the decode instead of starting the next runner.
+/// so it ends the decode instead of starting the next runner. So does a
+/// command refused its memory ([`is_out_of_memory`]), by rule.
 fn is_video_budget_error(error: &MediaConnectorError) -> bool {
     is_video_command_timeout(error)
         || matches!(
@@ -3153,6 +3404,28 @@ fn is_video_budget_error(error: &MediaConnectorError) -> bool {
                 | MediaConnectorError::FrameListTooLong { .. }
         )
         || matches!(error, MediaConnectorError::VideoDecode(message) if message.contains(VIDEO_MAX_DECODE_PIXELS_KNOB))
+        || is_out_of_memory(error)
+}
+
+/// `true` for a decode that was refused memory: one of its reservations
+/// ([`out_of_memory`]), or a pipe the system could not serve. Where the error
+/// of a frame runner decides a fallback, this one ends the decode by rule: no
+/// next runner, no sequential pass after the seeks, no resampling after a
+/// resized selection, no fallback after the OpenCV loader. The probes handle
+/// their own errors. It reads the kind, which is what
+/// [`MediaConnectorError::fallback_failed`] keeps of such an error.
+fn is_out_of_memory(error: &MediaConnectorError) -> bool {
+    matches!(error, MediaConnectorError::DecodeIo(io) if io.kind() == std::io::ErrorKind::OutOfMemory)
+}
+
+/// The error of a reservation the allocator refused, which is this process's:
+/// a command's output, the joined output of the seek runs, the raw runner's
+/// frame records, the OpenCV loader's output and frame records.
+pub(crate) fn out_of_memory(message: String) -> MediaConnectorError {
+    MediaConnectorError::DecodeIo(std::io::Error::new(
+        std::io::ErrorKind::OutOfMemory,
+        message,
+    ))
 }
 
 /// Runs a decoder command to completion under the video process timeout. A
@@ -3160,16 +3433,45 @@ fn is_video_budget_error(error: &MediaConnectorError) -> bool {
 /// process's ([`MediaConnectorError::DecoderUnavailable`]), reported in the
 /// operator's terms, and so is the command's own I/O (a pipe that breaks:
 /// [`MediaConnectorError::DecodeIo`]); only what the decoder says about the
-/// clip is the media's.
+/// clip is the media's. `stdout_bytes` is the size the caller expects on
+/// stdout (0: not known): the output is read into memory reserved once at
+/// that size, so what arrived is not moved each time a growing buffer fills.
+/// A reservation the allocator refuses is this process's and ends the decode
+/// ([`is_out_of_memory`]). `stdout_limit` is the most the caller can use: a
+/// command that writes more is ended there, refused as a decode over the
+/// decoded byte limit when its output passed that as well. Of its
+/// diagnostics the first [`VIDEO_COMMAND_TEXT_BYTES`] are kept.
 async fn run_video_command_output(
     mut command: Command,
     program: &'static str,
+    stdout_bytes: usize,
+    stdout_limit: usize,
 ) -> Result<Output, MediaConnectorError> {
+    async fn read_pipe(
+        pipe: &mut Option<impl AsyncReadExt + Unpin>,
+        bytes: &mut Vec<u8>,
+        limit: usize,
+    ) -> Result<(), MediaConnectorError> {
+        if let Some(pipe) = pipe {
+            pipe.take(u64::try_from(limit).unwrap_or(u64::MAX))
+                .read_to_end(bytes)
+                .await
+                .map_err(MediaConnectorError::DecodeIo)?;
+        }
+        Ok(())
+    }
+
+    let mut stdout = Vec::new();
+    stdout.try_reserve_exact(stdout_bytes).map_err(|e| {
+        out_of_memory(format!(
+            "failed to reserve {stdout_bytes} bytes for the {program} output: {e}"
+        ))
+    })?;
     command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    let child = command.spawn().map_err(|e| {
+    let mut child = command.spawn().map_err(|e| {
         let message = if e.kind() == std::io::ErrorKind::NotFound {
             format!("{program} executable not found; install {program} to decode video_url inputs")
         } else {
@@ -3178,15 +3480,77 @@ async fn run_video_command_output(
         MediaConnectorError::DecoderUnavailable(std::io::Error::new(e.kind(), message))
     })?;
 
+    // Both pipes are read beside the wait and dropped after it, as
+    // `Child::wait_with_output` does.
+    let (mut stdout_pipe, mut stderr_pipe) = (child.stdout.take(), child.stderr.take());
+    let mut stderr = Vec::new();
+    let run = futures::future::try_join3(
+        async { child.wait().await.map_err(MediaConnectorError::DecodeIo) },
+        async {
+            // One byte past the limit tells a longer output, and ends the run.
+            read_pipe(
+                &mut stdout_pipe,
+                &mut stdout,
+                stdout_limit.saturating_add(1),
+            )
+            .await?;
+            if stdout.len() > stdout_limit {
+                ensure_decoded_byte_limit(stdout.len())?;
+                return Err(MediaConnectorError::VideoDecode(format!(
+                    "{program} wrote more than the {stdout_limit} bytes its caller reads"
+                )));
+            }
+            Ok(())
+        },
+        async {
+            read_pipe(&mut stderr_pipe, &mut stderr, VIDEO_COMMAND_TEXT_BYTES).await?;
+            match &mut stderr_pipe {
+                // A text that fills what is kept may go on: the rest is read
+                // and dropped, as a full pipe nobody reads holds the command
+                // until the timeout.
+                Some(rest) if stderr.len() >= VIDEO_COMMAND_TEXT_BYTES => {
+                    tokio::io::copy(rest, &mut tokio::io::sink())
+                        .await
+                        .map(|_| ())
+                        .map_err(MediaConnectorError::DecodeIo)
+                }
+                _ => Ok(()),
+            }
+        },
+    );
     let timeout = video_process_timeout();
-    match time::timeout(timeout, child.wait_with_output()).await {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(error)) => Err(MediaConnectorError::DecodeIo(error)),
+    let ended = time::timeout(timeout, run).await;
+    match ended {
+        Ok(Ok((status, (), ()))) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        Ok(Err(error)) => Err(error),
         Err(_) => Err(MediaConnectorError::VideoDecode(format!(
             "{program} {VIDEO_COMMAND_TIMED_OUT} {:.3} seconds",
             timeout.as_secs_f64()
         ))),
     }
+}
+
+/// [`run_video_command_output`] for a command whose exit status is the
+/// decoder's verdict on the clip: a failure is the media's
+/// ([`MediaConnectorError::VideoDecode`]), with the decoder's stderr.
+async fn run_video_command_checked(
+    command: Command,
+    program: &'static str,
+    stdout_bytes: usize,
+    stdout_limit: usize,
+) -> Result<Output, MediaConnectorError> {
+    let output = run_video_command_output(command, program, stdout_bytes, stdout_limit).await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(MediaConnectorError::VideoDecode(format!(
+            "{program} failed: {stderr}"
+        )));
+    }
+    Ok(output)
 }
 
 async fn decode_video_with_ffmpeg_ppm(
@@ -3197,23 +3561,22 @@ async fn decode_video_with_ffmpeg_ppm(
 ) -> Result<DecodedRgbVideo, MediaConnectorError> {
     let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await?;
     let frame_size = rawvideo_frame_size(metadata.width, metadata.height)?;
-    let target_frames = selection.map_or_else(
-        || expected_sampled_frame_count(metadata, cfg),
-        FrameSelection::unique_count,
-    );
+    let counted = selection
+        .map(FrameSelection::unique_count)
+        .or_else(|| expected_sampled_frame_count(metadata, cfg));
+    let target_frames = counted.unwrap_or(cfg.max_frames);
     let decoded_bytes = checked_decoded_rgb_bytes(target_frames, frame_size)?;
     let output_limit = decoded_bytes
         .checked_add(target_frames.saturating_mul(64))
         .unwrap_or_else(video_max_decoded_bytes)
-        .min(video_max_decoded_bytes())
-        .to_string();
+        .min(video_max_decoded_bytes());
     let active_decode = ActiveVideoDecode::enter_async().await;
     let mut command = ffmpeg_decode_command(decoder_threads(active_decode.count()), true);
     command.arg(input_path);
     frame_args.apply(&mut command);
     command.args([
         "-fs",
-        &output_limit,
+        &output_limit.to_string(),
         "-f",
         "image2pipe",
         "-vcodec",
@@ -3222,14 +3585,30 @@ async fn decode_video_with_ffmpeg_ppm(
         "rgb24",
         "pipe:1",
     ]);
-    let output = run_video_command_output(command, "ffmpeg").await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "ffmpeg failed: {stderr}"
-        )));
-    }
+    // A count that is only the frame ceiling states no size, so that a few
+    // frames do not reserve the ceiling. Without a selection the decoder's
+    // frame count is that ceiling, and it ends at the output limit only after
+    // the frame that reaches it: below the ceiling, one frame past the limit
+    // can arrive.
+    let past_limit = if selection.is_none() && target_frames < cfg.max_frames {
+        frame_size.saturating_add(64)
+    } else {
+        0
+    };
+    let stdout_bytes = counted.map_or(0, |_| {
+        output_limit
+            .saturating_add(past_limit)
+            .min(video_max_decoded_bytes())
+    });
+    // Past the decoded byte limit and the frames' headers, the frames
+    // parsed below pass the limit: the run ends there with that refusal. A
+    // frame is three bytes at least, which bounds the headers.
+    let headers = target_frames
+        .max(cfg.max_frames)
+        .min(video_max_decoded_bytes() / 3)
+        .saturating_mul(64);
+    let stdout_limit = video_max_decoded_bytes().saturating_add(headers);
+    let output = run_video_command_checked(command, "ffmpeg", stdout_bytes, stdout_limit).await?;
 
     let mut video = parse_ppm_rgb_video(Bytes::from(output.stdout))?;
     if let Some(frame) = video.frames.first() {
@@ -3258,10 +3637,10 @@ async fn decode_video_with_ffmpeg_raw(
 ) -> Result<DecodedRgbVideo, MediaConnectorError> {
     let frame_args = FfmpegFrameArgs::for_metadata(selection, metadata, cfg).await?;
     let frame_size = rawvideo_frame_size(metadata.width, metadata.height)?;
-    let target_frames = selection.map_or_else(
-        || expected_sampled_frame_count(metadata, cfg),
-        FrameSelection::unique_count,
-    );
+    let counted = selection
+        .map(FrameSelection::unique_count)
+        .or_else(|| expected_sampled_frame_count(metadata, cfg));
+    let target_frames = counted.unwrap_or(cfg.max_frames);
     let decoded_bytes = checked_decoded_rgb_bytes(target_frames, frame_size)?;
     let output_limit = decoded_bytes.to_string();
     // Rawvideo has no per-frame header, so stdout is framed by the metadata's
@@ -3285,20 +3664,18 @@ async fn decode_video_with_ffmpeg_raw(
         "rgb24",
         "pipe:1",
     ]);
-    let output = run_video_command_output(command, "ffmpeg").await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "ffmpeg failed: {stderr}"
-        )));
-    }
+    // Headerless output ends at its limit, which is its size: nothing passes it.
+    let stdout_bytes = counted.map_or(0, |_| decoded_bytes);
+    // Past the decoded byte limit and one frame, the frames counted below
+    // pass the limit.
+    let stdout_limit = video_max_decoded_bytes().saturating_add(frame_size);
+    let output = run_video_command_checked(command, "ffmpeg", stdout_bytes, stdout_limit).await?;
 
     let frame_count = output.stdout.len() / frame_size;
     checked_decoded_rgb_bytes(frame_count, frame_size)?;
     let mut frames = Vec::new();
     frames.try_reserve(frame_count).map_err(|e| {
-        MediaConnectorError::VideoDecode(format!(
+        out_of_memory(format!(
             "failed to reserve {frame_count} decoded video frame records: {e}"
         ))
     })?;
@@ -3357,14 +3734,13 @@ async fn decode_video_with_ffmpeg_png(
         "png",
         "pipe:1",
     ]);
-    let output = run_video_command_output(command, "ffmpeg").await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "ffmpeg failed: {stderr}"
-        )));
-    }
+    // The decoder's limit lets the frame that crosses it through, and a
+    // frame whose PNG is three times the limit and its fixed framing long
+    // decodes past the limit.
+    let stdout_limit = video_max_decoded_bytes()
+        .saturating_mul(4)
+        .saturating_add(VIDEO_COMMAND_TEXT_BYTES);
+    let output = run_video_command_checked(command, "ffmpeg", 0, stdout_limit).await?;
 
     let pngs = split_png_stream(&output.stdout)?;
     let mut frames = Vec::with_capacity(pngs.len());
@@ -3536,14 +3912,7 @@ async fn probe_video_info(input_path: &Path) -> Result<ProbedVideoInfo, MediaCon
             "json",
         ])
         .arg(input_path);
-    let output = run_video_command_output(command, "ffprobe").await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "ffprobe failed: {stderr}"
-        )));
-    }
+    let output = run_video_command_checked(command, "ffprobe", 0, VIDEO_COMMAND_TEXT_BYTES).await?;
 
     parse_ffprobe_video_info(&output.stdout)
 }
@@ -3565,14 +3934,7 @@ async fn probe_decoded_frame_count(input_path: &Path) -> Result<usize, MediaConn
             "json",
         ])
         .arg(input_path);
-    let output = run_video_command_output(command, "ffprobe").await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "ffprobe failed: {stderr}"
-        )));
-    }
+    let output = run_video_command_checked(command, "ffprobe", 0, VIDEO_COMMAND_TEXT_BYTES).await?;
 
     let probe: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|error| {
         MediaConnectorError::VideoDecode(format!("failed to parse ffprobe output: {error}"))
@@ -3590,8 +3952,12 @@ async fn probe_decoded_frame_count(input_path: &Path) -> Result<usize, MediaConn
 
 /// The stream's frames in presentation order, listed by the probe tool
 /// without decoding anything; `None` when the listing is not one a seek plan
-/// can be built on.
-async fn probe_frame_table(input_path: &Path) -> Result<Option<FrameTable>, MediaConnectorError> {
+/// can be built on. A plan is built only on a listing of `frames` packets,
+/// so a longer one is not read to its end.
+async fn probe_frame_table(
+    input_path: &Path,
+    frames: usize,
+) -> Result<Option<FrameTable>, MediaConnectorError> {
     let mut command = Command::new("ffprobe");
     command
         .args([
@@ -3605,14 +3971,13 @@ async fn probe_frame_table(input_path: &Path) -> Result<Option<FrameTable>, Medi
             "csv",
         ])
         .arg(input_path);
-    let output = run_video_command_output(command, "ffprobe").await?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MediaConnectorError::VideoDecode(format!(
-            "ffprobe failed: {stderr}"
-        )));
-    }
+    // A packet's line (`packet,<pts>,<flags>`) fits 32 bytes; a listing
+    // past a quarter of the largest clip is of no stream a plan serves.
+    let listing_limit = frames
+        .saturating_mul(32)
+        .min(video_max_input_bytes() / 4)
+        .saturating_add(VIDEO_COMMAND_TEXT_BYTES);
+    let output = run_video_command_checked(command, "ffprobe", 0, listing_limit).await?;
 
     Ok(FrameTable::parse(&output.stdout))
 }
@@ -3628,7 +3993,7 @@ async fn seek_plan_for(input_path: &Path, selection: &FrameSelection) -> Option<
     {
         return None;
     }
-    let table = match probe_frame_table(input_path).await {
+    let table = match probe_frame_table(input_path, selection.total_frames).await {
         Ok(table) => table?,
         Err(error) => {
             if log_video_decode_timing_enabled() {
@@ -3674,13 +4039,10 @@ async fn decode_video_with_ffmpeg_seek(
                 .saturating_add(picks.saturating_mul(64))
                 .min(video_max_decoded_bytes());
             let command = ffmpeg_seek_run_command(input_path, segment, output_limit, passthrough);
-            let output = run_video_command_output(command, "ffmpeg").await?;
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(MediaConnectorError::VideoDecode(format!(
-                    "ffmpeg failed: {stderr}"
-                )));
-            }
+            // The decoder ends at its limit only after the frame that reaches it.
+            let stdout_limit = output_limit.saturating_add(frame_size).saturating_add(64);
+            let output =
+                run_video_command_checked(command, "ffmpeg", output_limit, stdout_limit).await?;
             // A run that comes back short ends the decode here, before the
             // other runs finish: its seek did not land where the plan says.
             let frames = if output.stdout.is_empty() {
@@ -3725,13 +4087,13 @@ async fn decode_video_with_ffmpeg_seek(
     };
     drop(active_decode);
 
+    let joined_bytes = expected_bytes.saturating_add(selection.unique_count().saturating_mul(64));
     let mut data = Vec::new();
-    data.try_reserve(expected_bytes.saturating_add(selection.unique_count().saturating_mul(64)))
-        .map_err(|e| {
-            MediaConnectorError::VideoDecode(format!(
-                "failed to reserve {expected_bytes} bytes for the decoded video frames: {e}"
-            ))
-        })?;
+    data.try_reserve(joined_bytes).map_err(|e| {
+        out_of_memory(format!(
+            "failed to reserve {joined_bytes} bytes for the decoded video frames: {e}"
+        ))
+    })?;
     let mut frames = Vec::with_capacity(selection.unique_count());
     for (stdout, run_frames) in outputs {
         let base = data.len();
@@ -3855,15 +4217,17 @@ fn fps_filter_for_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> St
         .unwrap_or_else(|| format!("fps={}", cfg.sample_fps))
 }
 
-fn expected_sampled_frame_count(metadata: VideoMetadata, cfg: VideoFetchConfig) -> usize {
-    if let Some(duration) = metadata.duration_seconds {
-        if duration.is_finite() && duration > 0.0 {
-            return (duration * cfg.sample_fps)
-                .round()
-                .clamp(cfg.min_frames as f64, cfg.max_frames as f64) as usize;
-        }
-    }
-    cfg.max_frames
+/// The frames a clip is resampled to by its duration; `None` for a clip whose
+/// length the probe did not give, which is held to the frame ceiling alone.
+fn expected_sampled_frame_count(metadata: VideoMetadata, cfg: VideoFetchConfig) -> Option<usize> {
+    let duration = metadata
+        .duration_seconds
+        .filter(|duration| duration.is_finite() && *duration > 0.0)?;
+    Some(
+        (duration * cfg.sample_fps)
+            .round()
+            .clamp(cfg.min_frames as f64, cfg.max_frames as f64) as usize,
+    )
 }
 
 fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) -> f64 {
@@ -4459,7 +4823,8 @@ async fn ffmpeg_passthrough_flag() -> [&'static str; 2] {
     }
     let mut command = Command::new("ffmpeg");
     command.arg("-version");
-    let output = match run_video_command_output(command, "ffmpeg").await {
+    let run = run_video_command_output(command, "ffmpeg", 0, VIDEO_COMMAND_TEXT_BYTES);
+    let output = match run.await {
         Ok(output) => output,
         // A probe that did not run says nothing about the build: the current
         // flag for this decode, and the next decode probes again.
@@ -4550,7 +4915,7 @@ async fn probe_video_duration_seconds_with_ffmpeg(
     command
         .args(["-hide_banner", "-nostdin", "-i"])
         .arg(input_path);
-    let output = run_video_command_output(command, "ffmpeg").await?;
+    let output = run_video_command_output(command, "ffmpeg", 0, VIDEO_COMMAND_TEXT_BYTES).await?;
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     parse_ffmpeg_duration_seconds(&stderr).ok_or_else(|| {
@@ -4793,7 +5158,7 @@ mod tests;
 
 /// The vision patch factor MiniMax-M3's `max_long_side_pixel` must align to
 /// (patch_size 14 * spatial merge 2).
-pub const MAX_LONG_SIDE_PIXEL_FACTOR: u32 = 28;
+pub(crate) const MAX_LONG_SIDE_PIXEL_FACTOR: u32 = 28;
 
 /// Reject a `max_long_side_pixel` that is zero or not a multiple of the patch
 /// factor, so the value cannot silently round to a different resolution tier.
@@ -4819,7 +5184,14 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// (PIL's defaults, accurate IDCT and fancy upsampling, so the pixels match an
 /// engine that decodes with PIL bit for bit; the pure-Rust decoder differs by
 /// a few levels, which the vision encoder amplifies), everything else and any
-/// turbojpeg failure through the `image` crate; then the long-side cap.
+/// turbojpeg failure through the `image` crate; then the long-side cap. A
+/// frame the library decoded cleanly is served as it is. A JPEG the library
+/// decoded with a warning, or that the fallback path would read, is refused
+/// when its data ends in a form the end-marker walk refuses (its
+/// entropy-coded data runs out, a progressive file misses its end marker,
+/// or a second scan header or a table follows a single-scan frame's scan):
+/// the warned frame is not kept, and the `image` crate's decoder never sees
+/// the file (`jpeg_turbo::end_is_served`).
 ///
 /// CMYK and YCCK JPEGs follow the same rule: with libjpeg-turbo they are
 /// decompressed as CMYK and converted with PIL's arithmetic
@@ -4835,10 +5207,15 @@ fn validate_max_long_side_pixel(value: Option<u32>) -> Result<(), MediaConnector
 /// (`ico_png_entry`). AVIF is not decoded: no decoder for it is among the
 /// crate's dependencies, and such a file is refused with a typed error that
 /// names the format.
-pub(crate) fn decode_image_bytes(
+///
+/// `header_orientation` is the tag [`encoded_image_size`] read from these
+/// bytes, when the caller holds it: the JPEG path then applies it without
+/// parsing the header again.
+pub(crate) fn decode_frame_bytes(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
     transparency: TransparencyPolicy,
+    header_orientation: Option<image::metadata::Orientation>,
 ) -> Result<image::DynamicImage, MediaConnectorError> {
     // An icon file whose chosen entry is a PNG is that PNG from here on
     // (`ico_png_entry`): the entry's own colour type and chunks then drive
@@ -4846,38 +5223,87 @@ pub(crate) fn decode_image_bytes(
     let bytes = ico_png_entry(bytes).unwrap_or(bytes);
     // The orientation tag is applied the way the engine's own loader applies
     // it, so a photo stored sideways reaches the model upright on both paths.
-    let mut image = match crate::jpeg_turbo::decode_jpeg_rgb(bytes) {
+    let mut image = match decode_jpeg_rgb(bytes) {
         Some(image) => {
             // libjpeg-turbo yields pixels only; the tag comes from the header.
-            oriented(image, jpeg_orientation(bytes))
+            oriented(
+                image,
+                header_orientation.unwrap_or_else(|| jpeg_orientation(bytes)),
+            )
         }
-        None => match crate::webp_native::decode_webp(bytes) {
-            Some(image) => {
-                // libwebp yields pixels only; the tag comes from the file's
-                // metadata chunk, read as the fallback decoder reads it.
-                oriented(image, webp_orientation(bytes))
+        None => {
+            // A JPEG that ends where the reference loader refuses it (a scan
+            // cut short, a bare end with no marker behind it, a progressive
+            // file short of its end marker: "image file is truncated"; a
+            // second scan header or a malformed table behind a single-scan
+            // frame's scan, end marker or not: "broken data stream") is
+            // refused here: the library did not keep a frame for it above,
+            // and the decoder below would serve one with the rest filled in.
+            // A valid table there is refused with the malformed ones, which
+            // the reading does not tell apart. A single-scan file ending in
+            // a comment or another skipped segment, which the loader serves,
+            // passes; the decoder below reads to the end marker and fails it
+            // on its own. The reading waits until here: a file the library
+            // decoded clean reached a real end marker and pays no walk over
+            // its data.
+            if is_jpeg(bytes) && !end_is_served(bytes) {
+                return Err(MediaConnectorError::Image(image::ImageError::Decoding(
+                    image::error::DecodingError::new(
+                        image::error::ImageFormatHint::Exact(image::ImageFormat::Jpeg),
+                        "the data behind the scan header ends in a form this decoder refuses",
+                    ),
+                )));
             }
-            None => {
-                let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
-                    .with_guessed_format()
-                    .map_err(MediaConnectorError::Io)?
-                    .into_decoder()?;
-                // `ImageReader::decode` reserves the decoded buffer against the
-                // crate's allocation limit (512 MiB by default) before it
-                // decodes; `into_decoder` does not, so the reservation is made
-                // here. A file whose header declares more than the limit (a
-                // decompression bomb, or a JPEG the turbojpeg path handed over
-                // for its size) is refused without the allocation.
-                let mut limits = image::Limits::default();
-                limits.reserve(decoder.total_bytes())?;
-                decoder.set_limits(limits)?;
-                let orientation = decoder
-                    .orientation()
-                    .unwrap_or(image::metadata::Orientation::NoTransforms);
-                let image = image::DynamicImage::from_decoder(decoder)?;
-                oriented(image, orientation)
+            match decode_webp(bytes) {
+                Some(image) => {
+                    // libwebp yields pixels only; the tag comes from the file's
+                    // metadata chunk, read as the fallback decoder reads it.
+                    oriented(image, webp_orientation(bytes))
+                }
+                None => {
+                    let reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+                        .with_guessed_format()
+                        .map_err(MediaConnectorError::Io)?;
+                    let is_png = reader.format() == Some(image::ImageFormat::Png);
+                    let is_bmp = reader.format() == Some(image::ImageFormat::Bmp);
+                    let mut decoder = reader.into_decoder()?;
+                    // `ImageReader::decode` reserves the decoded buffer against the
+                    // crate's allocation limit (512 MiB by default) before it
+                    // decodes; `into_decoder` does not, so the reservation is made
+                    // here. A file whose header declares more than the limit (a
+                    // decompression bomb, or a JPEG the turbojpeg path handed over
+                    // for its size) is refused without the allocation.
+                    let mut limits = image::Limits::default();
+                    limits.reserve(decoder.total_bytes())?;
+                    decoder.set_limits(limits)?;
+                    let orientation = decoder
+                        .orientation()
+                        .unwrap_or(image::metadata::Orientation::NoTransforms);
+                    // A bitmap of the plain kind is read here, behind the
+                    // decoder's own reading of the header and the reservation
+                    // above; any other one stays with the decoder.
+                    let plain_bmp = if is_bmp {
+                        plain_bmp_into_pool(bytes, decoder.dimensions())
+                    } else {
+                        None
+                    };
+                    let image = if is_png {
+                        // The PNG decoder writes every byte of the image
+                        // it reports.
+                        eight_bit_into_pool(decoder, false)?
+                    } else if let Some(image) = plain_bmp {
+                        image
+                    } else {
+                        // No other decoder is held to that (a GIF pixel
+                        // beyond its colour table is never written): its
+                        // buffer arrives zeroed, as the crate's own vector
+                        // does.
+                        eight_bit_into_pool(decoder, true)?
+                    };
+                    oriented(image, orientation)
+                }
             }
-        },
+        }
     };
     image = clip_sixteen_bit_grey(image, bytes);
     image = narrow_sixteen_bit_colour(image);
@@ -4888,6 +5314,137 @@ pub(crate) fn decode_image_bytes(
     image = apply_transparency(image, bytes, transparency);
     image = apply_max_long_side_pixel(image, max_long_side_pixel);
     Ok(image)
+}
+
+/// What `DynamicImage::from_decoder` returns for an image of an eight-bit
+/// layout, with the pixels in a buffer of the pool the JPEG and WebP decoders
+/// take theirs from. The crate's own vector is a zeroed allocation of the
+/// image's size, which is fresh pages on every request. With `zeroed` the
+/// pooled buffer arrives zeroed too, so a byte the decoder leaves alone
+/// reads as it does in the crate's vector; without it the buffer holds a
+/// previous request's bytes, for a decoder that writes every byte of the
+/// image it reports. A sixteen-bit layout, which the pool does not take
+/// back, keeps the crate's path.
+fn eight_bit_into_pool(
+    decoder: impl image::ImageDecoder,
+    zeroed: bool,
+) -> image::ImageResult<image::DynamicImage> {
+    type Layout = fn(u32, u32, Vec<u8>) -> Option<image::DynamicImage>;
+    let layout: Layout = match decoder.color_type() {
+        image::ColorType::Rgb8 => |width, height, pixels| {
+            image::RgbImage::from_raw(width, height, pixels).map(image::DynamicImage::ImageRgb8)
+        },
+        image::ColorType::Rgba8 => |width, height, pixels| {
+            image::RgbaImage::from_raw(width, height, pixels).map(image::DynamicImage::ImageRgba8)
+        },
+        image::ColorType::L8 => |width, height, pixels| {
+            image::GrayImage::from_raw(width, height, pixels).map(image::DynamicImage::ImageLuma8)
+        },
+        image::ColorType::La8 => |width, height, pixels| {
+            image::GrayAlphaImage::from_raw(width, height, pixels)
+                .map(image::DynamicImage::ImageLumaA8)
+        },
+        _ => return image::DynamicImage::from_decoder(decoder),
+    };
+    let Ok(len) = usize::try_from(decoder.total_bytes()) else {
+        return image::DynamicImage::from_decoder(decoder);
+    };
+    let (width, height) = decoder.dimensions();
+    let mut pixels = if zeroed {
+        buffer_pool::take_zeroed(len)
+    } else {
+        buffer_pool::take(len)
+    };
+    if let Err(error) = decoder.read_image(&mut pixels) {
+        // A refused decode hands its buffer back; the next take is warm.
+        buffer_pool::recycle(pixels);
+        return Err(error);
+    }
+    layout(width, height, pixels).ok_or_else(|| {
+        image::ImageError::Parameter(image::error::ParameterError::from_kind(
+            image::error::ParameterErrorKind::DimensionMismatch,
+        ))
+    })
+}
+
+/// What `DynamicImage::from_decoder` returns for a bitmap of the plain kind,
+/// with the pixels in a buffer of the pool: an info header (of 40, 52, 56,
+/// 108 or 124 bytes, which the `image` crate reads alike), one plane, 24 bits
+/// a pixel, no compression, and every row with its padding inside the file.
+/// A row is stored blue first and padded to four bytes, the bottom row first
+/// unless the height is negative; each goes to its place in one pass, where
+/// the crate's decoder makes a read call and a reverse for every pixel into
+/// a fresh zeroed vector.
+///
+/// `dimensions` is what the crate's decoder read from the same header, and
+/// the caller has reserved the image against the allocation limit. `None`
+/// for any other bitmap (a palette, a run-length or bit-field compression,
+/// 16 or 32 bits a pixel, the 12-byte header), for a header that does not
+/// give `dimensions` and for a file short of its rows: the crate's decoder
+/// then reads or refuses it as before.
+fn plain_bmp_into_pool(bytes: &[u8], dimensions: (u32, u32)) -> Option<image::DynamicImage> {
+    // The file header (14 bytes) and the first 40 bytes of the info header,
+    // the part every size of it shares.
+    let header = bytes.get(..54)?;
+    let word = |at: usize| -> Option<[u8; 4]> { header.get(at..at + 4)?.try_into().ok() };
+    let plain = header.starts_with(b"BM")
+        && matches!(u32::from_le_bytes(word(14)?), 40 | 52 | 56 | 108 | 124)
+        // One plane and 24 bits a pixel, then no compression.
+        && word(26)? == [1, 0, 24, 0]
+        && word(30)? == [0; 4];
+    if !plain {
+        return None;
+    }
+    let (width, height) = dimensions;
+    let stored_height = i32::from_le_bytes(word(22)?);
+    let as_declared = u32::try_from(i32::from_le_bytes(word(18)?)) == Ok(width)
+        && stored_height.unsigned_abs() == height;
+    if !as_declared || width == 0 || height == 0 {
+        return None;
+    }
+    let row_len = usize::try_from(width).ok()?.checked_mul(3)?;
+    let rows = usize::try_from(height).ok()?;
+    // A stored row is padded to a multiple of four bytes.
+    let stride = row_len.checked_add(3)? & !3;
+    let offset = usize::try_from(u32::from_le_bytes(word(10)?)).ok()?;
+    let stored = bytes.get(offset..)?.get(..stride.checked_mul(rows)?)?;
+    let mut pixels = buffer_pool::take(row_len.checked_mul(rows)?);
+    bgr_rows_into_rgb(stored, stride, stored_height < 0, row_len, &mut pixels);
+    image::RgbImage::from_raw(width, height, pixels).map(image::DynamicImage::ImageRgb8)
+}
+
+/// The stored rows of a 24-bit bitmap (`stride` bytes each, blue first, the
+/// top row first when `top_down`) into `pixels` (`row_len` bytes a row, red
+/// first, the top row first). The pixel loop is a fixed permutation of three
+/// bytes, which the compiler turns into byte shuffles where the target has
+/// them: `multiversion` compiles the function with AVX2 and without and
+/// selects the clone at the first call.
+#[cfg_attr(
+    target_arch = "x86_64",
+    multiversion::multiversion(targets("x86_64+avx2"))
+)]
+fn bgr_rows_into_rgb(
+    stored: &[u8],
+    stride: usize,
+    top_down: bool,
+    row_len: usize,
+    pixels: &mut [u8],
+) {
+    let rows = pixels.len() / row_len;
+    for (y, row) in pixels.chunks_exact_mut(row_len).enumerate() {
+        let from_top = if top_down { y } else { rows - 1 - y };
+        let Some(stored) = stored.chunks_exact(stride).nth(from_top) else {
+            return;
+        };
+        for (pixel, &[blue, green, red]) in row
+            .as_chunks_mut::<3>()
+            .0
+            .iter_mut()
+            .zip(stored.as_chunks::<3>().0)
+        {
+            *pixel = [red, green, blue];
+        }
+    }
 }
 
 /// The four bytes that open an icon file (reserved 0, type 1), the magic the
@@ -5070,20 +5627,24 @@ pub(crate) fn apply_transparency(
     if !image.color().has_alpha() {
         return image;
     }
-    match policy {
-        TransparencyPolicy::KeepAlpha => image,
-        TransparencyPolicy::DropAlpha => image::DynamicImage::ImageRgb8(image.to_rgb8()),
+    let flattened = match policy {
+        TransparencyPolicy::KeepAlpha => return image,
+        TransparencyPolicy::DropAlpha => image.to_rgb8(),
         TransparencyPolicy::CompositeOverWhite => {
             if png_colour_type(bytes) == Some(PNG_COLOUR_TYPE_TRUECOLOUR) {
-                return image::DynamicImage::ImageRgb8(image.to_rgb8());
+                image.to_rgb8()
+            } else {
+                match &image {
+                    image::DynamicImage::ImageRgba8(rgba) => composite_over_white(rgba),
+                    other => composite_over_white(&other.to_rgba8()),
+                }
             }
-            let composited = match image {
-                image::DynamicImage::ImageRgba8(rgba) => composite_over_white(&rgba),
-                other => composite_over_white(&other.to_rgba8()),
-            };
-            image::DynamicImage::ImageRgb8(composited)
         }
-    }
+    };
+    // The frame holds the flattened image from here on, so nothing later
+    // would return the decoder's buffer to the pool.
+    buffer_pool::recycle_image(image);
+    image::DynamicImage::ImageRgb8(flattened)
 }
 
 /// The eight-byte PNG signature.
@@ -5103,19 +5664,41 @@ fn png_colour_type(bytes: &[u8]) -> Option<u8> {
     }
 }
 
-/// Composite straight-alpha RGBA over opaque white with the reference's
-/// integer blend, `(src * a + 255 * (255 - a) + 127) / 255` per channel.
+/// `OVER_WHITE[alpha][value]`: a channel value composited over opaque white
+/// at that alpha with the reference's integer blend,
+/// `(value * alpha + 255 * (255 - alpha) + 127) / 255`.
+static OVER_WHITE: [[u8; 256]; 256] = {
+    let mut table = [[0u8; 256]; 256];
+    let mut alpha = 0;
+    while alpha < 256 {
+        let white = 255 * (255 - alpha) + 127;
+        let mut value = 0;
+        while value < 256 {
+            table[alpha][value] = ((value * alpha + white) / 255) as u8;
+            value += 1;
+        }
+        alpha += 1;
+    }
+    table
+};
+
+/// Composite straight-alpha RGBA over opaque white: per channel one read of
+/// [`OVER_WHITE`], in the row the pixel's alpha names. The row of a full
+/// alpha returns the value it is given, so the leading blocks in which every
+/// pixel is opaque keep their stored colour without those reads, and the
+/// table takes the image from the first block that holds a transparent pixel.
+/// The output is a buffer of the pool, and every pixel of the image writes
+/// its three bytes.
 fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
     let (width, height) = rgba.dimensions();
-    let mut out = Vec::with_capacity(width as usize * height as usize * 3);
-    for px in rgba.as_raw().as_chunks::<4>().0 {
-        let alpha = u32::from(px[3]);
-        let white = 255 * (255 - alpha) + 127;
-        out.extend_from_slice(&[
-            ((u32::from(px[0]) * alpha + white) / 255) as u8,
-            ((u32::from(px[1]) * alpha + white) / 255) as u8,
-            ((u32::from(px[2]) * alpha + white) / 255) as u8,
-        ]);
+    let (pixels, _) = rgba.as_raw()[..4 * width as usize * height as usize].as_chunks::<4>();
+    let mut out = buffer_pool::take(3 * pixels.len());
+    let lead = opaque_lead(pixels, &mut out);
+    let (_, blended) = pixels.split_at(lead);
+    let (_, rest) = out.split_at_mut(3 * lead);
+    for (rgb, px) in rest.as_chunks_mut::<3>().0.iter_mut().zip(blended) {
+        let over_white = &OVER_WHITE[usize::from(px[3])];
+        *rgb = [px[0], px[1], px[2]].map(|value| over_white[usize::from(value)]);
     }
     #[expect(
         clippy::expect_used,
@@ -5124,12 +5707,58 @@ fn composite_over_white(rgba: &image::RgbaImage) -> image::RgbImage {
     image::RgbImage::from_raw(width, height, out).expect("buffer matches image dimensions")
 }
 
+/// The pixels one step of [`opaque_lead`] takes: a block is read for its
+/// alpha and copied while the first-level cache still holds it, and an image
+/// with a transparent pixel pays that read for one block alone.
+const OPAQUE_BLOCK: usize = 1024;
+
+/// Writes the three colour bytes, as stored, of the leading blocks of
+/// `pixels` in which no pixel is transparent to any degree (the alpha bytes
+/// of the block, ANDed, are still the full alpha) into `out`, and returns how
+/// many pixels those blocks hold. Nothing is written for the first block that
+/// holds a transparent pixel, nor for any pixel behind it.
+#[cfg_attr(
+    target_arch = "x86_64",
+    multiversion::multiversion(targets("x86_64+avx2"))
+)]
+fn opaque_lead(pixels: &[[u8; 4]], out: &mut [u8]) -> usize {
+    let mut lead = 0;
+    for (block, stored) in pixels
+        .chunks(OPAQUE_BLOCK)
+        .zip(out.chunks_mut(3 * OPAQUE_BLOCK))
+    {
+        let [.., alpha] = block
+            .iter()
+            .fold(u32::MAX, |all, px| all & u32::from_ne_bytes(*px))
+            .to_ne_bytes();
+        if alpha != u8::MAX {
+            break;
+        }
+        for (rgb, px) in stored.as_chunks_mut::<3>().0.iter_mut().zip(block) {
+            *rgb = [px[0], px[1], px[2]];
+        }
+        lead += block.len();
+    }
+    lead
+}
+
+/// [`decode_frame_bytes`] for bytes whose header nobody read first.
+#[cfg(test)]
+pub(crate) fn decode_image_bytes(
+    bytes: &[u8],
+    max_long_side_pixel: Option<u32>,
+    transparency: TransparencyPolicy,
+) -> Result<image::DynamicImage, MediaConnectorError> {
+    decode_frame_bytes(bytes, max_long_side_pixel, transparency, None)
+}
+
 /// The dimensions the decode will produce, from the header alone (after the
-/// orientation tag, which swaps the axes for the 90-degree rotations).
+/// orientation tag, which swaps the axes for the 90-degree rotations), and
+/// that tag.
 pub(crate) fn encoded_image_size(
     bytes: &[u8],
     max_long_side_pixel: Option<u32>,
-) -> Result<crate::types::ImageSize, MediaConnectorError> {
+) -> Result<(ImageSize, image::metadata::Orientation), MediaConnectorError> {
     // The same entry the decode reads, so the two agree on an icon.
     let bytes = ico_png_entry(bytes).unwrap_or(bytes);
     let mut decoder = image::ImageReader::new(std::io::Cursor::new(bytes))
@@ -5148,7 +5777,7 @@ pub(crate) fn encoded_image_size(
     let (width, height) = max_long_side_pixel
         .and_then(|cap| capped_dimensions(width, height, cap))
         .unwrap_or((width, height));
-    Ok(crate::types::ImageSize::new(width, height))
+    Ok((ImageSize::new(width, height), orientation))
 }
 
 /// The EXIF orientation of a JPEG, from its header alone; absent or
@@ -5184,12 +5813,18 @@ fn apply_max_long_side_pixel(
     // The same fit `encoded_image_size` promised from the header.
     match max_long_side_pixel.and_then(|cap| capped_dimensions(image.width(), image.height(), cap))
     {
-        Some((width, height)) => match image {
-            image::DynamicImage::ImageRgb8(rgb) => {
-                image::DynamicImage::ImageRgb8(resize_catmull_rom_rgb(&rgb, width, height))
-            }
-            other => other.resize_exact(width, height, image::imageops::FilterType::CatmullRom),
-        },
+        Some((width, height)) => {
+            let resized = match &image {
+                image::DynamicImage::ImageRgb8(rgb) => {
+                    image::DynamicImage::ImageRgb8(resize_catmull_rom_rgb(rgb, width, height))
+                }
+                other => other.resize_exact(width, height, image::imageops::FilterType::CatmullRom),
+            };
+            // The frame holds the resized image from here on, so nothing
+            // later would return the decoder's buffer to the pool.
+            buffer_pool::recycle_image(image);
+            resized
+        }
         None => image,
     }
 }

@@ -9,8 +9,9 @@
 //! allocates into the window. The decode's own calls depend on which decoder is loaded
 //! (TurboJPEG and libwebp are runtime bindings; their C allocations never reach this
 //! allocator), so the decode pin counts the large buffers only, per decoder: the TurboJPEG
-//! binding decodes a frame of 256 KiB or more into a buffer from the pool, the fallback
-//! decoder allocates its own.
+//! binding decodes a frame of 256 KiB or more into a buffer from the pool, and the fallback
+//! decoder's eight-bit frame comes from it too. A PNG of an eight-bit layout decodes into a
+//! pool buffer under either, and an alpha channel composited over white is written into one.
 //! The warm pass returns its buffers the way a request does (the frame dropped, the wire
 //! payload sent), so the pins hold the steady state of the buffer pool: a decoded frame or a
 //! wire the pool serves counts no large buffer.
@@ -42,8 +43,10 @@ use llm_multimodal::{
     jpeg_turbo::turbojpeg_available,
     types::{ImageDetail, ImageFrame, ImageSize, ImageSource, TransparencyPolicy},
     vision::{
-        preprocessor_config::PreProcessorConfig, processors::Qwen3VLProcessor, VideoClipOptions,
-        VisionPreProcessor,
+        preprocessor_config::PreProcessorConfig,
+        processors::{NemotronOmniProcessor, Qwen3VLProcessor},
+        transforms::{resize_bicubic_pil, resize_bilinear_pil, resize_lanczos_pil},
+        VideoClipOptions, VisionPreProcessor,
     },
     Modality, Parallelism,
 };
@@ -234,9 +237,9 @@ fn measure(processor: &dyn VisionPreProcessor, class: &Class) -> Measured {
 ///
 /// - decode: the large buffers of the decode (the decoded frame, the decoder's own planes,
 ///   a copy of a large encoded file; a small input decodes under the threshold), per
-///   decoder (`Frames`): the TurboJPEG binding takes a frame of 256 KiB or more from the
-///   buffer pool, where the warm pass left one, the fallback decoder allocates it. The
-///   calls are not pinned: they differ between the two decoders in their bookkeeping.
+///   decoder (`Frames`): each takes an eight-bit frame of 256 KiB or more from the buffer
+///   pool, where the warm pass left one. The calls are not pinned: they differ between the
+///   two decoders in their bookkeeping.
 /// - copy: one call, one large buffer: the gateway's per-frame clone before the processor
 ///   (the first copy to go; its pin falls to zero calls when it does).
 /// - preprocess: the calls of the resize, the layout and the wire write of one image, one
@@ -274,7 +277,9 @@ impl Frames {
 /// collects wide taps and a scratch row of its own, and its height pass skips the scalar
 /// path's sums buffer); on x86-64 they are the Pillow-exact passes of
 /// `vision/transforms.rs` (`portable`, or the `avx2` and `avx512` arms with a scratch row
-/// pair per band), so a class counts a few calls more or fewer per path. Every count is
+/// per band; on the `avx2` arm taps that fit 16 bits allocate no high halves, and a width
+/// pass over them holds two tables more: a second layout of the taps and where every four
+/// outputs start), so a class counts a few calls more or fewer per path. Every count is
 /// recorded on its own path (the other arms forced off on a host that has them); CI runs
 /// this test on each architecture.
 struct Calls {
@@ -334,7 +339,7 @@ const PINS: &[Pin] = &[
     Pin {
         class: "jpeg-large",
         decode_large: Frames {
-            fallback: 2,
+            fallback: 1,
             turbo: 1,
         },
         copy: (1, 1),
@@ -342,7 +347,7 @@ const PINS: &[Pin] = &[
             scalar: 6038,
             neon: 6037,
             portable: 6037,
-            avx2: 6038,
+            avx2: 6037,
             avx512: 6037,
         },
         preprocess_large: 2,
@@ -360,7 +365,7 @@ const PINS: &[Pin] = &[
             neon: 1051,
             portable: 1048,
             avx2: 1052,
-            avx512: 1052,
+            avx512: 1051,
         },
         preprocess_large: 0,
         serialize_calls: 0,
@@ -368,7 +373,7 @@ const PINS: &[Pin] = &[
     Pin {
         class: "jpeg-grayscale",
         decode_large: Frames {
-            fallback: 1,
+            fallback: 0,
             turbo: 0,
         },
         copy: (1, 1),
@@ -377,7 +382,7 @@ const PINS: &[Pin] = &[
             neon: 1371,
             portable: 1368,
             avx2: 1372,
-            avx512: 1372,
+            avx512: 1371,
         },
         preprocess_large: 2,
         serialize_calls: 0,
@@ -394,7 +399,7 @@ const PINS: &[Pin] = &[
             neon: 1051,
             portable: 1048,
             avx2: 1052,
-            avx512: 1052,
+            avx512: 1051,
         },
         preprocess_large: 0,
         serialize_calls: 0,
@@ -402,15 +407,15 @@ const PINS: &[Pin] = &[
     Pin {
         class: "png-rgb",
         decode_large: Frames {
-            fallback: 2,
-            turbo: 2,
+            fallback: 1,
+            turbo: 1,
         },
         copy: (1, 1),
         preprocess_calls: Calls {
             scalar: 1429,
             neon: 1428,
             portable: 1428,
-            avx2: 1429,
+            avx2: 1428,
             avx512: 1428,
         },
         preprocess_large: 1,
@@ -419,8 +424,8 @@ const PINS: &[Pin] = &[
     Pin {
         class: "png-rgba",
         decode_large: Frames {
-            fallback: 3,
-            turbo: 3,
+            fallback: 1,
+            turbo: 1,
         },
         copy: (1, 1),
         preprocess_calls: Calls {
@@ -605,7 +610,148 @@ const VIDEO_CALLS: Calls = Calls {
     scalar: 8741,
     neon: 8737,
     portable: 8737,
-    avx2: 8741,
+    avx2: 8737,
     avx512: 8737,
 };
 const VIDEO_LARGE: usize = 4;
+
+/// The Inkling processor's rescaled path walks the resized image where the resize left it:
+/// it allocates what the resize and the plain preprocess of the resized image allocate,
+/// less the one copy the plain path takes of an RGB8 image, three bytes a pixel.
+#[test]
+fn an_inkling_rescale_copies_no_resized_image() {
+    use llm_multimodal::vision::processors::InklingImageProcessor;
+
+    let _window = window();
+    assert_eq!(
+        configure_parallelism(Parallelism::Inline),
+        Ok(()),
+        "the pins count the calling thread alone: this test must own the process's mode"
+    );
+    let plain = InklingImageProcessor::new();
+    let config = PreProcessorConfig::from_json(r#"{"rescale_image_frac": 2.0}"#).expect("config");
+    let rescaled = InklingImageProcessor::from_preprocessor_config(&config).expect("processor");
+    let small = DynamicImage::ImageRgb8(RgbImage::from_fn(320, 240, |x, y| {
+        image::Rgb([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8])
+    }));
+    let resized = resize_lanczos_pil(&small, 640, 480);
+    // Warm: the first pass pays for whatever the thread keeps.
+    drop(rescaled.preprocess(&[&small]).expect("warm"));
+    drop(plain.preprocess(&[&resized]).expect("warm"));
+    let whole = counted(|| rescaled.preprocess(&[&small]).expect("preprocess")).1;
+    let resize = counted(|| resize_lanczos_pil(&small, 640, 480)).1;
+    let walk = counted(|| plain.preprocess(&[&resized]).expect("preprocess")).1;
+    assert_eq!(
+        (
+            resize.calls + walk.calls - whole.calls,
+            resize.bytes + walk.bytes - whole.bytes
+        ),
+        (1, 3 * 640 * 480),
+        "the rescaled preprocess allocates no copy of the resized image"
+    );
+}
+
+/// A processor that composites the alpha channel itself reads an RGBA8 image where it
+/// stands: against the same pixels given as RGB8, its preprocess allocates the composited
+/// bytes and nothing else, one call of three bytes a pixel.
+#[test]
+fn an_alpha_composite_allocates_its_output_alone() {
+    let _window = window();
+    assert_eq!(
+        configure_parallelism(Parallelism::Inline),
+        Ok(()),
+        "the pins count the calling thread alone: this test must own the process's mode"
+    );
+    let processor = NemotronOmniProcessor::new();
+    // Opaque everywhere, so the composite is the image's own RGB and the two inputs give
+    // the processor the same pixels.
+    let rgba = RgbaImage::from_fn(640, 480, |x, y| {
+        Rgba([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 255])
+    });
+    let rgb = DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba.clone()).to_rgb8());
+    let rgba = DynamicImage::ImageRgba8(rgba);
+    let mut counts = Vec::new();
+    for image in [&rgb, &rgba] {
+        // Warm: the first pass pays for the thread-local scratch and the pool's buffers.
+        returned(processor.preprocess(&[image]).expect("warm"));
+        let (inputs, count) = counted(|| processor.preprocess(&[image]).expect("preprocess"));
+        returned(inputs);
+        counts.push(count);
+    }
+    assert_eq!(
+        (
+            counts[1].calls - counts[0].calls,
+            counts[1].bytes - counts[0].bytes
+        ),
+        (1, 3 * 640 * 480),
+        "the composite of an RGBA8 image allocates its output alone"
+    );
+}
+
+/// The Inkling2 processor reads an RGBA8 image where it stands: against the same pixels
+/// given as RGB8, its preprocess allocates nothing more.
+#[test]
+fn an_inkling2_rgba_image_is_read_where_it_stands() {
+    use llm_multimodal::vision::processors::Inkling2ImageProcessor;
+
+    let _window = window();
+    assert_eq!(
+        configure_parallelism(Parallelism::Inline),
+        Ok(()),
+        "the pins count the calling thread alone: this test must own the process's mode"
+    );
+    let processor = Inkling2ImageProcessor::new();
+    // Opaque everywhere, so the two inputs give the processor the same pixels.
+    let rgba = RgbaImage::from_fn(640, 480, |x, y| {
+        Rgba([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 255])
+    });
+    let rgb = DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba.clone()).to_rgb8());
+    let rgba = DynamicImage::ImageRgba8(rgba);
+    let mut counts = Vec::new();
+    for image in [&rgb, &rgba] {
+        // Warm: the first pass pays for whatever the thread and the pool keep.
+        returned(processor.preprocess(&[image]).expect("warm"));
+        let (inputs, count) = counted(|| processor.preprocess(&[image]).expect("preprocess"));
+        returned(inputs);
+        counts.push(count);
+    }
+    assert_eq!(
+        (counts[1].calls, counts[1].bytes),
+        (counts[0].calls, counts[0].bytes),
+        "an RGBA8 image is read where it stands"
+    );
+}
+
+/// The Pillow-exact resizes of a decoded image read an RGB8 image where it stands: against
+/// the same pixels given as RGBA8, a resize saves the copy to RGB8, one call of three bytes
+/// a pixel.
+#[test]
+fn a_pillow_resize_copies_no_rgb8_image() {
+    let _window = window();
+    assert_eq!(
+        configure_parallelism(Parallelism::Inline),
+        Ok(()),
+        "the pins count the calling thread alone: this test must own the process's mode"
+    );
+    let rgba = RgbaImage::from_fn(640, 480, |x, y| {
+        Rgba([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 255])
+    });
+    let rgb = DynamicImage::ImageRgb8(DynamicImage::ImageRgba8(rgba.clone()).to_rgb8());
+    let rgba = DynamicImage::ImageRgba8(rgba);
+    for resize in [resize_bicubic_pil, resize_lanczos_pil, resize_bilinear_pil] {
+        let mut counts = Vec::new();
+        for image in [&rgb, &rgba] {
+            // Warm: the first pass pays for the thread-local scratch.
+            drop(resize(image, 320, 240));
+            counts.push(counted(|| resize(image, 320, 240)).1);
+        }
+        assert_eq!(
+            (
+                counts[1].calls - counts[0].calls,
+                counts[1].bytes - counts[0].bytes
+            ),
+            (1, 3 * 640 * 480),
+            "the resize of an RGB8 image allocates no copy of it"
+        );
+    }
+}

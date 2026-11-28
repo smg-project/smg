@@ -41,11 +41,16 @@ mod info;
 mod media;
 mod service;
 #[cfg(test)]
+#[path = "../../tests/unit/vllm/tests.rs"]
 mod tests;
 
 use std::{sync::Arc, time::Duration};
 
 use engine::connect_engine;
+use engine_zmq_adapter::{
+    structured_outputs_backend_from_config, ConstraintKinds, StructuredOutputBackend,
+    StructuredOutputsBackendConfig, StructuredOutputsSupport,
+};
 use llm_tokenizer::traits::Tokenizer;
 use media::MediaGate;
 pub use media::{
@@ -58,7 +63,7 @@ use tonic::service::Routes;
 
 use crate::{
     engine_link::{EngineLink, TokenizerSlot},
-    kv_events::KvEventRelay,
+    kv_events::{record_with_queue, KvEventRelay, RankLoads},
     metrics::{Identity, ServicerMetrics},
     servicer::{self, Shared, WireState},
     ServicerConfig, ServicerError,
@@ -101,6 +106,13 @@ pub struct VllmModelInfo {
     pub kv_connector: String,
     pub kv_role: String,
     pub kv_engine_id: String,
+    /// How many trailing prompt tokens a PD decode side still computes
+    /// itself after its KV pull, as the launcher reads it off the engine's
+    /// config: the last token, recomputed to sample the next, or the
+    /// speculative drafter's prefill lookahead where it is longer (vLLM's
+    /// `num_prefill_lookahead_tokens`, which NIXL pulls short of). 0 when
+    /// unknown, and then a request's handoff claim loosens no prompt bound.
+    pub pd_local_tail: u32,
     /// Whether a Mooncake connector runs in the engine at all, as the
     /// launcher reads it off the raw `kv_transfer_config` (the top-level
     /// connector or any child a wrapper lists, whatever `kv_connector`
@@ -195,6 +207,34 @@ pub struct VllmModelInfo {
     pub log_stats: Option<bool>,
 }
 
+/// What the engine enforces of a structured request, read off the
+/// launcher's facts: the backend `structured_outputs_backend` names.
+/// `outlines` and `lm-format-enforcer` compile JSON schemas, regular
+/// expressions and choices and fail a structural tag at compile. Neither
+/// compiles an EBNF grammar either; that kind stays set for them because a
+/// choice is judged by it, so a grammar still goes to the engine. Every other
+/// name compiles all four kinds or is not judged here. The adapter refuses a
+/// constraint outside this before the engine, as on every wire.
+pub(super) fn structured_outputs_support(model: &VllmModelInfo) -> StructuredOutputsSupport {
+    use StructuredOutputBackend::{LmFormatEnforcer, Outlines};
+
+    let backend = structured_outputs_backend_from_config(&model.structured_outputs_backend);
+    match backend {
+        StructuredOutputsBackendConfig::Pinned(Outlines | LmFormatEnforcer) => {
+            StructuredOutputsSupport::new(
+                backend,
+                ConstraintKinds {
+                    json_schema: true,
+                    regex: true,
+                    ebnf: true,
+                    structural_tag: false,
+                },
+            )
+        }
+        _ => backend.into(),
+    }
+}
+
 /// How to bind, where the engine dials in, and what to advertise.
 #[derive(Clone)]
 pub struct VllmServicerConfig {
@@ -228,16 +268,13 @@ impl std::fmt::Debug for VllmServicerConfig {
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
 /// attaches to every batch it streams.
-impl crate::kv_events::RankLoads for State {
+impl RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
         // A connected rank reads its own entry (zero-filled until its first
         // scheduler step, whichever rank reported first), never another
         // rank's figures; a rank past the connected ones gets no record.
         let load = info::rank_load(self, dp_rank)?;
-        Some(crate::kv_events::record_with_queue(
-            &load,
-            load.num_waiting_uncached_tokens,
-        ))
+        Some(record_with_queue(&load, load.num_waiting_uncached_tokens))
     }
 
     fn engine_link(&self) -> &EngineLink {

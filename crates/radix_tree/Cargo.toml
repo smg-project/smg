@@ -29,3 +29,6 @@ rustc-hash = "2"
 # versioned dev-dep would have to exist on the registry first — a race
 # whenever both crates bump in one release).
 kv-index = { path = "../kv_index" }
+
+[lints]
+workspace = true

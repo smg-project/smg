@@ -11,7 +11,7 @@
 //! reach travel with it, and the annotations JSON Schema defines as such (`title`, `description`,
 //! `examples`, `$comment`), which constrain nothing, are dropped at every schema position.
 
-use std::collections::HashSet;
+use std::{collections::HashSet, sync::Arc};
 
 use serde_json::{json, Value};
 
@@ -185,7 +185,7 @@ pub(super) fn shape(
     let kind = kind(schema, definitions)?;
     let target = definitions.target_of(schema);
     let json = |schema: Value| Grammar::JsonSchema {
-        schema,
+        schema: Arc::new(schema),
         style: None,
         excludes: Vec::new(),
         whitespace: Whitespace::Free,

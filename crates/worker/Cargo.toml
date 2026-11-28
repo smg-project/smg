@@ -1,0 +1,125 @@
+[package]
+name = "smg-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Worker wire types, settings and optional runtime for SMG"
+license = "Apache-2.0"
+repository = "https://github.com/smg-project/smg"
+readme = "README.md"
+keywords = ["smg", "llm", "gateway", "worker", "types"]
+categories = ["data-structures"]
+# The default-layer case walks the workspace's manifests, which a published
+# package does not carry.
+exclude = ["tests/default_layer.rs"]
+# A dependent's build script finds the crate's proto directory through this
+# key: cargo hands it `DEP_SMG_WORKER_PROTO_DIR`, in the workspace and from
+# the registry alike.
+links = "smg_worker_proto"
+
+[lib]
+name = "smg_worker"
+
+[features]
+default = []
+# The HTTP responses of the worker's admin types.
+axum = ["dep:axum"]
+# The mechanism the worker's metric writers share with a host's: the bounded
+# label set, the model labels' one set and the handles a record keeps.
+metrics = ["dep:dashmap", "dep:rustc-hash"]
+# The messages every engine's gRPC service shares, generated from
+# `proto/common.proto` into the module `common_proto`. The build then runs
+# `protoc`.
+proto = ["dep:prost", "dep:prost-build"]
+# The worker's runtime, for the process that hosts the workers: the worker
+# with its builder, its registry, its health, its load monitor and its metric
+# writers, the engine handle, the collector of the KV events an engine pushes,
+# the HTTP client factory and the cache of worker-directed clients, the worker
+# errors, the periodic task and the merge of scraped metrics. The engine
+# handle names the messages of the engine's two pushed streams, so the runtime
+# builds `proto`.
+runtime = [
+    "metrics",
+    "proto",
+    "dep:anyhow",
+    "dep:arc-swap",
+    "dep:async-trait",
+    "dep:chrono",
+    "dep:futures",
+    "dep:kv-index",
+    "dep:metrics",
+    "dep:metrics-exporter-prometheus",
+    "dep:metrics-util",
+    "dep:once_cell",
+    "dep:openmetrics-parser",
+    "dep:parking_lot",
+    "dep:quanta",
+    "dep:reqwest",
+    "dep:rustls",
+    "dep:thiserror",
+    "dep:tokio",
+    "dep:tonic",
+    "dep:tracing",
+    "dep:uuid",
+]
+# The runtime's test support, with its test readers and hooks, for the tests
+# of a crate that hosts it. Its scripted engine speaks through tonic's prost
+# codec.
+test-util = ["runtime", "dep:tonic-prost"]
+# The worker side of the workflows a host runs over its workers on the
+# workflow engine: the steps of a worker's removal, the start of a worker's
+# registration, the data they pass along and the host trait they read.
+workflow = ["runtime", "dep:wfaas"]
+
+[dependencies]
+anyhow = { workspace = true, optional = true }
+arc-swap = { version = "1.9.1", optional = true }
+async-trait = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+bitflags.workspace = true
+chrono = { workspace = true, optional = true }
+dashmap = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+kv-index = { workspace = true, optional = true }
+metrics = { version = "0.24.6", optional = true }
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false, optional = true }
+metrics-util = { version = "0.20.4", default-features = false, features = ["registry"], optional = true }
+once_cell = { version = "1.21.4", optional = true }
+openmetrics-parser = { version = "0.4.4", optional = true }
+parking_lot = { workspace = true, optional = true }
+prost = { workspace = true, optional = true }
+quanta = { version = "0.12", optional = true }
+reqwest = { workspace = true, optional = true, features = ["blocking", "http2", "json", "rustls-no-provider"] }
+rustc-hash = { version = "2", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+schemars.workspace = true
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
+serde_with.workspace = true
+thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["macros", "net", "rt", "sync", "time"] }
+tonic = { workspace = true, optional = true }
+tonic-prost = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+url = "2.5"
+uuid = { workspace = true, optional = true }
+wfaas = { workspace = true, optional = true }
+
+[dev-dependencies]
+# The test servers speak HTTP/2 to the prior-knowledge clients.
+axum = { workspace = true, features = ["http2"] }
+base64 = "0.23"
+http.workspace = true
+openssl = "0.10.81"
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "sync", "test-util", "time"] }
+# The test support's scripted engine, in a test build that asks no `test-util`.
+tonic-prost.workspace = true
+tracing-test = "0.2"
+
+[build-dependencies]
+# The generator, with the feature `tonic-prost-build` gives the engine
+# files: a code block in a proto comment is marked as text, so rustdoc does
+# not run it as a test.
+prost-build = { version = "0.14.4", optional = true, features = ["cleanup-markdown"] }
+
+[lints]
+workspace = true

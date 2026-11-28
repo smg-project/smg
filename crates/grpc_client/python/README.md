@@ -31,22 +31,23 @@ from smg_grpc_proto import trtllm_service_pb2, trtllm_service_pb2_grpc
 
 ## Proto Source
 
-The proto source files live in [`grpc_client/proto/`](https://github.com/smg-project/smg/tree/main/grpc_client/proto) in the SMG repository. Python stubs are generated at build time using `grpcio-tools` and shipped in the wheel.
+The proto source files live in [`crates/grpc_client/proto/`](https://github.com/smg-project/smg/tree/main/crates/grpc_client/proto) in the SMG repository, and the messages every engine shares (`common.proto`) in [`crates/worker/proto/`](https://github.com/smg-project/smg/tree/main/crates/worker/proto). Python stubs are generated at build time using `grpcio-tools` and shipped in the wheel.
 
 ## Development
 
 To install in editable mode from the repo root:
 
 ```bash
-pip install -e grpc_client/python/
+pip install -e crates/grpc_client/python/
 ```
 
 For CI or environments where symlinks don't work:
 
 ```bash
-mkdir -p grpc_client/python/smg_grpc_proto/proto
-cp grpc_client/proto/*.proto grpc_client/python/smg_grpc_proto/proto/
-pip install -e grpc_client/python/
+rm -rf crates/grpc_client/python/smg_grpc_proto/proto
+mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
+cp crates/grpc_client/proto/*.proto crates/worker/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
+pip install -e crates/grpc_client/python/
 ```
 
 ### Testing proto changes on a remote GPU machine
@@ -55,11 +56,12 @@ After editing `.proto` files locally, build a wheel and install it in the remote
 
 ```bash
 # 1. Build wheel (regenerates Python stubs from latest .proto files)
-cd grpc_client/python
-# Copy proto files into the package tree (the repo uses a symlink which
+cd crates/grpc_client/python
+# Copy proto files into the package tree (the repo uses symlinks, which
 # won't survive wheel packaging)
+rm -rf smg_grpc_proto/proto
 mkdir -p smg_grpc_proto/proto
-cp ../proto/*.proto smg_grpc_proto/proto/
+cp ../proto/*.proto ../../worker/proto/*.proto smg_grpc_proto/proto/
 pip wheel . --no-deps -w dist/
 
 # 2. Copy to remote

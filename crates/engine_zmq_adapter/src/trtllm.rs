@@ -22,8 +22,11 @@ use crate::{
     context_window::admit_prompt,
     fanout::fan_out_n,
     sglang::normalize_finish_reason,
-    stream::{map_slim_output, matched_stop_of, poll_mapped, MappedGenerateStream, StreamState},
-    structured_outputs::ConstraintRef,
+    stream::{
+        finish, map_slim_output, matched_stop_of, poll_mapped, FinishParts, MappedGenerateStream,
+        StreamState,
+    },
+    structured_outputs::{ConstraintRef, StructuredOutputsSupport},
 };
 
 /// Streaming generate output for one TensorRT-LLM sub-request, mapping each
@@ -69,38 +72,20 @@ impl TrtllmGenerateStream {
     pub fn engine_index(&self) -> Option<u32> {
         self.inner.engine_index()
     }
+}
 
-    /// Whether the engine already finished this choice and its terminal
-    /// `Complete` is parked behind the chunk just yielded (the finish tick
-    /// carried new tokens).
-    pub fn has_parked_complete(&self) -> bool {
-        self.pending.is_some()
+impl finish::Parts for TrtllmGenerateStream {
+    fn parked(&self) -> Option<&vllm::GenerateResponse> {
+        self.pending.as_ref()
     }
 
-    /// End this choice as aborted: the engine's own parked `Complete` when it
-    /// already finished, else a terminal `Complete` with `finish_reason =
-    /// "abort"` and the output so far. The engine-side request is aborted
-    /// when the stream is dropped, so the caller drops it next.
-    pub fn complete_aborted(&mut self) -> vllm::GenerateResponse {
-        if let Some(parked) = self.pending.take() {
-            return parked;
+    fn finish_parts(&mut self) -> FinishParts<'_> {
+        FinishParts {
+            state: &mut self.state,
+            index: self.index,
+            pending: &mut self.pending,
+            input_logprobs_emitted: &mut self.input_logprobs_emitted,
         }
-        let mut pending = None;
-        // No new tokens on a frontend finish, so `emit_tick` yields the
-        // `Complete` directly and parks nothing.
-        let mut response = self.state.emit_tick(
-            self.index,
-            Vec::new(),
-            None,
-            Some(("abort".to_string(), None)),
-            &mut pending,
-        );
-        self.state.attach_input_logprobs(
-            &mut self.pending,
-            &mut self.input_logprobs_emitted,
-            &mut response,
-        );
-        response
     }
 }
 
@@ -312,6 +297,22 @@ pub(crate) fn constraint_ref(req: &trtllm::GenerateRequest) -> Option<Constraint
         "grammar" => ConstraintRef::Ebnf(&guided.guide),
         _ => ConstraintRef::StructuralTag(&guided.guide),
     })
+}
+
+/// A structural tag that is a JSON answer's schema alone, swapped for that
+/// schema where the engine's backend is not the one the tag is spelled for
+/// ([`crate::structured_outputs::answer_schema_in_place_of_tag`]); every
+/// other guide stays as it came.
+pub(crate) fn send_answer_tag_as_schema(
+    req: &mut trtllm::GenerateRequest,
+    support: StructuredOutputsSupport,
+) {
+    let schema =
+        crate::structured_outputs::answer_schema_in_place_of_tag(constraint_ref(req), support);
+    if let (Some(schema), Some(guided)) = (schema, req.guided_decoding.as_mut()) {
+        guided.guide_type = trtllm::guided_decoding_params::GuideType::JsonSchema as i32;
+        guided.guide = schema;
+    }
 }
 
 /// A field the wire does not carry, refused with the way out rather than
@@ -620,6 +621,33 @@ mod tests {
         );
     }
 
+    /// A chat request's `min_tokens` survives the whole path to the engine:
+    /// the gateway's chat builder writes it to the proto, the translation
+    /// copies it, and the request decoded from the wire's bytes carries it.
+    #[test]
+    fn a_chat_requests_min_tokens_survive_the_wire() {
+        use openai_protocol::chat::ChatCompletionRequest;
+        use smg_grpc_client::TrtllmServiceClient;
+
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "min_tokens": 30, "max_tokens": 40
+        }))
+        .expect("a chat request");
+        let proto = TrtllmServiceClient::build_generate_request_from_chat_parts(
+            "r1".to_string(),
+            &chat,
+            "hi".to_string(),
+            vec![1, 2, 3],
+            None,
+            Default::default(),
+        )
+        .expect("the chat builder");
+        let wire = translate(proto).expect("the translation");
+        let back: TrtllmGenerateReqInput = decode_msgpack(&encode_msgpack(&wire).unwrap()).unwrap();
+        assert_eq!(back.sampling.min_tokens, Some(30));
+    }
+
     /// A generation phase's first token crosses as sent, id 0 included (the
     /// message's presence decides, not the id's value); the context phase's
     /// opaque state has no slot on this wire and is refused by name, never
@@ -713,6 +741,32 @@ mod tests {
             req.tokenized.as_mut().unwrap().input_token_ids = vec![];
         })
         .contains("empty"));
+    }
+
+    /// A chat request's `seed` survives the whole path to the engine: the
+    /// gateway's chat builder writes it to the proto, the translation copies
+    /// it, and the request decoded from the wire's bytes carries it.
+    #[test]
+    fn a_chat_requests_seed_survives_the_wire() {
+        use openai_protocol::chat::ChatCompletionRequest;
+        use smg_grpc_client::TrtllmServiceClient;
+
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "seed": 7
+        }))
+        .expect("a chat request");
+        let proto = TrtllmServiceClient::build_generate_request_from_chat_parts(
+            "r1".to_string(),
+            &chat,
+            "hi".to_string(),
+            vec![1, 2, 3],
+            None,
+            Default::default(),
+        )
+        .expect("the chat builder");
+        let wire = translate(proto).expect("the translation");
+        let back: TrtllmGenerateReqInput = decode_msgpack(&encode_msgpack(&wire).unwrap()).unwrap();
+        assert_eq!(back.sampling.seed, Some(7));
     }
 
     /// `n > 1` fans out to one sub per sample under the parent's id with
@@ -829,6 +883,40 @@ mod tests {
         assert_eq!(complete.prompt_logprobs[0].logprob, 0.0);
         assert_eq!(complete.prompt_logprobs[1].token_id, 2);
         assert_eq!(complete.prompt_logprobs[1].logprob, -2.0);
+    }
+
+    /// A structural tag that is a JSON answer's schema alone reaches an engine
+    /// whose backend is pinned to another name than the tags are spelled for
+    /// as that schema, its keys in the order written; a call's tag reaches it
+    /// as it came.
+    #[tokio::test]
+    async fn an_answer_tag_reaches_a_pinned_other_backend_as_its_schema() {
+        use trtllm::guided_decoding_params::GuideType;
+
+        use crate::test_support::{answer_tag, call_tag, pinned_other_backend, ANSWER_SCHEMA};
+
+        let (client, engine, _dir) = connected_pair(RuntimeType::Trtllm).await;
+        client.set_structured_outputs_support(pinned_other_backend());
+        let (mut input, _output) = engine.split();
+        let mut streams = Vec::new();
+        for (id, tag, schema) in [
+            ("answer", answer_tag(), Some(ANSWER_SCHEMA)),
+            ("call", call_tag(), None),
+        ] {
+            let mut req = request(id);
+            req.guided_decoding = Some(trtllm::GuidedDecodingParams {
+                guide_type: GuideType::StructuralTag as i32,
+                guide: tag.clone(),
+            });
+            streams.push(client.generate_trtllm_streams(req, None).await.expect(id));
+            let frames = input.recv_frames().await.unwrap();
+            let sent: TrtllmGenerateReqInput = decode_msgpack(frames[1].as_ref()).unwrap();
+            let guide = match schema {
+                Some(schema) => ("json_schema".to_string(), schema.to_string()),
+                None => ("structural_tag".to_string(), tag),
+            };
+            assert_eq!(sent.sampling.guided_decoding, Some(guide), "{id}");
+        }
     }
 
     /// End-to-end over ipc:// for a TensorRT-LLM backend: the adapter frames a

@@ -30,6 +30,7 @@ mod test_fixtures;
 #[cfg(feature = "symphony")]
 pub mod to_symphony;
 #[cfg(test)]
+#[path = "../tests/unit/unit_tests.rs"]
 mod unit_tests;
 
 pub use error::{LoadError, ParseError, PyErrorKind, Unsupported};

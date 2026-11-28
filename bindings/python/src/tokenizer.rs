@@ -159,7 +159,7 @@ fn count_for(state: u64, pid: u32) -> u64 {
 /// One more in the count `counter` keeps for process `pid`.
 fn count_up(counter: &AtomicU64, pid: u32) {
     counter
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
             Some(u64::from(pid) << 32 | (count_for(state, pid) + 1))
         })
         .ok();
@@ -169,7 +169,7 @@ fn count_up(counter: &AtomicU64, pid: u32) {
 /// none.
 fn count_down(counter: &AtomicU64, pid: u32) {
     counter
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |state| {
             Some(u64::from(pid) << 32 | count_for(state, pid).saturating_sub(1))
         })
         .ok();
@@ -1132,7 +1132,7 @@ impl PyTokenizer {
     /// `transformers` tokenizer.
     fn __len__(&self) -> usize {
         match self.inner.as_any().downcast_ref::<HuggingFaceTokenizer>() {
-            Some(tokenizer) => tokenizer.tokenizers_pipeline().get_vocab_size(true),
+            Some(tokenizer) => tokenizer.vocab_size_with_added_tokens(),
             None => self.inner.vocab_size(),
         }
     }

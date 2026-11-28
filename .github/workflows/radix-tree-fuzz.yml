@@ -29,12 +29,13 @@ jobs:
   campaign:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    # No Rust cache step: this one run a day would be its entry's only
+    # reader, and the entry would take room in the repository's cache
+    # budget from the entries every pull request reads. The build it
+    # would spare takes seconds of the job.
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: radix-tree-fuzz
       - name: Run the differential campaign (release)
         env:
           RADIX_FUZZ_SEEDS: ${{ github.event.inputs.seeds || '600' }}

@@ -119,6 +119,33 @@ mod tests {
         assert!(dropped(&events).contains(&", "));
     }
 
+    /// A marker the table ignores is dropped inside a call's object too where markers frame the
+    /// list, as it is between the objects: the list reader keeps such a marker as the call's
+    /// text only for a list with no markers around it. No table of the registry that reads a
+    /// list between markers ignores one, so the case builds its own.
+    #[test]
+    fn a_marker_the_table_ignores_is_dropped_inside_a_call_of_the_list_between_markers() {
+        let format = llama_nemotron().ignores("pad", "<pad>");
+        format.validate().unwrap_or_else(|why| panic!("{why}"));
+        let events = drive(
+            &mut Engine::new(format, Declared::default()),
+            PROMPT,
+            &[
+                "<TOOLCALL>[{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Pa<pad>ris\"}}]\
+                 </TOOLCALL>",
+            ],
+        );
+        assert_eq!(
+            calls(&events),
+            [(
+                "get_weather".to_string(),
+                "{\"city\": \"Paris\"}".to_string()
+            )]
+        );
+        assert_eq!(content(&events), "");
+        assert!(dropped(&events).contains(&"<pad>"), "{events:?}");
+    }
+
     #[test]
     fn content_before_the_list_and_the_thought_before_both() {
         // call-with-content; the Super template's thought, which the model writes itself

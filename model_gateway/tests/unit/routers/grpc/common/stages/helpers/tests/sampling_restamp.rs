@@ -1,0 +1,240 @@
+//! A retry re-applies the sampling defaults from the request's baseline, not from the previous
+//! worker. Flash sampling also passes through request extraction and worker defaults.
+
+use std::sync::Arc;
+
+use axum::{
+    body::{to_bytes, Body},
+    extract::FromRequest,
+    http::{Request, StatusCode},
+};
+use openai_protocol::{chat::ChatCompletionRequest, validated::ValidatedJson};
+use serde_json::{json, Value};
+use smg_grpc_client::{sglang_proto, SglangSchedulerClient, VllmEngineClient};
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
+
+use super::*;
+use crate::routers::grpc::{
+    backend_client::BasicWorkerBuilder, context::ExecutionPlanKind, proto_wrapper::ProtoRequest,
+};
+
+fn worker_with_defaults(url: &str, defaults_json: Option<&str>) -> WorkerSelection {
+    let mut builder = BasicWorkerBuilder::new(url).worker_type(WorkerType::Regular);
+    if let Some(json) = defaults_json {
+        builder = builder.label(DEFAULT_SAMPLING_PARAMS_LABEL, json);
+    }
+    WorkerSelection::Single {
+        worker: Arc::new(builder.build()).into(),
+    }
+}
+
+fn sglang_request() -> ProtoGenerateRequest {
+    ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
+        request_id: "sampling-restamp".to_string(),
+        sampling_params: Some(sglang_proto::SamplingParams {
+            temperature: 1.0,
+            top_k: 3,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }))
+}
+
+fn sglang_params(plan: &ExecutionPlan) -> &sglang_proto::SamplingParams {
+    match plan {
+        ExecutionPlan::Single(ProtoRequest::Generate(ProtoGenerateRequest::Sglang(req))) => {
+            req.sampling_params.as_ref().unwrap()
+        }
+        _ => panic!("expected single SGLang plan"),
+    }
+}
+
+/// Attempt N's effective sampling params must be exactly (request values)
+/// + (worker N's defaults). A retry worker that omits a field the first
+/// worker defaulted must fall back to the build-time baseline, never to
+/// the first worker's value.
+#[test]
+fn retry_reapplies_defaults_from_the_baseline_not_the_previous_worker() {
+    let mask = SamplingDefaultsMask::from_request_type(&RequestType::Chat(Arc::new(
+        ChatCompletionRequest::default(),
+    )))
+    .expect("chat requests always carry a mask");
+
+    let worker_a = worker_with_defaults(
+        "grpc://worker-a:30000",
+        Some(r#"{"temperature":0.5,"top_k":7}"#),
+    );
+    let mut request = sglang_request();
+    let baseline = apply_sampling_defaults(&mut request, Some(mask), Some(&worker_a));
+    let stamp = AttemptStamp {
+        id: IdStamp::Exact,
+        sampling_mask: Some(mask),
+        sampling_baseline: baseline,
+        inject_pd_metadata: false,
+        tool_constraint: None,
+    };
+    let mut plan = ExecutionPlan::generate(ExecutionPlanKind::Single, request);
+    {
+        let params = sglang_params(&plan);
+        assert_eq!(params.temperature, 0.5, "worker A's default applied");
+        assert_eq!(params.top_k, 7);
+    }
+
+    // Worker B omits temperature: it must return to the baseline (1.0),
+    // not keep worker A's 0.5.
+    let worker_b = worker_with_defaults("grpc://worker-b:30000", Some(r#"{"top_k":9}"#));
+    restamp_plan_for_attempt(&mut plan, &stamp, &worker_b, &ToolParserFactory::new()).unwrap();
+    {
+        let params = sglang_params(&plan);
+        assert_eq!(params.temperature, 1.0, "baseline restored, not worker A's");
+        assert_eq!(params.top_k, 9, "worker B's default applied");
+    }
+
+    // Worker C has no defaults label at all: everything returns to the
+    // baseline.
+    let worker_c = worker_with_defaults("grpc://worker-c:30000", None);
+    restamp_plan_for_attempt(&mut plan, &stamp, &worker_c, &ToolParserFactory::new()).unwrap();
+    {
+        let params = sglang_params(&plan);
+        assert_eq!(params.temperature, 1.0);
+        assert_eq!(params.top_k, 3);
+    }
+}
+
+/// Read a POST body through the production Chat Completions extractor.
+async fn chat_request(body: &Value) -> Result<ChatCompletionRequest, (StatusCode, Value)> {
+    let request = Request::post("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    match ValidatedJson::<ChatCompletionRequest>::from_request(request, &()).await {
+        Ok(ValidatedJson(req)) => Ok(req),
+        Err(response) => {
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            Err((status, serde_json::from_slice(&bytes).unwrap()))
+        }
+    }
+}
+
+/// Flash's normalized sampling values reach both engines through worker defaults.
+#[tokio::test]
+async fn glm_flash_sampling_reaches_vllm_and_sglang() {
+    let worker = worker_with_defaults(
+        "grpc://worker:30000",
+        Some(r#"{"temperature":0.5,"top_p":0.8,"top_k":9}"#),
+    );
+    for (do_sample, top_p, expected) in [
+        (None, None, (1.0, 0.95, 9)),
+        (Some(false), Some(0.7), (0.0, 1.0, 1)),
+        (Some(true), Some(0.0), (1.0, 1.0, 1)),
+    ] {
+        let mut body = json!({
+            "model": "zai-org/GLM-5.3-Flash",
+            "messages": [{"role": "user", "content": "hi"}],
+            "top_p": top_p,
+        });
+        if let Some(do_sample) = do_sample {
+            body["do_sample"] = json!(do_sample);
+        }
+        let req = chat_request(&body).await.unwrap();
+        let mask = Some(SamplingDefaultsMask::from_chat_request(&req));
+
+        let vllm = VllmEngineClient::build_generate_request_from_chat(
+            "vllm".into(),
+            &req,
+            String::new(),
+            vec![1],
+            None,
+            Default::default(),
+        )
+        .unwrap();
+        let sglang = SglangSchedulerClient::build_generate_request_from_chat_parts(
+            "sglang".into(),
+            &req,
+            String::new(),
+            vec![1],
+            Default::default(),
+        )
+        .unwrap();
+        let (temperature, top_p, top_k) = expected;
+        let mut vllm = ProtoGenerateRequest::Vllm(Box::new(vllm));
+        apply_sampling_defaults(&mut vllm, mask, Some(&worker));
+        let ProtoGenerateRequest::Vllm(vllm) = vllm else {
+            panic!("expected a vLLM request");
+        };
+        let params = vllm.sampling_params.unwrap();
+        assert_eq!(
+            (params.temperature, params.top_p, params.top_k),
+            (Some(temperature), top_p, top_k as u32),
+        );
+
+        let mut sglang = ProtoGenerateRequest::Sglang(Box::new(sglang));
+        apply_sampling_defaults(&mut sglang, mask, Some(&worker));
+        let ProtoGenerateRequest::Sglang(sglang) = sglang else {
+            panic!("expected an SGLang request");
+        };
+        let params = sglang.sampling_params.unwrap();
+        assert_eq!((params.temperature, params.top_p, params.top_k), expected);
+    }
+}
+
+/// The mask of a chat request that set no sampling field: every default applies.
+fn chat_mask() -> SamplingDefaultsMask {
+    SamplingDefaultsMask::from_request_type(&RequestType::Chat(Arc::new(
+        ChatCompletionRequest::default(),
+    )))
+    .expect("chat requests always carry a mask")
+}
+
+/// A disaggregated pair whose sides carry the given default-sampling labels
+/// (`None` leaves a side unlabelled).
+fn labelled_pair(prefill_json: Option<&str>, decode_json: Option<&str>) -> WorkerSelection {
+    fn side(url: &str, worker_type: WorkerType, json: Option<&str>) -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new(url).worker_type(worker_type);
+        if let Some(json) = json {
+            builder = builder.label(DEFAULT_SAMPLING_PARAMS_LABEL, json);
+        }
+        Arc::new(builder.build())
+    }
+    WorkerSelection::Disaggregated {
+        encode_assignments: None,
+        prefill: side("grpc://prefill:30000", WorkerType::Prefill, prefill_json),
+        decode: side("grpc://decode:30000", WorkerType::Decode, decode_json).into(),
+        runtime_type: RuntimeType::Sglang,
+    }
+}
+
+fn sglang_params_of(request: &ProtoGenerateRequest) -> &sglang_proto::SamplingParams {
+    match request {
+        ProtoGenerateRequest::Sglang(req) => req.sampling_params.as_ref().unwrap(),
+        _ => panic!("expected an SGLang request"),
+    }
+}
+
+/// A disaggregated request samples under the decode worker's defaults: that
+/// side produces the visible tokens, so its label is the one read.
+#[test]
+fn a_disaggregated_request_takes_the_decode_workers_defaults() {
+    let pair = labelled_pair(
+        Some(r#"{"temperature":0.2,"top_k":5}"#),
+        Some(r#"{"temperature":0.8,"top_k":11}"#),
+    );
+    let mut request = sglang_request();
+    apply_sampling_defaults(&mut request, Some(chat_mask()), Some(&pair));
+    let params = sglang_params_of(&request);
+    assert_eq!(params.temperature, 0.8, "the decode worker's default");
+    assert_eq!(params.top_k, 11, "the decode worker's default");
+}
+
+/// The prefill worker's label is not read: a pair whose decode side carries
+/// none leaves the request as it was built.
+#[test]
+fn a_prefill_workers_label_alone_defaults_nothing() {
+    let pair = labelled_pair(Some(r#"{"temperature":0.2,"top_k":5}"#), None);
+    let mut request = sglang_request();
+    apply_sampling_defaults(&mut request, Some(chat_mask()), Some(&pair));
+    let params = sglang_params_of(&request);
+    assert_eq!(params.temperature, 1.0, "the request's own value");
+    assert_eq!(params.top_k, 3, "the request's own value");
+}

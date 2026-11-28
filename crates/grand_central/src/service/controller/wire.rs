@@ -1,0 +1,1159 @@
+//! The decide wire (design 5.2, appendix A): a `DecideRequest` as the
+//! engine reads a request, and the engine's decision as the wire's answer.
+//!
+//! A frame is checked once, where it is read ([`Checked::new`]): what the
+//! wire can say and the engine's record cannot hold is refused there, by
+//! the field's name, before the request takes a place in a queue. The read
+//! after it ([`Lists::of`]) borrows the frame and cannot fail: the
+//! model, the hashes, the keys and the header values are read where the
+//! frame holds them, and the three lists the record holds in another form
+//! (the tried and the excluded ids, the headers) are written into buffers
+//! the reading decider keeps ([`Lists`]).
+//!
+//! The record is narrower than the wire in three kinds of place, each with
+//! one rule. An enum the frame leaves unset reads as the record's default
+//! (a single-phase request, token hashes), and a number that names no
+//! value of it is refused. A count the wire carries wider than the record
+//! (the attempt, the media counts) saturates at the record's width. A
+//! header's name is a position, so one past the record's 256 is refused:
+//! saturated, it would read as another header's. A frame's headers are as
+//! many as those positions at most ([`MAX_HEADERS`]): a longer list repeats
+//! a name, and is refused by its count.
+//!
+//! A key is read in the form its frame carries, and the two keys' hash
+//! forms are two things (the contract's `Identity`). A tenant's is its
+//! key's fingerprint, which the record carries as it is. A session key's
+//! is the session's value, the key within the request's model and phase
+//! already, while the record carries a key's fingerprint and scopes it
+//! itself: the fingerprint is read back from the value
+//! ([`key_of_session`]), once, at the check. So one key names one session
+//! in either form, and a stage that reads the key itself reads one key.
+//! The one value that would give the fingerprint no key has is refused.
+//!
+//! A range the contract fixes refuses a frame, its id's length among
+//! them, and the transport refuses one over its size as received; a
+//! bound a generation's document sets never does,
+//! since the gateway may be a generation behind. The block hashes past what
+//! the deciding generation reads of the request are cut at the read, the
+//! first ones kept: a prefix cut short is still a prefix.
+//!
+//! A request that carries its prompt as text is checked like any other and
+//! says so ([`Checked::has_text`]): the controller is to hash the text into
+//! block hashes before any stage reads the view, and its decider has no
+//! decision for it until a step does. Until one reads the text it is
+//! dropped at the check, so a frame that waits in a queue holds none.
+//!
+//! A pick's answer carries the lease its decider had the store file for it
+//! ([`decided`]), with the time its gateway has to name the dispatch.
+//! A pair carries two sides under one id, prefill first. A shed and a
+//! queue ticket carry no lease.
+
+use std::{
+    mem,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use crate::{
+    document::{
+        operator::{Document, NeedsRow, Status},
+        spec::{AppliedSpec, MAX_HEADERS},
+    },
+    engine::{
+        decision::{Decision, ShedReason, Target},
+        demands::{Demands, References},
+        framework::{EncodeItems, EncodePlaced},
+        view::{
+            fingerprint, key_of_session, Constraints, HashKind, Header, Identity, MediaCounts,
+            ModelFingerprint, Phase, RequestFacts, Session, WireModes, WorkerId,
+        },
+    },
+    service::proto::{
+        self, busy::Reason, decide_answer::Answer, decision::Outcome, identity::Form,
+    },
+    store::{DecodeIssue, Hand, MemoryStore},
+    tracking::lease::{Lease, LeaseId, ReleaseReason, Said, Side},
+};
+
+/// Why a frame is refused before any decision: the field, by its path in
+/// the contract. A frame's size is the transport's to refuse
+/// ([`MAX_FRAME`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum Refusal {
+    /// The field holds a number its record has no place for.
+    #[error("{0} is out of its range in this protocol version")]
+    OutOfRange(&'static str),
+}
+
+/// The longest `request_id` a frame carries, in bytes; the shortest is one.
+/// The id is its request's key and rides back on every answer, so its
+/// length is a range of the contract.
+pub(crate) const MAX_REQUEST_ID: usize = 256;
+
+/// The largest `DecideRequest`, in bytes as received: the transport refuses
+/// a longer one on the `Decide` call at its length, before it reads it, so
+/// a field this build does not know counts too. A stream's window and a
+/// decider's queue hold frames by the place, so the frame's size is what
+/// bounds their bytes: as read, a frame holds no more than it was received
+/// as and one record for each of its headers, [`MAX_HEADERS`] of them at
+/// most. A frame over the bound is refused whole, whatever its lists hold:
+/// a sender cuts its hashes at the tail until its frame fits, and the
+/// spec's range for their cap ends at what one frame carries
+/// ([`MAX_BLOCK_HASHES`](crate::document::spec::MAX_BLOCK_HASHES)).
+pub(crate) const MAX_FRAME: usize = 64 * 1024;
+
+/// The bit of a [`Checked`] frame's rare words for one that carried its
+/// prompt as text.
+const TEXT: u8 = 1;
+
+/// The bit for a frame whose gateway asks its request again
+/// (`DecideRequest.again`).
+const AGAIN: u8 = 1 << 1;
+
+/// The bit for a pair's frame whose decode is sent after its prefill has
+/// run (`DecideRequest.decode_later`).
+const DECODE_LATER: u8 = 1 << 2;
+
+/// The bit for a frame that asks the decode side of a lease
+/// (`DecideRequest.decode_of`).
+const DECODE_OF: u8 = 1 << 3;
+
+/// The bit for a frame that is an encode request: it carries the request's
+/// items (`DecideRequest.encode`), with a key or with none.
+const ITEMS: u8 = 1 << 4;
+
+/// The most keys an encode request's items hold (`EncodeItems.keys`): a
+/// longer list is out of the field's range. The engine states no bound of
+/// its own, so the contract does.
+pub(crate) const MAX_ITEMS: usize = 256;
+
+/// The lease a frame asks the decode side of (`DecideRequest.decode_of`),
+/// `0` where it asks none. An id of 0 is no lease's and out of the field's
+/// range. The check of a frame received reads the field here, and so does
+/// a sender whose callers share one stream, as both read [`ranges`].
+#[inline(always)]
+pub(crate) fn asked_decode(decode_of: Option<u64>) -> Result<u64, Refusal> {
+    match decode_of {
+        Some(0) => Err(Refusal::OutOfRange("decode_of")),
+        asked => Ok(asked.unwrap_or(0)),
+    }
+}
+
+/// What the ranges of a frame's facts read as: its phase, the kind of its
+/// block hashes and its session key's fingerprint (`0` for a key carried
+/// plain, and for none). Refuses by the first field the record cannot
+/// hold. The check of a frame received reads its facts here
+/// ([`Checked::new`]), and so does a sender whose callers share one
+/// stream: a frame out of its ranges ends the stream it is sent on.
+/// Inline in both, so the check of a frame received pays no call for it.
+#[inline(always)]
+pub(crate) fn ranges(facts: &proto::RequestFacts) -> Result<(Phase, HashKind, u64), Refusal> {
+    let phase = match proto::Phase::try_from(facts.phase) {
+        Ok(proto::Phase::Unspecified | proto::Phase::Single) => Phase::Single,
+        Ok(proto::Phase::Prefill) => Phase::Prefill,
+        Ok(proto::Phase::Decode) => Phase::Decode,
+        Ok(proto::Phase::Encode) => Phase::Encode,
+        Err(_) => return Err(Refusal::OutOfRange("facts.phase")),
+    };
+    let hash_kind = match proto::HashKind::try_from(facts.hash_kind) {
+        Ok(proto::HashKind::Unspecified | proto::HashKind::Token) => HashKind::Token,
+        // A text request states its window: the window is its host's
+        // choice, and the view's block size is in tokens. One that carries
+        // hashes and states none cannot be priced. One with no hash prices
+        // nothing and is taken.
+        Ok(proto::HashKind::Text) if facts.block_size == 0 && !facts.block_hashes.is_empty() => {
+            return Err(Refusal::OutOfRange("facts.block_size"));
+        }
+        Ok(proto::HashKind::Text) => HashKind::Text,
+        Err(_) => return Err(Refusal::OutOfRange("facts.hash_kind")),
+    };
+    // The headers by their count first: an empty one is two bytes as
+    // encoded and a record of its own as read, so the frame's size
+    // does not bound them, and a list longer than a view's names
+    // repeats one.
+    if facts.headers.len() > MAX_HEADERS {
+        return Err(Refusal::OutOfRange("facts.headers"));
+    }
+    if facts
+        .headers
+        .iter()
+        .any(|header| u8::try_from(header.name).is_err())
+    {
+        return Err(Refusal::OutOfRange("facts.headers.name"));
+    }
+    // A session key's hash form is the session's value: the key's
+    // fingerprint is read back from it within the request's model and
+    // phase. A value of zero is no session.
+    let session = facts.session_key.as_ref();
+    let session_key = match session.and_then(|key| key.form.as_ref()) {
+        Some(Form::Hash(value @ 1..)) => {
+            let model = fingerprint(facts.model.as_bytes());
+            match key_of_session(*value, model, phase) {
+                0 => return Err(Refusal::OutOfRange("facts.session_key.hash")),
+                key => key,
+            }
+        }
+        _ => 0,
+    };
+    Ok((phase, hash_kind, session_key))
+}
+
+/// The range of the items a frame states (`DecideRequest.encode`). `phase`
+/// is the phase the frame is read at ahead of its items and `decode_of`
+/// the lease whose decode side it asks ([`asked_decode`]). A sender hands
+/// the phase its facts state ([`ranges`]). The check of a frame received
+/// hands that phase too, or the decode phase where the frame asks a
+/// lease's decode side ([`Checked::new`]): the answer is the same, since
+/// such a frame is refused here by its lease. Items are read on a frame
+/// of the encode phase, [`MAX_ITEMS`] keys at most. A frame of another
+/// phase that states them is out of range, and one that asks a lease's
+/// decode side is such a frame, whatever its facts say. The check of a
+/// frame received reads the field here, and so does a sender whose
+/// callers share one stream, as both read [`ranges`].
+#[inline(always)]
+pub(crate) fn stated_items(
+    encode: Option<&proto::EncodeItems>,
+    phase: Phase,
+    decode_of: u64,
+) -> Result<(), Refusal> {
+    match encode {
+        Some(_) if phase != Phase::Encode || decode_of != 0 => Err(Refusal::OutOfRange("encode")),
+        Some(stated) if stated.keys.len() > MAX_ITEMS => Err(Refusal::OutOfRange("encode.keys")),
+        _ => Ok(()),
+    }
+}
+
+/// The hard demands a frame states (`DecideRequest.demands`), or the field
+/// that puts them out of range. A message with no part demands nothing, on
+/// any frame. A stated demand is read on every frame: a part out of its
+/// own range is refused by its name, and no demand is refused for the kind
+/// of its frame.
+///
+/// The check of a frame received reads the field here ([`Checked::new`]).
+/// A sender whose callers share one stream reads it here too.
+///
+/// Out of line: a frame that states no message reads none of it.
+#[cold]
+#[inline(never)]
+pub(crate) fn stated_demands(stated: &proto::Demands) -> Result<Demands, Refusal> {
+    // Every field by its name: one the contract gains stops the build here,
+    // so no demand passes unread.
+    let proto::Demands {
+        runtime,
+        vision,
+        references,
+        input_window,
+        output_window,
+        decoding,
+    } = *stated;
+    let references = match proto::demands::References::try_from(references) {
+        Ok(proto::demands::References::None) => References::None,
+        Ok(proto::demands::References::Any) => References::Any,
+        Ok(proto::demands::References::Caller) => References::Caller,
+        Ok(proto::demands::References::Worker) => References::Worker,
+        Err(_) => return Err(Refusal::OutOfRange("demands.references")),
+    };
+    let Ok(decoding) = u8::try_from(decoding) else {
+        return Err(Refusal::OutOfRange("demands.decoding"));
+    };
+    Ok(Demands {
+        runtime,
+        vision,
+        references,
+        input_window,
+        output_window,
+        decoding,
+    })
+}
+
+/// A `DecideRequest` the engine's record holds whole.
+#[derive(Debug)]
+pub(crate) struct Checked {
+    id: Vec<u8>,
+    facts: proto::RequestFacts,
+    constraints: proto::Constraints,
+    phase: Phase,
+    hash_kind: HashKind,
+    /// The session key's fingerprint, for a frame that carries the key as
+    /// the session's value; `0` for one that carries it plain or carries
+    /// none.
+    session_key: u64,
+    /// What the frame says that few frames say, a bit a word ([`TEXT`],
+    /// [`AGAIN`], [`DECODE_LATER`], [`DECODE_OF`], [`ITEMS`]): `0` for a
+    /// frame that says none, so a decider reads them by one test.
+    rare: u8,
+    /// The number the frame's request names its worker by
+    /// (`DecideRequest.named_worker`), as it came; `None` for a frame that
+    /// names no worker.
+    named: Option<u32>,
+    /// The request's hard demands (`DecideRequest.demands`); the default
+    /// for a frame that states none.
+    demands: Demands,
+    /// The lease whose decode side the frame asks; `0` for a frame that
+    /// asks none.
+    decode_of: u64,
+    /// The items of an encode request (`DecideRequest.encode`); `None` for
+    /// every other frame. Boxed: every other frame's record grows by one
+    /// pointer, and holds no room for a list few frames carry.
+    items: Option<Box<Items>>,
+}
+
+/// An encode request's items as its frame carried them
+/// (`DecideRequest.encode`), with the room its answer takes for where they
+/// go (`DecideAnswer.encode`): an encoder a key at most. Both are made
+/// where the frame is checked, on its stream's thread. A deciding thread
+/// fills the room and makes no list. A pick's stream frees both, and any
+/// other answer frees them where it is decided.
+#[derive(Debug)]
+struct Items {
+    stated: proto::EncodeItems,
+    placed: proto::EncodePlaced,
+}
+
+impl Checked {
+    /// Checks `request`, or refuses it by the first field the record cannot
+    /// hold. Its size is not asked here: the transport held the frame to
+    /// [`MAX_FRAME`] as received, and a frame reads to no more than that.
+    /// A frame with no facts, or with no constraints, reads as one that
+    /// leaves every field of them unset.
+    pub(crate) fn new(request: proto::DecideRequest) -> Result<Self, Refusal> {
+        if !(1..=MAX_REQUEST_ID).contains(&request.request_id.len()) {
+            return Err(Refusal::OutOfRange("request_id"));
+        }
+        let mut facts = request.facts.unwrap_or_default();
+        // The prompt as text is said and not kept: no step reads it yet.
+        let text = !mem::take(&mut facts.prompt_text).is_empty();
+        let (phase, hash_kind, session_key) = ranges(&facts)?;
+        let decode_of = asked_decode(request.decode_of)?;
+        // A frame that asks a lease's decode side is read at the decode
+        // phase, whatever its facts say, and is no pair's first request:
+        // its `decode_later` is not read.
+        let phase = if decode_of == 0 { phase } else { Phase::Decode };
+        let later = request.decode_later && decode_of == 0;
+        // An encode request's items are read on a frame of the encode
+        // phase, which is its pair's one request: it is read at the
+        // prefill phase, where its pair is decided. A frame of another
+        // phase that carries them is out of range, so no frame with
+        // items is decided without them. A frame that asks a lease's
+        // decode side is one of another phase, whatever its facts say: a
+        // decode asked again states no items.
+        stated_items(request.encode.as_ref(), phase, decode_of)?;
+        let items = request.encode.map(|stated| {
+            let placed = proto::EncodePlaced {
+                encoders: Vec::with_capacity(stated.keys.len()),
+                one: false,
+            };
+            Box::new(Items { stated, placed })
+        });
+        let demands = match &request.demands {
+            None => Demands::default(),
+            Some(stated) => stated_demands(stated)?,
+        };
+        let phase = if items.is_some() {
+            Phase::Prefill
+        } else {
+            phase
+        };
+        let rare = (u8::from(text) * TEXT)
+            | (u8::from(request.again) * AGAIN)
+            | (u8::from(later) * DECODE_LATER)
+            | (u8::from(decode_of != 0) * DECODE_OF)
+            | (u8::from(items.is_some()) * ITEMS);
+        Ok(Self {
+            id: request.request_id,
+            facts,
+            constraints: request.constraints.unwrap_or_default(),
+            phase,
+            hash_kind,
+            session_key,
+            rare,
+            // Kept as the frame states it, whatever the frame's phase: the
+            // decision of a frame over one list reads it, under a spec
+            // whose binding names a target source, and no other does.
+            named: request.named_worker,
+            demands,
+            decode_of,
+            items,
+        })
+    }
+
+    /// The model the request is for: its deciders' key.
+    pub(crate) fn model(&self) -> &str {
+        &self.facts.model
+    }
+
+    pub(crate) const fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// The decision's seed, which its trace carries and its naming draws from.
+    pub(crate) const fn seed(&self) -> u64 {
+        self.facts.seed
+    }
+
+    /// The time the request gives its decision, counted from its frame's
+    /// receipt.
+    pub(crate) fn budget(&self) -> Duration {
+        Duration::from_micros(u64::from(self.facts.budget_micros))
+    }
+
+    /// Whether the frame says a word few frames say: it carried its prompt
+    /// as text, its gateway asks its request again, its pair's decode comes
+    /// later, or it asks a lease's decode side. A decider asks this of
+    /// every request, once, and which word it is of those that say one.
+    pub(crate) const fn says_more(&self) -> bool {
+        self.rare != 0
+    }
+
+    /// Whether the request carried its prompt as text, for the controller
+    /// to hash.
+    pub(crate) const fn has_text(&self) -> bool {
+        self.rare & TEXT != 0
+    }
+
+    /// Whether the request's gateway sent it before under this id and
+    /// holds no answer to it (`DecideRequest.again`).
+    pub(crate) const fn again(&self) -> bool {
+        self.rare & AGAIN != 0
+    }
+
+    /// Whether the pair's decode is sent after its prefill has run
+    /// (`DecideRequest.decode_later`): its first decision files the decode
+    /// side chosen.
+    pub(crate) const fn decode_later(&self) -> bool {
+        self.rare & DECODE_LATER != 0
+    }
+
+    /// The lease whose decode side the frame asks
+    /// (`DecideRequest.decode_of`); `None` for a frame that asks none.
+    pub(crate) fn decode_of(&self) -> Option<LeaseId> {
+        (self.rare & DECODE_OF != 0).then_some(LeaseId(self.decode_of))
+    }
+
+    /// Whether the frame is an encode request: it carried the request's
+    /// items (`DecideRequest.encode`) at the encode phase, and is read at
+    /// the prefill phase as its pair's one request ([`Self::phase`]).
+    pub(crate) const fn carries_items(&self) -> bool {
+        self.rare & ITEMS != 0
+    }
+
+    /// The number the frame's request names its worker by
+    /// (`DecideRequest.named_worker`), as its host read it under the
+    /// target source of its binding's routing key
+    /// ([`KeySources::target`](crate::document::KeySources::target));
+    /// `None` for a frame that names no worker. The widest number is a
+    /// text that was no number: it reaches no worker of any list.
+    pub(crate) const fn named_worker(&self) -> Option<u32> {
+        self.named
+    }
+
+    /// The request's hard demands as the frame states them
+    /// (`DecideRequest.demands`). The count of a frame that names its
+    /// worker reads them: a worker they leave out takes no number. A pair
+    /// that reads the number on neither side runs no count, and its
+    /// decision holds them as every frame's does.
+    pub(crate) const fn demands(&self) -> Demands {
+        self.demands
+    }
+
+    /// The keys of an encode request's items as the engine takes them, in
+    /// the request's order, on `room`: a buffer the frame's decider keeps
+    /// across frames, which goes back emptied ([`spent_keys`]). Empty for
+    /// a frame that is no encode request, and for a request with no key.
+    /// The keys borrow the frame.
+    pub(crate) fn item_keys(&self, room: Vec<Identity<'static>>) -> Vec<Identity<'_>> {
+        let mut keys = spent_keys(room);
+        if let Some(items) = self.items.as_deref() {
+            let stated = items.stated.keys.iter();
+            keys.extend(stated.map(|key| identity(Some(key))));
+        }
+        keys
+    }
+
+    /// The items of an encode request as the engine takes them, over
+    /// `keys` ([`Self::item_keys`]). A request with no key is one all the
+    /// same: it still says what it asks of its pair's decode. A frame that
+    /// is no encode request ([`Self::carries_items`]) states no item and
+    /// asks nothing. The items' one key is the frame's where it states one
+    /// (`EncodeItems.one`), with a form or with none: one with no form
+    /// still says that the items are taken as one. The items are lent no
+    /// ring, as no frame carries one: the encode stage's own ring places
+    /// them.
+    pub(crate) fn items<'a>(&'a self, keys: &'a [Identity<'a>]) -> EncodeItems<'a> {
+        let Some(items) = self.items.as_deref() else {
+            return EncodeItems::default();
+        };
+        let stated = &items.stated;
+        EncodeItems {
+            keys,
+            one: stated.one.as_ref().map(|one| identity(Some(one))),
+            references: stated.references,
+            decode_images: stated.decode_images,
+            ring: None,
+        }
+    }
+
+    /// What an answer takes of its frame: the frame's id and, for an
+    /// encode request whose `decision` picks, where the pick puts its
+    /// items. `placed` is what the frame's decider holds of that decision
+    /// ([`EncodePlaced`]): each key's encoder is written onto the room the
+    /// frame brought, so its deciding thread makes no list. `None` beside
+    /// any other answer, which places no item.
+    pub(crate) fn into_answer(
+        self,
+        decision: &Decision,
+        placed: &EncodePlaced,
+    ) -> (Vec<u8>, Option<ItemsPlaced>) {
+        let picked = decision.pick().is_some();
+        let encode = self.items.filter(|_| picked).map(|mut items| {
+            let room = &mut items.placed;
+            room.encoders.extend(placed.encoders().iter().map(target));
+            room.one = placed.one();
+            ItemsPlaced(items)
+        });
+        (self.id, encode)
+    }
+
+    /// How many block hashes the frame carries: a read hands the engine
+    /// as many as its generation reads of them ([`Self::hashes_read`]).
+    pub(crate) fn hashes(&self) -> usize {
+        self.facts.block_hashes.len()
+    }
+
+    /// How many of the frame's block hashes a decision under `spec` reads:
+    /// the depth of the generation's stages, in blocks as the frame's host
+    /// hashed them ([`AppliedSpec::block_hashes_read`]).
+    pub(crate) fn hashes_read(&self, spec: &AppliedSpec) -> usize {
+        spec.block_hashes_read(self.hash_kind, self.facts.block_size)
+    }
+
+    /// The request's id as its frame carried it: its lease's record keeps
+    /// the id's fingerprint.
+    pub(crate) fn id(&self) -> &[u8] {
+        &self.id
+    }
+
+    /// The request's id, for its answer.
+    pub(crate) fn into_id(self) -> Vec<u8> {
+        self.id
+    }
+
+    /// The wires the request's gateway states it speaks: `None` where it
+    /// states none. A bit this build does not know is dropped, as the
+    /// record drops it: a gateway that states such bits alone states wires,
+    /// and none that a member of this build shares.
+    pub(crate) fn wires(&self) -> Option<WireModes> {
+        let stated = self.constraints.wire_modes;
+        (stated != 0)
+            .then(|| WireModes::from_bits(u8::try_from(stated & 0b111).unwrap_or_default()))
+    }
+
+    /// The request's subset hint, absent where its gateway gives none: a
+    /// present 0 is a decision over no candidates.
+    pub(crate) const fn subset(&self) -> Option<u32> {
+        self.constraints.subset_hint
+    }
+
+    /// The frame's facts in the engine's form: every fact the frame
+    /// carries, its block hashes as deep as `depth` and its budget as
+    /// `budget_micros`, what is left of it at the decision. The request
+    /// borrows the frame and `lists`, the frame's own as its decider read
+    /// them ([`Lists::of`]).
+    ///
+    /// A fact that is the deciding program's own stands at rest: the
+    /// decision's instant, the rows the program names and what it lends
+    /// beside its candidates. A program that holds one writes it over this.
+    ///
+    /// The one reader of a frame's facts: whichever engine decides, its
+    /// request is made of this.
+    #[inline]
+    pub(crate) fn facts<'a>(
+        &'a self,
+        lists: &'a FrameLists<'_>,
+        depth: usize,
+        budget_micros: u32,
+    ) -> RequestFacts<'a> {
+        let facts = &self.facts;
+        let media = facts
+            .media
+            .as_ref()
+            .map(|media| MediaCounts {
+                images: narrowed(media.images),
+                audio: narrowed(media.audio),
+                video: narrowed(media.video),
+                bytes: media.bytes,
+            })
+            .unwrap_or_default();
+        RequestFacts {
+            model: &facts.model,
+            namespace_seed: facts.namespace_seed,
+            tenant: identity(facts.tenant.as_ref()),
+            priority: facts.priority,
+            streaming: facts.streaming,
+            max_output_tokens: facts.max_output_tokens,
+            prompt_tokens: facts.prompt_tokens,
+            // The first hashes, as deep as the generation reads.
+            block_hashes: facts
+                .block_hashes
+                .get(..depth)
+                .unwrap_or(&facts.block_hashes),
+            hash_kind: self.hash_kind,
+            session_key: match facts.session_key.as_ref().and_then(|key| key.form.as_ref()) {
+                Some(Form::Plain(key)) if !key.is_empty() => Identity::plain(key),
+                Some(Form::Hash(_)) => Identity::hashed(self.session_key),
+                Some(Form::Plain(_)) | None => Identity::NONE,
+            },
+            phase: self.phase,
+            attempt: u8::try_from(facts.attempt).unwrap_or(u8::MAX),
+            tried: &lists.lists.tried,
+            budget_micros,
+            headers: &lists.headers,
+            media,
+            seed: facts.seed,
+            block_size: facts.block_size,
+            // A frame states a count and no text's length.
+            prompt_chars: 0,
+            prompt_bytes: 0,
+            // The decision's instant and the candidates' column are its
+            // deciding program's own.
+            now_micros: 0,
+            affinity: &[],
+            // In-process only: the rows the deciding host names.
+            named: None,
+            // The wire carries the name: each read of the request's
+            // session fingerprints it.
+            model_fingerprint: ModelFingerprint::NONE,
+            // The request's maker sets it: no frame carries it.
+            session_counted: false,
+            // The frame carries no signal cells: they stand beside the
+            // candidates of the program that decides.
+            signal_cells: None,
+            client_key: facts.client_key,
+            // No frame carries a ring, nor a side's places on one: the
+            // ring stage places by its own, as it learns it from the rows.
+            ring: None,
+            ring_positions: &[],
+            decode_ring_positions: None,
+            // The frame states who handed the key. A host older than the
+            // field states nothing: its frame reads false, and a prefix
+            // ring places it by its key, as before the field.
+            session_key_from_rid: facts.session_key_from_rid,
+        }
+    }
+
+    /// The frame's constraints in the engine's form: the workers its
+    /// gateway just missed, the wires it states, the lifted veto, the later
+    /// decode and the subset hint. What the deciding program adds of its
+    /// own stands at rest: no position is held back and the request may
+    /// take every place of its list.
+    ///
+    /// The one reader of a frame's constraints, as [`Self::facts`] is of
+    /// its facts.
+    #[inline]
+    pub(crate) fn constraints<'a>(&'a self, lists: &'a FrameLists<'_>) -> Constraints<'a> {
+        let constraints = &self.constraints;
+        Constraints {
+            excluded: &lists.lists.excluded,
+            wire_modes: self.wires().unwrap_or_default(),
+            overload_lifted: constraints.overload_lifted,
+            decode_later: self.decode_later(),
+            // A frame's request is counted by the leases on file alone.
+            counted_on_decode: false,
+            subset_hint: constraints.subset_hint,
+            demands: self.demands,
+            stalled: &[],
+            held: &[],
+            // No frame holds a request to places.
+            places: None,
+            // The number a pair's decision counts is its maker's to state
+            // ([`FrameRequest::naming_decode`]): this reader states none.
+            target_worker: None,
+        }
+    }
+}
+
+/// The lists of one request in the engine's form, on buffers their decider
+/// keeps across requests: a read allocates only while they grow.
+#[derive(Debug, Default)]
+pub(crate) struct Lists {
+    tried: Vec<WorkerId>,
+    excluded: Vec<WorkerId>,
+    /// Empty between reads: a request's headers borrow its frame.
+    headers: Vec<Header<'static>>,
+}
+
+impl Lists {
+    /// Reads `frame`'s three lists onto these buffers, in the engine's
+    /// form: the tried and the excluded ids, and the headers, which borrow
+    /// the frame. The lists stand for as long as the answer is held
+    /// ([`FrameLists`]): what an earlier frame left here is gone.
+    #[inline]
+    pub(crate) fn of<'a>(&'a mut self, frame: &'a Checked) -> FrameLists<'a> {
+        let (facts, constraints) = (&frame.facts, &frame.constraints);
+        self.tried.clear();
+        self.tried.extend(facts.tried.iter().copied().map(WorkerId));
+        self.excluded.clear();
+        self.excluded
+            .extend(constraints.excluded.iter().copied().map(WorkerId));
+        let mut headers = emptied(mem::take(&mut self.headers));
+        headers.extend(facts.headers.iter().map(|header| Header {
+            // Checked: a name is a position below 256.
+            name: u8::try_from(header.name).unwrap_or(u8::MAX),
+            value: &header.value,
+        }));
+        FrameLists {
+            lists: self,
+            headers,
+        }
+    }
+}
+
+/// One frame's lists in the engine's form ([`Lists::of`]), lent to the
+/// frame's request for as long as the request is read
+/// ([`Checked::facts`], [`Checked::constraints`]). The headers borrow the
+/// frame. Their buffer goes back to the decider's where this is dropped,
+/// emptied: the next frame's headers take it.
+#[derive(Debug)]
+pub(crate) struct FrameLists<'a> {
+    lists: &'a mut Lists,
+    headers: Vec<Header<'a>>,
+}
+
+impl Drop for FrameLists<'_> {
+    fn drop(&mut self) {
+        self.lists.headers = emptied(mem::take(&mut self.headers));
+    }
+}
+
+/// `spent`'s buffer, emptied, for the headers of another frame. Nothing is
+/// left to map: the collect keeps the buffer and names the other frame's
+/// lifetime.
+fn emptied<'a>(mut spent: Vec<Header<'_>>) -> Vec<Header<'a>> {
+    spent.clear();
+    spent
+        .into_iter()
+        .map(|header| Header {
+            name: header.name,
+            value: "",
+        })
+        .collect()
+}
+
+/// `spent`'s buffer, emptied, for the keys of another frame's items, as
+/// [`emptied`] hands a frame's headers on: a decider keeps one buffer for
+/// the keys of every encode request it decides.
+pub(crate) fn spent_keys<'a>(mut spent: Vec<Identity<'_>>) -> Vec<Identity<'a>> {
+    spent.clear();
+    let keys = spent.into_iter().map(|key| Identity {
+        hash: key.hash,
+        plain: None,
+    });
+    keys.collect()
+}
+
+/// A tenant in the form its frame carries: the fingerprint, or the plain
+/// key, fingerprinted here. Absent when the frame carries none, a
+/// fingerprint of zero or an empty name.
+fn identity(wire: Option<&proto::Identity>) -> Identity<'_> {
+    match wire.and_then(|identity| identity.form.as_ref()) {
+        Some(Form::Hash(hash)) => Identity::hashed(*hash),
+        Some(Form::Plain(key)) if !key.is_empty() => Identity::plain(key),
+        Some(Form::Plain(_)) | None => Identity::NONE,
+    }
+}
+
+/// A count at the record's width: one past it reads as the widest.
+fn narrowed(count: u32) -> u16 {
+    u16::try_from(count).unwrap_or(u16::MAX)
+}
+
+/// What a pick's lease is handed over with, beside the lease. One word of
+/// the three: the queue's entry stays the size it was.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Beside {
+    /// A single's lease: nothing.
+    Alone,
+    /// The session key of the decode side's lease of a pair's pick. That
+    /// lease is the prefill side's under this key: one id, one record, and
+    /// at the answer one index and one count of tokens.
+    Decode(Session),
+    /// The issue of a decode call's pick. Where the answer does not leave,
+    /// its sender takes this one issue back: the prefill that runs under
+    /// the same lease keeps its booking ([`Leased::given_up`]).
+    Issue(DecodeIssue),
+}
+
+/// A pick's lease as its decider hands it over: the lease the store filed,
+/// what its decision left of the lease's dispatch span, and when that span
+/// ends.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Leased {
+    /// The lease as the store filed it.
+    pub(crate) lease: Lease,
+    /// What the lease is handed over with.
+    pub(crate) beside: Beside,
+    /// What is left of its dispatch span: at the decision's last read as
+    /// its decider hands it over, at the send as its stream sends it.
+    pub(crate) left: Duration,
+    /// When the span ends: the dispatch deadline the store filed.
+    pub(crate) due: Instant,
+}
+
+impl Leased {
+    /// The least of a dispatch span a lease is handed over with: the wire
+    /// tells the span in whole milliseconds, and under one is none.
+    pub(crate) const LEAST: Duration = Duration::from_millis(1);
+
+    /// The lease as its stream sends it at `now`, a read of the clock
+    /// behind its decider's last: with what is left of the span there.
+    pub(crate) fn sent_at(self, now: Instant) -> Self {
+        Self {
+            left: self.due.saturating_duration_since(now),
+            ..self
+        }
+    }
+
+    /// Gives the lease up for an answer that does not leave, under
+    /// `reason`, by a word handed to its file through `hand`, as a
+    /// `Released` frame's word is: whoever may act at the file next applies
+    /// it and tells its engine, so no stage hears it beside its decider at
+    /// work. A decode call's answer takes its one issue back, and the side
+    /// stands chosen for the first pick's dispatch
+    /// ([`MemoryStore::hand_taken_back`]).
+    /// Any other lease is released whole.
+    pub(crate) fn given_up(&self, store: &MemoryStore, hand: &Hand, reason: ReleaseReason) {
+        match self.beside {
+            Beside::Issue(issue) => {
+                store.hand_taken_back(hand, self.lease.id, issue, reason);
+            }
+            Beside::Alone | Beside::Decode(_) => {
+                store.hand(hand, self.lease.id, Said::Released(None, reason));
+            }
+        }
+    }
+
+    /// Whether too little of the span is left to hand the lease over.
+    pub(crate) fn spent(&self) -> bool {
+        self.left < Self::LEAST
+    }
+
+    /// Whether the lease's id was minted for this answer. A decode call's
+    /// was not: its lease is its pair's, minted for that pair's first
+    /// answer, under that answer's term.
+    pub(crate) const fn minted(&self) -> bool {
+        !matches!(self.beside, Beside::Issue(_))
+    }
+}
+
+/// Where an encode request's pick puts its items, as its decider hands it
+/// over with the decision (`DecideAnswer.encode`): the encoder of each
+/// placed key, and whether the one key was placed in the items' stead. It
+/// is the frame's own record of its items with the answer's list filled
+/// ([`Checked::into_answer`]): the stream that sends the answer moves the
+/// list into its frame and frees the rest.
+#[derive(Debug)]
+pub(crate) struct ItemsPlaced(Box<Items>);
+
+/// A decider's answer as its stream's queue holds it. A decision waits as
+/// it was made, with the lease issued for its pick, and its frame is built
+/// where its stream sends it, behind that send's read of the fence and of
+/// the lease's span: the lists a frame carries (a pick's targets, the
+/// trace's top, the lease) are made and freed on the thread that encodes
+/// them, and a deciding thread makes none. An encode request's pick waits
+/// with where its items go, written on the room its frame brought
+/// ([`ItemsPlaced`]).
+#[derive(Debug)]
+pub(crate) enum Decided {
+    /// A decision made under `term` for the request `id`, and the lease
+    /// its decider hands over with it.
+    Decision {
+        id: Vec<u8>,
+        term: u64,
+        decision: Decision,
+        lease: Option<Leased>,
+        /// Where an encode request's pick puts its items; `None` for
+        /// every other answer.
+        encode: Option<ItemsPlaced>,
+    },
+    /// An answer that carries no list: a `Busy`.
+    Frame(proto::DecideAnswer),
+}
+
+/// The answer that carries `decision`, made under `term`, with the lease
+/// the store filed for it where it is a pick that was issued one, and
+/// what that lease's dispatch span has left where the answer is sent. A pair's pick
+/// carries two leases of one id, the prefill side's first, or the prefill
+/// side's alone where its decode side was not issued. An encode request's
+/// pick carries where its items go beside the decision (`encode`), and no
+/// lease for an encoder.
+pub(crate) fn decided(
+    id: Vec<u8>,
+    term: u64,
+    decision: &Decision,
+    lease: Option<&Leased>,
+    encode: Option<ItemsPlaced>,
+) -> proto::DecideAnswer {
+    let mut decision = self::decision(decision);
+    if let Some(leased) = lease {
+        let decode = match leased.beside {
+            Beside::Decode(session) => Some(session),
+            Beside::Alone | Beside::Issue(_) => None,
+        };
+        let mut leases = Vec::with_capacity(1 + usize::from(decode.is_some()));
+        leases.push(self::lease(&leased.lease, leased.left));
+        if let Some(session) = decode {
+            let decode = Lease {
+                side: Side::Decode,
+                session,
+                ..leased.lease
+            };
+            leases.push(self::lease(&decode, leased.left));
+        }
+        decision.leases = leases;
+    }
+    proto::DecideAnswer {
+        request_id: id,
+        term,
+        answer: Some(Answer::Decision(decision)),
+        encode: encode.map(|ItemsPlaced(items)| items.placed),
+    }
+}
+
+/// A duration as a wire field's milliseconds: the field's largest value
+/// for a longer one.
+pub(super) fn millis(duration: Duration) -> u32 {
+    u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
+}
+
+/// Where a controller's lease id holds the term that minted it: the bits
+/// from this one up, over the term's counter.
+const MINTED_UNDER: u32 = 32;
+
+/// A lease this controller minted, as the wire carries it under the term
+/// that minted it, with `left`: what is left, where it is sent, of the time
+/// its gateway has to name the dispatch. The term is the one in the id's
+/// own bits ([`MINTED_UNDER`]): a decode call answered under a later term
+/// names a lease an earlier one minted. The decide call issues one kind of
+/// lease, a credit: on a single request's target, or on each side of a
+/// pair under one id.
+fn lease(lease: &Lease, left: Duration) -> proto::Lease {
+    let side = match lease.side {
+        Side::Single => proto::Side::Single,
+        Side::Prefill => proto::Side::Prefill,
+        Side::Decode => proto::Side::Decode,
+        Side::Encode => proto::Side::Encode,
+    };
+    proto::Lease {
+        id: lease.id.0,
+        kind: proto::LeaseKind::Credit.into(),
+        side: side.into(),
+        target_index: u32::from(lease.target_index),
+        generation: lease.generation,
+        session_key: lease.session.get(),
+        tokens: lease.tokens,
+        term: lease.id.0 >> MINTED_UNDER,
+        dispatch_ttl_ms: millis(left),
+        origin: proto::LeaseOrigin::Controller.into(),
+    }
+}
+
+/// The answer of a request this controller does not decide, for `reason`:
+/// the gateway decides it locally at once. No pacing hint rides it yet:
+/// when the gateway asks again is its own interval's to say.
+pub(crate) fn busy(id: Vec<u8>, term: u64, reason: Reason) -> proto::DecideAnswer {
+    proto::DecideAnswer {
+        request_id: id,
+        term,
+        answer: Some(Answer::Busy(proto::Busy {
+            reason: reason.into(),
+            retry_after_micros: 0,
+        })),
+        encode: None,
+    }
+}
+
+/// The frame that grants its stream `window` more requests.
+pub(crate) fn credit(term: u64, window: u32) -> proto::DecideAnswer {
+    proto::DecideAnswer {
+        request_id: Vec::new(),
+        term,
+        answer: Some(Answer::Credit(proto::Credit { window })),
+        encode: None,
+    }
+}
+
+/// A decision as the wire carries it; its lease is its answer's to add
+/// ([`decided`]).
+pub(super) fn decision(decision: &Decision) -> proto::Decision {
+    let outcome = match decision {
+        Decision::Pick(pick) => Outcome::Pick(proto::Pick {
+            targets: pick.targets.iter().map(target).collect(),
+        }),
+        Decision::Shed(shed) => Outcome::Shed(proto::Shed {
+            reason: shed_reason(shed.reason).into(),
+            emptied_by: shed.emptied_by.to_owned(),
+            retry_after_secs: u32::from(shed.retry_after_secs),
+            wait_allowed: shed.wait_allowed,
+        }),
+        Decision::Queue(queue) => Outcome::Queue(proto::Queue {
+            ticket: queue.ticket,
+            max_wait_micros: queue.max_wait_micros,
+        }),
+    };
+    proto::Decision {
+        leases: Vec::new(),
+        outcome: Some(outcome),
+        trace: Some(decision.trace().wire()),
+    }
+}
+
+fn target(target: &Target) -> proto::Target {
+    proto::Target {
+        id: target.id.0,
+        dp_rank: u32::from(target.dp_rank),
+        pair: target.pair.map(|pair| proto::Pair {
+            decode_id: pair.decode_id.0,
+            decode_dp_rank: u32::from(pair.decode_dp_rank),
+        }),
+    }
+}
+
+const fn shed_reason(reason: ShedReason) -> proto::ShedReason {
+    match reason {
+        ShedReason::Saturated => proto::ShedReason::Saturated,
+        ShedReason::FlowLimit => proto::ShedReason::FlowLimit,
+        ShedReason::NoEndpoints => proto::ShedReason::NoEndpoints,
+        ShedReason::PolicyDeclined => proto::ShedReason::PolicyDeclined,
+        ShedReason::Deadline => proto::ShedReason::Deadline,
+    }
+}
+
+/// A redacted snapshot row, with its age at the take's clock.
+pub(super) fn snapshot_row(row: &crate::store::WorkerRow, now: Instant) -> proto::WorkerRow {
+    let mut told = super::worker_wire::row(row);
+    told.admitted_age_ms = super::replication::age_ms(now, row.admitted_at);
+    told
+}
+
+/// The operator's status in the contract's form.
+pub(super) fn spec_status(status: Status) -> proto::SpecStatus {
+    let mode = if status.applied.is_some() {
+        proto::ApplyMode::Enforce
+    } else {
+        proto::ApplyMode::Unspecified
+    };
+    proto::SpecStatus {
+        generation: status.generation,
+        digest: status
+            .digest
+            .map_or_else(String::new, |digest| digest.to_string()),
+        applied_unix_micros: status.applied.map_or(0, unix_micros),
+        mode: mode.into(),
+        retained: status.retained,
+        source: if status.writable { "api" } else { "file" }.to_owned(),
+    }
+}
+
+/// The source's document as the spec read call answers it.
+pub(super) fn spec_document(document: Document) -> proto::PolicySpecDocument {
+    proto::PolicySpecDocument {
+        generation: document.generation,
+        digest: document.digest.to_string(),
+        document: document.document,
+        format: document.format.as_str().to_owned(),
+        applied_unix_micros: unix_micros(document.applied),
+        mode: proto::ApplyMode::Enforce.into(),
+        acks: Vec::new(),
+    }
+}
+
+/// The source's document and its status as a standby is sent them.
+pub(super) fn generation_event(document: Document) -> proto::GenerationEvent {
+    let digest = document.digest.to_string();
+    proto::GenerationEvent {
+        status: Some(proto::SpecStatus {
+            generation: document.generation,
+            digest: digest.clone(),
+            applied_unix_micros: unix_micros(document.applied),
+            mode: proto::ApplyMode::Enforce.into(),
+            ..proto::SpecStatus::default()
+        }),
+        document: Some(proto::SpecPush {
+            generation: document.generation,
+            digest,
+            document: document.document,
+            format: document.format.as_str().to_owned(),
+            needs: None,
+        }),
+    }
+}
+
+/// The feeds before and after a document's verdict.
+pub(super) fn needs_diff((before, after): (Vec<NeedsRow>, Vec<NeedsRow>)) -> proto::NeedsDiff {
+    proto::NeedsDiff {
+        before: Some(needs_summary(before)),
+        after: Some(needs_summary(after)),
+    }
+}
+
+/// A time as the contract carries it, or zero where it cannot be stated.
+pub(super) fn unix_micros(at: SystemTime) -> i64 {
+    at.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|since| i64::try_from(since.as_micros()).ok())
+        .unwrap_or(0)
+}
+
+/// What a host must feed for these rows, as the contract writes it: a row
+/// for each of the engine's rows that has a flag to set
+/// ([`crate::engine::Engine::needs_rows`]), in their order. A need the contract's row has
+/// no flag for is not told here: a worker's requests in flight, the
+/// sessions in flight, a key's in-flight count, the affinity column and
+/// the signal cells are the controller's own to hold.
+pub(super) fn needs_summary(rows: Vec<NeedsRow>) -> proto::NeedsSummary {
+    let models = rows
+        .into_iter()
+        .filter(|NeedsRow { needs, .. }| {
+            needs.text
+                || needs.token_hashes
+                || needs.text_hashes
+                || needs.loads
+                || needs.events
+                || needs.ring
+                || needs.headers
+                || needs.media
+        })
+        .map(
+            |NeedsRow {
+                 model,
+                 phase,
+                 needs,
+             }| proto::ModelNeeds {
+                model,
+                role: role(phase).into(),
+                text: needs.text,
+                token_hashes: needs.token_hashes,
+                text_hashes: needs.text_hashes,
+                loads: needs.loads,
+                events: needs.events,
+                ring: needs.ring,
+                headers: needs.headers,
+                media: needs.media,
+            },
+        )
+        .collect();
+    proto::NeedsSummary { models }
+}
+
+/// The role a phase's decision places on, as the contract writes it.
+const fn role(phase: Phase) -> proto::Role {
+    match phase {
+        Phase::Single => proto::Role::Single,
+        Phase::Prefill => proto::Role::Prefill,
+        Phase::Decode => proto::Role::Decode,
+        Phase::Encode => proto::Role::Encode,
+    }
+}
+
+#[cfg(test)]
+#[path = "../../../tests/unit/service/controller/wire/tests.rs"]
+pub(crate) mod tests;

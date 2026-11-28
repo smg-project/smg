@@ -47,7 +47,7 @@ use http_body::Frame;
 use tonic::{
     codegen::{
         http::{
-            header::{HeaderValue, USER_AGENT},
+            header::{HeaderName, HeaderValue, USER_AGENT},
             uri::{Authority, Uri},
             Request, Response, Version,
         },
@@ -57,9 +57,13 @@ use tonic::{
 };
 use tracing::{debug, info};
 
-use self::connection::{Connection, End};
+use self::connection::{Connection, DialFailure, End, KeepAliveTimeout};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// The status header a trailers-only response carries in its head; a static
+/// name, so the per-response check does not parse the key.
+static GRPC_STATUS: HeaderName = HeaderName::from_static("grpc-status");
 
 /// Default ceiling on a single TCP connect attempt.
 ///
@@ -196,21 +200,51 @@ pub async fn connect_channel_with_timeout(
 /// a dial the peer refuses or that times out (the channel's `UNAVAILABLE`
 /// over the connect error, before any call was in flight), nor the
 /// `UNAVAILABLE` "keep-alive timed out" of a connection this side dropped
-/// for a pong that never came, as tonic answered it.
+/// for a pong that never came, as tonic answered it
+/// ([`is_keep_alive_timeout`] tells that one).
 ///
 /// The gateway's liveness asks a different question of the ends of its
 /// polls and streams, whether the peer is reachable for work, and answers
-/// it from the code alone (`worker::liveness::is_connection_code` in the
+/// it from the code alone (`worker::health::liveness::is_connection_code` in the
 /// gateway crate); the two are not interchangeable.
 pub fn is_transport_failure(status: &tonic::Status) -> bool {
-    let mut source = std::error::Error::source(status);
-    while let Some(error) = source {
-        if error.is::<h2::Error>() {
-            return true;
-        }
-        source = error.source();
-    }
-    false
+    sources(status).any(|error| error.is::<h2::Error>())
+}
+
+/// Whether `status` is this client's own for a call whose connection it
+/// dropped at the keep-alive timeout ([`keep_alive_timeout_status`]): the
+/// peer answered no ping, so the status is no answer of the worker's. Its
+/// source says so; a worker's own `UNAVAILABLE` has none, whatever its
+/// words.
+pub fn is_keep_alive_timeout(status: &tonic::Status) -> bool {
+    sources(status).any(|error| error.is::<KeepAliveTimeout>())
+}
+
+/// The status of a call whose connection this side dropped at the keep-alive
+/// timeout: `UNAVAILABLE` "keep-alive timed out", the answer tonic gave that
+/// case, over the timeout as its source (see [`is_keep_alive_timeout`]).
+#[must_use]
+pub fn keep_alive_timeout_status() -> tonic::Status {
+    let mut status = tonic::Status::unavailable("keep-alive timed out");
+    status.set_source(Arc::new(KeepAliveTimeout));
+    status
+}
+
+/// The message of `status` less the peer's address, when the status is the
+/// channel's own for a dial that failed: the peer refused, the connect ran
+/// into its timeout, the host did not resolve. The status itself names the
+/// peer, so the log line of a failed call says which worker it was; an
+/// answer to a client takes this form. `None` for every other status, the
+/// worker's own included.
+pub fn dial_failure_without_peer(status: &tonic::Status) -> Option<&str> {
+    sources(status)
+        .find_map(DialFailure::of)
+        .map(DialFailure::without_peer)
+}
+
+/// The errors behind `status`, the nearest first.
+fn sources(status: &tonic::Status) -> impl Iterator<Item = &(dyn std::error::Error + 'static)> {
+    std::iter::successors(std::error::Error::source(status), |error| error.source())
 }
 
 /// Convert a `grpc://` or `grpcs://` endpoint to a tonic-compatible
@@ -235,10 +269,10 @@ struct Shared {
     /// the first.
     live: Mutex<Option<Connection>>,
     /// Held for the length of a dial, so a dead connection is re-dialled
-    /// once however many callers find it dead; the guard carries the text
-    /// of the failure the last dial ended in (`None` after a connection),
-    /// for the callers that queued behind that dial.
-    dial: tokio::sync::Mutex<Option<String>>,
+    /// once however many callers find it dead; the guard carries the
+    /// failure the last dial ended in (`None` after a connection), for the
+    /// callers that queued behind that dial.
+    dial: tokio::sync::Mutex<Option<DialFailure>>,
     /// Dials finished so far: a caller reads it before queuing for the
     /// lock and knows, once it holds the lock, whether a dial ended while
     /// it waited.
@@ -361,11 +395,14 @@ impl Shared {
         // lock is this caller's answer too: the callers behind a dial that
         // times out pay one connect timeout between them, not one each.
         let dialled_meanwhile = self.dials.load(Ordering::Acquire) != dials_before;
-        if let (true, Some(failure)) = (dialled_meanwhile, last_dial.as_deref()) {
-            return Err(ConnectError(std::io::Error::other(failure.to_owned()).into()).into());
+        if let (true, Some(failure)) = (dialled_meanwhile, last_dial.as_ref()) {
+            return Err(ConnectError(std::io::Error::other(failure.clone()).into()).into());
         }
         let dialled = self.dial().await;
-        *last_dial = dialled.as_ref().err().map(ToString::to_string);
+        *last_dial = dialled
+            .as_ref()
+            .err()
+            .map(|error| DialFailure::replay_of(error.as_ref()));
         self.dials.fetch_add(1, Ordering::Release);
         Ok(dialled.map_err(ConnectError)?)
     }
@@ -418,7 +455,7 @@ async fn exchange(
     .await?
     .map_err(|e| end.failure(e))?;
     let (parts, stream) = head.into_parts();
-    if stream.is_end_stream() || parts.headers.contains_key("grpc-status") {
+    if stream.is_end_stream() || parts.headers.contains_key(&GRPC_STATUS) {
         write = None;
     }
     Ok(Response::from_parts(parts, RecvBody { stream, write, end }))

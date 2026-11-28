@@ -1,5 +1,5 @@
 //! The lane map: one worker's blocks by engine hash, as the event lane that owns the worker
-//! keeps them for the chain index.
+//! keeps them for the chain index, and the place a block lives ([`BlockRef`]).
 //!
 //! An open-addressing table of 16-byte slots (engine hash, run id, offset) with a one-byte tag
 //! per slot beside them: Fibonacci home slot, linear probing over the tags (dense, so a probe
@@ -14,7 +14,14 @@
 //! absent key is a no-op, iteration yields every entry once. A differential test against a hash
 //! map model under random operations keeps the backshift right.
 
-use crate::{block::SequenceHash, chain_index::BlockRef};
+use crate::{block::SequenceHash, prefetch::prefetch_read};
+
+/// Where one of a worker's blocks lives: the run and the offset of the block within it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BlockRef {
+    pub run: u32,
+    pub offset: u32,
+}
 
 /// Smallest table a non-empty map allocates.
 const MIN_SLOTS: usize = 16;
@@ -225,8 +232,8 @@ impl ChainBlockMap {
     fn touch(&self, key: u64) {
         if !self.slots.is_empty() {
             let home = self.home(key);
-            crate::prefetch::prefetch_read(&self.tags[home]);
-            crate::prefetch::prefetch_read(&self.slots[home]);
+            prefetch_read(&self.tags[home]);
+            prefetch_read(&self.slots[home]);
         }
     }
 

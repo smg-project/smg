@@ -11,7 +11,7 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{
-    extract::{Json, Path, State},
+    extract::{Json, State},
     http::StatusCode,
     response::{IntoResponse, Response},
 };
@@ -19,12 +19,15 @@ use smg_auth::AuditResource;
 use uuid::Uuid;
 
 use crate::{
+    admin::{
+        json::{refusal, AdminJson},
+        params::AdminPath,
+    },
     server::AppState,
     wasm::{
         WasmMetrics, WasmModuleAddRequest, WasmModuleAddResponse, WasmModuleAddResult,
         WasmModuleListResponse,
     },
-    worker::admin_json::{refusal, AdminJson},
     workflow::{
         job_queue::{Job, JobOutcomeError},
         WasmModuleConfigRequest,
@@ -61,7 +64,7 @@ pub(crate) async fn add_wasm_module(
         return no_job_queue();
     };
 
-    let mut status = StatusCode::OK;
+    let mut failures = Vec::new();
     let mut modules = config.modules.clone();
 
     for module in &mut modules {
@@ -79,8 +82,7 @@ pub(crate) async fn add_wasm_module(
             Err(e) => {
                 let (failure, text) = add_failure(&e, module_uuid);
                 module.add_result = Some(WasmModuleAddResult::Error(text));
-                // The answer carries the highest status among the modules' failures.
-                status = status.max(failure);
+                failures.push(failure);
             }
         }
     }
@@ -92,16 +94,20 @@ pub(crate) async fn add_wasm_module(
             Some(WasmModuleAddResult::Error(_)) | None => None,
         })
         .collect();
-    let response = (status, Json(WasmModuleAddResponse { modules })).into_response();
+    let response = (
+        load_status(failures),
+        Json(WasmModuleAddResponse { modules }),
+    )
+        .into_response();
     if added.is_empty() {
         return response;
     }
     AuditResource::name(response, added.join(","))
 }
 
-pub async fn remove_wasm_module(
+pub(crate) async fn remove_wasm_module(
     State(state): State<Arc<AppState>>,
-    Path(module_uuid_str): Path<String>,
+    AdminPath(module_uuid_str): AdminPath<String>,
 ) -> Response {
     let Ok(module_uuid) = Uuid::parse_str(&module_uuid_str) else {
         return refusal(
@@ -159,7 +165,8 @@ pub async fn remove_wasm_module(
 
 /// The status and code of a module job the queue did not finish: no queue is a
 /// 503, a wait past its bound a 504 (the job may still finish; the client
-/// re-reads `GET /wasm`), a job that ran and failed a 500.
+/// re-reads `GET /wasm`), a job that ran and failed a 500, a removal while
+/// another caller waits on one for the same module a 409.
 fn job_refusal_parts(error: &JobOutcomeError) -> (StatusCode, &'static str) {
     match error {
         JobOutcomeError::NotQueued(_) => (StatusCode::SERVICE_UNAVAILABLE, "SERVICE_UNAVAILABLE"),
@@ -172,6 +179,13 @@ fn job_refusal_parts(error: &JobOutcomeError) -> (StatusCode, &'static str) {
 fn job_refusal(error: JobOutcomeError) -> Response {
     let (status, code) = job_refusal_parts(&error);
     refusal(status, code, error.to_string())
+}
+
+/// The answer's status for a load's module failures: the highest among
+/// them, so one module refused by the queue (503) beside one that failed
+/// to load (400) answers 503; a load with no failure answers 200.
+fn load_status(failures: impl IntoIterator<Item = StatusCode>) -> StatusCode {
+    failures.into_iter().fold(StatusCode::OK, StatusCode::max)
 }
 
 /// The status and the result text of a module whose add job did not end
@@ -227,67 +241,5 @@ pub async fn list_wasm_modules(State(state): State<Arc<AppState>>) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A removal the queue did not finish answers by what happened: no queue
-    /// 503, a wait past its bound 504, a failed job 500.
-    #[test]
-    fn a_removal_the_queue_did_not_finish_answers_by_what_happened() {
-        let cases = [
-            (
-                JobOutcomeError::NotQueued("no queue".into()),
-                StatusCode::SERVICE_UNAVAILABLE,
-                "SERVICE_UNAVAILABLE",
-            ),
-            (
-                JobOutcomeError::TimedOut(Duration::from_secs(60)),
-                StatusCode::GATEWAY_TIMEOUT,
-                "GATEWAY_TIMEOUT",
-            ),
-            (
-                JobOutcomeError::Failed("the job failed".into()),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "INTERNAL_SERVER_ERROR",
-            ),
-            (
-                JobOutcomeError::InFlight("0f1e2d3c".into()),
-                StatusCode::CONFLICT,
-                "CONFLICT",
-            ),
-        ];
-        for (error, status, code) in cases {
-            assert_eq!(job_refusal_parts(&error), (status, code), "{error}");
-        }
-    }
-
-    /// A module whose add job did not end well answers by what happened: a
-    /// failed job the module's own 400, no queue 503, a wait past its bound
-    /// 504 with the uuid a late registration carries in its text.
-    #[test]
-    fn a_module_whose_add_job_did_not_end_well_answers_by_what_happened() {
-        let uuid = Uuid::now_v7();
-        let cases = [
-            (
-                JobOutcomeError::Failed("the module failed to load".into()),
-                StatusCode::BAD_REQUEST,
-                "the module failed to load".to_string(),
-            ),
-            (
-                JobOutcomeError::NotQueued("the queue is full".into()),
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Failed to submit job: the queue is full".to_string(),
-            ),
-            (
-                JobOutcomeError::TimedOut(Duration::from_secs(300)),
-                StatusCode::GATEWAY_TIMEOUT,
-                format!(
-                    "Job timeout after 300s; a registration that ends late carries the uuid {uuid}"
-                ),
-            ),
-        ];
-        for (error, status, text) in cases {
-            assert_eq!(add_failure(&error, uuid), (status, text), "{error}");
-        }
-    }
-}
+#[path = "../../tests/unit/wasm/route/tests.rs"]
+mod tests;

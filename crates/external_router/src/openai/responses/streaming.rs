@@ -23,6 +23,7 @@ use openai_protocol::{
     },
     responses::{ResponseTool, ResponsesRequest},
 };
+use serde::Serialize;
 use serde_json::{json, Value};
 use smg_mcp::{McpOrchestrator, McpServerBinding, McpToolSession};
 use tokio_stream::wrappers::ReceiverStream;
@@ -53,14 +54,18 @@ use crate::{
     openai::{
         context::{RequestContext, StreamingEventContext, StreamingRequest},
         mcp::{
-            build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
-            mcp_list_tools_bindings_to_emit, prepare_mcp_tools_as_functions, retained_output_items,
-            send_mcp_list_tools_events, skip_streaming_tool_calls, StreamAction,
-            StreamingToolHandler, ToolLoopState, TOOL_CALL_LIMIT_REASON,
+            execute_streaming_tool_calls, inject_mcp_metadata_last, prepare_mcp_tools_as_functions,
+            resume_payload_in_place, retained_output_items, send_mcp_list_tools_events,
+            skip_streaming_tool_calls, StreamAction, StreamingToolHandler, ToolLoopState,
+            TOOL_CALL_LIMIT_REASON,
         },
     },
-    persistence_utils::persist_conversation_items,
+    persistence_utils::persist_conversation_items_owned,
     sse::{sse_channel, SseEncoder, SseSender},
+    upstream_body::{
+        error_body_text, read_response_body_limited, ReadBodyResult, ERROR_BODY_TOO_LARGE,
+        MAX_ERROR_RESPONSE_SIZE,
+    },
 };
 
 /// Apply all transformations to event data in-place (rewrite + transform)
@@ -543,75 +548,106 @@ fn end_at_tool_call_limit(response: &mut Value, original_request: &ResponsesRequ
     );
 }
 
-/// Send the `response.completed` event that ends the tool loop's stream:
-/// the final response built from the handler's snapshot, the loop's items
-/// in place, the client's view of the tools, the request's metadata, and
-/// the note of a loop stopped at its tool-call allowance.
-/// Returns false if client disconnected
-pub(super) async fn send_final_response_event(
-    handler: &StreamingToolHandler,
-    tx: &SseSender,
-    enc: &mut SseEncoder,
-    sequence_number: &mut u64,
-    state: &ToolLoopState,
+/// The loop's final response shaped once, for the wire and the record alike:
+/// the preserved response id written back, the loop's items in place (the
+/// kept `mcp_list_tools` items move in; nothing reads them afterwards), the
+/// client's view of the tools, the request's metadata, and the note of a
+/// loop stopped at its tool-call allowance.
+pub(super) fn shape_final_response(
+    final_response: &mut Value,
+    preserved_response_id: Option<&str>,
+    state: &mut ToolLoopState,
     ctx: &StreamingEventContext<'_>,
     end: ToolLoopEnd,
-) -> bool {
-    let mut final_response = match handler.snapshot_final_response() {
-        Some(resp) => resp,
-        None => {
-            warn!("Final response snapshot unavailable; skipping synthetic completion event");
-            return true;
-        }
-    };
-
-    if let Some(original_id) = handler.original_response_id() {
+) {
+    if let Some(original_id) = preserved_response_id {
         if let Some(obj) = final_response.as_object_mut() {
             obj.insert("id".to_string(), Value::String(original_id.to_string()));
         }
     }
 
     if let Some(session) = ctx.session {
-        inject_mcp_metadata_streaming(&mut final_response, state, session);
+        inject_mcp_metadata_last(final_response, state, session);
     }
 
     // With the session, the wire hides what the record hides: the internal
     // servers' items and the calls to their tools. The asks for the session's
     // exposed tools that a limit stop leaves beside their not-executed items
     // are dropped by `end_at_tool_call_limit` below.
-    restore_original_tools(&mut final_response, ctx.original_request, ctx.session);
+    restore_original_tools(final_response, ctx.original_request, ctx.session);
     patch_response_with_request_metadata(
-        &mut final_response,
+        final_response,
         ctx.original_request,
         ctx.previous_response_id,
     );
 
-    if let Some(obj) = final_response.as_object_mut() {
-        obj.insert("status".to_string(), Value::String("completed".to_string()));
-    }
     if end == ToolLoopEnd::ToolCallLimit {
-        end_at_tool_call_limit(&mut final_response, ctx.original_request);
+        end_at_tool_call_limit(final_response, ctx.original_request);
     }
+}
 
-    let completed_payload = json!({
-        "type": ResponseEvent::COMPLETED,
-        "sequence_number": *sequence_number,
-        "response": final_response
-    });
+/// Send the `response.completed` event that ends the tool loop's stream with
+/// the shaped final response. The event's response reads `completed` for
+/// either end of the loop; the value keeps the status it carried afterwards,
+/// so the record stores what the upstream said. Returns false if the client
+/// disconnected.
+pub(super) async fn send_final_response_event(
+    final_response: &mut Value,
+    tx: &SseSender,
+    enc: &mut SseEncoder,
+    sequence_number: &mut u64,
+) -> bool {
+    let upstream_status = final_response
+        .as_object_mut()
+        .map(|obj| obj.insert("status".to_string(), Value::String("completed".to_string())));
+
+    let sequence = *sequence_number;
     *sequence_number += 1;
+    let completed_payload = CompletedEventPayload {
+        event_type: ResponseEvent::COMPLETED,
+        sequence_number: sequence,
+        response: final_response,
+    };
 
-    match enc.encode_event(ResponseEvent::COMPLETED, &completed_payload) {
+    let sent = match enc.encode_event(ResponseEvent::COMPLETED, &completed_payload) {
         Ok(bytes) => tx.send(Ok(bytes)).await.is_ok(),
         Err(e) => {
             warn!("failed to encode response.completed via SseEncoder, falling back: {e}");
             let completed_event = format!(
                 "event: {}\ndata: {}\n\n",
                 ResponseEvent::COMPLETED,
-                completed_payload
+                json!({
+                    "type": ResponseEvent::COMPLETED,
+                    "sequence_number": sequence,
+                    "response": final_response
+                })
             );
             tx.send(Ok(Bytes::from(completed_event))).await.is_ok()
         }
+    };
+
+    if let (Some(previous), Some(obj)) = (upstream_status, final_response.as_object_mut()) {
+        match previous {
+            Some(status) => {
+                obj.insert("status".to_string(), status);
+            }
+            None => {
+                obj.remove("status");
+            }
+        }
     }
+    sent
+}
+
+/// The `response.completed` event's payload, serialised onto the wire from
+/// the final response where it stands; `json!` would copy the whole response,
+/// its `mcp_list_tools` schemas included, into the event first.
+#[derive(Serialize)]
+struct CompletedEventPayload<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    sequence_number: u64,
+    response: &'a Value,
 }
 
 /// Simple pass-through streaming without MCP interception
@@ -634,7 +670,7 @@ pub(super) async fn handle_simple_streaming_passthrough(
             worker.record_outcome(502);
             return (
                 StatusCode::BAD_GATEWAY,
-                format!("Failed to forward request to OpenAI: {err}"),
+                format!("Failed to forward request to OpenAI: {}", err.without_url()),
             )
                 .into_response();
         }
@@ -645,10 +681,15 @@ pub(super) async fn handle_simple_streaming_passthrough(
     worker.record_outcome(status.as_u16());
 
     if !status.is_success() {
-        let error_body = response
-            .text()
-            .await
-            .unwrap_or_else(|err| format!("Failed to read upstream error body: {err}"));
+        let error_body = match read_response_body_limited(response, MAX_ERROR_RESPONSE_SIZE).await {
+            ReadBodyResult::Ok(body) => body,
+            ReadBodyResult::TooLarge => {
+                return error::create_error(status, "upstream_error", ERROR_BODY_TOO_LARGE);
+            }
+            // The reader's text of a failed read is the body stream's own, which
+            // carries no request URL.
+            ReadBodyResult::Error(err) => format!("Failed to read upstream error body: {err}"),
+        };
         let error_body = error::sanitize_error_body(&error_body);
         return (status, error_body).into_response();
     }
@@ -681,12 +722,12 @@ pub(super) async fn handle_simple_streaming_passthrough(
 
                     while let Some(raw_block) = chunk_processor.next_block() {
                         let block_cow = match rewrite_streaming_block(
-                            &raw_block,
+                            raw_block,
                             &original_request,
                             previous_response_id.as_deref(),
                         ) {
                             Some(modified) => Cow::Owned(modified),
-                            None => Cow::Borrowed(raw_block.as_str()),
+                            None => Cow::Borrowed(raw_block),
                         };
 
                         if should_store {
@@ -731,11 +772,11 @@ pub(super) async fn handle_simple_streaming_passthrough(
                 );
 
                 // Always persist conversation items and response (even without conversation)
-                if let Err(err) = persist_conversation_items(
+                if let Err(err) = persist_conversation_items_owned(
                     storage.conversation.clone(),
                     storage.conversation_item.clone(),
                     storage.response.clone(),
-                    &response_json,
+                    response_json,
                     &original_request,
                     storage.tenant.as_deref(),
                     storage.request_context.clone(),
@@ -757,8 +798,9 @@ pub(super) async fn handle_simple_streaming_passthrough(
     *response.status_mut() = status;
 
     let headers_mut = response.headers_mut();
+    // One pair per value: a repeated upstream header keeps every value here too.
     for (name, value) in &preserved_headers {
-        headers_mut.insert(name, value.clone());
+        headers_mut.append(name, value.clone());
     }
 
     if !headers_mut.contains_key(CONTENT_TYPE) {
@@ -789,11 +831,12 @@ struct RelayFlags {
     mcp_list_tools_sent: bool,
 }
 
-/// Relays one upstream event stream to the client: every block goes through
-/// the handler and is forwarded, buffered or dropped as it says; the MCP
-/// list-tools items go out at the first `in_progress` of the first stream
-/// (the bindings exist only with a session, [`StreamingEventContext::session`]);
-/// a tool-call trigger ends the relay with the calls pending in the handler.
+/// Relays one upstream event stream to the client: every block but the
+/// upstream's end sentinel (the loop ends the client's stream with its own)
+/// goes through the handler and is forwarded, buffered or dropped as it says;
+/// the MCP list-tools items (the loop's, built once with its session; none
+/// without one) go out at the first `in_progress` of the first stream; a
+/// tool-call trigger ends the relay with the calls pending in the handler.
 #[expect(
     clippy::too_many_arguments,
     reason = "The relay reads the loop's client side as the loop's own text did (the sender, the encoder, the sequence number) beside the handler and its two flags; a struct for one call would be a type the loop's other phases do not share."
@@ -802,7 +845,7 @@ async fn relay_upstream_stream(
     upstream_stream: &mut (impl Stream<Item = reqwest::Result<Bytes>> + Unpin),
     handler: &mut StreamingToolHandler,
     flags: &mut RelayFlags,
-    list_tools_bindings: &[(String, String)],
+    list_tools_items: &[Value],
     tx: &SseSender,
     sse_encoder: &mut SseEncoder,
     streaming_ctx: &StreamingEventContext<'_>,
@@ -817,20 +860,23 @@ async fn relay_upstream_stream(
 
                 while let Some(raw_block) = chunk_processor.next_block() {
                     // Parse event
-                    let (event_name, data) = parse_sse_block(&raw_block);
+                    let (event_name, data) = parse_sse_block(raw_block);
 
-                    if data.is_empty() {
+                    if data.is_empty() || data == "[DONE]" {
                         continue;
                     }
 
-                    // Process through handler
-                    let action = handler.process_event(event_name, data.as_ref());
+                    // Parse the payload once: the handler's gate and record, the skip and
+                    // in_progress checks below and the forward all read this value.
+                    let parsed = serde_json::from_str::<Value>(data.as_ref()).ok();
+                    let action = match parsed.as_ref() {
+                        Some(value) => handler.process_parsed(event_name, value),
+                        // An unparsable payload: the handler's own path logs and forwards it.
+                        None => handler.process_event(event_name, data.as_ref()),
+                    };
 
                     match action {
                         StreamAction::Forward => {
-                            // Parse data once and reuse for skip check, forwarding, and in_progress check
-                            let parsed = serde_json::from_str::<Value>(data.as_ref()).ok();
-
                             // Skip response.created and response.in_progress on subsequent iterations
                             let should_skip = if flags.first_iteration {
                                 false
@@ -855,7 +901,7 @@ async fn relay_upstream_stream(
                                 // Forward the event with pre-parsed value (moved, not cloned)
                                 if !forward_streaming_event(
                                     SseEventData {
-                                        raw_block: &raw_block,
+                                        raw_block,
                                         event_name,
                                         data: data.as_ref(),
                                         pre_parsed: parsed,
@@ -875,23 +921,20 @@ async fn relay_upstream_stream(
                             if is_in_progress {
                                 seen_in_progress = true;
                                 if !flags.mcp_list_tools_sent {
-                                    if let Some(session) = streaming_ctx.session {
-                                        for (server_label, server_key) in list_tools_bindings {
-                                            let list_tools_index =
-                                                handler.allocate_synthetic_output_index();
-                                            if !send_mcp_list_tools_events(
-                                                tx,
-                                                session,
-                                                server_label,
-                                                list_tools_index,
-                                                sequence_number,
-                                                server_key,
-                                            )
-                                            .await
-                                            {
-                                                // Client disconnected
-                                                return RelayEnd::Stopped;
-                                            }
+                                    for item in list_tools_items {
+                                        let list_tools_index =
+                                            handler.allocate_synthetic_output_index();
+                                        if !send_mcp_list_tools_events(
+                                            tx,
+                                            sse_encoder,
+                                            item,
+                                            list_tools_index,
+                                            sequence_number,
+                                        )
+                                        .await
+                                        {
+                                            // Client disconnected
+                                            return RelayEnd::Stopped;
                                         }
                                     }
                                     flags.mcp_list_tools_sent = true;
@@ -932,10 +975,10 @@ async fn relay_upstream_stream(
                             if forward_triggering_event
                                 && !forward_streaming_event(
                                     SseEventData {
-                                        raw_block: &raw_block,
+                                        raw_block,
                                         event_name,
                                         data: data.as_ref(),
-                                        pre_parsed: None,
+                                        pre_parsed: parsed,
                                     },
                                     handler,
                                     tx,
@@ -985,7 +1028,6 @@ pub(super) fn handle_streaming_with_tool_interception(
     let client_clone = client.clone();
     let url_clone = url.clone();
     let headers_opt = headers.cloned();
-    let payload_clone = payload.clone();
     let orchestrator_clone = Arc::clone(orchestrator);
     let forwarded_headers = extract_forwardable_request_headers(headers);
 
@@ -999,16 +1041,17 @@ pub(super) fn handle_streaming_with_tool_interception(
 
         // Create session inside spawned task (borrows from orchestrator_clone which lives in closure)
         let session_request_id = format!("resp_{}", uuid::Uuid::now_v7());
-        let session = McpToolSession::new_with_headers(
+        let mut session = McpToolSession::new_with_headers(
             &orchestrator_clone,
             mcp_servers.clone(),
             &session_request_id,
             forwarded_headers.clone(),
         );
-        let mut current_payload = payload_clone;
+        if let Some(tools) = original_request.tools.as_deref() {
+            openai_bridge::configure_response_tools_approval(&mut session, tools);
+        }
+        let mut current_payload = payload;
         prepare_mcp_tools_as_functions(&mut current_payload, &session);
-        let tools_json = current_payload.get("tools").cloned().unwrap_or(json!([]));
-        let base_payload = current_payload.clone();
         let mut flags = RelayFlags {
             first_iteration: true,
             mcp_list_tools_sent: false,
@@ -1017,10 +1060,6 @@ pub(super) fn handle_streaming_with_tool_interception(
         let mut sse_encoder = SseEncoder::new();
         let mut next_output_index: usize = 0;
         let mut preserved_response_id: Option<String> = None;
-        let list_tools_bindings = mcp_list_tools_bindings_to_emit(
-            &state.existing_mcp_list_tools_labels,
-            session.mcp_servers(),
-        );
 
         let streaming_ctx = StreamingEventContext {
             original_request: &original_request,
@@ -1056,8 +1095,7 @@ pub(super) fn handle_streaming_with_tool_interception(
 
             if !response.status().is_success() {
                 let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                let body = error::sanitize_error_body(&body);
+                let body = error_body_text(response).await;
                 let (code, message) = upstream_status_error(status, &body);
                 send_error_event(&tx, &mut sse_encoder, &mut sequence_number, &code, &message)
                     .await;
@@ -1073,7 +1111,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                 &mut upstream_stream,
                 &mut handler,
                 &mut flags,
-                &list_tools_bindings,
+                state.mcp_list_tools_items(&session),
                 &tx,
                 &mut sse_encoder,
                 &streaming_ctx,
@@ -1156,15 +1194,10 @@ pub(super) fn handle_streaming_with_tool_interception(
                 break (handler, ToolLoopEnd::ToolCallLimit);
             }
 
-            // Build resume payload
-            match build_resume_payload(
-                &base_payload,
-                &state.conversation_history,
-                &tools_json,
-                true, // is_streaming = true
-            ) {
-                Ok(resume_payload) => {
-                    current_payload = resume_payload;
+            // The next turn's payload: this one, the calls just executed
+            // appended
+            match resume_payload_in_place(&mut current_payload, state.history_to_append(), true) {
+                Ok(()) => {
                     flags.first_iteration = false;
                 }
                 Err(e) => {
@@ -1183,51 +1216,41 @@ pub(super) fn handle_streaming_with_tool_interception(
         };
 
         // The loop's end, answered or stopped at the tool-call allowance: the
-        // terminal event, the record, the sentinel.
+        // final response once, shaped once, the terminal event from it, the
+        // same value the record, the sentinel.
+        let mut final_response = match handler.accumulator.into_final_response() {
+            Some(resp) => resp,
+            None => {
+                warn!("Final response unavailable; skipping synthetic completion event");
+                let _ = tx.send(Ok(Bytes::from_static(SSE_DONE.as_bytes()))).await;
+                return;
+            }
+        };
+        shape_final_response(
+            &mut final_response,
+            preserved_response_id.as_deref(),
+            &mut state,
+            &streaming_ctx,
+            end,
+        );
         if !send_final_response_event(
-            &handler,
+            &mut final_response,
             &tx,
             &mut sse_encoder,
             &mut sequence_number,
-            &state,
-            &streaming_ctx,
-            end,
         )
         .await
         {
             return;
         }
 
-        let final_response_json = if should_store {
-            handler.accumulator.into_final_response()
-        } else {
-            None
-        };
-
-        if let Some(mut response_json) = final_response_json {
-            if let Some(ref id) = preserved_response_id {
-                if let Some(obj) = response_json.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.clone()));
-                }
-            }
-            inject_mcp_metadata_streaming(&mut response_json, &state, &session);
-
-            restore_original_tools(&mut response_json, &original_request, Some(&session));
-            patch_response_with_request_metadata(
-                &mut response_json,
-                &original_request,
-                previous_response_id.as_deref(),
-            );
-            if end == ToolLoopEnd::ToolCallLimit {
-                end_at_tool_call_limit(&mut response_json, &original_request);
-            }
-
+        if should_store {
             // Always persist conversation items and response (even without conversation)
-            if let Err(err) = persist_conversation_items(
+            if let Err(err) = persist_conversation_items_owned(
                 storage.conversation.clone(),
                 storage.conversation_item.clone(),
                 storage.response.clone(),
-                &response_json,
+                final_response,
                 &original_request,
                 storage.tenant.as_deref(),
                 storage.request_context.clone(),
@@ -1255,7 +1278,7 @@ pub(super) fn handle_streaming_with_tool_interception(
 
 /// Main entry point for streaming responses
 pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
-    use crate::mcp_utils::{ensure_request_mcp_client, request_uses_mcp_routing};
+    use crate::mcp_utils::{ensure_request_mcp_routing, request_uses_mcp_routing};
 
     let worker = match ctx.worker() {
         Some(w) => w.clone(),
@@ -1288,9 +1311,10 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
                 );
             };
             let registry = registry.clone();
-            ensure_request_mcp_client(&mcp_orchestrator, &registry, tools)
-                .await
-                .map(|servers| (servers, mcp_orchestrator, registry))
+            match ensure_request_mcp_routing(&mcp_orchestrator, &registry, tools).await {
+                Ok(servers) => servers.map(|servers| (servers, mcp_orchestrator, registry)),
+                Err(refusal) => return refusal,
+            }
         }
         _ => None,
     };
@@ -1319,516 +1343,5 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
-    use openai_protocol::responses::ResponseInput;
-
-    use super::*;
-
-    /// The terminal of a loop stopped at the request's tool-call allowance
-    /// is the terminal of an answered loop, `response.completed` with the
-    /// response `completed` at the stream's own sequence number, plus the
-    /// note the non-streamed loop leaves on the same stop,
-    /// `incomplete_details.reason` `max_tool_calls`; nothing else differs
-    /// between the two frames.
-    #[tokio::test]
-    async fn the_tool_call_limit_terminal_is_the_completed_terminal_with_the_non_streamed_note() {
-        let request = ResponsesRequest {
-            model: "m".to_string(),
-            input: ResponseInput::Text("hi".to_string()),
-            ..Default::default()
-        };
-        let ctx = StreamingEventContext {
-            original_request: &request,
-            previous_response_id: None,
-            session: None,
-            mcp_format_registry: None,
-        };
-        let state = ToolLoopState::new(Vec::new());
-        let mut handler = StreamingToolHandler::with_starting_index(0);
-        handler.accumulator.ingest_block(
-            "event: response.created\ndata: {\"type\":\"response.created\",\"sequence_number\":0,\
-             \"response\":{\"id\":\"resp_1\",\"object\":\"response\",\"created_at\":1,\
-             \"model\":\"m\",\"status\":\"in_progress\",\"output\":[]}}",
-        );
-
-        let mut frames = Vec::new();
-        for end in [ToolLoopEnd::Answered, ToolLoopEnd::ToolCallLimit] {
-            let (tx, mut rx) = sse_channel();
-            let mut enc = SseEncoder::new();
-            let mut sequence_number = 7;
-            assert!(
-                send_final_response_event(
-                    &handler,
-                    &tx,
-                    &mut enc,
-                    &mut sequence_number,
-                    &state,
-                    &ctx,
-                    end,
-                )
-                .await
-            );
-            drop(tx);
-            assert_eq!(sequence_number, 8, "{end:?}");
-            let frame = rx.recv().await.expect("the terminal").expect("a frame");
-            assert!(rx.recv().await.is_none(), "one frame, {end:?}");
-            frames.push(String::from_utf8(frame.to_vec()).expect("utf-8"));
-        }
-
-        let data = |frame: &str| -> Value {
-            let data = frame
-                .strip_prefix("event: response.completed\ndata: ")
-                .expect("the completed event");
-            serde_json::from_str(data.trim_end()).expect("json")
-        };
-        let answered = data(&frames[0]);
-        let mut limited = data(&frames[1]);
-        assert_eq!(limited["type"], "response.completed");
-        assert_eq!(limited["sequence_number"], 7);
-        assert_eq!(limited["response"]["status"], "completed");
-        assert_eq!(
-            limited["response"]["incomplete_details"],
-            json!({ "reason": "max_tool_calls" })
-        );
-        assert!(answered["response"].get("incomplete_details").is_none());
-        limited["response"]
-            .as_object_mut()
-            .expect("an object")
-            .remove("incomplete_details");
-        assert_eq!(answered, limited, "the note is the only difference");
-    }
-
-    /// The error event that ends a failed stream is the frame every router
-    /// writes for one, at the stream's own sequence number, which it
-    /// advances; nothing follows it.
-    #[tokio::test]
-    async fn the_error_event_is_the_shared_frame_at_the_streams_sequence_number() {
-        let (tx, mut rx) = sse_channel();
-        let mut enc = SseEncoder::new();
-        let mut sequence_number = 4;
-        send_error_event(
-            &tx,
-            &mut enc,
-            &mut sequence_number,
-            STREAM_ERROR,
-            "Stream error: connection reset",
-        )
-        .await;
-        drop(tx);
-        assert_eq!(sequence_number, 5);
-        let frame = rx.recv().await.expect("the error frame").expect("a frame");
-        assert_eq!(
-            frame,
-            SseEncoder::new().encode_responses_error(
-                "stream_error",
-                "Stream error: connection reset",
-                4
-            )
-        );
-        assert!(rx.recv().await.is_none(), "nothing follows the error event");
-    }
-
-    /// An upstream status answered after the stream began: the body's own
-    /// code (else its type) and message when it carries the error envelope;
-    /// the status's error type, with the status and the body, when it does
-    /// not.
-    #[test]
-    fn an_upstream_status_keeps_the_bodys_code_and_message_when_it_has_them() {
-        let cases = [
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                r#"{"error":{"code":"overloaded","type":"server_error","message":"busy"}}"#,
-                "overloaded",
-                "busy",
-            ),
-            (
-                StatusCode::TOO_MANY_REQUESTS,
-                r#"{"error":{"type":"rate_limit_error","message":"slow down"}}"#,
-                "rate_limit_error",
-                "slow down",
-            ),
-            (
-                StatusCode::BAD_REQUEST,
-                r#"{"error":{"message":"bad input"}}"#,
-                "invalid_request_error",
-                "bad input",
-            ),
-            (
-                StatusCode::BAD_GATEWAY,
-                "bad gateway",
-                "server_error",
-                "Upstream error 502 Bad Gateway: bad gateway",
-            ),
-        ];
-        for (status, body, code, message) in cases {
-            assert_eq!(
-                upstream_status_error(status, body),
-                (code.to_string(), message.to_string()),
-                "{status} {body}"
-            );
-        }
-    }
-
-    /// The routed-worker header of a streaming answer names the worker
-    /// masked: the header reaches every client of the stream and the access
-    /// log copies it, so a credential in a worker URL never reaches either.
-    #[tokio::test]
-    async fn the_routed_worker_header_names_the_worker_masked() {
-        use std::sync::Arc;
-
-        use axum::{
-            http::{header::CONTENT_TYPE, StatusCode},
-            routing::any,
-            Router,
-        };
-        use openai_protocol::responses::ResponsesRequest;
-        use serde_json::json;
-        use smg_data_connector::{
-            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-        };
-
-        use crate::{
-            openai::context::StorageHandles,
-            test_support::{http_client, StubWorker},
-        };
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a listener");
-        let port = listener.local_addr().expect("an address").port();
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test stub upstream answering one event stream; aborted at the test's end"
-        )]
-        let upstream = tokio::spawn(async move {
-            let app = Router::new().fallback(any(|| async {
-                (
-                    [(CONTENT_TYPE, "text/event-stream")],
-                    "event: response.completed\ndata: {}\n\n",
-                )
-            }));
-            axum::serve(listener, app).await.expect("the stub serves");
-        });
-        let worker_url = format!("http://user:secret@127.0.0.1:{port}");
-        let request: ResponsesRequest =
-            serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
-                .expect("a request");
-        let req = StreamingRequest {
-            url: format!("{worker_url}/v1/responses"),
-            payload: json!({}),
-            original_body: request,
-            previous_response_id: None,
-            existing_mcp_list_tools_labels: Vec::new(),
-            storage: StorageHandles {
-                response: Arc::new(MemoryResponseStorage::new()),
-                conversation: Arc::new(MemoryConversationStorage::new()),
-                conversation_item: Arc::new(MemoryConversationItemStorage::new()),
-                request_context: None,
-                tenant: None,
-            },
-        };
-
-        let response = handle_simple_streaming_passthrough(
-            &http_client(),
-            &StubWorker::at(&worker_url),
-            None,
-            req,
-        )
-        .await;
-        upstream.abort();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let header = response
-            .headers()
-            .get("x-smg-routed-worker-id")
-            .and_then(|value| value.to_str().ok())
-            .expect("the routed-worker header");
-        assert!(!header.contains("secret"), "{header}");
-        assert_eq!(header, format!("http://***@127.0.0.1:{port}"));
-    }
-
-    /// The relay's inputs: a stream of chunks, one SSE block per chunk.
-    fn chunks(blocks: &[&str]) -> impl Stream<Item = reqwest::Result<Bytes>> + Unpin {
-        let frames: Vec<reqwest::Result<Bytes>> = blocks
-            .iter()
-            .map(|block| Ok(Bytes::from(format!("{block}\n\n"))))
-            .collect();
-        futures_util::stream::iter(frames)
-    }
-
-    const CREATED: &str = "event: response.created\ndata: {\"type\":\"response.created\",\
-                           \"sequence_number\":0,\"response\":{\"id\":\"resp_1\",\"object\":\
-                           \"response\",\"created_at\":1,\"model\":\"m\",\"status\":\
-                           \"in_progress\",\"output\":[]}}";
-    const IN_PROGRESS: &str = "event: response.in_progress\ndata: {\"type\":\
-                               \"response.in_progress\",\"sequence_number\":1,\"response\":{\"id\":\
-                               \"resp_1\",\"object\":\"response\",\"created_at\":1,\"model\":\"m\",\
-                               \"status\":\"in_progress\",\"output\":[]}}";
-    const DELTA: &str = "event: response.output_text.delta\ndata: {\"type\":\
-                         \"response.output_text.delta\",\"sequence_number\":2,\"item_id\":\"msg_1\",\
-                         \"output_index\":0,\"content_index\":0,\"delta\":\"hi\"}";
-    const COMPLETED: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\
-                             \"sequence_number\":3,\"response\":{\"id\":\"resp_1\",\"object\":\
-                             \"response\",\"created_at\":1,\"model\":\"m\",\"status\":\
-                             \"completed\",\"output\":[]}}";
-    const CALL_ADDED: &str = "event: response.output_item.added\ndata: {\"type\":\
-                              \"response.output_item.added\",\"sequence_number\":1,\"output_index\":0,\
-                              \"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\
-                              \"call_1\",\"name\":\"lookup\",\"arguments\":\"\"}}";
-    const CALL_DONE: &str = "event: response.function_call_arguments.done\ndata: {\"type\":\
-                             \"response.function_call_arguments.done\",\"sequence_number\":2,\
-                             \"item_id\":\"fc_1\",\"output_index\":0,\"arguments\":\"{}\"}";
-
-    /// Relays `blocks` through a fresh context with no session; the client
-    /// reads the frames as they come, or is gone before the first one. Returns
-    /// the relay's end, the frames, the sequence number and the count of
-    /// blocks the relay left unread.
-    async fn relayed(
-        blocks: &[&str],
-        flags: &mut RelayFlags,
-        handler: &mut StreamingToolHandler,
-        connected: bool,
-    ) -> (RelayEnd, Vec<String>, u64, usize) {
-        let request = ResponsesRequest {
-            model: "m".to_string(),
-            input: ResponseInput::Text("hi".to_string()),
-            ..Default::default()
-        };
-        let ctx = StreamingEventContext {
-            original_request: &request,
-            previous_response_id: None,
-            session: None,
-            mcp_format_registry: None,
-        };
-        let (tx, rx) = sse_channel();
-        let rx = connected.then_some(rx);
-        let mut encoder = SseEncoder::new();
-        let mut sequence_number = 0;
-        let mut upstream = chunks(blocks);
-        let relay = async {
-            let end = relay_upstream_stream(
-                &mut upstream,
-                handler,
-                flags,
-                &[],
-                &tx,
-                &mut encoder,
-                &ctx,
-                &mut sequence_number,
-            )
-            .await;
-            drop(tx);
-            end
-        };
-        let read = async {
-            let mut frames = Vec::new();
-            if let Some(mut rx) = rx {
-                while let Some(frame) = rx.recv().await {
-                    let frame = frame.expect("a frame");
-                    frames.push(String::from_utf8(frame.to_vec()).expect("utf-8"));
-                }
-            }
-            frames
-        };
-        let (end, frames) = tokio::join!(relay, read);
-        let unread = upstream.count().await;
-        (end, frames, sequence_number, unread)
-    }
-
-    /// The first stream's events reach the client in order, re-stamped from
-    /// the stream's own sequence number; the upstream's `response.completed`
-    /// is not among them (the loop's end sends the terminal); the relay ends
-    /// answered with the response id kept and the list-tools step taken.
-    #[tokio::test]
-    async fn the_first_stream_is_forwarded_and_ends_answered() {
-        let mut flags = RelayFlags {
-            first_iteration: true,
-            mcp_list_tools_sent: false,
-        };
-        let mut handler = StreamingToolHandler::with_starting_index(0);
-        let (end, frames, sequence_number, unread) = relayed(
-            &[CREATED, IN_PROGRESS, DELTA, COMPLETED],
-            &mut flags,
-            &mut handler,
-            true,
-        )
-        .await;
-        assert_eq!(end, RelayEnd::Answered);
-        assert_eq!(unread, 0, "the stream is read to its end");
-        let events: Vec<&str> = frames
-            .iter()
-            .map(|frame| frame.split('\n').next().expect("an event line"))
-            .collect();
-        assert_eq!(
-            events,
-            [
-                "event: response.created",
-                "event: response.in_progress",
-                "event: response.output_text.delta"
-            ]
-        );
-        assert_eq!(sequence_number, 3);
-        assert_eq!(handler.original_response_id(), Some("resp_1"));
-        assert!(flags.mcp_list_tools_sent);
-    }
-
-    /// A resumed stream (after a tool round) skips its own `response.created`
-    /// and `response.in_progress`: the client saw the first stream's.
-    #[tokio::test]
-    async fn a_resumed_stream_skips_created_and_in_progress() {
-        let mut flags = RelayFlags {
-            first_iteration: false,
-            mcp_list_tools_sent: true,
-        };
-        let mut handler = StreamingToolHandler::with_starting_index(1);
-        let (end, frames, sequence_number, unread) = relayed(
-            &[CREATED, IN_PROGRESS, DELTA, COMPLETED],
-            &mut flags,
-            &mut handler,
-            true,
-        )
-        .await;
-        assert_eq!(end, RelayEnd::Answered);
-        assert_eq!(unread, 0, "the stream is read to its end");
-        assert_eq!(frames.len(), 1, "{frames:?}");
-        assert!(frames[0].starts_with("event: response.output_text.delta"));
-        assert_eq!(sequence_number, 1);
-    }
-
-    /// A function call the upstream completes ends the relay with the call
-    /// pending in the handler: the loop's tool phase runs it, and the blocks
-    /// after the trigger are not read by this relay.
-    #[tokio::test]
-    async fn a_completed_tool_call_ends_the_relay_with_the_call_pending() {
-        let mut flags = RelayFlags {
-            first_iteration: true,
-            mcp_list_tools_sent: false,
-        };
-        let mut handler = StreamingToolHandler::with_starting_index(0);
-        let (end, _frames, _, unread) = relayed(
-            &[CREATED, CALL_ADDED, CALL_DONE, COMPLETED],
-            &mut flags,
-            &mut handler,
-            true,
-        )
-        .await;
-        assert_eq!(end, RelayEnd::ToolCalls);
-        assert_eq!(unread, 1, "the completed after the trigger is not read");
-        assert_eq!(handler.take_pending_calls().len(), 1);
-    }
-
-    /// A client that is gone before the first frame stops the relay at that
-    /// frame: the frame is numbered, its send fails, nothing is read further
-    /// and nothing reaches the client.
-    #[tokio::test]
-    async fn a_gone_client_stops_the_relay() {
-        let mut flags = RelayFlags {
-            first_iteration: true,
-            mcp_list_tools_sent: false,
-        };
-        let mut handler = StreamingToolHandler::with_starting_index(0);
-        let (end, frames, sequence_number, unread) = relayed(
-            &[CREATED, DELTA, COMPLETED],
-            &mut flags,
-            &mut handler,
-            false,
-        )
-        .await;
-        assert_eq!(end, RelayEnd::Stopped);
-        assert_eq!(unread, 2, "the relay stops at the first refused send");
-        assert!(frames.is_empty());
-        assert_eq!(sequence_number, 1);
-    }
-
-    /// The whole interception path against a stub upstream that answers one
-    /// four-event stream: the client reads the stream's events, the loop's
-    /// terminal and the sentinel.
-    #[tokio::test]
-    async fn a_tool_interception_stream_ends_with_the_terminal_and_the_sentinel() {
-        use std::sync::Arc;
-
-        use axum::{
-            http::{header::CONTENT_TYPE, StatusCode},
-            routing::any,
-            Router,
-        };
-        use smg_data_connector::{
-            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-        };
-        use smg_mcp::McpConfig;
-
-        use crate::{
-            openai::context::StorageHandles, openai_bridge::FormatRegistry,
-            test_support::http_client,
-        };
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a listener");
-        let port = listener.local_addr().expect("an address").port();
-        let body = [CREATED, IN_PROGRESS, DELTA, COMPLETED].join("\n\n") + "\n\n";
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "test stub upstream answering one event stream per request; aborted at the test's end"
-        )]
-        let upstream = tokio::spawn(async move {
-            let app = Router::new().fallback(any(move || {
-                let body = body.clone();
-                async move { ([(CONTENT_TYPE, "text/event-stream")], body) }
-            }));
-            axum::serve(listener, app).await.expect("the stub serves");
-        });
-        let orchestrator = Arc::new(
-            McpOrchestrator::new(McpConfig::default())
-                .await
-                .expect("an orchestrator with no servers"),
-        );
-        let client = http_client();
-        let storage = StorageHandles {
-            response: Arc::new(MemoryResponseStorage::new()),
-            conversation: Arc::new(MemoryConversationStorage::new()),
-            conversation_item: Arc::new(MemoryConversationItemStorage::new()),
-            request_context: None,
-            tenant: None,
-        };
-        let request: ResponsesRequest =
-            serde_json::from_value(json!({"model": "m", "input": "hi", "stream": true}))
-                .expect("a request");
-        let req = StreamingRequest {
-            url: format!("http://127.0.0.1:{port}/v1/responses"),
-            payload: json!({"model": "m", "input": "hi", "stream": true}),
-            original_body: request,
-            previous_response_id: None,
-            existing_mcp_list_tools_labels: Vec::new(),
-            storage: StorageHandles {
-                response: Arc::clone(&storage.response),
-                conversation: Arc::clone(&storage.conversation),
-                conversation_item: Arc::clone(&storage.conversation_item),
-                request_context: None,
-                tenant: None,
-            },
-        };
-        let response = handle_streaming_with_tool_interception(
-            &client,
-            None,
-            None,
-            req,
-            &orchestrator,
-            FormatRegistry::new(),
-            Vec::new(),
-        );
-        assert_eq!(response.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("the stream to its end");
-        let text = String::from_utf8(bytes.to_vec()).expect("utf-8");
-        assert!(text.contains("event: response.created\n"), "{text}");
-        assert!(
-            text.contains("event: response.output_text.delta\n"),
-            "{text}"
-        );
-        assert!(text.contains("event: response.completed\n"), "{text}");
-        assert!(text.ends_with("data: [DONE]\n\n"), "{text}");
-        upstream.abort();
-    }
-}
+#[path = "../../../tests/unit/openai/responses/streaming/tests.rs"]
+mod tests;

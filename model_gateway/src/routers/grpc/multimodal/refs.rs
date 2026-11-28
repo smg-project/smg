@@ -3,31 +3,41 @@
 //! advertises worker-side processing, and build the wire payload.
 
 use std::{
+    borrow::Cow,
     collections::{BTreeSet, HashSet},
     sync::Arc,
 };
 
 use axum::response::Response;
-use llm_multimodal::{data_url::data_url_payload_bytes, media, MediaContentPart, Modality};
+use llm_multimodal::{
+    data_url::{base64_payload, data_url_payload, data_url_payload_bytes},
+    media, MediaConnectorError, MediaContentPart, MediaErrorCode, Modality,
+};
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
+use smg_worker::{
+    identity::basic::{ConnectionMode, RuntimeType, Worker, WorkerType},
+    labels::SUPPORTS_VISION_LABEL,
+};
 
 use super::{
-    capability::{runtime_supports_modality, SUPPORTS_VISION_LABEL},
+    capability::{runtime_supports_modality, worker_takes_stripped_refs_side},
     config::MultimodalComponents,
     plan::{MediaPlan, PlaceholderTokens},
 };
 use crate::{
     observability::metrics::Metrics,
     routers::{
-        common::placement::{self, PipelinePin, NO_MEDIA_REF_CAPABLE_WORKER_CODE},
+        common::{
+            placement::{self, PipelinePin, NO_MEDIA_REF_CAPABLE_WORKER_CODE},
+            snapshot::WorkerRegistry,
+        },
         error,
         grpc::{
             common::stages::pd_protocol::{EncodeHandoff, PdProtocol},
             context::WorkerSelection,
         },
     },
-    worker::{ConnectionMode, RuntimeType, Worker, WorkerRegistry, WorkerType},
 };
 
 /// Worker label carrying the advertised backend (`GetServerInfo.mm_processor`).
@@ -77,6 +87,16 @@ pub(crate) enum MmRefsError {
     ModalityUnsupported(Modality),
     /// A part kind with no reference form (inline bytes or embeddings).
     UnsupportedPart(&'static str),
+    /// A reference the request got wrong, refused at the door before any
+    /// worker is selected, in the media connector's own words (`cause`): a
+    /// url that is empty or begins with whitespace or a control character, a
+    /// data URL whose header names no base64 payload or whose payload is
+    /// empty, an inline part whose media type is not one `type/subtype` pair
+    /// or whose payload itself opens with a data URL header. The request's
+    /// own fault, under the code the router-side pipeline answers invalid
+    /// media with (`invalid_multimodal_request`); the media type read has no
+    /// router-side counterpart (see `check_forwarded_references`).
+    InvalidReference { index: usize, cause: String },
     /// An inline `data:` payload above the router's byte cap.
     RefTooLarge {
         index: usize,
@@ -110,6 +130,7 @@ impl MmRefsError {
             Self::ModalityUnsupported(_)
             | Self::UnsupportedPart(_)
             | Self::PipelineTakesNoAudio => "multimodal_not_supported",
+            Self::InvalidReference { .. } => MediaErrorCode::InvalidRequest.as_str(),
             Self::RefTooLarge { .. } => "media_ref_too_large",
             Self::SchemeNotAccepted { .. } => "media_ref_scheme_not_accepted",
             Self::EncodeNotSupported | Self::WorkerNotCapable | Self::RouterSpecMissing => {
@@ -168,6 +189,7 @@ impl std::fmt::Display for MmRefsError {
             Self::UnsupportedPart(kind) => {
                 write!(f, "{kind} cannot be forwarded as a media reference")
             }
+            Self::InvalidReference { index, cause } => write!(f, "media item {index}: {cause}"),
             Self::RefTooLarge {
                 index,
                 bytes,
@@ -176,11 +198,20 @@ impl std::fmt::Display for MmRefsError {
                 f,
                 "media item {index}: inline payload is {bytes} bytes, above the {limit}-byte cap"
             ),
-            Self::SchemeNotAccepted { scheme, accepted } => write!(
-                f,
-                "the selected worker does not fetch '{scheme}' URLs (accepts: {accepted}); \
-                 file:// needs --allowed-local-media-path on the worker"
-            ),
+            Self::SchemeNotAccepted { scheme, accepted } => {
+                write!(
+                    f,
+                    "the selected worker does not fetch '{scheme}' URLs (accepts: {accepted})"
+                )?;
+                // The remedy is the refused scheme's own: a file URL needs the
+                // worker's local-media flag; any other scheme, the empty one of
+                // a bare path or a port-less host written without a scheme
+                // included, has none to name beyond the accepted list.
+                if scheme == "file" {
+                    f.write_str("; file:// needs --allowed-local-media-path on the worker")?;
+                }
+                Ok(())
+            }
             Self::EncodeNotSupported => f.write_str(
                 "media references cannot be routed through encode workers (encode-prefill-decode \
                  pipeline); run the router with --mm-processing auto or router",
@@ -561,6 +592,13 @@ pub(crate) fn resolve_mm_processing(
         }
     };
 
+    if resolved == MmProcessing::Worker {
+        // The references a worker would be handed, read once at the door:
+        // a shape no engine serves is refused here, in the connector's
+        // words, before a worker is selected.
+        check_forwarded_references(plan)?;
+    }
+
     if resolved == MmProcessing::Router && placeholders.is_worker_only() {
         // No spec: the router has nothing to process the media with.
         return Err(MmRefsError::RouterSpecMissing);
@@ -577,21 +615,26 @@ pub(crate) fn resolve_mm_processing(
     Ok(resolved)
 }
 
-/// Post-selection check: every worker must accept references, and every URL
-/// scheme in the plan must be one every worker that advertised schemes fetches
-/// (the prefill worker processes them; the decode worker does too whenever the
-/// identity relay does not apply, as with n>1). A plan pinned to the
-/// gateway's own pipeline (`pin`, see [`media_refs_pipeline_pin`]) needs
-/// every worker on that pipeline, and a worker on it takes no audio; selection
-/// draws its candidates by the same pin, so this is the backstop.
+/// Post-selection check: every worker the references can reach must accept
+/// them, and every URL scheme in the plan must be one every such worker that
+/// advertised schemes fetches (the prefill worker processes them; the decode
+/// worker does too whenever the identity relay does not apply, as with n>1,
+/// but never when `refs_stripped_decode` and the decode worker is a vLLM
+/// language-model-only one: that side is served the prefill's media identity,
+/// stripped to text and content hashes, so no reference reaches it). A plan
+/// pinned to the gateway's own pipeline (`pin`, see
+/// [`media_refs_pipeline_pin`]) needs every worker on that pipeline, and a
+/// worker on it takes no audio; selection draws its candidates by the same
+/// pin, so this is the backstop.
 pub(crate) fn ensure_selection_supports_media_refs(
     workers: &WorkerSelection,
     plan: &MediaPlan,
     pin: PipelinePin,
+    refs_stripped_decode: bool,
 ) -> Result<(), MmRefsError> {
     let needs_pipeline = pin == PipelinePin::Only;
     let workers: Vec<&dyn Worker> = match workers {
-        WorkerSelection::Single { worker } => vec![worker.as_ref()],
+        WorkerSelection::Single { worker } => vec![&**worker],
         WorkerSelection::Disaggregated {
             encode_assignments: Some(assignments),
             ..
@@ -601,7 +644,13 @@ pub(crate) fn ensure_selection_supports_media_refs(
             .collect(),
         WorkerSelection::Disaggregated {
             prefill, decode, ..
-        } => vec![prefill.as_ref(), decode.as_ref()],
+        } => {
+            if refs_stripped_decode && worker_takes_stripped_refs_side(&**decode) {
+                vec![prefill.as_ref()]
+            } else {
+                vec![prefill.as_ref(), &**decode]
+            }
+        }
     };
     if !workers
         .iter()
@@ -634,10 +683,9 @@ pub(crate) fn ensure_selection_supports_media_refs(
         return Ok(());
     };
     for part in plan.parts() {
-        let Some(url) = part_url(part) else {
+        let Some(scheme) = part_scheme(part) else {
             continue;
         };
-        let scheme = url_scheme(url);
         if !accepted.contains(&scheme) {
             let mut accepted: Vec<_> = accepted.into_iter().collect();
             accepted.sort();
@@ -650,16 +698,48 @@ pub(crate) fn ensure_selection_supports_media_refs(
     Ok(())
 }
 
-fn part_url(part: &MediaContentPart) -> Option<&str> {
+/// The scheme a part's reference is fetched by: a URL part's own, `data`
+/// for a base64 source.
+fn part_scheme(part: &MediaContentPart) -> Option<String> {
     match part {
         MediaContentPart::ImageUrl { url, .. }
         | MediaContentPart::VideoUrl { url, .. }
-        | MediaContentPart::AudioUrl { url, .. } => Some(url),
+        | MediaContentPart::AudioUrl { url, .. } => Some(url_scheme(url)),
+        MediaContentPart::ImageBase64 { .. } | MediaContentPart::AudioBase64 { .. } => {
+            Some("data".to_string())
+        }
         _ => None,
     }
 }
 
-/// Lower-cased URL scheme; `data` for data URLs, empty for bare paths.
+/// The data URL a base64 source stands for, built for a wire that takes URLs.
+fn data_url(media_type: &str, data: &str) -> String {
+    format!("data:{media_type};base64,{data}")
+}
+
+/// The wire form of a forwardable part's URL: the text as the request wrote
+/// it, or the base64 source a data URL is built from. Classifying a part
+/// names the form; only a wire that takes the URL builds it.
+enum WireUrl<'a> {
+    AsWritten(&'a str),
+    Base64 { media_type: &'a str, data: &'a str },
+}
+
+impl<'a> WireUrl<'a> {
+    /// The URL the wire takes: borrowed as written, or the data URL built
+    /// once from the base64 source.
+    fn build(&self) -> Cow<'a, str> {
+        match self {
+            Self::AsWritten(url) => Cow::Borrowed(url),
+            Self::Base64 { media_type, data } => Cow::Owned(data_url(media_type, data)),
+        }
+    }
+}
+
+/// Lower-cased URL scheme; `data` for data URLs, empty for bare paths and for
+/// a url that begins with whitespace: the reference is forwarded as written and
+/// the byte caps read the scheme at offset zero, so nothing reads past it here
+/// (the door refuses such a url as an invalid URL).
 fn url_scheme(url: &str) -> String {
     url.split_once(':')
         .map(|(scheme, _)| scheme)
@@ -673,35 +753,63 @@ fn url_scheme(url: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Classify one part as a forwardable reference: its modality, URL and the
-/// router's byte cap for inline payloads.
+/// Classify one part as a forwardable reference: its modality, the wire form
+/// of its URL (built only where a wire takes it) and the router's byte cap
+/// for inline payloads.
 fn forwardable_ref(
     part: &MediaContentPart,
-) -> Result<(common::Modality, &str, usize), MmRefsError> {
+) -> Result<(common::Modality, WireUrl<'_>, usize), MmRefsError> {
     match part {
         MediaContentPart::ImageUrl {
             url,
             max_long_side_pixel: None,
             ..
-        } => Ok((common::Modality::Image, url, media::image_max_input_bytes())),
+        } => Ok((
+            common::Modality::Image,
+            WireUrl::AsWritten(url.as_str()),
+            media::image_max_input_bytes(),
+        )),
+        MediaContentPart::ImageBase64 {
+            media_type,
+            data,
+            max_long_side_pixel: None,
+            ..
+        } => Ok((
+            common::Modality::Image,
+            WireUrl::Base64 { media_type, data },
+            media::image_max_input_bytes(),
+        )),
         MediaContentPart::VideoUrl {
             url,
             fps: None,
             max_long_side_pixel: None,
             ..
-        } => Ok((common::Modality::Video, url, media::video_max_input_bytes())),
-        MediaContentPart::ImageUrl { .. } | MediaContentPart::VideoUrl { .. } => {
-            Err(MmRefsError::HintUnsupported)
-        }
+        } => Ok((
+            common::Modality::Video,
+            WireUrl::AsWritten(url.as_str()),
+            media::video_max_input_bytes(),
+        )),
+        MediaContentPart::ImageUrl { .. }
+        | MediaContentPart::ImageBase64 { .. }
+        | MediaContentPart::VideoUrl { .. } => Err(MmRefsError::HintUnsupported),
         MediaContentPart::ImageData { .. } => {
             Err(MmRefsError::UnsupportedPart("inline image bytes"))
         }
         MediaContentPart::VideoData { .. } => {
             Err(MmRefsError::UnsupportedPart("inline video bytes"))
         }
-        MediaContentPart::AudioUrl { url, .. } => {
-            Ok((common::Modality::Audio, url, media::audio_max_input_bytes()))
-        }
+        MediaContentPart::AudioUrl { url, .. } => Ok((
+            common::Modality::Audio,
+            WireUrl::AsWritten(url.as_str()),
+            media::audio_max_input_bytes(),
+        )),
+        MediaContentPart::AudioBase64 {
+            media_type, data, ..
+        } => Ok((
+            common::Modality::Audio,
+            WireUrl::Base64 { media_type, data },
+            media::audio_max_input_bytes(),
+        )),
         MediaContentPart::AudioData { .. } => {
             Err(MmRefsError::UnsupportedPart("inline audio bytes"))
         }
@@ -714,7 +822,8 @@ fn forwardable_ref(
 
 /// Whether this plan is forwardable apart from per-item hints: `Ok(true)` when
 /// a part carries one, `Ok(false)` when none does; a part with no reference
-/// form at all is the error, whatever its position.
+/// form at all is the error, whatever its position. Classification only: no
+/// part's URL is built here.
 fn plan_carries_hints(plan: &MediaPlan) -> Result<bool, MmRefsError> {
     let mut hinted = false;
     for part in plan.parts() {
@@ -727,12 +836,131 @@ fn plan_carries_hints(plan: &MediaPlan) -> Result<bool, MmRefsError> {
     Ok(hinted)
 }
 
+/// The characters of a refused url its refusal echoes, at most: the sentence
+/// names the url the client sent, never a whole inline payload.
+const URL_ECHO_CHARS: usize = 64;
+
+/// The first `URL_ECHO_CHARS` characters of a refused url, an ellipsis when cut.
+fn echoed_url(url: &str) -> String {
+    let mut echoed: String = url.chars().take(URL_ECHO_CHARS).collect();
+    if url.chars().nth(URL_ECHO_CHARS).is_some() {
+        echoed.push_str("...");
+    }
+    echoed
+}
+
+/// The references a forwarded plan carries, read once at the door before any
+/// worker is selected, by the rules the router-side pipeline's fetch applies
+/// to the same media: a url that is empty or begins with whitespace or a
+/// control character (the reference is forwarded as written and the byte caps
+/// read the scheme at offset zero; the refusal echoes at most the first
+/// `URL_ECHO_CHARS` characters of it), a data URL whose header names no base64
+/// payload and an empty payload are refused here in the connector's own
+/// words, instead of being forwarded to a worker no engine of which serves
+/// them. An inline part's header is read before the door builds its data URL
+/// (one `type/subtype` pair of the registration grammar's characters; a
+/// payload that does not itself open with a data URL header), since the
+/// request names the media type and the wire takes the URL as built. That
+/// read is this door's own, with no router-side counterpart: the router
+/// placement decodes a base64 source's payload alone and never its media
+/// type, so under the automatic placement a malformed header is answered by
+/// the placement the request lands on. The symbols and the length of a
+/// base64 payload stay the engine's verdict: nothing here reads the payload
+/// past the five bytes a data URL header would occupy.
+fn check_forwarded_references(plan: &MediaPlan) -> Result<(), MmRefsError> {
+    let refused = |index: usize, cause: MediaConnectorError| MmRefsError::InvalidReference {
+        index,
+        cause: cause.to_string(),
+    };
+    for (index, part) in plan.parts().iter().enumerate() {
+        match part {
+            MediaContentPart::ImageUrl { url, .. }
+            | MediaContentPart::VideoUrl { url, .. }
+            | MediaContentPart::AudioUrl { url, .. } => {
+                // The reference is forwarded as written and every byte cap reads
+                // the scheme at offset zero: nothing is trimmed here either, so a
+                // url that is empty or begins with a control character (DEL and
+                // the C1 range among them) or any whitespace is an invalid URL,
+                // echoed by a bounded prefix. No scheme begins with one.
+                if url.is_empty() || url.starts_with(|c: char| c.is_control() || c.is_whitespace())
+                {
+                    return Err(refused(
+                        index,
+                        MediaConnectorError::InvalidUrl(echoed_url(url)),
+                    ));
+                }
+                if opens_a_data_url(url) {
+                    data_url_payload(url).map_err(|cause| refused(index, cause))?;
+                }
+            }
+            MediaContentPart::ImageBase64 {
+                media_type, data, ..
+            }
+            | MediaContentPart::AudioBase64 {
+                media_type, data, ..
+            } => {
+                // The wire takes a data URL built here from the part's media
+                // type and payload (`data_url`); the header's shape is read
+                // before it is built, the payload's symbols are not. The chat
+                // door writes `audio/<format>` from `input_audio.format` as
+                // sent, so a MIME type or a stray character there is a media
+                // type that is not one type/subtype pair; a payload that
+                // itself opens with a data URL header (a data URL sent where
+                // bare base64 is documented; read trimmed, as the payload rule
+                // reads it) would be wrapped a second time. Either is refused
+                // as the invalid URL it would make, echoed from the payload's
+                // head alone: a refusal copies no payload whole.
+                if !media_type_is_a_type_pair(media_type) || opens_a_data_url(data.trim_start()) {
+                    let payload_head: String = data.chars().take(URL_ECHO_CHARS).collect();
+                    return Err(refused(
+                        index,
+                        MediaConnectorError::InvalidUrl(echoed_url(&data_url(
+                            media_type,
+                            &payload_head,
+                        ))),
+                    ));
+                }
+                base64_payload(data).map_err(|cause| refused(index, cause))?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// Whether `media_type` is one `type/subtype` pair of the media type
+/// registration grammar's restricted-name characters (RFC 6838 section 4.2:
+/// an alphanumeric first, then alphanumerics and `!#$&-^_.+`), the shape a
+/// data URL header carries before its parameters: both halves present,
+/// neither holding a second slash, a parameter separator or whitespace.
+fn media_type_is_a_type_pair(media_type: &str) -> bool {
+    let Some((kind, subtype)) = media_type.split_once('/') else {
+        return false;
+    };
+    let restricted_name = |part: &str| {
+        part.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && part
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "!#$&-^_.+".contains(c))
+    };
+    restricted_name(kind) && restricted_name(subtype)
+}
+
+/// Whether `text` opens with a data URL header (`data:` in any case): a URL
+/// part's url that is a data URL, or a base64 payload where the request sent
+/// a data URL in place of the bare base64 documented.
+fn opens_a_data_url(text: &str) -> bool {
+    text.get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+}
+
 /// Build the wire payload from the plan, in authored (prompt) order.
-pub(crate) fn assemble_media_refs(plan: MediaPlan) -> Result<vllm::MediaRefs, MmRefsError> {
+pub(crate) fn assemble_media_refs(plan: &MediaPlan) -> Result<vllm::MediaRefs, MmRefsError> {
     let mut items = Vec::with_capacity(plan.parts().len());
     for (index, part) in plan.parts().iter().enumerate() {
         let (modality, url, limit) = forwardable_ref(part)?;
-        if let Some(bytes) = data_url_payload_bytes(url) {
+        let url = url.build();
+        if let Some(bytes) = data_url_payload_bytes(&url) {
             if bytes > limit {
                 return Err(MmRefsError::RefTooLarge {
                     index,
@@ -743,1158 +971,12 @@ pub(crate) fn assemble_media_refs(plan: MediaPlan) -> Result<vllm::MediaRefs, Mm
         }
         items.push(vllm::MediaRef {
             modality: modality as i32,
-            url: url.to_string(),
+            url: url.into_owned(),
         });
     }
     Ok(vllm::MediaRefs { items })
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use super::*;
-    use crate::{
-        routers::grpc::multimodal::{
-            config::MultimodalConfigRegistry, settings::MultimodalSettings,
-        },
-        worker::{
-            test_support::{no_health_check, registry_with},
-            BasicWorkerBuilder, ModelCard, WorkerType,
-        },
-    };
-
-    const MODEL: &str = "qwen3-vl";
-
-    fn image_url(url: &str) -> MediaContentPart {
-        MediaContentPart::ImageUrl {
-            url: url.to_string(),
-            detail: None,
-            uuid: None,
-            max_long_side_pixel: None,
-        }
-    }
-
-    fn plan(parts: Vec<MediaContentPart>) -> MediaPlan {
-        MediaPlan::new(parts)
-    }
-
-    fn expandable_placeholders() -> PlaceholderTokens {
-        let mut placeholders = PlaceholderTokens::default();
-        placeholders.insert(Modality::Image, "<|image_pad|>".to_string());
-        placeholders.set_worker_expandable(Modality::Image, true);
-        placeholders
-    }
-
-    fn components(mode: MmProcessingMode) -> MultimodalComponents {
-        let mut components = MultimodalComponents::new(
-            Arc::new(MultimodalConfigRegistry::new()),
-            None,
-            None,
-            &MultimodalSettings::default(),
-        )
-        .expect("components");
-        components.processing = mode;
-        assert!(!components.drain_fetches_on_error);
-        components
-    }
-
-    fn worker(
-        url: &str,
-        runtime: RuntimeType,
-        connection: ConnectionMode,
-        labels: &[(&str, &str)],
-    ) -> Arc<dyn Worker> {
-        let mut builder = BasicWorkerBuilder::new(url)
-            .model(ModelCard::new(MODEL))
-            .worker_type(WorkerType::Regular)
-            .runtime_type(runtime)
-            .connection_mode(connection)
-            .health_config(no_health_check());
-        for (key, value) in labels {
-            builder = builder.label(*key, *value);
-        }
-        Arc::new(builder.build())
-    }
-
-    fn capable(url: &str) -> Arc<dyn Worker> {
-        worker(
-            url,
-            RuntimeType::Vllm,
-            ConnectionMode::Grpc,
-            &[
-                (MM_PROCESSOR_LABEL, "inprocess"),
-                (MM_MEDIA_REF_SCHEMES_LABEL, "http,https,data"),
-            ],
-        )
-    }
-
-    type AcceptCase = (
-        RuntimeType,
-        ConnectionMode,
-        &'static [(&'static str, &'static str)],
-        bool,
-    );
-
-    #[test]
-    /// Forward references only to gRPC workers advertising a supported processor.
-    fn accepts_only_supported_labeled_grpc_workers() {
-        let cases: [AcceptCase; 8] = [
-            (
-                RuntimeType::Vllm,
-                ConnectionMode::Grpc,
-                &[(MM_PROCESSOR_LABEL, "inprocess")],
-                true,
-            ),
-            (
-                RuntimeType::Vllm,
-                ConnectionMode::Grpc,
-                &[(MM_PROCESSOR_LABEL, "")],
-                false,
-            ),
-            (RuntimeType::Vllm, ConnectionMode::Grpc, &[], false),
-            (
-                RuntimeType::Vllm,
-                ConnectionMode::Zmq,
-                &[(MM_PROCESSOR_LABEL, "inprocess")],
-                false,
-            ),
-            (
-                RuntimeType::Sglang,
-                ConnectionMode::Grpc,
-                &[(MM_PROCESSOR_LABEL, "inprocess")],
-                false,
-            ),
-            (
-                RuntimeType::Sglang,
-                ConnectionMode::Grpc,
-                &[(MM_PROCESSOR_LABEL, "smg")],
-                true,
-            ),
-            (RuntimeType::Sglang, ConnectionMode::Grpc, &[], false),
-            (
-                RuntimeType::Sglang,
-                ConnectionMode::Zmq,
-                &[(MM_PROCESSOR_LABEL, "smg")],
-                false,
-            ),
-        ];
-        for (i, (runtime, connection, labels, expected)) in cases.into_iter().enumerate() {
-            let scheme = if connection == ConnectionMode::Zmq {
-                format!("ipc:///tmp/smg-refs-{i}.ipc")
-            } else {
-                format!("grpc://127.0.0.1:{}", 9100 + i)
-            };
-            let w = worker(&scheme, runtime, connection, labels);
-            assert_eq!(worker_accepts_media_refs(w.as_ref()), expected, "case {i}");
-        }
-    }
-
-    #[test]
-    fn schemes_label_is_parsed_case_insensitively() {
-        let w = worker(
-            "grpc://127.0.0.1:9200",
-            RuntimeType::Vllm,
-            ConnectionMode::Grpc,
-            &[(MM_MEDIA_REF_SCHEMES_LABEL, "HTTP, https ,data,")],
-        );
-        let schemes = worker_media_ref_schemes(w.as_ref());
-        assert_eq!(schemes.len(), 3);
-        assert!(schemes.contains("http") && schemes.contains("https") && schemes.contains("data"));
-    }
-
-    /// A model without a registry spec: worker placement forwards it, auto
-    /// forwards it when every worker of the model processes media itself and
-    /// refuses it otherwise, router placement refuses it; the refusal names
-    /// the router's missing spec, not the model.
-    #[test]
-    fn a_model_without_a_spec_goes_to_a_capable_worker_or_is_refused() {
-        let worker_only = PlaceholderTokens::worker_only();
-        let plan_ok = plan(vec![image_url("https://a/1.png")]);
-        assert!(worker_only.worker_expandable(Modality::Image));
-
-        assert_eq!(
-            resolve_mm_processing(
-                &components(MmProcessingMode::Worker),
-                &registry_with(vec![]),
-                MODEL,
-                &plan_ok,
-                &worker_only
-            )
-            .expect("worker placement forwards"),
-            MmProcessing::Worker
-        );
-        let auto = components(MmProcessingMode::Auto);
-        assert_eq!(
-            resolve_mm_processing(
-                &auto,
-                &registry_with(vec![capable("grpc://127.0.0.1:9450")]),
-                MODEL,
-                &plan_ok,
-                &worker_only
-            )
-            .expect("a uniform capable fleet forwards"),
-            MmProcessing::Worker
-        );
-        for (registry, placement) in [
-            (registry_with(vec![]), &auto),
-            (
-                registry_with(vec![capable("grpc://127.0.0.1:9451")]),
-                &components(MmProcessingMode::Router),
-            ),
-        ] {
-            let err = resolve_mm_processing(placement, &registry, MODEL, &plan_ok, &worker_only)
-                .expect_err("nothing processes the media");
-            assert_eq!(err, MmRefsError::RouterSpecMissing);
-            assert_eq!(err.code(), "multimodal_not_supported");
-            assert!(err.to_string().contains("no media spec"), "{err}");
-        }
-    }
-
-    #[test]
-    fn router_mode_never_forwards() {
-        let registry = registry_with(vec![capable("grpc://127.0.0.1:9300")]);
-        let resolved = resolve_mm_processing(
-            &components(MmProcessingMode::Router),
-            &registry,
-            MODEL,
-            &plan(vec![image_url("https://a/1.png")]),
-            &expandable_placeholders(),
-        )
-        .expect("router mode resolves");
-        assert_eq!(resolved, MmProcessing::Router);
-    }
-
-    #[test]
-    fn auto_forwards_only_for_a_uniform_capable_fleet() {
-        let placeholders = expandable_placeholders();
-        let plan_ok = plan(vec![image_url("https://a/1.png")]);
-        let components = components(MmProcessingMode::Auto);
-
-        let uniform = registry_with(vec![
-            capable("grpc://127.0.0.1:9400"),
-            capable("grpc://127.0.0.1:9401"),
-        ]);
-        assert_eq!(
-            resolve_mm_processing(&components, &uniform, MODEL, &plan_ok, &placeholders)
-                .expect("resolves"),
-            MmProcessing::Worker
-        );
-
-        let mixed = registry_with(vec![
-            capable("grpc://127.0.0.1:9402"),
-            worker(
-                "grpc://127.0.0.1:9403",
-                RuntimeType::Vllm,
-                ConnectionMode::Grpc,
-                &[],
-            ),
-        ]);
-        assert_eq!(
-            resolve_mm_processing(&components, &mixed, MODEL, &plan_ok, &placeholders)
-                .expect("resolves"),
-            MmProcessing::Router
-        );
-
-        let empty = registry_with(vec![]);
-        assert_eq!(
-            resolve_mm_processing(&components, &empty, MODEL, &plan_ok, &placeholders)
-                .expect("resolves"),
-            MmProcessing::Router
-        );
-    }
-
-    /// An encode-prefill-decode pool resolves to router-side processing under
-    /// `auto`, whatever its workers advertise: references never travel on
-    /// that pipeline, so a pool whose workers all accept them would otherwise
-    /// resolve to a mode selection refuses, with a 400 naming the mode the
-    /// router already runs.
-    #[test]
-    fn auto_processes_in_the_router_for_an_encode_prefill_decode_pool() {
-        let placeholders = expandable_placeholders();
-        let plan_ok = plan(vec![image_url("https://a/1.png")]);
-        let components = components(MmProcessingMode::Auto);
-        let encode: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://127.0.0.1:9410")
-                .model(ModelCard::new(MODEL))
-                .worker_type(WorkerType::Encode)
-                .runtime_type(RuntimeType::Vllm)
-                .connection_mode(ConnectionMode::Grpc)
-                .label(MM_PROCESSOR_LABEL, "inprocess")
-                .label(MM_MEDIA_REF_SCHEMES_LABEL, "http,https,data")
-                .health_config(no_health_check())
-                .build(),
-        );
-        let epd = registry_with(vec![
-            capable("grpc://127.0.0.1:9411"),
-            capable("grpc://127.0.0.1:9412"),
-            encode,
-        ]);
-        assert_eq!(
-            resolve_mm_processing(&components, &epd, MODEL, &plan_ok, &placeholders)
-                .expect("resolves"),
-            MmProcessing::Router
-        );
-    }
-
-    #[test]
-    fn auto_falls_back_for_hints_and_unopted_models() {
-        let components = components(MmProcessingMode::Auto);
-        let registry = registry_with(vec![capable("grpc://127.0.0.1:9500")]);
-
-        let hinted = plan(vec![MediaContentPart::ImageUrl {
-            url: "https://a/1.png".to_string(),
-            detail: None,
-            uuid: None,
-            max_long_side_pixel: Some(512),
-        }]);
-        assert_eq!(
-            resolve_mm_processing(
-                &components,
-                &registry,
-                MODEL,
-                &hinted,
-                &expandable_placeholders()
-            )
-            .expect("resolves"),
-            MmProcessing::Router
-        );
-
-        let mut unopted = PlaceholderTokens::default();
-        unopted.insert(Modality::Image, "<|image|>".to_string());
-        assert_eq!(
-            resolve_mm_processing(
-                &components,
-                &registry,
-                MODEL,
-                &plan(vec![image_url("https://a/1.png")]),
-                &unopted
-            )
-            .expect("resolves"),
-            MmProcessing::Router
-        );
-    }
-
-    /// Under worker-side placement a model with workers and none that
-    /// processes media references is refused in preparation, as the fleet
-    /// verdict it is: a terminal 503 under the code selection has always
-    /// answered the condition with, whose message names the flag and the
-    /// fix. One capable worker lifts it (selection picks it); an empty pool
-    /// is left to selection; a hinted request the router can serve keeps its
-    /// router fallback; a fault of the request keeps its 400.
-    #[test]
-    fn worker_mode_refuses_a_fleet_that_processes_no_media_references() {
-        use crate::routers::common::retry::is_retryable_response;
-
-        let components = components(MmProcessingMode::Worker);
-        let plan_ok = plan(vec![image_url("https://a/1.png")]);
-        let placeholders = expandable_placeholders();
-        let plain = |url: &str| worker(url, RuntimeType::Vllm, ConnectionMode::Grpc, &[]);
-
-        let none_capable = registry_with(vec![
-            plain("grpc://127.0.0.1:9800"),
-            plain("grpc://127.0.0.1:9801"),
-        ]);
-        let err = resolve_mm_processing(&components, &none_capable, MODEL, &plan_ok, &placeholders)
-            .expect_err("no worker processes media references");
-        assert_eq!(
-            err,
-            MmRefsError::NoCapableWorker {
-                model: MODEL.to_string(),
-                workers: 2,
-            }
-        );
-        assert_eq!(err.code(), "no_media_ref_capable_worker");
-        let message = err.to_string();
-        assert!(
-            message.contains("--mm-processing worker") && message.contains("2 registered worker"),
-            "{message}"
-        );
-        let response = err.into_response();
-        assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(
-            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
-            "no_media_ref_capable_worker"
-        );
-        assert!(
-            !is_retryable_response(&response),
-            "a capability verdict is terminal for the retry layer"
-        );
-        assert!(
-            placement::refusal_reason(&response).is_some(),
-            "the refusal's line names its reason"
-        );
-
-        // An engine of another family never processes references either.
-        let other_engine = registry_with(vec![worker(
-            "grpc://127.0.0.1:9802",
-            RuntimeType::TokenSpeed,
-            ConnectionMode::Grpc,
-            &[],
-        )]);
-        assert!(matches!(
-            resolve_mm_processing(&components, &other_engine, MODEL, &plan_ok, &placeholders),
-            Err(MmRefsError::NoCapableWorker { workers: 1, .. })
-        ));
-
-        // A pool with an encode worker runs the encode-prefill-decode
-        // pipeline, on which media references never travel whatever the
-        // workers advertise: left to selection, whose refusal is the
-        // request's own 400 and names the fix that applies there.
-        let encode: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://127.0.0.1:9805")
-                .model(ModelCard::new(MODEL))
-                .worker_type(WorkerType::Encode)
-                .runtime_type(RuntimeType::Vllm)
-                .connection_mode(ConnectionMode::Grpc)
-                .health_config(no_health_check())
-                .build(),
-        );
-        let epd = registry_with(vec![plain("grpc://127.0.0.1:9806"), encode]);
-        assert_eq!(
-            resolve_mm_processing(&components, &epd, MODEL, &plan_ok, &placeholders)
-                .expect("an encode-prefill-decode pool is selection's to refuse"),
-            MmProcessing::Worker
-        );
-
-        let mixed = registry_with(vec![
-            plain("grpc://127.0.0.1:9803"),
-            capable("grpc://127.0.0.1:9804"),
-        ]);
-        assert_eq!(
-            resolve_mm_processing(&components, &mixed, MODEL, &plan_ok, &placeholders)
-                .expect("one capable worker is enough: selection picks it"),
-            MmProcessing::Worker
-        );
-
-        let hinted = plan(vec![MediaContentPart::ImageUrl {
-            url: "https://a/1.png".to_string(),
-            detail: None,
-            uuid: None,
-            max_long_side_pixel: Some(512),
-        }]);
-        assert_eq!(
-            resolve_mm_processing(&components, &none_capable, MODEL, &hinted, &placeholders)
-                .expect("the router applies the hint itself"),
-            MmProcessing::Router
-        );
-
-        let mut unopted = PlaceholderTokens::default();
-        unopted.insert(Modality::Image, "<|image|>".to_string());
-        let fault = resolve_mm_processing(&components, &mixed, MODEL, &plan_ok, &unopted)
-            .expect_err("an unopted model is the request's fault");
-        assert_eq!(
-            fault.code(),
-            "multimodal_worker_processing_unsupported_model"
-        );
-        assert_eq!(
-            fault.into_response().status(),
-            http::StatusCode::BAD_REQUEST
-        );
-    }
-
-    /// What readiness names: under worker-side placement, a model with a
-    /// worker that reports a vision encoder and no worker that processes
-    /// media references. A pool without the label (unknown) or with a
-    /// `false` (a text-only engine) is not it, one capable worker takes the
-    /// model off the list, a model with an encode worker is never on it (nor
-    /// is its registration warned about), and the other placements name
-    /// nothing.
-    #[test]
-    fn models_without_media_processing_names_vision_pools_with_no_capable_worker() {
-        fn typed_worker_of(
-            model: &str,
-            url: &str,
-            labels: &[(&str, &str)],
-            worker_type: WorkerType,
-        ) -> Arc<dyn Worker> {
-            let mut builder = BasicWorkerBuilder::new(url)
-                .model(ModelCard::new(model))
-                .worker_type(worker_type)
-                .runtime_type(RuntimeType::Vllm)
-                .connection_mode(ConnectionMode::Grpc)
-                .health_config(no_health_check());
-            for (key, value) in labels {
-                builder = builder.label(*key, *value);
-            }
-            Arc::new(builder.build())
-        }
-        fn worker_of(model: &str, url: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
-            typed_worker_of(model, url, labels, WorkerType::Regular)
-        }
-        let vision = [(SUPPORTS_VISION_LABEL, "true")];
-        let vision_capable = [
-            (SUPPORTS_VISION_LABEL, "true"),
-            (MM_PROCESSOR_LABEL, "inprocess"),
-        ];
-        let text_only = [(SUPPORTS_VISION_LABEL, "false")];
-
-        let workers: Vec<Arc<dyn Worker>> = vec![
-            // Two vision workers, neither processes references: held.
-            worker_of("vl-b", "grpc://127.0.0.1:9900", &vision),
-            worker_of("vl-b", "grpc://127.0.0.1:9901", &vision),
-            // A vision worker without, beside one with: the model is served.
-            worker_of("vl-a", "grpc://127.0.0.1:9902", &vision),
-            worker_of("vl-a", "grpc://127.0.0.1:9903", &vision_capable),
-            // Text-only and unlabeled pools say nothing about media.
-            worker_of("text", "grpc://127.0.0.1:9904", &text_only),
-            worker_of("legacy", "grpc://127.0.0.1:9905", &[]),
-            // An encode-prefill-decode pool: references never travel on it,
-            // so its vision sides without a processor are not what readiness
-            // waits on.
-            typed_worker_of(
-                "vl-epd",
-                "grpc://127.0.0.1:9906",
-                &vision,
-                WorkerType::Prefill,
-            ),
-            typed_worker_of(
-                "vl-epd",
-                "grpc://127.0.0.1:9907",
-                &vision,
-                WorkerType::Decode,
-            ),
-            typed_worker_of("vl-epd", "grpc://127.0.0.1:9908", &[], WorkerType::Encode),
-        ];
-        assert_eq!(
-            models_without_media_processing(MmProcessingMode::Worker, &workers),
-            vec!["vl-b".to_string()]
-        );
-        // The registration warning follows the same line: vl-b's worker is
-        // said, the encode-prefill-decode pool's vision side is not, and a
-        // capable worker beside a plain one is not either; the plain one
-        // beside it is said, with the pool serving the media (the line's
-        // consequence reads the pool, `pool_processes_media_refs`).
-        let pool_of = |model: &str| {
-            workers
-                .iter()
-                .filter(move |worker| worker.model_id() == model)
-                .collect::<Vec<_>>()
-        };
-        assert!(registration_lacks_media_processing(
-            workers[0].as_ref(),
-            pool_of("vl-b").into_iter()
-        ));
-        assert!(!registration_lacks_media_processing(
-            workers[6].as_ref(),
-            pool_of("vl-epd").into_iter()
-        ));
-        assert!(!registration_lacks_media_processing(
-            workers[3].as_ref(),
-            pool_of("vl-a").into_iter()
-        ));
-        assert!(registration_lacks_media_processing(
-            workers[2].as_ref(),
-            pool_of("vl-a").into_iter()
-        ));
-        assert!(pool_processes_media_refs(pool_of("vl-a").into_iter()));
-        assert!(!pool_processes_media_refs(pool_of("vl-b").into_iter()));
-        assert!(pool_has_encode_worker(pool_of("vl-epd").into_iter()));
-        assert!(!pool_has_encode_worker(pool_of("vl-a").into_iter()));
-        for placement in [MmProcessingMode::Auto, MmProcessingMode::Router] {
-            assert!(models_without_media_processing(placement, &workers).is_empty());
-        }
-        assert!(models_without_media_processing(MmProcessingMode::Worker, &[]).is_empty());
-
-        // The predicate behind it, per worker.
-        assert!(vision_worker_without_media_processing(workers[0].as_ref()));
-        assert!(!vision_worker_without_media_processing(workers[3].as_ref()));
-        assert!(!vision_worker_without_media_processing(workers[4].as_ref()));
-        assert!(!vision_worker_without_media_processing(workers[5].as_ref()));
-    }
-
-    #[test]
-    fn worker_mode_is_strict() {
-        let components = components(MmProcessingMode::Worker);
-        // No registered workers: the decision is still Worker; selection enforces.
-        let registry = registry_with(vec![]);
-        assert_eq!(
-            resolve_mm_processing(
-                &components,
-                &registry,
-                MODEL,
-                &plan(vec![image_url("https://a/1.png")]),
-                &expandable_placeholders()
-            )
-            .expect("resolves"),
-            MmProcessing::Worker
-        );
-
-        let mut unopted = PlaceholderTokens::default();
-        unopted.insert(Modality::Image, "<|image|>".to_string());
-        let err = resolve_mm_processing(
-            &components,
-            &registry,
-            MODEL,
-            &plan(vec![image_url("https://a/1.png")]),
-            &unopted,
-        )
-        .expect_err("unopted model is refused");
-        assert_eq!(err.code(), "multimodal_worker_processing_unsupported_model");
-
-        let inline = plan(vec![MediaContentPart::ImageData {
-            data: vec![0, 1, 2],
-            mime_type: None,
-            uuid: None,
-            detail: None,
-        }]);
-        let err = resolve_mm_processing(
-            &components,
-            &registry,
-            MODEL,
-            &inline,
-            &expandable_placeholders(),
-        )
-        .expect_err("inline bytes are refused by name");
-        assert_eq!(err, MmRefsError::UnsupportedPart("inline image bytes"));
-    }
-
-    fn hinted_image(url: &str, max_long_side_pixel: u32) -> MediaContentPart {
-        MediaContentPart::ImageUrl {
-            url: url.to_string(),
-            detail: None,
-            uuid: None,
-            max_long_side_pixel: Some(max_long_side_pixel),
-        }
-    }
-
-    fn hinted_video(
-        url: &str,
-        fps: Option<f64>,
-        max_long_side_pixel: Option<u32>,
-    ) -> MediaContentPart {
-        MediaContentPart::VideoUrl {
-            url: url.to_string(),
-            uuid: None,
-            fps,
-            max_long_side_pixel,
-        }
-    }
-
-    #[test]
-    fn worker_mode_preprocesses_hinted_items_itself() {
-        let components = components(MmProcessingMode::Worker);
-        let registry = registry_with(vec![capable("grpc://127.0.0.1:9700")]);
-        let placeholders = expandable_placeholders();
-
-        // The hints are the router pipeline's knobs: a request carrying one
-        // is preprocessed here, whichever item carries it.
-        for (name, hinted) in [
-            (
-                "image long side",
-                plan(vec![hinted_image("https://a/1.png", 504)]),
-            ),
-            (
-                "video fps",
-                plan(vec![hinted_video("https://a/c.mp4", Some(1.0), None)]),
-            ),
-            (
-                "video long side",
-                plan(vec![hinted_video("https://a/c.mp4", None, Some(504))]),
-            ),
-            (
-                "one hinted item among plain ones",
-                plan(vec![
-                    image_url("https://a/1.png"),
-                    hinted_video("https://a/c.mp4", Some(2.0), None),
-                ]),
-            ),
-        ] {
-            assert_eq!(
-                resolve_mm_processing(&components, &registry, MODEL, &hinted, &placeholders)
-                    .unwrap_or_else(|err| panic!("{name}: {err}")),
-                MmProcessing::Router,
-                "{name}"
-            );
-        }
-
-        // Plain items still forward.
-        assert_eq!(
-            resolve_mm_processing(
-                &components,
-                &registry,
-                MODEL,
-                &plan(vec![image_url("https://a/1.png")]),
-                &placeholders
-            )
-            .expect("plain items forward"),
-            MmProcessing::Worker
-        );
-
-        // The router expands the placeholders itself, so the model's worker
-        // expansion is not consulted for a hinted request.
-        let mut unopted = PlaceholderTokens::default();
-        unopted.insert(Modality::Image, "<|image|>".to_string());
-        assert_eq!(
-            resolve_mm_processing(
-                &components,
-                &registry,
-                MODEL,
-                &plan(vec![hinted_image("https://a/1.png", 252)]),
-                &unopted
-            )
-            .expect("the router processes it"),
-            MmProcessing::Router
-        );
-
-        // A part with no reference form is still refused by name, before or
-        // after the hinted one.
-        let inline = MediaContentPart::ImageData {
-            data: vec![0, 1, 2],
-            mime_type: None,
-            uuid: None,
-            detail: None,
-        };
-        for parts in [
-            vec![hinted_image("https://a/1.png", 504), inline.clone()],
-            vec![inline.clone(), hinted_image("https://a/1.png", 504)],
-        ] {
-            assert_eq!(
-                resolve_mm_processing(&components, &registry, MODEL, &plan(parts), &placeholders)
-                    .expect_err("inline bytes are refused"),
-                MmRefsError::UnsupportedPart("inline image bytes")
-            );
-        }
-
-        // Without a spec the router cannot apply the hints: the request is
-        // refused for the hint, not for the missing spec.
-        let err = resolve_mm_processing(
-            &components,
-            &registry,
-            MODEL,
-            &plan(vec![hinted_image("https://a/1.png", 504)]),
-            &PlaceholderTokens::worker_only(),
-        )
-        .expect_err("no pipeline applies the hint");
-        assert_eq!(err.code(), "multimodal_hint_unsupported_in_worker_mode");
-        assert!(
-            err.to_string().contains("cannot apply them itself"),
-            "{err}"
-        );
-
-        // Audio is the worker's alone on this runtime: a hinted request that
-        // also carries it keeps the cheap refusal instead of a fetch and a
-        // decode that worker selection would refuse, while the same audio
-        // without a hint still forwards.
-        let audio = MediaContentPart::AudioUrl {
-            url: "https://a/x.wav".to_string(),
-            uuid: None,
-        };
-        let mut with_audio = expandable_placeholders();
-        with_audio.insert(Modality::Audio, "<|audio_pad|>".to_string());
-        with_audio.set_worker_expandable(Modality::Audio, true);
-        let err = resolve_mm_processing(
-            &components,
-            &registry,
-            MODEL,
-            &plan(vec![hinted_image("https://a/1.png", 504), audio.clone()]),
-            &with_audio,
-        )
-        .expect_err("the router cannot serve audio to this worker");
-        assert_eq!(err.code(), "multimodal_hint_unsupported_in_worker_mode");
-        assert_eq!(
-            resolve_mm_processing(
-                &components,
-                &registry,
-                MODEL,
-                &plan(vec![audio]),
-                &with_audio
-            )
-            .expect("plain audio forwards"),
-            MmProcessing::Worker
-        );
-    }
-
-    #[test]
-    fn selection_check_requires_every_worker_and_scheme() {
-        let plan_https = plan(vec![image_url("https://a/1.png")]);
-        let single = WorkerSelection::Single {
-            worker: capable("grpc://127.0.0.1:9600"),
-        };
-        ensure_selection_supports_media_refs(&single, &plan_https, PipelinePin::Any)
-            .expect("capable single");
-
-        let plain = WorkerSelection::Single {
-            worker: worker(
-                "grpc://127.0.0.1:9601",
-                RuntimeType::Vllm,
-                ConnectionMode::Grpc,
-                &[],
-            ),
-        };
-        assert_eq!(
-            ensure_selection_supports_media_refs(&plain, &plan_https, PipelinePin::Any),
-            Err(MmRefsError::WorkerNotCapable)
-        );
-
-        let file_plan = plan(vec![image_url("file:///media/1.png")]);
-        let err = ensure_selection_supports_media_refs(&single, &file_plan, PipelinePin::Any)
-            .expect_err("file scheme not advertised");
-        assert_eq!(err.code(), "media_ref_scheme_not_accepted");
-
-        let pd = WorkerSelection::Disaggregated {
-            encode_assignments: None,
-            prefill: capable("grpc://127.0.0.1:9602"),
-            decode: worker(
-                "grpc://127.0.0.1:9603",
-                RuntimeType::Vllm,
-                ConnectionMode::Grpc,
-                &[],
-            ),
-            runtime_type: RuntimeType::Vllm,
-        };
-        assert_eq!(
-            ensure_selection_supports_media_refs(&pd, &plan_https, PipelinePin::Any),
-            Err(MmRefsError::WorkerNotCapable)
-        );
-
-        // Both workers fetch: the accepted schemes are the intersection of what
-        // each advertising worker fetches.
-        let file_prefill = worker(
-            "grpc://127.0.0.1:9604",
-            RuntimeType::Vllm,
-            ConnectionMode::Grpc,
-            &[
-                (MM_PROCESSOR_LABEL, "inprocess"),
-                (MM_MEDIA_REF_SCHEMES_LABEL, "http,https,data,file"),
-            ],
-        );
-        let mixed = WorkerSelection::Disaggregated {
-            encode_assignments: None,
-            prefill: file_prefill,
-            decode: capable("grpc://127.0.0.1:9605"),
-            runtime_type: RuntimeType::Vllm,
-        };
-        ensure_selection_supports_media_refs(&mixed, &plan_https, PipelinePin::Any)
-            .expect("https on both workers");
-        assert_eq!(
-            ensure_selection_supports_media_refs(&mixed, &file_plan, PipelinePin::Any),
-            Err(MmRefsError::SchemeNotAccepted {
-                scheme: "file".to_string(),
-                accepted: "data,http,https".to_string(),
-            })
-        );
-
-        // A worker that advertises no schemes leaves the other worker's set in force.
-        let silent_decode = worker(
-            "grpc://127.0.0.1:9606",
-            RuntimeType::Vllm,
-            ConnectionMode::Grpc,
-            &[(MM_PROCESSOR_LABEL, "inprocess")],
-        );
-        let half = WorkerSelection::Disaggregated {
-            encode_assignments: None,
-            prefill: capable("grpc://127.0.0.1:9607"),
-            decode: silent_decode,
-            runtime_type: RuntimeType::Vllm,
-        };
-        assert_eq!(
-            ensure_selection_supports_media_refs(&half, &file_plan, PipelinePin::Any)
-                .expect_err("prefill's set still applies")
-                .code(),
-            "media_ref_scheme_not_accepted"
-        );
-    }
-
-    /// A worker running the gateway's own pipeline, which expands any
-    /// spec's anchor itself.
-    fn pipeline_worker(url: &str) -> Arc<dyn Worker> {
-        worker(
-            url,
-            RuntimeType::Vllm,
-            ConnectionMode::Grpc,
-            &[
-                (MM_PROCESSOR_LABEL, GATEWAY_PIPELINE_PROCESSOR),
-                (MM_MEDIA_REF_SCHEMES_LABEL, "http,https,data"),
-            ],
-        )
-    }
-
-    /// A spec'd model whose image anchor the engine's own processor does not
-    /// expand.
-    fn unopted_placeholders() -> PlaceholderTokens {
-        let mut placeholders = PlaceholderTokens::default();
-        placeholders.insert(Modality::Image, "<|media_pad|>".to_string());
-        placeholders
-    }
-
-    /// Only a spec'd model with a modality the engine's processor does not
-    /// expand needs the pipeline pin: an opted-in modality and a model
-    /// without a spec (whose template renders the engine's own placeholders)
-    /// go to any worker that processes references.
-    #[test]
-    fn only_unopted_modalities_of_a_specd_model_need_the_pipeline() {
-        let image = plan(vec![image_url("https://a/1.png")]);
-        assert!(plan_needs_gateway_pipeline(&image, &unopted_placeholders()));
-        assert!(!plan_needs_gateway_pipeline(
-            &image,
-            &expandable_placeholders()
-        ));
-        assert!(!plan_needs_gateway_pipeline(
-            &image,
-            &PlaceholderTokens::worker_only()
-        ));
-        assert!(worker_runs_gateway_pipeline(
-            pipeline_worker("grpc://127.0.0.1:9700").as_ref()
-        ));
-        assert!(!worker_runs_gateway_pipeline(
-            capable("grpc://127.0.0.1:9701").as_ref()
-        ));
-
-        // The pin selection reads: the pipeline alone for an unopted anchor,
-        // never the pipeline for audio, either otherwise.
-        let audio = plan(vec![MediaContentPart::AudioUrl {
-            url: "https://a/x.wav".to_string(),
-            uuid: None,
-        }]);
-        let mut audio_opted = PlaceholderTokens::default();
-        audio_opted.insert(Modality::Audio, "<|audio_pad|>".to_string());
-        audio_opted.set_worker_expandable(Modality::Audio, true);
-        assert_eq!(
-            media_refs_pipeline_pin(&image, &unopted_placeholders()),
-            PipelinePin::Only
-        );
-        assert_eq!(
-            media_refs_pipeline_pin(&audio, &audio_opted),
-            PipelinePin::Never
-        );
-        assert_eq!(
-            media_refs_pipeline_pin(&image, &expandable_placeholders()),
-            PipelinePin::Any
-        );
-        assert_eq!(
-            media_refs_pipeline_pin(&image, &PlaceholderTokens::worker_only()),
-            PipelinePin::Any
-        );
-    }
-
-    /// Strict worker mode forwards a model the engine's processor cannot
-    /// expand when every media-processing worker of the model runs the
-    /// gateway's own pipeline; a fleet mixing in the engine's processors, or
-    /// one with no such worker yet, keeps the refusal that names the opt-in.
-    #[test]
-    fn worker_mode_forwards_unopted_models_to_a_pipeline_fleet() {
-        let components = components(MmProcessingMode::Worker);
-        let image = plan(vec![image_url("https://a/1.png")]);
-        let unopted = unopted_placeholders();
-
-        let pipeline_fleet = registry_with(vec![
-            pipeline_worker("grpc://127.0.0.1:9710"),
-            pipeline_worker("grpc://127.0.0.1:9711"),
-        ]);
-        assert_eq!(
-            resolve_mm_processing(&components, &pipeline_fleet, MODEL, &image, &unopted)
-                .expect("forwarded to the pipeline workers"),
-            MmProcessing::Worker
-        );
-
-        let mixed = registry_with(vec![
-            pipeline_worker("grpc://127.0.0.1:9712"),
-            capable("grpc://127.0.0.1:9713"),
-        ]);
-        let err = resolve_mm_processing(&components, &mixed, MODEL, &image, &unopted)
-            .expect_err("a worker on the engine's processor keeps the opt-in");
-        assert_eq!(err, MmRefsError::ModelNotOptedIn(Modality::Image));
-        assert!(
-            err.to_string().contains(GATEWAY_PIPELINE_PROCESSOR),
-            "{err}"
-        );
-
-        let empty = registry_with(vec![]);
-        assert_eq!(
-            resolve_mm_processing(&components, &empty, MODEL, &image, &unopted)
-                .expect_err("no fleet"),
-            MmRefsError::ModelNotOptedIn(Modality::Image)
-        );
-
-        // The pipeline takes no audio, so an unopted audio anchor is refused
-        // here, with the opt-in named, rather than forwarded to a refusal.
-        let audio = plan(vec![MediaContentPart::AudioUrl {
-            url: "https://a/x.wav".to_string(),
-            uuid: None,
-        }]);
-        let mut unopted_audio = PlaceholderTokens::default();
-        unopted_audio.insert(Modality::Audio, "<|audio_pad|>".to_string());
-        assert_eq!(
-            resolve_mm_processing(&components, &pipeline_fleet, MODEL, &audio, &unopted_audio)
-                .expect_err("the pipeline expands no audio anchor"),
-            MmRefsError::ModelNotOptedIn(Modality::Audio)
-        );
-
-        // An opted-in model needs no pipeline worker, as before.
-        assert_eq!(
-            resolve_mm_processing(
-                &components,
-                &mixed,
-                MODEL,
-                &image,
-                &expandable_placeholders()
-            )
-            .expect("opted-in model forwards to any capable worker"),
-            MmProcessing::Worker
-        );
-    }
-
-    /// `auto` forwards an unopted model only to a fleet made entirely of
-    /// pipeline workers; one worker on the engine's processor sends the
-    /// model back to the gateway's own pipeline, as before.
-    #[test]
-    fn auto_forwards_unopted_models_only_to_a_uniform_pipeline_fleet() {
-        let components = components(MmProcessingMode::Auto);
-        let image = plan(vec![image_url("https://a/1.png")]);
-        let unopted = unopted_placeholders();
-
-        let pipeline_fleet = registry_with(vec![
-            pipeline_worker("grpc://127.0.0.1:9720"),
-            pipeline_worker("grpc://127.0.0.1:9721"),
-        ]);
-        assert_eq!(
-            resolve_mm_processing(&components, &pipeline_fleet, MODEL, &image, &unopted)
-                .expect("resolves"),
-            MmProcessing::Worker
-        );
-
-        let mixed = registry_with(vec![
-            pipeline_worker("grpc://127.0.0.1:9722"),
-            capable("grpc://127.0.0.1:9723"),
-        ]);
-        assert_eq!(
-            resolve_mm_processing(&components, &mixed, MODEL, &image, &unopted).expect("resolves"),
-            MmProcessing::Router
-        );
-    }
-
-    /// Selection pins an unopted model's references to pipeline workers on
-    /// every worker, and keeps audio off a pipeline worker, which takes none.
-    #[test]
-    fn selection_check_pins_unopted_models_to_pipeline_workers_and_audio_off_them() {
-        let image = plan(vec![image_url("https://a/1.png")]);
-        let audio = plan(vec![MediaContentPart::AudioUrl {
-            url: "https://a/x.wav".to_string(),
-            uuid: None,
-        }]);
-        let pipeline_single = WorkerSelection::Single {
-            worker: pipeline_worker("grpc://127.0.0.1:9730"),
-        };
-        let engine_single = WorkerSelection::Single {
-            worker: capable("grpc://127.0.0.1:9731"),
-        };
-        ensure_selection_supports_media_refs(&pipeline_single, &image, PipelinePin::Only)
-            .expect("the pipeline worker takes the unopted model");
-        assert_eq!(
-            ensure_selection_supports_media_refs(&engine_single, &image, PipelinePin::Only),
-            Err(MmRefsError::PipelineWorkerRequired)
-        );
-        ensure_selection_supports_media_refs(&engine_single, &image, PipelinePin::Any)
-            .expect("an opted-in model goes to the engine's processor");
-
-        let half = WorkerSelection::Disaggregated {
-            encode_assignments: None,
-            prefill: pipeline_worker("grpc://127.0.0.1:9732"),
-            decode: capable("grpc://127.0.0.1:9733"),
-            runtime_type: RuntimeType::Vllm,
-        };
-        assert_eq!(
-            ensure_selection_supports_media_refs(&half, &image, PipelinePin::Only),
-            Err(MmRefsError::PipelineWorkerRequired)
-        );
-
-        assert_eq!(
-            ensure_selection_supports_media_refs(&pipeline_single, &audio, PipelinePin::Any),
-            Err(MmRefsError::PipelineTakesNoAudio)
-        );
-        ensure_selection_supports_media_refs(&engine_single, &audio, PipelinePin::Any)
-            .expect("the engine's processor takes audio");
-        assert_eq!(
-            MmRefsError::PipelineTakesNoAudio.code(),
-            "multimodal_not_supported"
-        );
-        assert_eq!(
-            MmRefsError::PipelineWorkerRequired.code(),
-            "multimodal_worker_processing_unsupported_model"
-        );
-    }
-
-    #[test]
-    fn assemble_keeps_prompt_order_and_maps_modalities() {
-        let refs = assemble_media_refs(plan(vec![
-            image_url("https://a/1.png"),
-            MediaContentPart::VideoUrl {
-                url: "data:video/mp4;base64,AAAA".to_string(),
-                uuid: None,
-                fps: None,
-                max_long_side_pixel: None,
-            },
-            image_url("https://a/2.png"),
-        ]))
-        .expect("assembles");
-        let items: Vec<(i32, &str)> = refs
-            .items
-            .iter()
-            .map(|item| (item.modality, item.url.as_str()))
-            .collect();
-        assert_eq!(
-            items,
-            vec![
-                (common::Modality::Image as i32, "https://a/1.png"),
-                (common::Modality::Video as i32, "data:video/mp4;base64,AAAA"),
-                (common::Modality::Image as i32, "https://a/2.png"),
-            ]
-        );
-    }
-
-    #[test]
-    fn audio_refs_require_an_expandable_model_and_stay_in_prompt_order() {
-        let plan = plan(vec![
-            MediaContentPart::AudioUrl {
-                url: "data:audio/wav;base64,AAAA".to_string(),
-                uuid: None,
-            },
-            image_url("https://a/1.png"),
-        ]);
-        assert!(plan.is_forwardable());
-        let mut placeholders = expandable_placeholders();
-        assert_eq!(
-            ensure_worker_expandable(&plan, &placeholders, false),
-            Err(MmRefsError::ModelNotOptedIn(Modality::Audio))
-        );
-        placeholders.set_worker_expandable(Modality::Audio, true);
-        ensure_worker_expandable(&plan, &placeholders, false).unwrap();
-        let refs = assemble_media_refs(plan).unwrap();
-        assert_eq!(refs.items[0].modality, common::Modality::Audio as i32);
-        assert_eq!(refs.items[0].url, "data:audio/wav;base64,AAAA");
-        assert_eq!(refs.items[1].modality, common::Modality::Image as i32);
-    }
-
-    #[test]
-    fn assemble_rejects_unsupported_parts_and_oversized_data_urls() {
-        let err = assemble_media_refs(plan(vec![MediaContentPart::AudioData {
-            data: vec![0; 4],
-            mime_type: Some("audio/wav".to_string()),
-            uuid: None,
-        }]))
-        .expect_err("raw audio bytes have no reference form");
-        assert_eq!(err, MmRefsError::UnsupportedPart("inline audio bytes"));
-
-        let oversized = format!(
-            "data:image/png;base64,{}",
-            "A".repeat(media::image_max_input_bytes() * 4 / 3 + 8)
-        );
-        let err =
-            assemble_media_refs(plan(vec![image_url(&oversized)])).expect_err("oversized data url");
-        assert_eq!(err.code(), "media_ref_too_large");
-    }
-
-    #[test]
-    fn url_scheme_and_data_url_size() {
-        assert_eq!(url_scheme("HTTPS://a/1.png"), "https");
-        assert_eq!(url_scheme("data:image/png;base64,AAAA"), "data");
-        assert_eq!(url_scheme("/local/path.png"), "");
-        assert_eq!(data_url_payload_bytes("https://a/1.png"), None);
-        assert_eq!(
-            data_url_payload_bytes("data:image/png;base64,AAAAAAAA"),
-            Some(6)
-        );
-        assert_eq!(data_url_payload_bytes("DATA:text/plain,hello"), Some(5));
-    }
-}
+#[path = "../../../../tests/unit/routers/grpc/multimodal/refs/tests.rs"]
+mod tests;

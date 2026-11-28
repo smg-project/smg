@@ -12,12 +12,14 @@ mod generate;
 mod info;
 mod service;
 #[cfg(test)]
+#[path = "../../tests/unit/trtllm/tests.rs"]
 mod tests;
 
 use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{
-    StructuredOutputBackend, StructuredOutputsBackendConfig, StructuredOutputsSupport,
+    ConstraintKinds, StructuredOutputBackend, StructuredOutputsBackendConfig,
+    StructuredOutputsSupport,
 };
 use smg_grpc_client::{
     common_proto as common, trtllm_proto::trtllm_service_server::TrtllmServiceServer,
@@ -26,7 +28,7 @@ use tonic::service::Routes;
 
 use crate::{
     engine_link::EngineLink,
-    kv_events::KvEventRelay,
+    kv_events::{record_with_queue, KvEventRelay, RankLoads},
     metrics::{Identity, ServicerMetrics},
     servicer::{self, Shared, WireState},
     ServicerConfig, ServicerError,
@@ -98,18 +100,41 @@ pub struct TrtllmModelInfo {
 /// What the engine enforces of a structured request, read off the
 /// launcher's facts: the `guided_decoding_backend` the engine's arguments
 /// resolve to. `none` enforces nothing (the engine refuses a guided request
-/// at admission, which the shim reports as a 400 abort); `xgrammar` and
-/// `llguidance` compile all four kinds. A launcher that could not tell leaves
-/// nothing judged ahead of the engine. The adapter refuses a constraint
-/// outside this before the engine, as on every wire.
+/// at admission, which the shim reports as a 400 abort); `xgrammar` compiles
+/// all four kinds; `llguidance` compiles JSON schemas, regular expressions
+/// and EBNF grammars and fails a structural tag at compile. A launcher that
+/// could not tell leaves nothing judged ahead of the engine. The adapter
+/// refuses a constraint outside this before the engine, as on every wire.
 pub(super) fn structured_outputs_support(model: &TrtllmModelInfo) -> StructuredOutputsSupport {
     use StructuredOutputsBackendConfig::{Other, Pinned};
 
     match model.guided_decoding_backend.trim() {
         "xgrammar" => Pinned(StructuredOutputBackend::Xgrammar).into(),
-        "llguidance" => Pinned(StructuredOutputBackend::Guidance).into(),
+        "llguidance" => StructuredOutputsSupport::new(
+            Pinned(StructuredOutputBackend::Guidance),
+            ConstraintKinds {
+                json_schema: true,
+                regex: true,
+                ebnf: true,
+                structural_tag: false,
+            },
+        ),
         "none" => StructuredOutputsSupport::DISABLED,
         _ => Other.into(),
+    }
+}
+
+/// Where the engine starts a request's grammar on a prompt that ends inside
+/// the model's thinking block (the `constrained_decoding_start` label the
+/// router shapes a forced tool call's grammar by): `first_token` under the
+/// backends that compile one, since the engine's guided decoder builds a
+/// request's matcher before the first generated token and no reasoning
+/// parser gates it. Empty under `none`, where no grammar ever starts, and
+/// under a backend the launcher could not name.
+pub(super) fn constrained_decoding_start(model: &TrtllmModelInfo) -> &'static str {
+    match model.guided_decoding_backend.trim() {
+        "xgrammar" | "llguidance" => "first_token",
+        _ => "",
     }
 }
 
@@ -131,13 +156,10 @@ pub struct TrtllmServicerConfig {
 /// the KV capacity included). A connected rank reads its own entry,
 /// zero-filled before its first load tail; a rank past the connected ones
 /// gets no record (`info::rank_load`).
-impl crate::kv_events::RankLoads for State {
+impl RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad> {
         let load = info::rank_load(self, dp_rank)?;
-        Some(crate::kv_events::record_with_queue(
-            &load,
-            load.num_waiting_uncached_tokens,
-        ))
+        Some(record_with_queue(&load, load.num_waiting_uncached_tokens))
     }
 
     fn engine_link(&self) -> &EngineLink {

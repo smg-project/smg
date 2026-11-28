@@ -1,4 +1,8 @@
-use std::{sync::Arc, thread};
+use std::{
+    sync::{atomic::AtomicBool, Arc},
+    thread,
+    time::{Duration, Instant},
+};
 
 use super::*;
 
@@ -611,7 +615,7 @@ fn test_concurrent_operations_with_eviction() {
             let tenant_id: TenantId = Arc::from(format!("tenant{t}"));
             for _ in 0..10 {
                 tree.evict_tenant(&tenant_id, 50);
-                thread::sleep(std::time::Duration::from_millis(1));
+                thread::sleep(Duration::from_millis(1));
             }
         }));
     }
@@ -1710,6 +1714,55 @@ fn test_evict_by_size_shared_budget_lru_tenants() {
             "tenant{t} should survive"
         );
     }
+}
+
+/// A size pass that waits below a node holds no shard of the root's child
+/// map. The tree is the root, a node `P` and its child `C`, one page each,
+/// under one tenant. The test holds the write guard of `P`'s stamp map,
+/// which the collection reads before it leaves `P`. A further handle of `C`
+/// says the collection has passed the root's children, and the held guard
+/// keeps it below the root through the probe: there a writer must find the
+/// root's edge to `P` free, as an insert under the root takes that shard. A
+/// walk that asks a child under the guard that names it kept the shard for
+/// as long as it was below. Once the guard is released the pass queues `C`
+/// alone: `P` holds the tenant above a child that holds it too.
+#[test]
+fn a_collection_that_waits_below_the_root_leaves_its_edges_free() {
+    let tree = TokenTree::new();
+    let prompt = make_tokens(1, 2);
+    tree.insert_tokens(&prompt[..PAGE_SIZE], "tenant1");
+    tree.insert_tokens(&prompt, "tenant1");
+    let (edge, parent) = {
+        let first = tree.root.children.iter().next().unwrap();
+        (*first.key(), Arc::clone(first.value()))
+    };
+    let child = Arc::clone(parent.children.iter().next().unwrap().value());
+    let handles = Arc::strong_count(&child);
+    let until = Instant::now() + Duration::from_secs(60);
+
+    let (reached, free, leaves) = thread::scope(|scope| {
+        let held = parent.tenant_last_access_time.get_mut("tenant1").unwrap();
+        let collector = scope.spawn(|| {
+            let mut leaves = Vec::new();
+            tree.collect_all_tenant_leaves(&tree.root, &mut leaves);
+            leaves
+        });
+        while Arc::strong_count(&child) == handles && Instant::now() < until {
+            thread::yield_now();
+        }
+        let reached = Arc::strong_count(&child) > handles;
+        let free = !tree.root.children.try_get_mut(&edge).is_locked();
+        drop(held);
+        (reached, free, collector.join().unwrap())
+    });
+
+    assert!(reached, "the collection never reached the child");
+    assert!(
+        free,
+        "the root's edge stayed locked while the collection waited below it"
+    );
+    assert_eq!(leaves.len(), 1);
+    assert!(Arc::ptr_eq(&leaves[0].0, &child) && leaves[0].1.as_ref() == "tenant1");
 }
 
 #[test]
@@ -2833,4 +2886,192 @@ fn hashes_name_live_nodes_through_random_inserts_and_evictions() {
     }
     assert_eq!(tree.hashed_paths(), 0);
     assert_hashes_name_live_nodes(&tree);
+}
+
+/// A purge by name beside the writes of its own tenant leaves no prompt
+/// standing that the tenant's count lacks. One writer inserts prompt after
+/// prompt for the tenant, none a prefix of another. The purge runs each time
+/// the tenant holds 500 prompts, so its removals take long enough for whole
+/// inserts to fall between its walk and its end, and it is repeated until 50
+/// prompts were written beside one purge. A count dropped whole behind the
+/// removals erased the count of every such prompt.
+#[test]
+fn test_remove_tenant_all_beside_inserts_keeps_prompts_counted() {
+    let tree = TokenTree::new();
+    let purged = tenant("tenant1");
+    let written = AtomicUsize::new(0);
+    let done = AtomicBool::new(false);
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            for prompt in 0..4_000_000_u32 {
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                tree.match_and_insert(&make_tokens(prompt * 1_000, 4), "tenant1");
+                written.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let until = Instant::now() + Duration::from_secs(60);
+        loop {
+            if Instant::now() >= until {
+                // The writer stops too: `thread::scope` joins it ahead of
+                // the panic, and it would write on with no purge.
+                done.store(true, Ordering::Relaxed);
+                panic!("no purge ran beside 50 inserts");
+            }
+            if tree.tenant_token_size(&purged) < 500 * 4 * PAGE_SIZE {
+                thread::yield_now();
+                continue;
+            }
+            let before = written.load(Ordering::Relaxed);
+            tree.remove_tenant_all(&purged);
+            if written.load(Ordering::Relaxed) >= before + 50 {
+                break;
+            }
+        }
+        done.store(true, Ordering::Relaxed);
+    });
+
+    // At rest. The root's own entry is no prompt.
+    let standing: usize = tree.iter_entries().map(|(prompt, _)| prompt.len()).sum();
+    let counted = tree.tenant_token_size(&purged);
+    assert!(
+        counted >= standing,
+        "{standing} tokens stand in the tree, {counted} are counted"
+    );
+}
+
+/// A removal beside a split debits what the tenant held on the node when
+/// its ownership left. The purge's step for one node runs here by hand: its
+/// helper, then the debit. A second tenant's insert splits the node at its
+/// page boundary, and a read guard of the test's parks that split ahead of
+/// its `tokens` write section. A waiting writer holds every later reader
+/// off, so the helper's read of the length runs behind the split. A helper
+/// that took the ownership ahead of the guard debited the suffix alone: the
+/// split's clone no longer named the tenant, and its prefix stayed counted
+/// with no node behind it, past every later purge. Under one guard the
+/// helper waits, the new prefix node keeps the tenant with its count, and
+/// the tenant's next purge takes both.
+#[test]
+fn a_removal_beside_a_split_leaves_no_count_without_a_node() {
+    let tree = TokenTree::new();
+    let (purged, prompt) = (tenant("tenant1"), make_tokens(1, 2));
+    tree.insert_tokens(&prompt, "tenant1");
+    let node = Arc::clone(tree.root.children.iter().next().unwrap().value());
+    let entered = AtomicBool::new(false);
+    let until = Instant::now() + Duration::from_secs(60);
+
+    thread::scope(|scope| {
+        let held = node.tokens.read();
+        scope.spawn(|| tree.insert_tokens(&prompt[..PAGE_SIZE], "tenant2"));
+        while node.tokens.try_read().is_some() {
+            assert!(Instant::now() < until, "the split never asked to write");
+            thread::yield_now();
+        }
+        scope.spawn(|| {
+            entered.store(true, Ordering::Relaxed);
+            let taken = tree.remove_tenant_and_cleanup(&node, &purged).0;
+            tree.sub_tenant_tokens(&purged, taken);
+        });
+        // The split is let go once the ownership left, as it does where the
+        // helper takes it ahead of the guard, or 50 ms into the helper's wait.
+        while !entered.load(Ordering::Relaxed) {
+            thread::yield_now();
+        }
+        let waited = Instant::now() + Duration::from_millis(50);
+        while node.tenant_last_access_time.contains_key("tenant1") && Instant::now() < waited {
+            thread::yield_now();
+        }
+        drop(held);
+    });
+
+    // The split ran: the node keeps its second page alone.
+    assert_eq!(node.tokens.read().len(), PAGE_SIZE);
+    tree.remove_tenant_all(&purged);
+    assert!(
+        !tree.get_tenant_token_counts().contains_key("tenant1"),
+        "{} tokens are counted for a tenant no node names",
+        tree.tenant_token_size(&purged)
+    );
+}
+
+/// A purge leaves the purged tenant nothing counted, in the token tree and in
+/// the string tree alike, where another tenant's inserts split its nodes
+/// meanwhile. `worker-a` holds `GROUPS` heads with `FAN` keys of two more
+/// parts under each. While it is purged, a second thread inserts for
+/// `worker-b` a key that shares two parts with each of them and differs in
+/// the third: every such insert splits one node of `worker-a`. A split
+/// between the purge's walk and that node's removal hands `worker-a`'s
+/// second part to a new node the walk never saw, under a first part the
+/// purge cleared: one walk left it standing, counted, to the tenant's next
+/// purge, and the pruned walk does not reach it. The size is the read
+/// because no insert for `worker-a` runs beside the purge: every node that
+/// still names it is counted.
+#[test]
+fn a_purge_beside_splits_by_another_tenant_leaves_the_purged_nothing_counted() {
+    const GROUPS: u32 = 2_000;
+    const FAN: u32 = 10;
+    /// A tree by its name: its insert of the key `(group, leaf, third)` for
+    /// a tenant, its purge of `worker-a`, and what it then counts for it.
+    type Row<'a> = (
+        &'a str,
+        &'a (dyn Fn(u32, u32, u32, &str) + Sync),
+        &'a dyn Fn(),
+        &'a dyn Fn() -> usize,
+    );
+    let purged = tenant("worker-a");
+    let (tokens, texts) = (TokenTree::new(), crate::string_tree::Tree::new());
+    let prompt = |group: u32, leaf: u32, third: u32| {
+        let second = group * 100_000 + (leaf + 1) * 1_000;
+        let mut prompt = make_tokens(group * 100_000, 1);
+        prompt.extend(make_tokens(second, 1));
+        prompt.extend(make_tokens(second + third, 1));
+        prompt
+    };
+    let text = |group: u32, leaf: u32, third: u32| {
+        format!("group {group:04} of the head, leaf {leaf:02} of the middle, the tail {third}")
+    };
+    let rows: [Row<'_>; 2] = [
+        (
+            "token tree",
+            &|group, leaf, third, tenant| tokens.insert_tokens(&prompt(group, leaf, third), tenant),
+            &|| tokens.remove_tenant_all(&purged),
+            &|| tokens.tenant_token_size(&purged),
+        ),
+        (
+            "string tree",
+            &|group, leaf, third, tenant| texts.insert_text(&text(group, leaf, third), tenant),
+            &|| texts.remove_tenant_all(&purged),
+            &|| texts.tenant_char_size(&purged),
+        ),
+    ];
+
+    let left = rows.map(|(tree, insert, purge, counted)| {
+        for group in 0..GROUPS {
+            for leaf in 0..FAN {
+                insert(group, leaf, 100, "worker-a");
+            }
+        }
+        let splitting = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                for group in 0..GROUPS {
+                    for leaf in 0..FAN {
+                        insert(group, leaf, 200, "worker-b");
+                        splitting.store(true, Ordering::Relaxed);
+                    }
+                }
+            });
+            while !splitting.load(Ordering::Relaxed) {
+                thread::yield_now();
+            }
+            purge();
+        });
+        (tree, counted())
+    });
+    assert_eq!(
+        left,
+        [("token tree", 0), ("string tree", 0)],
+        "what each tree still counts for the purged tenant"
+    );
 }

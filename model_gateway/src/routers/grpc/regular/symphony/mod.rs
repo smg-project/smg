@@ -8,9 +8,13 @@
 //! set for it (`ParserResolver::names`: the `tool_parser` and `reasoning_parser` of the model's
 //! card, its workers' labels, apart from the gateway's `--tool-call-parser` and
 //! `--reasoning-parser` flags) and the registry: the labels, when they select anything; else the
-//! registry's table for a model it knows (`symphony::formats::for_model`); else the flags, for a
-//! model the registry does not know, so that a fleet-wide name never reads a family the registry
-//! has a table for; else the legacy parsers with their own detection. Names select a table when
+//! flags, when they select anything; else the registry's table for a model it knows
+//! (`symphony::formats::for_model`); else the legacy parsers with their own detection. A reasoning
+//! name alone in the flags does not come before the registry
+//! ([`flags_read_first`](names::flags_read_first)): the
+//! family's usual engine flag (`--reasoning-parser qwen3`) leaves a model the registry knows to
+//! the registry's table, and its table reads only the models the registry does not know. Names
+//! select a table when
 //! it answers to them (`utils::answering_to`: its own name, a legacy parser's
 //! that reads its format, `qwen` for `qwen3`, `qwen_xml` for `qwen3_tagged`, or a launcher's name
 //! for a family whose table has no older parser, `muse` for `muse_spark`), the tool-call name
@@ -26,7 +30,8 @@
 //! legacy registries in `names` holds every name to one of the two); no name at all, or a reasoning
 //! name alone that no table answers to, other than `passthrough`, selects nothing. The names are
 //! checked at startup and at a worker's registration ([`check_names`]), which also says, once per
-//! model, when the registry's table sets the flags' choice aside ([`set_aside_by_the_registry`]).
+//! model, when the registry's table sets a reasoning name alone in the flags aside
+//! ([`set_aside_by_the_registry`]).
 //! Every request read with `legacy` keeps the older parsers. The response names
 //! the parser that read it in `x-smg-parser`, legacy when the choice was Symphony but no table
 //! took the request, so a client comparing the two can tell which one read each answer, and the
@@ -39,7 +44,10 @@
 //! its thought ([`assign_for`]). A `tool_choice` of `none` over declared tools keeps the table's
 //! calls: the prompt declares the tools as under `auto`, as the engine's own server renders it,
 //! and the reader drops every call the model writes anyway, counted per table
-//! (`smg_symphony_calls_forbidden_total`), so none is delivered as a call or as content.
+//! (`smg_symphony_calls_forbidden_total`), so none is delivered as a call or as content. Under a
+//! named function, an allowed list or `required` the reader drops the same way, and counts in
+//! the same counter, a call to a function outside the tools the choice leaves callable; the
+//! calls beside it go out, numbered from zero.
 //!
 //! Request building assigns Symphony to a request ([`assign_for`]) and stores
 //! the [`Assignment`] in the response spec: the table, and the part of the rendered prompt the
@@ -47,7 +55,10 @@
 //! structural tag of a forced or required call, or of a JSON `response_format`
 //! ([`constraint_for`]) before the older registry. Both decide with one predicate, so the
 //! output a table's tag constrains is read by that table and never by the older parsers, which
-//! expect another syntax. Request building decides what constrains the output on the worker
+//! expect another syntax. Where the table has no tag for a forced or required call, the older
+//! registry constrains it with its JSON schema and the table reads that output too, with its
+//! forced call ([`assign_for`]): the thought as the table reads one, then the JSON alone.
+//! Request building decides what constrains the output on the worker
 //! selected for the request ([`worker_constraint`]): a worker whose engine takes a grammar on every
 //! turn from its first token gets the whole turn's grammar where the response template's table
 //! spells one ([`turn_constraint`]); a table's refusal in preparation waits for that decision. The
@@ -61,6 +72,7 @@ mod reader;
 pub(crate) mod telemetry;
 pub(crate) mod template;
 #[cfg(test)]
+#[path = "../../../../../tests/unit/routers/grpc/regular/symphony/testing.rs"]
 pub(crate) mod testing;
 
 use axum::http::HeaderMap;
@@ -133,17 +145,20 @@ pub(crate) fn choice(
     })
 }
 
+#[cfg(any(test, feature = "test-util"))]
+pub(crate) use self::constraint::Forbids;
 #[cfg(test)]
 pub(crate) use self::{constraint::constraint, reader::assign};
 pub(crate) use self::{
     constraint::{
-        constraint_for, grammar_start_of, turn_constraint, vocabulary_of, worker_constraint, Asks,
-        AutoRequest, AutoTag, Prepared, PreparedConstraint,
+        constraint_for, grammar_start_of, keeps_references, turn_constraint, vocabulary_of,
+        worker_constraint, Asks, AutoRequest, AutoTag, Prepared, PreparedConstraint,
+        ToolConstraint,
     },
     names::{
-        check_names, keeps_special_tokens_for, labels_select_nothing, named_table, reading,
-        reasoning_open, reasoning_open_for, set_aside_by_the_registry, table_label_read,
-        PromptReplay, Reading,
+        check_names, keeps_special_tokens_for, labels_select_nothing, named_table, names_template,
+        read_by_alias, reading, reasoning_open, reasoning_open_for, set_aside_by_the_registry,
+        table_label_read, tables_by_alias, ByAlias, PromptReplay, Reading,
     },
     reader::{assign_for, engine_finish, finished, Assignment, Delta, Reader},
 };

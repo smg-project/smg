@@ -179,17 +179,86 @@ impl ProviderProfile {
         registered.unwrap_or_else(|| Self::from_model_segments(model))
     }
 
+    /// Whether a model id selects the GLM-5.3-Flash Chat Completions
+    /// tool-reference syntax. Opaque model names can inherit the Flash contract
+    /// through the registered aliases.
+    pub fn supports_chat_tool_references(self, model: &str) -> bool {
+        self == Self::Zai && zai::is_glm53_flash(model)
+    }
+
     /// The thinking on/off preference the profile reads from a request's
     /// effective `reasoning_effort` (`thinking.effort`, else the top-level
     /// field) when the request states no `thinking.type`. The OpenAI reading
     /// ([`thinking_from_reasoning_effort`]: `none` and `minimal` switch
     /// thinking off, every other value leaves the template's default) for
-    /// every profile but MiniMax, whose contract keeps thinking on for every
-    /// value: `none` is the model's default depth and `minimal` is `low`.
+    /// every profile but MiniMax, whose contract reads `none` as thinking off
+    /// (the request answers as one with `thinking.type: disabled` does: no
+    /// reasoning, `reasoning_tokens` 0) and `minimal` as its lowest named
+    /// level, `low`, thinking on. Which values reach the template is the
+    /// profile's second reading, [`Self::template_reasoning_effort`].
     pub fn thinking_from_reasoning_effort(self, reasoning_effort: Option<&str>) -> Option<bool> {
         match self {
-            ProviderProfile::Minimax => None,
+            ProviderProfile::Minimax => match reasoning_effort {
+                Some("none") => Some(false),
+                _ => None,
+            },
             _ => thinking_from_reasoning_effort(reasoning_effort),
+        }
+    }
+
+    /// The `reasoning_effort` the prompt is rendered with, from the request's
+    /// effective effort and the thinking preference the prompt renders with
+    /// (the typed toggle, else [`Self::thinking_from_reasoning_effort`]): the
+    /// value as sent under every profile but MiniMax, where the template owns
+    /// the level-to-value mapping, defaulting and validation. The MiniMax
+    /// templates write the value into an effort tag the model reads
+    /// literally, and the contract names the levels: `low`, `medium`, `high`,
+    /// `xhigh` and `max` reach the template, `minimal` reaches it as `low`;
+    /// any other value renders no effort (`none` switches thinking off
+    /// instead, an unknown level is the default depth), and no effort is
+    /// rendered while thinking is off, where the contract ignores it.
+    pub fn template_reasoning_effort(
+        self,
+        reasoning_effort: Option<&str>,
+        thinking: Option<bool>,
+    ) -> Option<&str> {
+        let effort = reasoning_effort?;
+        match self {
+            ProviderProfile::Minimax => {
+                if thinking == Some(false) {
+                    return None;
+                }
+                if effort == minimax::EFFORT_MINIMAL {
+                    return Some(minimax::EFFORT_LOW);
+                }
+                minimax::EFFORT_LEVELS.contains(&effort).then_some(effort)
+            }
+            _ => Some(effort),
+        }
+    }
+
+    /// The thinking preference an explicit template switch in the request's
+    /// `chat_template_kwargs` states, read by the profile that knows its
+    /// templates' key: under MiniMax `thinking_mode` `enabled` / `disabled`
+    /// (the templates' own tri-state switch; `adaptive` or any other value
+    /// leaves the default); `None` under every other profile, whose
+    /// templates' switches the gateway reads from the template text instead.
+    /// The gateway applies it where the template reads that key (its detected
+    /// thinking key is `thinking_mode`), as the backed plan and the parser do
+    /// for the mode: there the explicit switch ranks above the typed toggle
+    /// and the effort, as the template renders it; elsewhere it is inert and
+    /// the typed toggle and the effort decide.
+    pub fn thinking_from_template_kwargs(
+        self,
+        kwargs: Option<&HashMap<String, serde_json::Value>>,
+    ) -> Option<bool> {
+        match self {
+            ProviderProfile::Minimax => match kwargs?.get(minimax::THINKING_MODE_KEY)?.as_str()? {
+                minimax::THINKING_MODE_ENABLED => Some(true),
+                minimax::THINKING_MODE_DISABLED => Some(false),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
@@ -293,30 +362,71 @@ impl ProviderProfile {
         )
     }
 
-    /// The vendor a model id names in one of its `/`-separated segments.
+    /// The vendor a model id names in one of its `/`-separated segments,
+    /// read in one walk: the first segment naming a vendor decides; with
+    /// none, the id is OpenAI's own when a segment is OpenAI's and no
+    /// segment is `gpt-oss` (the rule of [`is_openai_vendor_model`]).
+    ///
+    /// Every name a segment is tested against starts with one of nine
+    /// letters, so a segment's first byte selects the few tests that can
+    /// hold for it, and a segment that starts with none of them (most
+    /// segments of a self-hosted id) is passed without a comparison. A chat
+    /// request is read through here several times: once to normalize it,
+    /// once to validate it, once more for the stages. A name added under a
+    /// new first letter needs its arm here: the lists of names kept outside
+    /// this function check their first letters when the crate is built, and
+    /// the tests hold the plain reading, every test on every segment, and
+    /// compare the two.
     fn from_model_segments(model: &str) -> Self {
+        let mut openai = false;
+        let mut gpt_oss = false;
         for segment in model.split('/') {
-            if deepseek::matches_model(segment) {
-                return ProviderProfile::DeepSeek;
-            }
-            if starts_with_ignore_ascii_case(segment, "kimi")
-                || starts_with_ignore_ascii_case(segment, "moonshot")
-            {
-                return ProviderProfile::Kimi;
-            }
-            if starts_with_ignore_ascii_case(segment, "minimax")
-                || starts_with_ignore_ascii_case(segment, "abab")
-            {
-                return ProviderProfile::Minimax;
-            }
-            if starts_with_ignore_ascii_case(segment, "glm")
-                || starts_with_ignore_ascii_case(segment, "zai")
-                || starts_with_ignore_ascii_case(segment, "z-ai")
-            {
-                return ProviderProfile::Zai;
+            match segment.as_bytes().first().map(u8::to_ascii_lowercase) {
+                Some(b'd') => {
+                    if deepseek::matches_model(segment) {
+                        return ProviderProfile::DeepSeek;
+                    }
+                }
+                Some(b'k') => {
+                    if starts_with_ignore_ascii_case(segment, "kimi") {
+                        return ProviderProfile::Kimi;
+                    }
+                }
+                Some(b'm') => {
+                    if starts_with_ignore_ascii_case(segment, "moonshot") {
+                        return ProviderProfile::Kimi;
+                    }
+                    if starts_with_ignore_ascii_case(segment, "minimax") {
+                        return ProviderProfile::Minimax;
+                    }
+                }
+                Some(b'a') => {
+                    if starts_with_ignore_ascii_case(segment, "abab") {
+                        return ProviderProfile::Minimax;
+                    }
+                }
+                Some(b'z') => {
+                    if starts_with_ignore_ascii_case(segment, "zai")
+                        || starts_with_ignore_ascii_case(segment, "z-ai")
+                    {
+                        return ProviderProfile::Zai;
+                    }
+                }
+                Some(b'g') => {
+                    if starts_with_ignore_ascii_case(segment, "glm") {
+                        return ProviderProfile::Zai;
+                    }
+                    gpt_oss = gpt_oss || starts_with_ignore_ascii_case(segment, "gpt-oss");
+                    openai = openai || is_openai_segment(segment);
+                }
+                // The other letters OpenAI's own names start with: `openai`,
+                // `omni-moderation` and the reasoning series; `chatgpt-`,
+                // `codex-` and `computer-use-preview`; `text-embedding-`.
+                Some(b'o' | b'c' | b't') => openai = openai || is_openai_segment(segment),
+                _ => {}
             }
         }
-        if is_openai_vendor_model(model) {
+        if openai && !gpt_oss {
             return ProviderProfile::OpenAi;
         }
         ProviderProfile::Generic
@@ -501,6 +611,24 @@ fn effort_fields(req: &mut ChatCompletionRequest) -> impl Iterator<Item = &mut S
 /// requests through to the engine, whose grammar compiler decides what it can
 /// constrain, so the gateway does not refuse ahead of it.
 pub fn is_openai_vendor_model(model: &str) -> bool {
+    let mut openai = false;
+    for segment in model.split('/') {
+        // The open-weight gpt-oss models are served locally whatever route
+        // segment precedes or follows them: never the vendor's hosted
+        // contract.
+        if starts_with_ignore_ascii_case(segment, "gpt-oss") {
+            return false;
+        }
+        openai = openai || is_openai_segment(segment);
+    }
+    openai
+}
+
+/// One `/`-separated segment of a model id that is OpenAI's: the `openai`
+/// route segment, one of the hosted families' prefixes, or the reasoning
+/// series. The `gpt-oss` exception is the callers' to apply over the whole
+/// id, so the readers walk it once.
+fn is_openai_segment(segment: &str) -> bool {
     const PREFIXES: [&str; 6] = [
         "gpt-",
         "chatgpt-",
@@ -509,21 +637,35 @@ pub fn is_openai_vendor_model(model: &str) -> bool {
         "text-embedding-",
         "omni-moderation",
     ];
-    // The open-weight gpt-oss models are served locally whatever route
-    // segment precedes them: never the vendor's hosted contract.
-    if model
-        .split('/')
-        .any(|segment| starts_with_ignore_ascii_case(segment, "gpt-oss"))
-    {
-        return false;
+    // A segment reaches this test under one of four first letters in
+    // `ProviderProfile::from_model_segments`: a prefix under another letter
+    // does not build before it has its arm there. `openai` and the reasoning
+    // series start with an `o`.
+    const _: () = assert!(every_name_starts_with(&PREFIXES, b"gcto"));
+    segment.eq_ignore_ascii_case("openai")
+        || PREFIXES
+            .iter()
+            .any(|prefix| starts_with_ignore_ascii_case(segment, prefix))
+        || is_openai_reasoning_series(segment)
+}
+
+/// Whether every name starts with one of `letters`, whatever its case: the
+/// compile-time check that ties a list of names kept outside
+/// [`ProviderProfile::from_model_segments`] to its arm there.
+const fn every_name_starts_with(names: &[&str], letters: &[u8]) -> bool {
+    let mut name = 0;
+    while name < names.len() {
+        let first = names[name].as_bytes()[0].to_ascii_lowercase();
+        let mut letter = 0;
+        while letter < letters.len() && letters[letter] != first {
+            letter += 1;
+        }
+        if letter == letters.len() {
+            return false;
+        }
+        name += 1;
     }
-    model.split('/').any(|segment| {
-        segment.eq_ignore_ascii_case("openai")
-            || PREFIXES
-                .iter()
-                .any(|prefix| starts_with_ignore_ascii_case(segment, prefix))
-            || is_openai_reasoning_series(segment)
-    })
+    true
 }
 
 /// `o1`, `o3`, `o4-mini`, `o3-pro-2025-06-10`: an `o`, the series digit, then
@@ -743,6 +885,7 @@ mod tests {
             "meta-llama/Llama-3.3-70B-Instruct",
             "openai/gpt-oss-120b",
             "gpt-oss-20b",
+            "gpt-4.1/gpt-oss-20b",
             "olmo-2",
             "o5",
             "m1",
@@ -750,6 +893,124 @@ mod tests {
         ] {
             assert!(!is_openai_vendor_model(model), "{model}");
         }
+    }
+
+    /// The plain reading of a model id: every test on every segment, in the
+    /// order the rule states them. [`ProviderProfile::from_model_segments`]
+    /// reaches the same answer through each segment's first byte.
+    fn every_test_on_every_segment(model: &str) -> ProviderProfile {
+        let mut openai = false;
+        let mut gpt_oss = false;
+        for segment in model.split('/') {
+            if deepseek::matches_model(segment) {
+                return ProviderProfile::DeepSeek;
+            }
+            if starts_with_ignore_ascii_case(segment, "kimi")
+                || starts_with_ignore_ascii_case(segment, "moonshot")
+            {
+                return ProviderProfile::Kimi;
+            }
+            if starts_with_ignore_ascii_case(segment, "minimax")
+                || starts_with_ignore_ascii_case(segment, "abab")
+            {
+                return ProviderProfile::Minimax;
+            }
+            if starts_with_ignore_ascii_case(segment, "glm")
+                || starts_with_ignore_ascii_case(segment, "zai")
+                || starts_with_ignore_ascii_case(segment, "z-ai")
+            {
+                return ProviderProfile::Zai;
+            }
+            gpt_oss = gpt_oss || starts_with_ignore_ascii_case(segment, "gpt-oss");
+            openai = openai || is_openai_segment(segment);
+        }
+        if openai && !gpt_oss {
+            return ProviderProfile::OpenAi;
+        }
+        ProviderProfile::Generic
+    }
+
+    #[test]
+    fn the_first_byte_reading_agrees_with_every_test_on_every_segment() {
+        // Every name the rule knows, a few versions of each, and the same
+        // names under another first letter, which must select nothing.
+        const NAMES: [&str; 24] = [
+            "deepseek-flash",
+            "deepseek-v4-flash",
+            "deepseek-v4-pro",
+            "deepseek-v4.1-flash",
+            "deepseek-v4.1-flash-1017",
+            "kimi",
+            "moonshot",
+            "minimax",
+            "abab",
+            "glm",
+            "zai",
+            "z-ai",
+            "gpt-oss",
+            "openai",
+            "gpt-",
+            "chatgpt-",
+            "codex-",
+            "computer-use-preview",
+            "text-embedding-",
+            "omni-moderation",
+            "o1",
+            "o3",
+            "o4-mini",
+            "o3-pro-2025-06-10",
+        ];
+        let mut segments: Vec<String> = ["", "models", "served-model", "Llama-3.3-70B", "é-model"]
+            .map(String::from)
+            .to_vec();
+        for name in NAMES {
+            for form in [name.to_string(), name.to_uppercase()] {
+                segments.push(form.clone());
+                segments.push(format!("{form}-x1"));
+                // The same name behind another first letter.
+                for letter in ["d", "k", "m", "a", "z", "g", "o", "c", "t", "x", "É"] {
+                    segments.push(format!("{letter}{form}"));
+                }
+                // The name with its own first letter replaced.
+                segments.push(format!("x{}", &form[1..]));
+            }
+        }
+        // A segment either names a vendor, which ends the reading, or sets
+        // the two OpenAI flags. Alone and beside each partner, in both
+        // orders, a segment shows which it does under either reading.
+        let mut read = 0usize;
+        for segment in &segments {
+            let mut ids = vec![segment.clone()];
+            for partner in ["openai", "gpt-oss-120b", "kimi-k2", "models"] {
+                ids.push(format!("{partner}/{segment}"));
+                ids.push(format!("{segment}/{partner}"));
+            }
+            for model in &ids {
+                assert_eq!(
+                    ProviderProfile::from_model_segments(model),
+                    every_test_on_every_segment(model),
+                    "{model}"
+                );
+                read += 1;
+            }
+        }
+        // Three segments: an OpenAI name, the open-weight exception and a
+        // vendor name in every order.
+        for model in [
+            "openai/gpt-oss-120b/kimi-k2",
+            "kimi-k2/openai/gpt-oss-120b",
+            "gpt-oss-120b/kimi-k2/openai",
+            "openai/models/gpt-4o",
+            "gpt-oss/models/gpt-4o",
+            "models/o3-mini/served",
+        ] {
+            assert_eq!(
+                ProviderProfile::from_model_segments(model),
+                every_test_on_every_segment(model),
+                "{model}"
+            );
+        }
+        assert!(read > 6_000, "the corpus is {read} ids");
     }
 
     #[test]
@@ -812,6 +1073,7 @@ mod tests {
         for model in [
             "",
             "/models/llama-3",
+            "gpt-4.1/gpt-oss-20b",
             "qwen3-8b",
             "Qwen/Qwen3-VL-8B-Instruct",
             "gpt-oss-20b",

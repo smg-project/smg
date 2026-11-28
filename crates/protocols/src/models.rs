@@ -7,21 +7,12 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+// The entry lives beside the model card in the worker crate; the path it had
+// here is kept.
+#[doc(inline)]
+pub use smg_worker::models::ModelObject;
 
 use super::{model_card::ModelCard, worker::ProviderType};
-
-/// A single model entry in the `/v1/models` response.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct ModelObject {
-    /// Model identifier (e.g., "meta-llama/Llama-3.1-8B-Instruct").
-    pub id: String,
-    /// Always `"model"`.
-    pub object: String,
-    /// Unix timestamp of model creation (0 = unknown).
-    pub created: i64,
-    /// Who owns/hosts the model.
-    pub owned_by: String,
-}
 
 /// Response body for `GET /v1/models`.
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]

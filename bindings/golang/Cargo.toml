@@ -34,10 +34,13 @@ workspace = true
 [dependencies.llm-tokenizer]
 workspace = true
 
-[dependencies.tool-parser]
+[dependencies.smg-symphony]
 workspace = true
 
 [dependencies.smg-grpc-client]
+workspace = true
+
+[dependencies.smg-worker]
 workspace = true
 
 [features]

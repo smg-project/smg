@@ -42,10 +42,12 @@ def tracing_enabled() -> bool:
 def _api_server_time_stats() -> Any:
     """The frontend-role time stats for one request, as the tokenizer manager
     creates them."""
-    from sglang.srt.disaggregation.utils import DisaggregationMode
     from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
     from sglang.srt.runtime_context import get_disagg
 
+    from smg_grpc_servicer.sglang.compat import get_disaggregation_types
+
+    DisaggregationMode, _ = get_disaggregation_types()
     return APIServerReqTimeStats(disagg_mode=DisaggregationMode(get_disagg().disaggregation_mode))
 
 

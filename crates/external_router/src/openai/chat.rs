@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use super::{
-    context::{ComponentRefs, PayloadState, RequestContext, SharedComponents, WorkerSelection},
+    context::{ComponentRefs, RequestContext, SharedComponents, WorkerSelection},
     provider::ProviderRegistry,
     router::resolve_provider,
 };
@@ -46,6 +46,8 @@ pub(super) struct ChatRouterContext<'a> {
 
 /// One attempt against the worker: the payload posted with the caller's auth
 /// and the provider's headers, as an event stream when the request streams.
+/// A failure comes back without the request URL the client's text ends with:
+/// the route's answers carry that text to the caller.
 async fn send_attempt(
     client: &reqwest::Client,
     url: &str,
@@ -60,7 +62,7 @@ async fn send_attempt(
     if streaming {
         req = req.header("Accept", "text/event-stream");
     }
-    req.send().await
+    req.send().await.map_err(reqwest::Error::without_url)
 }
 
 /// The upstream's success stream relayed to the client frame by frame; an
@@ -107,7 +109,9 @@ fn relayed_body(resp: reqwest::Response, status: StatusCode) -> Response {
 /// here: [`upstream_body::answer_error`] answers it.
 async fn buffered_body(resp: reqwest::Response, status: StatusCode) -> Response {
     let content_type = resp.headers().get(CONTENT_TYPE).cloned();
-    match resp.bytes().await {
+    // The client's text ends with the request URL; both failure answers
+    // carry the text to the caller.
+    match resp.bytes().await.map_err(reqwest::Error::without_url) {
         Ok(body) => {
             let mut response = Response::new(Body::from(body));
             *response.status_mut() = status;
@@ -232,18 +236,11 @@ pub(super) async fn route_chat(
     });
 
     let url = format!("{}/v1/chat/completions", worker.url());
-    ctx.state.payload = Some(PayloadState {
-        json: payload,
-        url: url.clone(),
-    });
 
-    // Wrap values in Arc to avoid cloning large objects on each retry attempt
-    #[expect(
-        clippy::expect_used,
-        reason = "payload is set earlier in this function; absence is a logic error"
-    )]
-    let payload_ref = ctx.payload().expect("Payload not prepared");
-    let payload_json = Arc::new(payload_ref.json.clone());
+    // The attempts share the one serialized payload through an Arc, and it
+    // moves in: nothing on this route reads it back from the context, so it
+    // is not stored there to be copied out again.
+    let payload_json = Arc::new(payload);
     let client = ctx.components.client().clone();
     let headers_cloned = Arc::new(ctx.headers().cloned());
     let worker_api_key = Arc::new(worker.api_key().cloned());
@@ -353,139 +350,5 @@ pub(super) async fn route_chat(
 }
 
 #[cfg(test)]
-mod tests {
-    use axum::body::to_bytes;
-
-    use super::*;
-    use crate::test_support::upstream;
-
-    async fn bytes_of(response: Response) -> Vec<u8> {
-        to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("a body")
-            .to_vec()
-    }
-
-    fn content_type_of(response: &Response) -> Option<String> {
-        response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-    }
-
-    /// A DeepSeek V4.1 `medium` effort goes to the upstream as the vendor's
-    /// `high`, in both top-level spellings; a chat-template kwarg and another
-    /// vendor's request go out as sent.
-    #[test]
-    fn a_v41_medium_effort_reaches_the_upstream_as_the_vendors_high() {
-        let request = |model: &str| {
-            serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({
-                "model": model,
-                "messages": [{"role": "user", "content": "Hello"}],
-                "reasoning_effort": "medium",
-                "thinking": {"effort": "medium"},
-                "chat_template_kwargs": {"reasoning_effort": "medium"},
-            }))
-            .unwrap()
-        };
-        let body = chat_for_upstream(request("deepseek-v4.1-flash"));
-        assert_eq!(body.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(
-            body.thinking
-                .as_ref()
-                .and_then(|thinking| thinking.effort.as_deref()),
-            Some("high")
-        );
-        assert_eq!(
-            body.chat_template_kwargs
-                .as_ref()
-                .and_then(|kwargs| kwargs.get("reasoning_effort")),
-            Some(&serde_json::json!("medium"))
-        );
-        let body = chat_for_upstream(request("gpt-4o"));
-        assert_eq!(body.reasoning_effort.as_deref(), Some("medium"));
-    }
-
-    #[tokio::test]
-    async fn a_buffered_body_keeps_the_upstreams_status_content_type_and_bytes() {
-        let response = buffered_body(
-            upstream(201, Some("application/json"), "{\"ok\":true}"),
-            StatusCode::CREATED,
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::CREATED);
-        assert_eq!(
-            content_type_of(&response).as_deref(),
-            Some("application/json")
-        );
-        assert_eq!(bytes_of(response).await, b"{\"ok\":true}");
-    }
-
-    /// A stub whose answer's head and first chunk leave at once and whose
-    /// body then never ends, as a provider that stalls mid-answer does.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "test stub server lives for the duration of the test process"
-    )]
-    async fn stalled_upstream() -> String {
-        use futures_util::StreamExt;
-        let app = axum::Router::new().fallback(axum::routing::any(|| async {
-            let head = futures_util::stream::iter([Ok::<_, std::io::Error>(
-                bytes::Bytes::from_static(b"{\"partial\":"),
-            )]);
-            (
-                [(CONTENT_TYPE, "application/json")],
-                Body::from_stream(head.chain(futures_util::stream::pending())),
-            )
-        }));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        format!("http://{addr}")
-    }
-
-    /// A client whose budget for a call is `timeout`, the process TLS
-    /// crypto provider installed first.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test binary's client factory; the process TLS crypto provider is installed first"
-    )]
-    fn client_with_timeout(timeout: std::time::Duration) -> reqwest::Client {
-        use rustls::crypto::ring::default_provider;
-        let _ = default_provider().install_default();
-        reqwest::Client::builder().timeout(timeout).build().unwrap()
-    }
-
-    /// The request's own timeout running out while the body is read is the
-    /// request's end: the final 504, not the replayable 500 of a read failure.
-    #[tokio::test]
-    async fn a_buffered_body_the_request_timeout_cuts_is_the_final_504() {
-        let url = stalled_upstream().await;
-        let client = client_with_timeout(std::time::Duration::from_millis(200));
-        let answer = client.post(url).send().await.unwrap();
-
-        let response = buffered_body(answer, StatusCode::OK).await;
-
-        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(
-            error::extract_error_code_from_response(&response),
-            crate::retry::REQUEST_TIMEOUT_CODE
-        );
-        assert!(!is_retryable_response(&response));
-    }
-
-    #[tokio::test]
-    async fn a_relayed_body_forwards_the_bytes_and_is_an_event_stream_on_a_success_without_a_type()
-    {
-        let response = relayed_body(upstream(200, None, "data: x\n\n"), StatusCode::OK);
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            content_type_of(&response).as_deref(),
-            Some("text/event-stream")
-        );
-        assert_eq!(bytes_of(response).await, b"data: x\n\n");
-    }
-}
+#[path = "../../tests/unit/openai/chat/tests.rs"]
+mod tests;

@@ -17,10 +17,10 @@ use serde_json::{json, Value};
 use smg::{
     config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::RouterFactory,
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::{net::TcpListener, time::timeout};
 
 use crate::{common, scripted_worker};

@@ -50,20 +50,16 @@ install_apt() {
   local sudo=""
   has_cmd sudo && sudo="sudo"
   export DEBIAN_FRONTEND=noninteractive
-  local retry=()
+  local packages=(clang libclang-dev cmake ninja-build pkg-config libopencv-dev)
   if [[ "${CI:-}" == "true" ]]; then
-    run bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_update.sh" $sudo
-    retry=(bash "$(dirname "${BASH_SOURCE[0]}")/ci_retry.sh" 3 10)
+    # CI's helper refreshes the package lists itself, and moves to another
+    # mirror when the one in use fails.
+    run bash "$(dirname "${BASH_SOURCE[0]}")/ci_apt_install.sh" $sudo \
+      -y --no-install-recommends "${packages[@]}"
   else
     run $sudo apt-get update
+    run $sudo apt-get install -y --no-install-recommends "${packages[@]}"
   fi
-  run "${retry[@]}" $sudo apt-get install -y --no-install-recommends \
-    clang \
-    libclang-dev \
-    cmake \
-    ninja-build \
-    pkg-config \
-    libopencv-dev
 }
 
 install_brew() {

@@ -27,6 +27,8 @@ use std::{
 use image::{DynamicImage, RgbImage, RgbaImage};
 use libloading::{Library, Symbol};
 
+use crate::buffer_pool;
+
 /// Cap on the decoded buffer, the `image` crate's default limit, which the
 /// pure-Rust fallback decoder already enforces.
 const MAX_DECODED_BYTES: usize = 512 * 1024 * 1024;
@@ -191,7 +193,7 @@ pub fn decode_webp(bytes: &[u8]) -> Option<DynamicImage> {
     let (wu, hu) = (w as usize, h as usize);
     let channels = if alpha { 4 } else { 3 };
     let nbytes = decoded_buffer_len(wu, hu, channels)?;
-    let mut buf = crate::buffer_pool::take(nbytes);
+    let mut buf = buffer_pool::take(nbytes);
     let stride = c_int::try_from(wu.checked_mul(channels)?).ok()?;
     let decode = if alpha {
         lib.decode_rgba
@@ -217,7 +219,7 @@ pub fn decode_webp(bytes: &[u8]) -> Option<DynamicImage> {
     };
     if written.is_null() {
         // A refused decode hands its buffer back; the next take is warm.
-        crate::buffer_pool::recycle(buf);
+        buffer_pool::recycle(buf);
         return None;
     }
     if alpha {
@@ -296,7 +298,9 @@ mod tests {
             .expect("encode");
         assert!(is_webp(&encoded));
         match decode_webp(&encoded) {
-            Some(DynamicImage::ImageRgb8(decoded)) => assert_eq!(decoded.as_raw(), rgb.as_raw()),
+            Some(DynamicImage::ImageRgb8(decoded)) => {
+                assert!(decoded == rgb, "lossless RGB pixels differ");
+            }
             Some(other) => panic!("unexpected image type {other:?}"),
             None => assert!(
                 !webp_available(),
@@ -313,7 +317,9 @@ mod tests {
             .write_image(rgba.as_raw(), 5, 4, image::ExtendedColorType::Rgba8)
             .expect("encode");
         match decode_webp(&encoded) {
-            Some(DynamicImage::ImageRgba8(decoded)) => assert_eq!(decoded.as_raw(), rgba.as_raw()),
+            Some(DynamicImage::ImageRgba8(decoded)) => {
+                assert!(decoded == rgba, "lossless RGBA pixels differ");
+            }
             Some(other) => panic!("unexpected image type {other:?}"),
             None => assert!(!webp_available()),
         }

@@ -4,15 +4,25 @@
 //! worker's engine came back into service (a restart on the same address may
 //! run with other settings), or it finished loading after the worker was
 //! registered on provisional information. The labels the engine reports now
-//! are handed to the update step, which rebuilds the worker only when they
-//! change anything. Without a refresh request the step is skipped.
+//! (at its metadata endpoints; at the handshake its link holds, for a ZMQ
+//! engine) are handed to the update step, which rebuilds the worker only
+//! when they change anything. Without a refresh request the step is skipped.
 
 use async_trait::async_trait;
+use smg_worker::{
+    identity::basic::ConnectionMode,
+    workflow::{discover_engine_labels, WorkflowHost},
+};
 use tracing::debug;
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-use super::discover_metadata::discover_engine_labels;
-use crate::{worker::ConnectionMode, workflow::data::WorkerUpdateWorkflowData};
+use crate::{
+    routers::grpc::{
+        backend_client::{backend_client_if_initialized, BackendClient},
+        zmq_client,
+    },
+    workflow::data::{require_app_context, WorkerUpdateWorkflowData},
+};
 
 /// Step to re-read a worker's labels from its engine for a label refresh.
 pub struct RediscoverLabelsStep;
@@ -37,10 +47,46 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
         let connection_mode = *worker.connection_mode();
         if connection_mode == ConnectionMode::Zmq {
             // A ZMQ engine reports its geometry at the handshake, not at an
-            // endpoint; there is nothing to re-read.
-            return Ok(StepResult::Skip);
+            // endpoint: the worker's own link holds it once the handshake is
+            // in (the refresh runs on that connect signal). Its window joins
+            // what registration read from the model's files; a link not up
+            // yet leaves the labels as they are, and the next transition
+            // into service refreshes again.
+            let link = backend_client_if_initialized(worker.as_ref()).map_err(|e| {
+                WorkflowError::StepFailed {
+                    step_id: StepId::new("rediscover_labels"),
+                    message: format!("could not read the link of {}: {e}", worker.redacted_url()),
+                }
+            })?;
+            let Some(link) = link else {
+                debug!(worker_url = %worker.redacted_url(), "The ZMQ link is not up; nothing to refresh");
+                return Ok(StepResult::Skip);
+            };
+            let BackendClient::Zmq(client) = link.as_ref() else {
+                return Ok(StepResult::Skip);
+            };
+            // The seed is the worker's record, kept in rank space
+            // (`report_for_rank`); the update step passes the report
+            // through that rule again. That is the identity for what the
+            // record holds besides the link's own labels: sampling defaults
+            // and the grammar start, which no rank shares. The link's labels
+            // replace the record's in engine space: the context window, and
+            // a TokenSpeed group's running window with the width its ranks
+            // share it by (`refreshed_labels`).
+            let fresh = zmq_client::refreshed_labels(
+                &worker.metadata().discovered_labels,
+                zmq_client::link_labels(client),
+            );
+            debug!(
+                worker_url = %worker.redacted_url(),
+                labels = fresh.len(),
+                "Read the ZMQ link's handshake window for a refresh"
+            );
+            context.data.fresh_engine_labels = Some(fresh);
+            return Ok(StepResult::Success);
         }
         let spec = &worker.metadata().spec;
+        let app_context = require_app_context(context.data.app_context.as_ref())?;
         // A strict read: an endpoint that fails is an error (the step retries,
         // then the next transition into service tries again), never a gap
         // that would read as labels the engine dropped. Through the worker's
@@ -48,6 +94,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
         // HTTP/2 setting); the gRPC read ignores it.
         let (fresh, _) = discover_engine_labels(
             worker.http_client(),
+            app_context.engine_connector().as_ref(),
             worker.base_url(),
             connection_mode,
             spec.runtime_type.as_str(),
@@ -76,90 +123,8 @@ impl StepExecutor<WorkerUpdateWorkflowData> for RediscoverLabelsStep {
         context.data.fresh_engine_labels = Some(fresh);
         Ok(StepResult::Success)
     }
-
-    fn is_retryable(&self, _error: &WorkflowError) -> bool {
-        true
-    }
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use openai_protocol::worker::{WorkerStatus, WorkerUpdateRequest};
-    use wfaas::WorkflowInstanceId;
-
-    use super::*;
-    use crate::{
-        service_discovery::testing::create_test_app_context,
-        worker::{BasicWorkerBuilder, Worker},
-    };
-
-    fn context(
-        worker: Arc<dyn Worker>,
-        refresh: bool,
-    ) -> WorkflowContext<WorkerUpdateWorkflowData> {
-        let data = WorkerUpdateWorkflowData {
-            config: WorkerUpdateRequest {
-                priority: None,
-                cost: None,
-                labels: None,
-                api_key: None,
-                health: None,
-            },
-            worker_url: worker.url().to_string(),
-            app_context: Some(create_test_app_context()),
-            workers_to_update: Some(vec![worker]),
-            updated_workers: None,
-            refresh_discovered_labels: refresh,
-            fresh_engine_labels: None,
-            snapshot: None,
-        };
-        WorkflowContext::new(WorkflowInstanceId::new(), data)
-    }
-
-    #[tokio::test]
-    async fn without_a_refresh_request_the_step_is_skipped() {
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://127.0.0.1:1")
-                .connection_mode(ConnectionMode::Grpc)
-                .status(WorkerStatus::Ready)
-                .build(),
-        );
-        let mut ctx = context(worker, false);
-        assert_eq!(
-            RediscoverLabelsStep.execute(&mut ctx).await.unwrap(),
-            StepResult::Skip
-        );
-        assert!(ctx.data.fresh_engine_labels.is_none());
-    }
-
-    /// A read that fails leaves nothing for the update step: the worker keeps
-    /// its labels, and the step reports a retryable error.
-    #[tokio::test]
-    async fn a_failed_read_leaves_the_worker_unchanged() {
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("grpc://127.0.0.1:1")
-                .connection_mode(ConnectionMode::Grpc)
-                .label("max_num_seqs", "256")
-                .status(WorkerStatus::Ready)
-                .build(),
-        );
-        let mut ctx = context(Arc::clone(&worker), true);
-        let err = RediscoverLabelsStep
-            .execute(&mut ctx)
-            .await
-            .expect_err("nothing listens on the port");
-        assert!(RediscoverLabelsStep.is_retryable(&err));
-        assert!(ctx.data.fresh_engine_labels.is_none());
-        assert_eq!(
-            worker
-                .metadata()
-                .spec
-                .labels
-                .get("max_num_seqs")
-                .map(String::as_str),
-            Some("256")
-        );
-    }
-}
+#[path = "../../../../tests/unit/workflow/steps/local/rediscover_labels/tests.rs"]
+mod tests;

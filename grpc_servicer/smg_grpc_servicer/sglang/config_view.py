@@ -59,6 +59,7 @@ class ServerArgsSection:
     attn_cp_size: int | None
     kv_events_config: Any
     disaggregation_mode: str
+    load_balance_method: str
     language_only: bool
     encoder_only: bool
 
@@ -81,6 +82,7 @@ class ServerArgsSection:
             attn_cp_size=positive_int(getattr(server_args, "attn_cp_size", None)),
             kv_events_config=getattr(server_args, "kv_events_config", None),
             disaggregation_mode=getattr(server_args, "disaggregation_mode", "null") or "null",
+            load_balance_method=str(getattr(server_args, "load_balance_method", None) or ""),
             language_only=bool(getattr(server_args, "language_only", False)),
             encoder_only=bool(getattr(server_args, "encoder_only", False)),
         )
@@ -152,6 +154,22 @@ class ModelConfigSection:
             is_generation=bool(getattr(model_config, "is_generation", True)),
             is_multimodal=bool(getattr(model_config, "is_multimodal", False)),
         )
+
+
+def v41_vision(hf_config: Any) -> tuple[int, int] | None:
+    """A served DeepSeek-V4.1 model's patch size and downsample ratio, under
+    the names its SGLang model reads them by (``vision_patch_size``,
+    ``vision_downsample_ratio``); None for another model, or a config that
+    does not hold both as counts above zero. The Python servicer checks a V4.1
+    image batch against them, and the scheduler plugin declares them at its
+    handshake for the Rust one."""
+    if getattr(hf_config, "model_type", None) != "deepseek_v41":
+        return None
+    patch_size = positive_int(getattr(hf_config, "vision_patch_size", None))
+    ratio = positive_int(getattr(hf_config, "vision_downsample_ratio", None))
+    if patch_size is None or ratio is None:
+        return None
+    return patch_size, ratio
 
 
 class EngineConfigView:

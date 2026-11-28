@@ -1,12 +1,21 @@
 //! Oracle storage implementation using OracleStore helper.
 
-use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool::managed::{Manager, Metrics, Pool, RecycleError, RecycleResult};
-use oracle::{sql_type::ToSql, Connection, Connector, Row};
+use oracle::{sql_type::ToSql, ConnStatus, Connection, Connector, ErrorKind, Row};
 use serde_json::Value;
+use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 
 use super::core::{
     make_item_id, sql_string_list, ConditionalStore, Conversation, ConversationId,
@@ -17,13 +26,14 @@ use super::core::{
 };
 use crate::{
     common::{
-        build_response_select_base, extra_column_defs, parse_json_value, parse_raw_response,
-        resolve_extra_column_values,
+        build_response_select_base, extra_column_defs, parse_conversation_metadata,
+        parse_json_value, parse_raw_response, resolve_extra_column_values,
     },
     config::OracleConfig,
     context::current_extra_columns,
+    factory::{contact_blocking, StoreContactError},
     oracle_migrations::ORACLE_HISTORY_MIGRATIONS,
-    schema::SchemaConfig,
+    schema::{SchemaConfig, TableConfig},
     versioning::{
         bootstrap_oracle_schema, oracle_recorded_version, run_oracle_migrations, Migration,
         OracleSchemaSteps,
@@ -47,15 +57,11 @@ pub(crate) struct OracleStore {
 }
 
 impl OracleStore {
-    /// Create a connection pool, with the schema brought to this build's
-    /// shape first.
-    ///
-    /// Accepts a list of schema initializers that run on a single connection
-    /// before the pool is created, ensuring all tables exist. The database's
-    /// recorded schema version is checked against this build's migrations
-    /// before any of them runs, so a database a newer build migrated forward
-    /// is refused untouched (see [`bootstrap_oracle_schema`]).
-    pub fn new(config: &OracleConfig, init_schemas: &[SchemaInitFn]) -> Result<Self, String> {
+    /// The pool, built without a connection: the schema configuration
+    /// validated and the client configured, no round trip. The start-up
+    /// connection is [`Self::contact`]'s, the schema's bootstrap on it
+    /// [`Self::bootstrap`]'s, in that order in the factory.
+    pub fn new(config: &OracleConfig) -> Result<Self, String> {
         // Extract and validate schema config.
         // Oracle folds unquoted identifiers to uppercase, so existing tables
         // and columns are CONVERSATIONS, CONV_ID, etc.  Uppercase all
@@ -68,42 +74,28 @@ impl OracleStore {
         // Configure Oracle client (wallet env vars, etc.)
         configure_oracle_env(config)?;
 
-        // Initialize schemas using a single connection
-        let conn = connect_oracle(
-            config.external_auth,
-            &config.username,
-            &config.password,
-            &config.connect_descriptor,
-        )
-        .map_err(map_oracle_error)?;
-
-        // The recorded schema version against this build's migrations before
-        // any history table is touched; then the tables, the migrations and
-        // the indexes on the columns they added.
-        bootstrap_oracle_schema(
-            &OracleSchemaSetup {
-                conn: &conn,
-                schema: schema.as_ref(),
-                init_schemas,
-            },
-            &ORACLE_HISTORY_MIGRATIONS,
-            schema.version,
-        )?;
-
-        drop(conn);
-
-        // Create connection pool
-        let config_arc = Arc::new(config.clone());
+        // Create connection pool. Each call as a whole is bounded by the
+        // `bounded` wrappers the factory installs. The pool and the driver
+        // bound their own steps (creating a connection, recycling one, each
+        // round trip of a connection) at twice that bound: backstops that
+        // clean up after a call the wrapper has already answered, never the
+        // first to fire.
+        let backstop = config.op_timeout().saturating_mul(2);
         let manager = OracleConnectionManager {
-            params: Arc::new(OracleConnectParams::from_config(&config_arc)),
+            params: Arc::new(OracleConnectParams::from_config(config)),
+            call_timeout: backstop,
+            call_timeout_refused: Arc::new(AtomicBool::new(false)),
+            connects: Arc::new(Semaphore::new(config.pool_max)),
         };
 
         let mut builder = Pool::builder(manager)
             .max_size(config.pool_max)
+            .create_timeout(Some(backstop))
+            .recycle_timeout(Some(backstop))
             .runtime(deadpool::Runtime::Tokio1);
 
-        if config.pool_timeout_secs > 0 {
-            builder = builder.wait_timeout(Some(Duration::from_secs(config.pool_timeout_secs)));
+        if let Some(wait) = config.pool_timeout() {
+            builder = builder.wait_timeout(Some(wait));
         }
 
         let pool = builder
@@ -111,6 +103,52 @@ impl OracleStore {
             .map_err(|e| format!("Failed to build Oracle pool: {e}"))?;
 
         Ok(Self { pool, schema })
+    }
+
+    /// The start-up contact: one connection, made on a blocking thread (the
+    /// driver connects synchronously) and awaited under `bound`, the pool's
+    /// wait, so a store that accepts the connection and never answers is a
+    /// verdict at the bound instead of a start that never ends; a refused or
+    /// failed connection is a verdict at once. The connection is handed to
+    /// [`Self::bootstrap`]. The bound ends the wait, not the driver's thread,
+    /// which returns when the socket does.
+    pub(crate) async fn contact(
+        &self,
+        bound: Option<Duration>,
+    ) -> Result<Connection, StoreContactError> {
+        let params = self.pool.manager().params.clone();
+        contact_blocking(bound, move || {
+            connect_oracle(
+                params.external_auth,
+                &params.username,
+                &params.password,
+                &params.connect_descriptor,
+            )
+            .map_err(map_oracle_error)
+        })
+        .await
+    }
+
+    /// Brings the database to the schema this build expects, on the
+    /// connection the contact made: the recorded schema version against this
+    /// build's migrations before any history table is touched, then the
+    /// tables, the migrations and the indexes on the columns they added; a
+    /// database a newer build migrated forward is refused untouched (see
+    /// [`bootstrap_oracle_schema`]).
+    pub(crate) fn bootstrap(
+        &self,
+        conn: &Connection,
+        init_schemas: &[SchemaInitFn],
+    ) -> Result<(), String> {
+        bootstrap_oracle_schema(
+            &OracleSchemaSetup {
+                conn,
+                schema: self.schema.as_ref(),
+                init_schemas,
+            },
+            &ORACLE_HISTORY_MIGRATIONS,
+            self.schema.version,
+        )
     }
 
     /// Execute function with a connection from the pool
@@ -136,8 +174,8 @@ impl OracleStore {
     }
 }
 
-/// The start-up steps of [`OracleStore::new`] on its connection, in the order
-/// [`bootstrap_oracle_schema`] runs them.
+/// The start-up steps of [`OracleStore::bootstrap`] on the contact's
+/// connection, in the order [`bootstrap_oracle_schema`] runs them.
 struct OracleSchemaSetup<'a> {
     conn: &'a Connection,
     schema: &'a SchemaConfig,
@@ -258,6 +296,18 @@ impl std::fmt::Debug for OracleConnectParams {
 #[derive(Clone)]
 struct OracleConnectionManager {
     params: Arc<OracleConnectParams>,
+    /// The driver's own bound on each round trip of a pooled connection:
+    /// twice the store-call bound, the backstop behind the wrapper's verdict.
+    call_timeout: Duration,
+    /// Set once the driver refused the call timeout (a client library older
+    /// than the one that bounds its calls), so the warning is logged once.
+    call_timeout_refused: Arc<AtomicBool>,
+    /// At most `pool_max` connects at a time. The pool gives its slot back
+    /// when a bound drops the checkout, the connect's thread runs on: the
+    /// permit rides on that thread and returns when the driver does, so a
+    /// store frozen at connect holds at most `pool_max` connect threads and
+    /// the next connect waits here, where a bound can end the wait.
+    connects: Arc<Semaphore>,
 }
 
 impl std::fmt::Debug for OracleConnectionManager {
@@ -269,6 +319,36 @@ impl std::fmt::Debug for OracleConnectionManager {
     }
 }
 
+/// Runs a pooled `connect` on a thread of its own that carries the connect
+/// permit, answered through a oneshot. Not a `spawn_blocking` task: the
+/// runtime's drop waits for those without limit, so a connect frozen at the
+/// socket (a descriptor without a connect timeout) would hold the process's
+/// exit after its drain; a thread of its own ends when the driver returns or
+/// the process exits, as the start-up contact's does. The permit returns
+/// when the driver does, so a stalled connect keeps its slot of the limiter
+/// and the next connect waits for a permit, where a bound can end the wait.
+/// The error text names a thread that could not start or ended without an
+/// answer (a panic in `connect`).
+async fn connect_on_own_thread<T: Send + 'static>(
+    permit: OwnedSemaphorePermit,
+    connect: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, String> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("history-store-connect".to_string())
+        .spawn(move || {
+            let answer = connect();
+            // The slot of the limiter returns with the driver, before the
+            // answer is handed over.
+            drop(permit);
+            // The receiver is gone when a bound ended the wait: nothing to do.
+            let _ = tx.send(answer);
+        })
+        .map_err(|e| format!("the connect thread could not start: {e}"))?;
+    rx.await
+        .map_err(|_gone| "the connect thread ended without an answer".to_string())
+}
+
 impl Manager for OracleConnectionManager {
     type Type = Connection;
     type Error = oracle::Error;
@@ -277,20 +357,59 @@ impl Manager for OracleConnectionManager {
         &self,
     ) -> impl std::future::Future<Output = Result<Connection, oracle::Error>> + Send {
         let params = self.params.clone();
+        let call_timeout = self.call_timeout;
+        let refused = self.call_timeout_refused.clone();
+        let connects = self.connects.clone();
         async move {
-            let mut conn = connect_oracle(
-                params.external_auth,
-                &params.username,
-                &params.password,
-                &params.connect_descriptor,
-            )?;
-            conn.set_autocommit(true);
-            Ok(conn)
+            // A connect permit first (an async wait a bound can end); it is
+            // dropped by the connect's thread when the driver returns.
+            let permit = connects.acquire_owned().await.map_err(|closed| {
+                oracle::Error::new(
+                    ErrorKind::Other,
+                    format!("the connect limiter is closed: {closed}"),
+                )
+            })?;
+            // The driver connects synchronously: on a thread of its own (see
+            // `connect_on_own_thread`), so the checkout's future yields and the
+            // bound around the call can end the wait; the thread returns when
+            // the driver does and never holds the runtime's drop.
+            connect_on_own_thread(permit, move || {
+                let mut conn = connect_oracle(
+                    params.external_auth,
+                    &params.username,
+                    &params.password,
+                    &params.connect_descriptor,
+                )?;
+                conn.set_autocommit(true);
+                // The driver's own bound on every round trip of this
+                // connection: a statement or a ping the store never answers
+                // ends here, and the thread and the connection come back.
+                if let Err(err) = conn.set_call_timeout(Some(call_timeout)) {
+                    if !refused.swap(true, Ordering::Relaxed) {
+                        tracing::warn!(
+                            "Oracle client library refused the call timeout of {call_timeout:?} ({err}); \
+                             a round trip the store never answers holds its thread and connection until the socket ends"
+                        );
+                    }
+                }
+                Ok::<Connection, oracle::Error>(conn)
+            })
+            .await
+            .map_err(|text| oracle::Error::new(ErrorKind::Other, text))?
         }
     }
 
     async fn recycle(&self, conn: &mut Connection, _: &Metrics) -> RecycleResult<Self::Error> {
-        conn.ping().map_err(RecycleError::Backend)
+        // The driver's local view of the connection, no round trip: the
+        // Postgres pool's `Fast` recycling, one round trip fewer per call and
+        // nothing synchronous on the runtime thread. A connection the store
+        // dropped without the client noticing fails its next statement, which
+        // the call answers as the store's failure.
+        match conn.status() {
+            Ok(ConnStatus::Normal) => Ok(()),
+            Ok(status) => Err(RecycleError::message(format!("connection {status:?}"))),
+            Err(err) => Err(RecycleError::Backend(err)),
+        }
     }
 }
 
@@ -364,8 +483,7 @@ impl OracleConversationStorage {
     fn parse_metadata(
         raw: Option<String>,
     ) -> Result<Option<ConversationMetadata>, ConversationStorageError> {
-        crate::common::parse_conversation_metadata(raw)
-            .map_err(ConversationStorageError::StorageError)
+        parse_conversation_metadata(raw).map_err(ConversationStorageError::StorageError)
     }
 }
 
@@ -747,12 +865,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 }
 
                 let (sql, binds) = create_item_sql(&table, &columns);
-                let named: Vec<(&str, &dyn ToSql)> = binds
-                    .iter()
-                    .map(String::as_str)
-                    .zip(params.iter().copied())
-                    .collect();
-                match conn.execute_named(&sql, &named) {
+                match conn.execute_named(&sql, &named_binds(&binds, &params)) {
                     Ok(stmt) => stmt.row_count().map_err(map_oracle_error),
                     // ORA-00001: a concurrent create of the same id won the
                     // insert between this MERGE's probe and its own insert;
@@ -817,12 +930,8 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 }
 
                 let (sql, binds) = link_sql(&table, &columns);
-                let named: Vec<(&str, &dyn ToSql)> = binds
-                    .iter()
-                    .map(String::as_str)
-                    .zip(params.iter().copied())
-                    .collect();
-                conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
+                conn.execute_named(&sql, &named_binds(&binds, &params))
+                    .map_err(map_oracle_error)?;
                 Ok(())
             })
             .await
@@ -1105,10 +1214,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
 
 /// Parse a single `oracle::Row` into a `ConversationItem`, respecting
 /// the `is_skipped` guards configured in `TableConfig`.
-fn build_item_from_oracle_row(
-    row: &Row,
-    si: &crate::schema::TableConfig,
-) -> Result<ConversationItem, String> {
+fn build_item_from_oracle_row(row: &Row, si: &TableConfig) -> Result<ConversationItem, String> {
     let id: String = row.get(si.col("id")).map_err(map_oracle_error)?;
     let response_id: Option<String> = if si.is_skipped("response_id") {
         None
@@ -1376,7 +1482,7 @@ impl OracleResponseStorage {
 /// those stored under the caller's (see
 /// [`tenant_scope_allows`](crate::core::tenant_scope_allows)). `None` when
 /// the schema skips the column: every row is served then, as before.
-fn tenant_scope_sql(s: &crate::schema::TableConfig, bind: usize) -> Option<String> {
+fn tenant_scope_sql(s: &TableConfig, bind: usize) -> Option<String> {
     if s.is_skipped("tenant") {
         return None;
     }
@@ -1395,7 +1501,7 @@ struct IdentifierScope<'a> {
 /// its binds: the identifier as `:1`, the tenant (NULL when absent) as `:2`
 /// when the table keeps a tenant column.
 fn identifier_filter<'a>(
-    s: &crate::schema::TableConfig,
+    s: &TableConfig,
     scope: IdentifierScope<'a>,
 ) -> (String, Vec<&'a dyn ToSql>) {
     let col_safety = s.col("safety_identifier");
@@ -1453,7 +1559,7 @@ impl ResponseRow {
     /// defaults' extra columns.
     fn columns_and_binds<'a>(
         &'a self,
-        s: &'a crate::schema::TableConfig,
+        s: &'a TableConfig,
         extra_cols: &'a [(&'a str, Option<String>)],
     ) -> (Vec<&'a str>, Vec<&'a dyn ToSql>) {
         let logical_fields: [(&str, &dyn ToSql); 9] = [
@@ -1483,6 +1589,17 @@ impl ResponseRow {
         }
         (columns, binds)
     }
+}
+
+/// The named binds of a statement built here (`merge_on_id_sql`, `link_sql`,
+/// `update_if_open_sql`): each bind name with its value, in the columns'
+/// order.
+fn named_binds<'a>(binds: &'a [String], params: &[&'a dyn ToSql]) -> Vec<(&'a str, &'a dyn ToSql)> {
+    binds
+        .iter()
+        .map(String::as_str)
+        .zip(params.iter().copied())
+        .collect()
 }
 
 /// The statement that stores a response, with the names of its binds in the
@@ -1711,7 +1828,7 @@ fn oracle_open_predicate(col_raw: &str) -> String {
 /// schema skips it: there is no status to check, so the conditional store is
 /// a plain update of the row under the id (every backend of this crate
 /// agrees).
-fn oracle_open_predicate_for(s: &crate::schema::TableConfig) -> Option<String> {
+fn oracle_open_predicate_for(s: &TableConfig) -> Option<String> {
     (!s.is_skipped("raw_response")).then(|| oracle_open_predicate(s.col("raw_response")))
 }
 
@@ -1735,12 +1852,7 @@ impl ResponseStorage for OracleResponseStorage {
                 let (columns, params) = row.columns_and_binds(s, &extra_cols);
 
                 let (sql, binds) = store_response_sql(&table, &columns);
-                let named: Vec<(&str, &dyn ToSql)> = binds
-                    .iter()
-                    .map(String::as_str)
-                    .zip(params.iter().copied())
-                    .collect();
-                conn.execute_named(&sql, &named)
+                conn.execute_named(&sql, &named_binds(&binds, &params))
                     .map(|_| ())
                     .map_err(map_oracle_error)
             })
@@ -1768,12 +1880,9 @@ impl ResponseStorage for OracleResponseStorage {
                 let (columns, params) = row.columns_and_binds(s, &extra_cols);
                 let open = oracle_open_predicate_for(s);
                 let (sql, binds) = update_if_open_sql(&table, &columns, open.as_deref());
-                let named: Vec<(&str, &dyn ToSql)> = binds
-                    .iter()
-                    .map(String::as_str)
-                    .zip(params.iter().copied())
-                    .collect();
-                let stmt = conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
+                let stmt = conn
+                    .execute_named(&sql, &named_binds(&binds, &params))
+                    .map_err(map_oracle_error)?;
                 stmt.row_count().map_err(map_oracle_error)
             })
             .await
@@ -1803,9 +1912,9 @@ impl ResponseStorage for OracleResponseStorage {
                 let (sql, binds) =
                     update_if_open_sql(&table, &[s.col("id"), s.col("raw_response")], Some(&open));
                 let params: Vec<&dyn ToSql> = vec![&id_str, &json_raw_response];
-                let named: Vec<(&str, &dyn ToSql)> =
-                    binds.iter().map(String::as_str).zip(params).collect();
-                let stmt = conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
+                let stmt = conn
+                    .execute_named(&sql, &named_binds(&binds, &params))
+                    .map_err(map_oracle_error)?;
                 stmt.row_count().map_err(map_oracle_error)
             })
             .await
@@ -1976,12 +2085,12 @@ impl ResponseStorage for OracleResponseStorage {
                     )
                 };
 
+                let terminal = sql_string_list(&TERMINAL_RESPONSE_STATUSES);
                 // The predicate is the expression the table's unstored index
                 // holds (see the bootstrap), so the sweep reads those rows only.
                 conn.execute(
                     &format!(
-                        "DELETE FROM {table} WHERE {} IN ('completed', 'incomplete', 'failed', 'cancelled') \
-                         AND {ended} < :1",
+                        "DELETE FROM {table} WHERE {} IN ({terminal}) AND {ended} < :1",
                         unstored_status_expr(col_raw)
                     ),
                     &[&cutoff_secs],
@@ -2082,252 +2191,5 @@ fn create_index_if_missing(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The identifier filter binds the identifier first and the tenant scope
-    /// second, and leaves the scope out when the table keeps no tenant.
-    #[test]
-    fn the_identifier_filter_scopes_by_tenant_only_when_the_table_keeps_one() {
-        let mut s = SchemaConfig::default().responses;
-        let identifier = "user-1".to_string();
-        let tenant = Some("t".to_string());
-        let scope = || IdentifierScope {
-            identifier: &identifier,
-            tenant: &tenant,
-        };
-        let (filter, binds) = identifier_filter(&s, scope());
-        assert_eq!(
-            filter,
-            "safety_identifier = :1 AND (tenant IS NULL OR tenant = :2)"
-        );
-        assert_eq!(binds.len(), 2);
-        assert!(
-            std::ptr::addr_eq(binds[0], &identifier),
-            "the identifier is :1"
-        );
-        assert!(std::ptr::addr_eq(binds[1], &tenant), "the tenant is :2");
-
-        s.skip_columns.insert("tenant".to_string());
-        let (filter, binds) = identifier_filter(&s, scope());
-        assert_eq!(filter, "safety_identifier = :1");
-        assert_eq!(binds.len(), 1);
-        assert!(std::ptr::addr_eq(binds[0], &identifier));
-    }
-
-    /// The responses row binds the id whatever the table skips, the other
-    /// logical fields unless skipped, then the extra columns, one bind per
-    /// column.
-    #[test]
-    fn the_responses_row_keeps_the_id_skips_the_skipped_and_appends_the_extras() {
-        let mut s = SchemaConfig::default().responses;
-        s.skip_columns.insert("id".to_string());
-        s.skip_columns.insert("model".to_string());
-        let row = ResponseRow::new(StoredResponse {
-            id: ResponseId("resp_1".to_string()),
-            previous_response_id: Some(ResponseId("resp_0".to_string())),
-            input: serde_json::json!([]),
-            created_at: Utc::now(),
-            safety_identifier: None,
-            model: Some("m".to_string()),
-            conversation_id: None,
-            raw_response: serde_json::json!({"id": "resp_1"}),
-            tenant: None,
-        })
-        .expect("the JSON fields serialize");
-        let extras = vec![("region", Some("eu".to_string()))];
-        let (columns, binds) = row.columns_and_binds(&s, &extras);
-        assert_eq!(
-            columns,
-            [
-                "id",
-                "previous_response_id",
-                "input",
-                "created_at",
-                "safety_identifier",
-                "conversation_id",
-                "raw_response",
-                "tenant",
-                "region",
-            ]
-        );
-        assert_eq!(binds.len(), columns.len());
-    }
-
-    #[test]
-    fn output_item_lookup_binds_the_id_into_the_json_path_and_takes_one_row() {
-        let schema = SchemaConfig::default();
-        let sql = find_by_output_item_sql(&schema, &build_response_select_base(&schema))
-            .expect("raw_response is stored by default");
-        assert!(
-            sql.contains(
-                "JSON_EXISTS(raw_response, '$.output[*]?(@.id == $iid)' PASSING :1 AS \"iid\")"
-            ),
-            "{sql}"
-        );
-        assert!(
-            sql.ends_with(" ORDER BY created_at DESC) WHERE ROWNUM <= 1"),
-            "{sql}"
-        );
-    }
-
-    #[test]
-    fn output_item_lookup_needs_the_raw_response_column() {
-        let mut schema = SchemaConfig::default();
-        schema
-            .responses
-            .skip_columns
-            .insert("raw_response".to_string());
-        assert!(find_by_output_item_sql(&schema, "SELECT 1 FROM dual").is_none());
-    }
-
-    #[test]
-    fn link_sql_merges_on_the_conversation_and_item_key() {
-        let (sql, binds) = link_sql(
-            "links",
-            &["conversation_id", "item_id", "added_at", "tenant"],
-        );
-        assert_eq!(
-            sql,
-            "MERGE INTO links t USING (SELECT :v1 AS conversation_id, :v2 AS item_id, \
-             :v3 AS added_at FROM dual) s \
-             ON (t.conversation_id = s.conversation_id AND t.item_id = s.item_id) \
-             WHEN MATCHED THEN UPDATE SET t.added_at = s.added_at, t.tenant = :v4 \
-             WHEN NOT MATCHED THEN INSERT (conversation_id, item_id, added_at, tenant) \
-             VALUES (s.conversation_id, s.item_id, s.added_at, :v4)"
-        );
-        assert_eq!(binds, ["v1", "v2", "v3", "v4"]);
-        // An extra column may be a CLOB: its value is never bound inside the
-        // source (ORA-01461 above 4,000 bytes there), as in `store_response_sql`.
-        let source = &sql[sql.find("USING (").unwrap()..sql.find(") s ON").unwrap()];
-        assert!(!source.contains(":v4"), "{source}");
-        // The key alone leaves nothing to move.
-        let (sql, _) = link_sql("l", &["conversation_id", "item_id"]);
-        assert!(!sql.contains("WHEN MATCHED"), "{sql}");
-        assert!(
-            sql.ends_with("VALUES (s.conversation_id, s.item_id)"),
-            "{sql}"
-        );
-    }
-
-    #[test]
-    fn link_items_sql_merges_the_batch_in_one_statement() {
-        let sql = link_items_sql(
-            "links",
-            &["conversation_id", "item_id", "added_at", "tenant"],
-            2,
-        );
-        assert_eq!(
-            sql,
-            "MERGE INTO links t USING (\
-             SELECT :cid AS conversation_id, :iid0 AS item_id, :ts0 AS added_at FROM dual \
-             UNION ALL \
-             SELECT :cid AS conversation_id, :iid1 AS item_id, :ts1 AS added_at FROM dual) s \
-             ON (t.conversation_id = s.conversation_id AND t.item_id = s.item_id) \
-             WHEN MATCHED THEN UPDATE SET t.added_at = s.added_at, t.tenant = :ex0 \
-             WHEN NOT MATCHED THEN INSERT (conversation_id, item_id, added_at, tenant) \
-             VALUES (s.conversation_id, s.item_id, s.added_at, :ex0)"
-        );
-        let source = &sql[sql.find("USING (").unwrap()..sql.find(") s ON").unwrap()];
-        assert!(!source.contains(":ex0"), "{source}");
-    }
-
-    #[test]
-    fn a_batch_keeps_the_last_stamp_of_a_repeated_item() {
-        let t = |secs: i64| DateTime::<Utc>::from_timestamp(secs, 0).unwrap();
-        let rows = last_stamp_per_item(vec![
-            ("a".to_string(), t(1)),
-            ("b".to_string(), t(2)),
-            ("a".to_string(), t(3)),
-            ("c".to_string(), t(4)),
-            ("b".to_string(), t(5)),
-        ]);
-        assert_eq!(
-            rows,
-            vec![
-                ("a".to_string(), t(3)),
-                ("b".to_string(), t(5)),
-                ("c".to_string(), t(4)),
-            ]
-        );
-    }
-
-    #[test]
-    fn update_if_open_sql_updates_the_row_under_its_id_only_while_its_status_is_open() {
-        let open = oracle_open_predicate("raw_response");
-        let (sql, binds) =
-            update_if_open_sql("responses", &["id", "input", "raw_response"], Some(&open));
-        assert_eq!(binds, ["v1", "v2", "v3"]);
-        assert_eq!(
-            sql,
-            "UPDATE responses SET input = :v2, raw_response = :v3 WHERE id = :v1 AND \
-             COALESCE(JSON_VALUE(raw_response, '$.status'), ' ') NOT IN ('completed', \
-             'incomplete', 'failed', 'cancelled')"
-        );
-        let (plain, _) = update_if_open_sql("r", &["response_key", "input"], None);
-        assert_eq!(plain, "UPDATE r SET input = :v2 WHERE response_key = :v1");
-    }
-
-    #[test]
-    fn create_item_sql_inserts_under_a_free_id_and_leaves_a_stored_row_as_it_is() {
-        let (sql, binds) = create_item_sql("conversation_items", &["id", "item_type", "content"]);
-        assert_eq!(
-            sql,
-            "MERGE INTO conversation_items t USING (SELECT :v1 AS id FROM dual) s ON (t.id = s.id) \
-             WHEN NOT MATCHED THEN INSERT (id, item_type, content) VALUES (:v1, :v2, :v3)"
-        );
-        assert_eq!(binds, ["v1", "v2", "v3"]);
-        // The content may be a CLOB: bound in INSERT VALUES, never inside the
-        // source (ORA-01461 above 4,000 bytes there), as `store_response_sql` binds.
-        let source = &sql[sql.find("USING (").unwrap()..sql.find(") s ON").unwrap()];
-        assert!(!source.contains(":v3"), "{source}");
-    }
-
-    #[test]
-    fn store_response_sql_merges_on_the_id_and_binds_the_values_outside_the_source() {
-        let (sql, binds) = store_response_sql("responses", &["id", "input", "raw_response"]);
-        assert_eq!(
-            sql,
-            "MERGE INTO responses t USING (SELECT :v1 AS id FROM dual) s ON (t.id = s.id) \
-             WHEN MATCHED THEN UPDATE SET t.input = :v2, t.raw_response = :v3 \
-             WHEN NOT MATCHED THEN INSERT (id, input, raw_response) VALUES (:v1, :v2, :v3)"
-        );
-        assert_eq!(
-            binds,
-            ["v1", "v2", "v3"],
-            "one bind per column, in the columns' order"
-        );
-        // The CLOB-sized values never sit in the USING source (ORA-01461 above
-        // 4,000 bytes there); they are bound where an INSERT binds them.
-        let source = &sql[sql.find("USING (").unwrap()..sql.find(") s ON").unwrap()];
-        assert!(
-            !source.contains(":v2") && !source.contains(":v3"),
-            "{source}"
-        );
-        let (sql, binds) = store_response_sql("r", &["id"]);
-        assert_eq!(
-            sql,
-            "MERGE INTO r t USING (SELECT :v1 AS id FROM dual) s ON (t.id = s.id) \
-             WHEN NOT MATCHED THEN INSERT (id) VALUES (:v1)"
-        );
-        assert_eq!(binds, ["v1"]);
-    }
-
-    #[test]
-    fn a_schema_without_the_object_column_has_no_open_condition() {
-        let mut s = crate::schema::TableConfig::with_table("responses");
-        s.columns
-            .insert("raw_response".to_string(), "payload".to_string());
-        assert_eq!(
-            oracle_open_predicate_for(&s).as_deref(),
-            Some(oracle_open_predicate("payload").as_str()),
-            "the mapped column is checked"
-        );
-        s.skip_columns.insert("raw_response".to_string());
-        assert_eq!(
-            oracle_open_predicate_for(&s),
-            None,
-            "no object column: the conditional store is a plain update"
-        );
-    }
-}
+#[path = "../tests/unit/oracle/tests.rs"]
+mod tests;

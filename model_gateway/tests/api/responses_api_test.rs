@@ -4,9 +4,10 @@ use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode};
 use openai_protocol::{
     common::{GenerationRequest, UsageInfo},
     responses::{
-        CodeInterpreterTool, McpTool, ReasoningEffort, RequireApproval, RequireApprovalMode,
-        ResponseContentPart, ResponseInput, ResponseReasoningParam, ResponseTool, ResponsesRequest,
-        ResponsesToolChoice, ServiceTier, ToolChoiceOptions, Truncation, WebSearchPreviewTool,
+        CodeInterpreterTool, McpAllowedTools, McpTool, ReasoningEffort, RequireApproval,
+        RequireApprovalMode, ResponseContentPart, ResponseInput, ResponseReasoningParam,
+        ResponseTool, ResponsesRequest, ResponsesToolChoice, ServiceTier, ToolChoiceOptions,
+        Truncation, WebSearchPreviewTool,
     },
 };
 use smg::{
@@ -14,10 +15,11 @@ use smg::{
     endpoints::conversations,
     routers::RouterFactory,
     tenant::{RouteRequestMeta, TenantKey},
-    worker::test_support::RefusedAddress,
 };
+use smg_worker::test_support::RefusedAddress;
 
 use crate::common::{
+    create_test_context, create_test_context_with_mcp_config,
     mock_mcp_server::{MockFailingMCPServer, MockMCPServer},
     mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType},
 };
@@ -91,9 +93,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     let router_cfg = worker_router_config(worker_url);
 
     // Create router and context with MCP config from file
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build a simple ResponsesRequest that will trigger the tool call
@@ -124,6 +124,8 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: None,
@@ -141,6 +143,11 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -284,9 +291,7 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
@@ -316,6 +321,8 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: None,
@@ -333,6 +340,11 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -422,9 +434,7 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
@@ -454,6 +464,8 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: None,
@@ -471,6 +483,11 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -523,6 +540,86 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
     mcp.stop().await;
 }
 
+/// One server under two labels: each tool is attributed to one of them, and
+/// the approval the other label asks for still holds the call.
+#[tokio::test]
+async fn test_non_streaming_mcp_approval_holds_for_a_tool_listed_under_another_label() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let url = mcp.url();
+    let mcp_yaml = format!("servers:\n  - name: mock\n    protocol: streamable\n    url: {url}\n");
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+
+    let mut worker = MockWorker::new(MockWorkerConfig {
+        port: 0,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    });
+    let worker_url = worker.start().await.expect("start worker");
+    let router_cfg = worker_router_config(worker_url);
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let label = |server_label: &str, narrow: bool, asks: bool| {
+        ResponseTool::Mcp(McpTool {
+            server_url: Some(url.clone()),
+            authorization: None,
+            headers: None,
+            server_label: server_label.to_string(),
+            server_description: None,
+            require_approval: asks.then_some(RequireApproval::Mode(RequireApprovalMode::Always)),
+            allowed_tools: narrow
+                .then(|| McpAllowedTools::List(vec!["brave_web_search".to_string()])),
+            connector_id: None,
+            defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
+        })
+    };
+    let mut seen = Vec::new();
+    for tools in [
+        vec![label("conf", false, false), label("conf-b", true, true)],
+        vec![label("conf-b", true, false), label("conf", false, true)],
+    ] {
+        let req = ResponsesRequest {
+            input: ResponseInput::Text("search something".to_string()),
+            model: "mock-model".to_string(),
+            store: Some(true),
+            stream: Some(false),
+            tools: Some(tools),
+            ..Default::default()
+        };
+        let resp = router
+            .route_responses(None, &test_tenant_meta(), req.clone(), req.model.as_str())
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("the response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("a JSON body");
+        let types: Vec<String> = body["output"]
+            .as_array()
+            .expect("the output items")
+            .iter()
+            .filter_map(|item| item["type"].as_str().map(str::to_string))
+            .collect();
+        seen.push(types);
+    }
+    for types in &seen {
+        assert!(
+            types.iter().any(|t| t == "mcp_approval_request")
+                && !types.iter().any(|t| t == "mcp_call"),
+            "each order waits for the approval before the call: {seen:?}"
+        );
+    }
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
 #[tokio::test]
 async fn test_final_response_hides_internal_mcp_trace_items() {
     let mut mcp = MockMCPServer::start().await.expect("start mcp");
@@ -546,9 +643,7 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
@@ -578,6 +673,8 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: None,
@@ -595,6 +692,11 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -669,9 +771,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let mcp_tool = ResponseTool::Mcp(McpTool {
@@ -684,6 +784,8 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         allowed_tools: None,
         connector_id: None,
         defer_loading: None,
+        allowed_callers: None,
+        tunnel_id: None,
     });
 
     let req1 = ResponsesRequest {
@@ -720,6 +822,11 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -777,6 +884,11 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -842,9 +954,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
@@ -874,6 +984,8 @@ async fn test_final_response_hides_internal_mcp_error_details() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: None,
@@ -891,6 +1003,11 @@ async fn test_final_response_hides_internal_mcp_error_details() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -931,14 +1048,18 @@ async fn test_conversations_crud_basic() {
     // Router in OpenAI mode (no actual upstream calls in these tests)
     let router_cfg = conversation_router_config();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create
     let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
-    let create_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_body.clone())
-            .await;
+    let create_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_body.clone(),
+    )
+    .await;
     assert_eq!(create_resp.status(), StatusCode::OK);
     let create_bytes = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
         .await
@@ -1009,11 +1130,16 @@ async fn ok_json(
 #[tokio::test]
 async fn a_conversation_without_metadata_answers_an_empty_metadata_object(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+    let ctx = create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     assert_eq!(created["metadata"], serde_json::json!({}), "{created}");
@@ -1033,11 +1159,16 @@ async fn a_conversation_without_metadata_answers_an_empty_metadata_object(
 #[tokio::test]
 async fn items_added_with_string_content_are_listed_as_typed_parts(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+    let ctx = create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let conv_id = created["id"].as_str().expect("id missing");
@@ -1131,11 +1262,16 @@ async fn items_added_with_string_content_are_listed_as_typed_parts(
 #[tokio::test]
 async fn an_assistant_message_added_as_a_string_is_stored_as_an_output_text_part(
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+    let ctx = create_test_context(conversation_router_config()).await;
 
     let created = ok_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let conv_id = created["id"].as_str().expect("id missing");
@@ -1219,6 +1355,9 @@ fn test_responses_request_creation() {
         reasoning: Some(ResponseReasoningParam {
             effort: Some(ReasoningEffort::Medium),
             summary: None,
+            mode: None,
+            context: None,
+            generate_summary: None,
         }),
         service_tier: Some(ServiceTier::Auto),
         store: Some(true),
@@ -1244,6 +1383,11 @@ fn test_responses_request_creation() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: -1,
         min_p: 0.0,
@@ -1294,6 +1438,11 @@ fn test_responses_request_sglang_extensions() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         // SGLang-specific extensions:
         top_k: 10,
@@ -1380,6 +1529,9 @@ fn test_reasoning_param_default() {
     let param = ResponseReasoningParam {
         effort: Some(ReasoningEffort::Medium),
         summary: None,
+        mode: None,
+        context: None,
+        generate_summary: None,
     };
 
     let json = serde_json::to_string(&param).unwrap();
@@ -1419,6 +1571,9 @@ fn test_json_serialization() {
         reasoning: Some(ResponseReasoningParam {
             effort: Some(ReasoningEffort::High),
             summary: None,
+            mode: None,
+            context: None,
+            generate_summary: None,
         }),
         service_tier: Some(ServiceTier::Priority),
         store: Some(false),
@@ -1444,6 +1599,11 @@ fn test_json_serialization() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: 50,
         min_p: 0.1,
@@ -1499,7 +1659,7 @@ async fn test_multi_turn_loop_with_mcp() {
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Build request with MCP tools
@@ -1530,6 +1690,8 @@ async fn test_multi_turn_loop_with_mcp() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: Some(1.0),
@@ -1547,6 +1709,11 @@ async fn test_multi_turn_loop_with_mcp() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: 50,
         min_p: 0.0,
@@ -1653,7 +1820,7 @@ async fn test_max_tool_calls_limit() {
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let req = ResponsesRequest {
@@ -1683,6 +1850,8 @@ async fn test_max_tool_calls_limit() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: Some(1.0),
@@ -1700,6 +1869,11 @@ async fn test_max_tool_calls_limit() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: 50,
         min_p: 0.0,
@@ -1779,9 +1953,7 @@ async fn setup_streaming_mcp_test() -> (
 
     let router_cfg = worker_router_config(worker_url);
 
-    let ctx =
-        crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
-            .await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap()).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
 
     (mcp, worker, router, dir)
@@ -1863,6 +2035,8 @@ async fn test_streaming_with_mcp_tool_calls() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: Some(1.0),
@@ -1880,6 +2054,11 @@ async fn test_streaming_with_mcp_tool_calls() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: 50,
         min_p: 0.0,
@@ -1939,6 +2118,11 @@ async fn test_streaming_with_mcp_tool_calls() {
     let mut found_mcp_call_arguments_done = false;
     let mut found_mcp_call_done = false;
     let mut found_response_completed = false;
+    // The one change a client sees from the kept items: the `mcp_list_tools`
+    // item the stream announces and the item in the final response are the
+    // same item, with the same id.
+    let mut announced_list_tools_ids: Vec<String> = Vec::new();
+    let mut completed_list_tools_ids: Vec<String> = Vec::new();
 
     for (event_name, data) in &events {
         let event_type = data.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -1950,6 +2134,12 @@ async fn test_streaming_with_mcp_tool_calls() {
                     if item.get("type").and_then(|v| v.as_str()) == Some("mcp_list_tools") {
                         found_mcp_list_tools = true;
                         println!("✓ Found mcp_list_tools added event");
+                        announced_list_tools_ids.push(
+                            item["id"]
+                                .as_str()
+                                .expect("the announced mcp_list_tools item carries its id")
+                                .to_string(),
+                        );
 
                         // Verify tools array is present (should be empty in added event)
                         assert!(
@@ -2058,6 +2248,14 @@ async fn test_streaming_with_mcp_tool_calls() {
             "response.completed" => {
                 found_response_completed = true;
                 println!("✓ Found response.completed event");
+                if let Some(output) = data["response"]["output"].as_array() {
+                    completed_list_tools_ids.extend(
+                        output
+                            .iter()
+                            .filter(|item| item["type"] == "mcp_list_tools")
+                            .filter_map(|item| item["id"].as_str().map(str::to_string)),
+                    );
+                }
             }
             _ => {
                 println!("  Other event: {event_type}");
@@ -2081,6 +2279,15 @@ async fn test_streaming_with_mcp_tool_calls() {
     println!("MCP call arguments done: {found_mcp_call_arguments_done}");
     println!("MCP call done: {found_mcp_call_done}");
     println!("Response completed: {found_response_completed}");
+
+    assert!(
+        !announced_list_tools_ids.is_empty(),
+        "the stream announces an mcp_list_tools item with an id"
+    );
+    assert_eq!(
+        completed_list_tools_ids, announced_list_tools_ids,
+        "the mcp_list_tools item in response.completed carries the id the stream announced"
+    );
 
     // Assert critical events are present
     assert!(
@@ -2153,6 +2360,8 @@ async fn test_streaming_multi_turn_with_mcp() {
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         top_logprobs: Some(0),
         top_p: Some(1.0),
@@ -2170,6 +2379,11 @@ async fn test_streaming_multi_turn_with_mcp() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        prompt_cache_options: None,
+        background_options: None,
+        moderation: None,
+        image: None,
+        access_programs: None,
         client_metadata: None,
         top_k: 50,
         min_p: 0.0,
@@ -2211,13 +2425,18 @@ async fn test_conversation_items_create_and_get() {
     // Test creating items and getting a specific item
     let router_cfg = conversation_router_config();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     assert_eq!(conv_resp.status(), StatusCode::OK);
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
@@ -2315,13 +2534,14 @@ async fn items_of_one_add_call_are_listed_in_request_order(
     // Items that share a stamp are listed by their random ids, which is request order about
     // half of the time: twenty rounds, each with two items in one call and a third in the next.
     let router_cfg = conversation_router_config();
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     for round in 0..20 {
         let conv = conversation_json(
             conversations::create_conversation(
                 &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
                 None,
                 serde_json::json!({}),
             )
@@ -2433,7 +2653,7 @@ async fn items_of_one_add_call_are_listed_in_request_order(
 async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let router_cfg = conversation_router_config();
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     let add_items = |conv_id: String, items: serde_json::Value| {
@@ -2471,8 +2691,13 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
     };
 
     let conv = conversation_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let conv_id = conv["id"].as_str().ok_or("conversation id")?.to_string();
@@ -2508,8 +2733,13 @@ async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
 
     // The same reference into another conversation links the item there, once.
     let other = conversation_json(
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await,
+        conversations::create_conversation(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            serde_json::json!({}),
+        )
+        .await,
     )
     .await?;
     let other_id = other["id"].as_str().ok_or("conversation id")?.to_string();
@@ -2546,13 +2776,18 @@ async fn test_conversation_items_delete() {
     // Test deleting an item from a conversation
     let router_cfg = conversation_router_config();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2647,13 +2882,18 @@ async fn test_conversation_items_max_limit() {
     // Test that creating > 20 items returns error
     let router_cfg = conversation_router_config();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2693,13 +2933,18 @@ async fn test_conversation_items_unsupported_type() {
     // Test that unsupported item types return error
     let router_cfg = conversation_router_config();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create conversation
     let create_conv = serde_json::json!({});
-    let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
+    let conv_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        create_conv,
+    )
+    .await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2738,22 +2983,30 @@ async fn test_conversation_items_multi_conversation_sharing() {
     // Test that items can be shared across conversations via soft delete
     let router_cfg = conversation_router_config();
 
-    let ctx = crate::common::create_test_context(router_cfg).await;
+    let ctx = create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations
-    let conv_a_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await;
+    let conv_a_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     let conv_a_bytes = axum::body::to_bytes(conv_a_resp.into_body(), usize::MAX)
         .await
         .unwrap();
     let conv_a_json: serde_json::Value = serde_json::from_slice(&conv_a_bytes).unwrap();
     let conv_a_id = conv_a_json["id"].as_str().unwrap();
 
-    let conv_b_resp =
-        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
-            .await;
+    let conv_b_resp = conversations::create_conversation(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
     let conv_b_bytes = axum::body::to_bytes(conv_b_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2934,6 +3187,8 @@ fn mcp_request(
             allowed_tools: None,
             connector_id: None,
             defer_loading: None,
+            allowed_callers: None,
+            tunnel_id: None,
         })]),
         ..Default::default()
     }
@@ -3165,7 +3420,7 @@ async fn external_router_with_mcp_yaml(
         .max_concurrent_requests(8)
         .build_unchecked();
     let cfg_path = cfg_path.to_str().expect("a utf-8 path");
-    let ctx = crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path).await;
+    let ctx = create_test_context_with_mcp_config(router_cfg, cfg_path).await;
     // A running gateway's registration job populates the format registry as
     // it connects each configured server; the test context connects them
     // itself, so the registry is populated here the same way.
@@ -3226,6 +3481,59 @@ async fn a_failed_upstream_status_ends_the_stream_with_the_typed_error_event() {
         "data: {\"type\":\"error\",\"code\":\"overloaded\",\"message\":\"busy, try again\",\
          \"param\":null,\"sequence_number\":0}\n\n"
     );
+    server.abort();
+    mcp.stop().await;
+}
+
+/// A tool call that fails, streamed (the tool server that always fails behind
+/// an upstream that asks for the tool on every turn, a limit of one): the
+/// call that ran and failed and the call past the limit close alike, each
+/// under `response.mcp_call.failed` and then its `response.output_item.done`
+/// with a `failed` item. No `response.mcp_call.completed` is sent for a call
+/// that failed. The gateway's own tool loop closes a failed call under the
+/// same event (`a_failed_mcp_call_closes_under_the_failed_event` in the
+/// Responses stream contract tests).
+#[tokio::test]
+async fn a_streamed_mcp_call_that_failed_closes_under_the_failed_event() {
+    let mut mcp = MockFailingMCPServer::start("the tool is down")
+        .await
+        .expect("start failing mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let (router, _ctx, _dir) = external_router_with_mcp_yaml(&upstream, &mcp_yaml, 5).await;
+
+    let body = stream_body(
+        router.as_ref(),
+        mcp_request(&mcp.url(), Some(1), true, false),
+    )
+    .await;
+
+    let events = frame_events(&body);
+    // Each call's close: its sub-event, and the status of the item behind it.
+    let closes: Vec<(&str, &str)> = events
+        .windows(2)
+        .filter(|pair| {
+            pair[1]["type"] == "response.output_item.done" && pair[1]["item"]["type"] == "mcp_call"
+        })
+        .map(|pair| {
+            (
+                pair[0]["type"].as_str().unwrap_or_default(),
+                pair[1]["item"]["status"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        closes,
+        [
+            ("response.mcp_call.failed", "failed"),
+            ("response.mcp_call.failed", "failed")
+        ],
+        "the call that ran and failed, then the call past the limit: {body}"
+    );
+    assert!(!body.contains("response.mcp_call.completed"), "{body}");
     server.abort();
     mcp.stop().await;
 }
@@ -3574,6 +3882,48 @@ async fn an_unstreamed_turn_the_allowance_cuts_renders_each_call_once() {
     mcp.stop().await;
 }
 
+/// A streamed request holds a call under `require_approval: always` as a
+/// non-streamed request does: the tool does not run, and the call the stream
+/// announced closes as failed.
+#[tokio::test]
+async fn a_streamed_call_that_waits_for_approval_does_not_run() {
+    let (mut mcp, mut worker, router, _dir) = setup_streaming_mcp_test().await;
+    let mut req = streaming_mcp_request(&mcp.url(), None);
+    if let Some(ResponseTool::Mcp(tool)) = req.tools.as_mut().and_then(|tools| tools.first_mut()) {
+        tool.require_approval = Some(RequireApproval::Mode(RequireApprovalMode::Always));
+    }
+
+    let body = stream_body(router.as_ref(), req).await;
+
+    assert_eq!(mcp.call_count(), 0, "the tool ran without its approval");
+    let events = frame_events(&body);
+    let closed_calls: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| {
+            event["type"] == "response.output_item.done" && event["item"]["type"] == "mcp_call"
+        })
+        .collect();
+    assert_eq!(
+        closed_calls.len(),
+        1,
+        "one call announced and closed: {body}"
+    );
+    assert_eq!(closed_calls[0]["item"]["status"], "failed");
+    assert!(
+        closed_calls[0]["item"]["error"]
+            .to_string()
+            .contains("requires approval"),
+        "the call failed for its approval: {body}"
+    );
+    assert_eq!(
+        events.last().and_then(|event| event["type"].as_str()),
+        Some("response.completed")
+    );
+
+    worker.stop().await;
+    mcp.stop().await;
+}
+
 /// An upstream nothing listens on: the stream is the one typed error event
 /// with the request's failure, at sequence number 0.
 #[tokio::test]
@@ -3599,4 +3949,406 @@ async fn an_unreachable_upstream_ends_the_stream_with_the_typed_error_event() {
     );
     assert!(event["param"].is_null(), "{body}");
     mcp.stop().await;
+}
+
+/// The most the gateway reads of an upstream's error body.
+const ERROR_BODY_BOUND: usize = smg_external_router::upstream_body::MAX_ERROR_RESPONSE_SIZE;
+
+/// The API's error envelope as an upstream writes it, its message `len` bytes
+/// long.
+fn refusal_with_a_message_of(len: usize) -> String {
+    format!(
+        r#"{{"error":{{"message":"{}","type":"invalid_request_error","code":"invalid_prompt"}}}}"#,
+        "x".repeat(len)
+    )
+}
+
+/// What a client reads of one request through an OpenAI-mode gateway whose
+/// upstream answers every request with status 400 and `refusal`: the status,
+/// the content type and the whole body. The request carries an MCP tool (the
+/// tool loop) or none (the plain path), and is streamed or not.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn answer_to_a_refusal(
+    refusal: String,
+    tools: bool,
+    stream: bool,
+) -> (StatusCode, String, String) {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(axum::routing::post(move || {
+        let refusal = refusal.clone();
+        async move {
+            (
+                StatusCode::BAD_REQUEST,
+                [(CONTENT_TYPE, "application/json")],
+                refusal,
+            )
+        }
+    }))
+    .await;
+    let (router, _ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+    let request = if tools {
+        mcp_request(&mcp.url(), None, stream, false)
+    } else {
+        ResponsesRequest {
+            input: ResponseInput::Text("say something".to_string()),
+            model: "mock-model".to_string(),
+            store: Some(false),
+            stream: Some(stream),
+            ..Default::default()
+        }
+    };
+    let response = router
+        .route_responses(None, &test_tenant_meta(), request.clone(), &request.model)
+        .await;
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    server.abort();
+    mcp.stop().await;
+    (
+        status,
+        content_type,
+        String::from_utf8(bytes.to_vec()).expect("utf-8"),
+    )
+}
+
+/// The gateway's own error envelope in `body`: its type, code and message.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn envelope_of(body: &str) -> (String, String, String) {
+    let envelope: serde_json::Value = serde_json::from_str(body).expect("an error envelope");
+    let field = |name: &str| {
+        envelope["error"][name]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    (field("type"), field("code"), field("message"))
+}
+
+/// The gateway's own envelope where an upstream error body past the bound
+/// would have stood, under the upstream's status 400.
+fn too_large_envelope() -> (String, String, String) {
+    (
+        "invalid_request_error".to_string(),
+        "upstream_error".to_string(),
+        "Upstream error response too large".to_string(),
+    )
+}
+
+/// The plain non-streamed path passes an upstream's error body on under the
+/// upstream's status, as it came. A body past the bound is not passed on: the
+/// client reads the upstream's status with the gateway's own error envelope.
+#[tokio::test]
+async fn the_plain_path_passes_on_an_upstream_error_body_within_the_bound_only() {
+    let within = refusal_with_a_message_of(16);
+    let (status, content_type, body) = answer_to_a_refusal(within.clone(), false, false).await;
+    assert_eq!(
+        (status, content_type.as_str(), body.as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            within.as_str()
+        ),
+        "under the bound"
+    );
+
+    let past = refusal_with_a_message_of(ERROR_BODY_BOUND);
+    let (status, content_type, body) = answer_to_a_refusal(past, false, false).await;
+    assert!(
+        body.len() < 1024,
+        "past the bound: {} bytes are passed on",
+        body.len()
+    );
+    assert_eq!(
+        (status, content_type.as_str(), envelope_of(&body)),
+        (
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            too_large_envelope()
+        ),
+        "past the bound"
+    );
+}
+
+/// The plain streamed path answers an upstream's refusal before any stream
+/// begins, the same way: the body as it came within the bound, the gateway's
+/// own error envelope past it.
+#[tokio::test]
+async fn the_plain_streamed_path_passes_on_an_upstream_error_body_within_the_bound_only() {
+    let within = refusal_with_a_message_of(16);
+    let (status, content_type, body) = answer_to_a_refusal(within.clone(), false, true).await;
+    assert_eq!(
+        (status, content_type.as_str(), body.as_str()),
+        (
+            StatusCode::BAD_REQUEST,
+            "text/plain; charset=utf-8",
+            within.as_str()
+        ),
+        "under the bound"
+    );
+
+    let past = refusal_with_a_message_of(ERROR_BODY_BOUND);
+    let (status, content_type, body) = answer_to_a_refusal(past, false, true).await;
+    assert!(
+        body.len() < 1024,
+        "past the bound: {} bytes are passed on",
+        body.len()
+    );
+    assert_eq!(
+        (status, content_type.as_str(), envelope_of(&body)),
+        (
+            StatusCode::BAD_REQUEST,
+            "application/json",
+            too_large_envelope()
+        ),
+        "past the bound"
+    );
+}
+
+/// The non-streamed tool loop fails on an upstream error status with a
+/// message that names the status and carries the body. Past the bound the
+/// message says the error body was too large, where the body stood.
+#[tokio::test]
+async fn the_tool_loop_carries_an_upstream_error_body_within_the_bound_only() {
+    let within = refusal_with_a_message_of(16);
+    let (status, _, body) = answer_to_a_refusal(within.clone(), true, false).await;
+    assert_eq!(
+        (status, envelope_of(&body)),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            (
+                "server_error".to_string(),
+                "upstream_error".to_string(),
+                format!("upstream error 400 Bad Request: {within}")
+            )
+        ),
+        "under the bound"
+    );
+
+    let past = refusal_with_a_message_of(ERROR_BODY_BOUND);
+    let (status, _, body) = answer_to_a_refusal(past, true, false).await;
+    assert!(
+        body.len() < 1024,
+        "past the bound: {} bytes are passed on",
+        body.len()
+    );
+    assert_eq!(
+        (status, envelope_of(&body)),
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            (
+                "server_error".to_string(),
+                "upstream_error".to_string(),
+                "upstream error 400 Bad Request: Upstream error response too large".to_string()
+            )
+        ),
+        "past the bound"
+    );
+}
+
+/// The streamed tool loop ends the stream with the one typed error event on
+/// an upstream error status: the upstream's own code and message when the
+/// body carries them. Past the bound the event names the status and says the
+/// error body was too large, where the body stood.
+#[tokio::test]
+async fn the_streamed_tool_loop_carries_an_upstream_error_body_within_the_bound_only() {
+    let (status, _, body) = answer_to_a_refusal(refusal_with_a_message_of(16), true, true).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            StatusCode::OK,
+            "data: {\"type\":\"error\",\"code\":\"invalid_prompt\",\"message\":\"xxxxxxxxxxxxxxxx\",\
+             \"param\":null,\"sequence_number\":0}\n\n"
+        ),
+        "under the bound"
+    );
+
+    let past = refusal_with_a_message_of(ERROR_BODY_BOUND);
+    let (status, _, body) = answer_to_a_refusal(past, true, true).await;
+    assert!(
+        body.len() < 1024,
+        "past the bound: {} bytes are passed on",
+        body.len()
+    );
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            StatusCode::OK,
+            "data: {\"type\":\"error\",\"code\":\"invalid_request_error\",\"message\":\"Upstream error 400 \
+             Bad Request: Upstream error response too large\",\"param\":null,\"sequence_number\":0}\n\n"
+        ),
+        "past the bound"
+    );
+}
+
+/// The Conversations routes refuse a body the way the typed routes do: in
+/// the gateway's envelope with a code, not with the framework's text/plain
+/// answer.
+mod conversation_body_refusals {
+    use axum::{
+        body::Body,
+        http::{header::CONTENT_TYPE, Request, StatusCode},
+    };
+    use tower::ServiceExt;
+
+    use crate::common::{
+        mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
+        AppTestContext,
+    };
+
+    /// The status, the content type and the body of `body` posted to `path`
+    /// under `content_type` (no header when `None`); a body that is not JSON
+    /// is kept under `not_json`, so an assertion names it. A request that
+    /// cannot be built or a body that cannot be read is the caller's error.
+    async fn post(
+        app: &axum::Router,
+        path: &str,
+        content_type: Option<&str>,
+        body: &[u8],
+    ) -> Result<(StatusCode, String, serde_json::Value), Box<dyn std::error::Error>> {
+        let mut req = Request::builder().method("POST").uri(path);
+        if let Some(content_type) = content_type {
+            req = req.header(CONTENT_TYPE, content_type);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::from(body.to_vec()))?)
+            .await?;
+        let status = resp.status();
+        let response_type = resp
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+        let answer = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| serde_json::json!({"not_json": String::from_utf8_lossy(&bytes)}));
+        Ok((status, response_type, answer))
+    }
+
+    /// Create, update and create-items each refuse a truncated object, an
+    /// empty body, a body that is not UTF-8 and a body under another or no
+    /// content type with 400 in the envelope: `invalid_json` for a body that
+    /// does not parse, `json_parse_error` for the content type, the codes
+    /// the typed routes carry.
+    #[tokio::test]
+    async fn the_posting_routes_refuse_a_malformed_body_in_the_envelope() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18131,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let app = ctx.create_app();
+        let cases: [(Option<&str>, &[u8], &str); 5] = [
+            (Some("application/json"), br#"{"metadata":"#, "invalid_json"),
+            (Some("application/json"), b"", "invalid_json"),
+            (
+                Some("application/json"),
+                b"{\"metadata\":\"\xff\"}",
+                "invalid_json",
+            ),
+            (None, br#"{"metadata":{}}"#, "json_parse_error"),
+            (
+                Some("text/plain"),
+                br#"{"metadata":{}}"#,
+                "json_parse_error",
+            ),
+        ];
+        for path in [
+            "/v1/conversations",
+            "/v1/conversations/conv_missing",
+            "/v1/conversations/conv_missing/items",
+        ] {
+            for (content_type, body, code) in cases.iter().copied() {
+                let case = format!(
+                    "{path} {content_type:?} {:?}",
+                    String::from_utf8_lossy(body)
+                );
+                let (status, response_type, answer) = post(&app, path, content_type, body)
+                    .await
+                    .expect("an answer from the route");
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{case}: {answer}");
+                assert!(
+                    response_type.starts_with("application/json"),
+                    "{case}: {response_type} {answer}"
+                );
+                assert_eq!(
+                    answer["error"]["type"], "invalid_request_error",
+                    "{case}: {answer}"
+                );
+                assert_eq!(answer["error"]["code"], code, "{case}: {answer}");
+            }
+        }
+        ctx.shutdown().await;
+    }
+
+    /// Create, update and create-items refuse a body with a repeated key at
+    /// the door, before a conversation is looked up: 400 `json_parse_error`
+    /// with serde's `duplicate field` words and the place as `param`. The
+    /// keys of `metadata` keep the last value.
+    #[tokio::test]
+    async fn the_posting_routes_refuse_a_repeated_key_outside_metadata() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+        let json = Some("application/json");
+        let twice = r#"{"metadata":{"a":"1"},"metadata":{"a":"2"}}"#;
+        let cases = [
+            ("/v1/conversations", twice, serde_json::Value::Null),
+            (
+                "/v1/conversations/conv_missing",
+                twice,
+                serde_json::Value::Null,
+            ),
+            (
+                "/v1/conversations/conv_missing/items",
+                r#"{"items":[{"type":"message","role":"user","content":[{"type":"input_text","text":"a","text":"b"}]}]}"#,
+                serde_json::json!("items[0].content[0]"),
+            ),
+        ];
+        for (path, body, param) in cases {
+            let (status, _, answer) = post(&app, path, json, body.as_bytes())
+                .await
+                .expect("an answer from the route");
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {body}: {answer}");
+            assert_eq!(
+                answer["error"]["code"], "json_parse_error",
+                "{path} {body}: {answer}"
+            );
+            assert_eq!(answer["error"]["param"], param, "{path} {body}: {answer}");
+            assert!(
+                answer["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("duplicate field `")),
+                "{path} {body}: {answer}"
+            );
+        }
+        let (status, _, created) = post(
+            &app,
+            "/v1/conversations",
+            json,
+            br#"{"metadata":{"a":"1","a":"2"}}"#,
+        )
+        .await
+        .expect("an answer from the route");
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["metadata"]["a"], "2", "{created}");
+        ctx.shutdown().await;
+    }
 }

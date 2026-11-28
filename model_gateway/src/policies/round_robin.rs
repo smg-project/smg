@@ -1,7 +1,7 @@
 //! Round-robin load balancing policy
 
 use std::{
-    hash::{DefaultHasher, Hash, Hasher},
+    hash::Hasher,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -9,9 +9,10 @@ use std::{
 };
 
 use dashmap::DashMap;
+use rustc_hash::FxHasher;
+use smg_worker::identity::basic::Worker;
 
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, SelectWorkerInfo};
-use crate::worker::Worker;
 
 /// Distinct candidate sets one instance keeps a rotation for; past this a
 /// new set evicts the least recently used one. Sets come and go with worker
@@ -36,11 +37,24 @@ struct Rotation {
 /// happen to interleave, pinning each set to a subset of its workers.
 ///
 /// A set is identified by its healthy workers in the order the caller lists
-/// them; callers hand over a stable order (a pool snapshot, a pair index's
-/// partners), which the rotation relies on either way. A set seen for the
-/// first time starts from a shared, advancing position rather than its
-/// first worker, so a fleet whose shape keeps changing does not lean on
-/// index 0.
+/// them, each by its handle and never by its URL. Callers hand over a stable
+/// order and the same handles for the same workers (a pool snapshot, a pair
+/// index's partners), which the rotation relies on either way: a worker
+/// under a new handle is a new member, and the sets that hold it start
+/// again. A set seen for the first time starts from a shared, advancing
+/// position rather than its first worker, so a fleet whose shape keeps
+/// changing does not lean on index 0.
+///
+/// A list the caller names whole (a routing snapshot's pool) is rotated by
+/// row instead: its rotation is kept under the list's own address, and the
+/// row the count lands on is the pick when the request may use that worker.
+/// Nothing is asked of the other workers and nobody is listed, so the pick
+/// costs the same at any pool size. While every worker is admitted that is
+/// the set's own walk. A row the request may not use falls to the set's
+/// rotation over the admitted workers: each of them keeps its own turns and
+/// takes an even share of the refused rows', so the spread stays even while
+/// the order is no longer one strict rotation. A narrowed list (the decode
+/// partners of a cohort) is a set as before.
 #[derive(Debug, Default)]
 pub struct RoundRobinPolicy {
     counters: DashMap<u64, Rotation>,
@@ -57,15 +71,30 @@ impl RoundRobinPolicy {
         }
     }
 
-    /// The identity of a candidate set: its healthy workers' URLs, in
-    /// order. A worker that re-registers under the same URL resumes its
-    /// sets' rotations, which is harmless; the hashing is a short string
-    /// per healthy candidate, on every selection.
+    /// The identity of a candidate set: its healthy workers in order, each
+    /// by its handle's address, one word hashed a candidate. Nothing of a
+    /// worker is read, so a selection's cost does not grow with its
+    /// workers' URLs. A worker replaced under its URL is a new handle: its
+    /// sets start again from the shared position, which is harmless, as is
+    /// a freed address that a later worker takes over.
     fn set_key(workers: &[Arc<dyn Worker>], healthy: &[usize]) -> u64 {
-        let mut hasher = DefaultHasher::new();
+        let mut hasher = FxHasher::default();
         for &i in healthy {
-            workers[i].url().hash(&mut hasher);
+            hasher.write_usize(Arc::as_ptr(&workers[i]).addr());
         }
+        hasher.finish()
+    }
+
+    /// The identity of a list the caller names whole: the list's own
+    /// address, one word. A snapshot never changes its list, so the address
+    /// stands for the members in their order until the registry publishes
+    /// another list, whose rotation starts from the shared position while
+    /// the old one ages out as a set's does. A list's key meets a set's only
+    /// through an address reused after a free, which is as harmless here as
+    /// it is there.
+    fn list_key(list: &Arc<[Arc<dyn Worker>]>) -> u64 {
+        let mut hasher = FxHasher::default();
+        hasher.write_usize(Arc::as_ptr(list).addr());
         hasher.finish()
     }
 
@@ -111,6 +140,21 @@ impl RoundRobinPolicy {
 
 impl LoadBalancingPolicy for RoundRobinPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+        // A list named whole is rotated by row: the row's worker is the only
+        // one asked anything. A refused row falls to the set's rotation.
+        if let Some(named) = info.named.filter(|named| named.positions.is_none()) {
+            debug_assert!(
+                std::ptr::eq(&named.list[..], workers),
+                "a list named whole is the slice handed"
+            );
+            if !workers.is_empty() {
+                let row = self.advance(Self::list_key(named.list)) % workers.len();
+                if info.admits(workers[row].routing_state()) {
+                    return Some(row);
+                }
+            }
+        }
+
         let healthy_indices = get_healthy_worker_indices(workers, info);
 
         if healthy_indices.is_empty() {
@@ -121,6 +165,10 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
         let selected_idx = count % healthy_indices.len();
 
         Some(healthy_indices[selected_idx])
+    }
+
+    fn hears_request_complete(&self) -> bool {
+        false
     }
 
     fn name(&self) -> &'static str {
@@ -139,172 +187,5 @@ impl LoadBalancingPolicy for RoundRobinPolicy {
 }
 
 #[cfg(test)]
-mod tests {
-    use openai_protocol::worker::WorkerStatus;
-
-    use super::*;
-    use crate::{
-        policies::test_support::make_workers,
-        worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType},
-    };
-
-    #[test]
-    fn test_round_robin_selection() {
-        let policy = RoundRobinPolicy::new();
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-
-        // Should select workers in order: 0, 1, 2, 0, 1, 2, ...
-        let info = SelectWorkerInfo::default();
-        assert_eq!(policy.select_worker(&workers, &info), Some(0));
-        assert_eq!(policy.select_worker(&workers, &info), Some(1));
-        assert_eq!(policy.select_worker(&workers, &info), Some(2));
-        assert_eq!(policy.select_worker(&workers, &info), Some(0));
-        assert_eq!(policy.select_worker(&workers, &info), Some(1));
-    }
-
-    #[test]
-    fn test_round_robin_with_unhealthy_workers() {
-        let policy = RoundRobinPolicy::new();
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000", "http://w3:8000"]);
-
-        // Mark middle worker as unhealthy
-        workers[1].set_status(WorkerStatus::NotReady);
-
-        // Should skip unhealthy worker: 0, 2, 0, 2, ...
-        let info = SelectWorkerInfo::default();
-        assert_eq!(policy.select_worker(&workers, &info), Some(0));
-        assert_eq!(policy.select_worker(&workers, &info), Some(2));
-        assert_eq!(policy.select_worker(&workers, &info), Some(0));
-        assert_eq!(policy.select_worker(&workers, &info), Some(2));
-    }
-
-    #[test]
-    fn test_round_robin_reset() {
-        let policy = RoundRobinPolicy::new();
-        let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
-
-        // Advance the counter
-        let info = SelectWorkerInfo::default();
-        assert_eq!(policy.select_worker(&workers, &info), Some(0));
-        assert_eq!(policy.select_worker(&workers, &info), Some(1));
-
-        // Reset should start from beginning
-        policy.reset();
-        assert_eq!(policy.select_worker(&workers, &info), Some(0));
-    }
-
-    fn assert_even_two_pool_coverage(prefill: [usize; 4], decode: [usize; 4]) {
-        assert_eq!(
-            prefill,
-            [10, 10, 10, 10],
-            "even two-pool round-robin coverage: prefill"
-        );
-        assert_eq!(
-            decode,
-            [10, 10, 10, 10],
-            "even two-pool round-robin coverage: decode"
-        );
-    }
-
-    fn make_regular_workers(prefix: &str, n: usize) -> Vec<Arc<dyn Worker>> {
-        (0..n)
-            .map(|i| {
-                Arc::new(
-                    BasicWorkerBuilder::new(format!("http://{prefix}{i}:8000"))
-                        .worker_type(WorkerType::Regular)
-                        .health_config(no_health_check())
-                        .build(),
-                ) as Arc<dyn Worker>
-            })
-            .collect()
-    }
-
-    #[test]
-    fn test_one_instance_keeps_each_candidate_set_fair() {
-        // One instance serving two interleaved sets: each set gets its own
-        // rotation, so the interleaving cannot pin a set to some of its
-        // workers (a single counter would give each set only two of four).
-        let prefill_workers = make_regular_workers("p", 4);
-        let decode_workers = make_regular_workers("d", 4);
-        let info = SelectWorkerInfo::default();
-
-        let shared = RoundRobinPolicy::new();
-        let mut shared_prefill = [0usize; 4];
-        let mut shared_decode = [0usize; 4];
-        for _ in 0..40 {
-            let p = shared.select_worker(&prefill_workers, &info).unwrap();
-            let d = shared.select_worker(&decode_workers, &info).unwrap();
-            shared_prefill[p] += 1;
-            shared_decode[d] += 1;
-        }
-        assert_even_two_pool_coverage(shared_prefill, shared_decode);
-    }
-
-    #[test]
-    fn test_a_set_that_shrinks_and_grows_keeps_rotating() {
-        // Health changes the set's identity. The shrunken set is new, so it
-        // starts from the shared position (1 by then), not from worker 0
-        // again; the full set resumes where it left off when it returns.
-        let workers = make_regular_workers("w", 3);
-        let info = SelectWorkerInfo::default();
-        let policy = RoundRobinPolicy::new();
-        assert_eq!(policy.select_worker(&workers, &info), Some(0));
-        workers[1].set_status(WorkerStatus::NotReady);
-        assert_eq!(policy.select_worker(&workers, &info), Some(2));
-        assert_eq!(policy.select_worker(&workers, &info), Some(0));
-        workers[1].set_status(WorkerStatus::Ready);
-        assert_eq!(policy.select_worker(&workers, &info), Some(1));
-        assert_eq!(policy.select_worker(&workers, &info), Some(2));
-    }
-
-    #[test]
-    fn test_past_the_cap_a_new_set_evicts_the_least_recently_used() {
-        let info = SelectWorkerInfo::default();
-        let policy = RoundRobinPolicy::new();
-        let hot = make_regular_workers("hot", 2);
-        assert_eq!(policy.select_worker(&hot, &info), Some(0));
-        // Distinct one-worker sets fill the map to just under the cap.
-        let filler: Vec<Vec<Arc<dyn Worker>>> = (0..MAX_TRACKED_SETS + 3)
-            .map(|i| make_regular_workers(&format!("f{i}-"), 1))
-            .collect();
-        for set in &filler[..MAX_TRACKED_SETS - 2] {
-            policy.select_worker(set, &info);
-        }
-        // The hot set is used again, so it is recent when the cap is hit.
-        assert_eq!(policy.select_worker(&hot, &info), Some(1));
-        for set in &filler[MAX_TRACKED_SETS - 2..] {
-            policy.select_worker(set, &info);
-        }
-        // Evictions took the oldest fillers, one per miss: the map stays at
-        // the cap and the hot set kept its rotation, which continues.
-        assert_eq!(policy.counters.len(), MAX_TRACKED_SETS);
-        assert!(policy
-            .counters
-            .contains_key(&RoundRobinPolicy::set_key(&hot, &[0, 1])));
-        assert!(!policy
-            .counters
-            .contains_key(&RoundRobinPolicy::set_key(&filler[0], &[0])));
-        assert_eq!(policy.select_worker(&hot, &info), Some(0));
-    }
-
-    #[test]
-    fn test_independent_counters_pass_even_two_pool_coverage() {
-        let prefill_workers = make_regular_workers("p", 4);
-        let decode_workers = make_regular_workers("d", 4);
-        let info = SelectWorkerInfo::default();
-
-        let prefill_policy = RoundRobinPolicy::new();
-        let decode_policy = RoundRobinPolicy::new();
-        let mut indep_prefill = [0usize; 4];
-        let mut indep_decode = [0usize; 4];
-        for _ in 0..40 {
-            let p = prefill_policy
-                .select_worker(&prefill_workers, &info)
-                .unwrap();
-            let d = decode_policy.select_worker(&decode_workers, &info).unwrap();
-            indep_prefill[p] += 1;
-            indep_decode[d] += 1;
-        }
-        assert_even_two_pool_coverage(indep_prefill, indep_decode);
-    }
-}
+#[path = "../../tests/unit/policies/round_robin/tests.rs"]
+mod tests;

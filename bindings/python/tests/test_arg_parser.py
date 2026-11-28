@@ -6,6 +6,7 @@ without starting actual router instances.
 """
 
 import argparse
+import logging
 import re
 import sys
 from types import SimpleNamespace
@@ -71,7 +72,7 @@ class TestRouterArgs:
         # Test basic defaults
         assert args.host == "0.0.0.0"
         assert args.port == 30000
-        assert args.policy == "cache_aware"
+        assert args.policy is None
         assert args.worker_urls == []
         assert args.pd_disaggregation is False
         assert args.prefill_urls == []
@@ -1299,6 +1300,8 @@ class TestParseRouterArgs:
             "example.com/connector",
             "--kv-engine-id-annotation",
             "example.com/engine-id",
+            "--pairing-protocol-label",
+            "example.com/rollout",
         ]
         args_b = [
             "--service-discovery",
@@ -1313,6 +1316,8 @@ class TestParseRouterArgs:
             "example.com/connector",
             "--kv-engine-id-annotation",
             "example.com/engine-id",
+            "--pairing-protocol-label",
+            "example.com/rollout",
         ]
 
         for args in [args_a, args_b]:
@@ -1324,12 +1329,14 @@ class TestParseRouterArgs:
             assert router_args.service_discovery_namespace == "default"
             assert router_args.kv_connector_annotation == "example.com/connector"
             assert router_args.kv_engine_id_annotation == "example.com/engine-id"
+            assert router_args.pairing_protocol_label == "example.com/rollout"
 
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser)
         defaults = parser.parse_args([])
         assert defaults.kv_connector_annotation == RouterArgs.kv_connector_annotation
         assert defaults.kv_engine_id_annotation == RouterArgs.kv_engine_id_annotation
+        assert defaults.pairing_protocol_label == RouterArgs.pairing_protocol_label
 
     def test_repeated_list_flags_accumulate(self):
         """Repeated occurrences of list flags append, matching the Rust CLI."""
@@ -2070,8 +2077,8 @@ class TestParserFlag:
 
 class TestParserNames:
     """--tool-call-parser and --reasoning-parser take the legacy parsers' names, Symphony's tables'
-    names, and a name a table answers to that no legacy parser has, which a launcher passes for a
-    model family whose table has no older parser."""
+    names, and every name a table answers to: a legacy parser's of either kind, and one a
+    launcher passes for a model family whose table has no older parser."""
 
     def test_a_tables_name_without_a_legacy_parser_is_a_choice_of_both_flags(self):
         for choices in (get_available_tool_call_parsers(), get_available_reasoning_parsers()):
@@ -2079,9 +2086,13 @@ class TestParserNames:
             assert "muse" in choices
             assert "muse_spark" in choices
             assert "hf" in choices
-        # A legacy parser's name stays a choice of its own flag only.
+        # A legacy parser's name a table answers to is a choice of both flags; one no table
+        # answers to stays a choice of its own flag only.
         assert "qwen_xml" in get_available_tool_call_parsers()
-        assert "qwen_xml" not in get_available_reasoning_parsers()
+        assert "qwen_xml" in get_available_reasoning_parsers()
+        assert "minimax" in get_available_tool_call_parsers()
+        assert "pythonic" in get_available_tool_call_parsers()
+        assert "pythonic" not in get_available_reasoning_parsers()
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser)
         args = RouterArgs.from_cli_args(
@@ -2344,9 +2355,9 @@ class TestSecretSources:
         assert args.redis_url == "redis://new.example:6379"
 
     def test_the_key_files_reach_the_arguments_as_paths(self, tmp_path, monkeypatch):
-        """A key read from a file leaves the file's path on the arguments beside
-        the value, by the flag or the environment: the target of the key
-        reload. A key given as a value leaves no path."""
+        """A key file named by the flag or the environment reaches the arguments
+        as its path alone: the binding reads it and the key reload watches it.
+        A key given as a value leaves no path."""
         api_key = tmp_path / "api-key"
         api_key.write_text("file-shared-key\n")
         tenants = tmp_path / "tenants"
@@ -2367,12 +2378,13 @@ class TestSecretSources:
         assert by_flag.api_key_file == str(api_key)
         assert by_flag.tenant_api_keys_file == str(tenants)
         assert by_flag.control_plane_api_keys_file == str(operators)
-        assert by_flag.api_key == "file-shared-key"
+        assert by_flag.api_key is None, "the binding reads the file"
+        assert by_flag.tenant_api_keys == [] and by_flag.control_plane_api_keys == []
 
         monkeypatch.setenv("SMG_API_KEY_FILE", str(api_key))
         by_env = parse_router_args([])
         assert by_env.api_key_file == str(api_key)
-        assert by_env.api_key == "file-shared-key"
+        assert by_env.api_key is None
         monkeypatch.delenv("SMG_API_KEY_FILE")
 
         by_value = parse_router_args(["--api-key", "flag-key", "--tenant-api-key", "red:flag-red"])
@@ -2380,34 +2392,55 @@ class TestSecretSources:
         assert by_value.tenant_api_keys_file is None
         assert by_value.control_plane_api_keys_file is None
 
-    def test_a_key_file_without_its_value_is_refused_by_the_binding(self, tmp_path):
-        """A direct RouterArgs naming a key file without the key read from it
-        would start the gateway without that key while the record named the
-        file: the binding refuses it by name. With the value beside the file,
-        as from_cli_args passes them, it is taken."""
+    def test_the_binding_reads_a_key_file_and_refuses_a_key_given_twice(self, tmp_path):
+        """A RouterArgs naming a key file alone is taken: the binding reads the
+        file as the CLI does. A key beside its file is refused as given twice,
+        by the two keywords; no refusal carries a key."""
         key_file = tmp_path / "api-key"
         key_file.write_text("file-shared-key\n")
+        tenants = tmp_path / "tenants"
+        tenants.write_text("red:file-red\n")
+        operators = tmp_path / "control-plane-keys"
+        operators.write_text("ops:Ops:admin:file-ops-key\n")
         worker_urls = ["http://localhost:8000"]
-        with pytest.raises(ValueError, match=r"^api_key_file names a key file without the key"):
-            Router.from_args(RouterArgs(worker_urls=worker_urls, api_key_file=str(key_file)))
-        with pytest.raises(ValueError, match=r"^tenant_api_keys_file names a key file"):
-            Router.from_args(
-                RouterArgs(worker_urls=worker_urls, tenant_api_keys_file=str(key_file))
-            )
         Router.from_args(
             RouterArgs(
-                worker_urls=worker_urls, api_key="file-shared-key", api_key_file=str(key_file)
+                worker_urls=worker_urls,
+                api_key_file=str(key_file),
+                tenant_api_keys_file=str(tenants),
+                control_plane_api_keys_file=str(operators),
             )
         )
+        with pytest.raises(ValueError, match=r"^api_key and api_key_file are both given"):
+            Router.from_args(
+                RouterArgs(worker_urls=worker_urls, api_key="k", api_key_file=str(key_file))
+            )
+        with pytest.raises(ValueError, match=r"^tenant_api_keys and tenant_api_keys_file"):
+            Router.from_args(
+                RouterArgs(
+                    worker_urls=worker_urls,
+                    tenant_api_keys=[("red", "k")],
+                    tenant_api_keys_file=str(tenants),
+                )
+            )
+        with pytest.raises(ValueError, match=r"^control_plane_auth.api_keys and") as excinfo:
+            Router.from_args(
+                RouterArgs(
+                    worker_urls=worker_urls,
+                    control_plane_api_keys=[("ops", "Ops", "k", "admin")],
+                    control_plane_api_keys_file=str(operators),
+                )
+            )
+        assert "file-ops-key" not in str(excinfo.value)
 
     def test_the_key_files_are_watched_only_when_asked(self):
         assert parse_router_args([]).secrets_auto_reload is False
         assert parse_router_args(["--secrets-auto-reload"]).secrets_auto_reload is True
 
     def test_secrets_are_read_from_files(self, tmp_path, monkeypatch):
-        """A secret file is read whole with its trailing newline dropped, a
-        tenant key file one entry per line with blank and comment lines
-        skipped; the file is named by its flag or its environment variable."""
+        """A store URL file is read whole with its trailing newline dropped; a
+        key file reaches the arguments as its path, for the binding to read.
+        Each file is named by its flag or its environment variable."""
         api_key = tmp_path / "api-key"
         api_key.write_text("file-shared-key\n")
         tenants = tmp_path / "tenants"
@@ -2437,12 +2470,10 @@ class TestSecretSources:
                 str(pg),
             ]
         )
-        assert by_flag.api_key == "file-shared-key"
-        assert by_flag.tenant_api_keys == [("red", "file-red"), ("blue", "file-blue")]
-        assert by_flag.control_plane_api_keys == [
-            ("ops", "Ops", "file-ops-key", "admin"),
-            ("ro", "Read", "file-ro-key", "user"),
-        ]
+        assert by_flag.api_key is None and by_flag.api_key_file == str(api_key)
+        assert by_flag.tenant_api_keys == [] and by_flag.tenant_api_keys_file == str(tenants)
+        assert by_flag.control_plane_api_keys == []
+        assert by_flag.control_plane_api_keys_file == str(operators)
         assert by_flag.postgres_db_url == "postgresql://u:file-pg@db.example:5432/smg"
 
         monkeypatch.setenv("SMG_API_KEY_FILE", str(api_key))
@@ -2450,9 +2481,9 @@ class TestSecretSources:
         monkeypatch.setenv("CONTROL_PLANE_API_KEYS_FILE", str(operators))
         monkeypatch.setenv("SMG_REDIS_URL_FILE", str(redis))
         by_env = parse_router_args(["--history-backend", "redis"])
-        assert by_env.api_key == "file-shared-key"
-        assert by_env.tenant_api_keys == [("red", "file-red"), ("blue", "file-blue")]
-        assert len(by_env.control_plane_api_keys) == 2
+        assert by_env.api_key is None and by_env.api_key_file == str(api_key)
+        assert by_env.tenant_api_keys == [] and by_env.tenant_api_keys_file == str(tenants)
+        assert by_env.control_plane_api_keys_file == str(operators)
         assert by_env.redis_url == "redis://:file-redis@cache.example:6379/1"
 
     @pytest.mark.parametrize(
@@ -2540,26 +2571,8 @@ class TestSecretSources:
         comments_only = tmp_path / "comments-only"
         comments_only.write_text("# nothing here\n\n")
 
+        # The store URL files are the launcher's: refused by the flag and the path.
         for argv, flag, reason in [
-            (["--api-key-file", str(missing)], "--api-key-file", "cannot be read"),
-            (["--api-key-file", str(empty)], "--api-key-file", "is empty"),
-            (["--api-key-file", str(two_lines)], "--api-key-file", "more than one line"),
-            (
-                ["--tenant-api-keys-file", str(comments_only)],
-                "--tenant-api-keys-file",
-                "holds no entry",
-            ),
-            (["--tenant-api-keys-file", str(missing)], "--tenant-api-keys-file", "cannot be read"),
-            (
-                ["--control-plane-api-keys-file", str(comments_only)],
-                "--control-plane-api-keys-file",
-                "holds no entry",
-            ),
-            (
-                ["--control-plane-api-keys-file", str(missing)],
-                "--control-plane-api-keys-file",
-                "cannot be read",
-            ),
             (
                 ["--history-backend", "postgres", "--postgres-db-url-file", str(two_lines)],
                 "--postgres-db-url-file",
@@ -2575,6 +2588,35 @@ class TestSecretSources:
                 parse_router_args(argv)
             text = str(excinfo.value)
             assert flag in text and str(tmp_path) in text and reason in text, text
+            assert "first-secret" not in text
+
+        # The key files are the binding's: refused by the file's setting and the path.
+        worker_urls = ["http://localhost:8000"]
+        for kwargs, setting, reason in [
+            ({"api_key_file": str(missing)}, "api-key-file", "cannot be read"),
+            ({"api_key_file": str(empty)}, "api-key-file", "is empty"),
+            ({"api_key_file": str(two_lines)}, "api-key-file", "more than one line"),
+            (
+                {"tenant_api_keys_file": str(comments_only)},
+                "tenant-api-keys-file",
+                "holds no entry",
+            ),
+            ({"tenant_api_keys_file": str(missing)}, "tenant-api-keys-file", "cannot be read"),
+            (
+                {"control_plane_api_keys_file": str(comments_only)},
+                "control-plane-api-keys-file",
+                "holds no entry",
+            ),
+            (
+                {"control_plane_api_keys_file": str(missing)},
+                "control-plane-api-keys-file",
+                "cannot be read",
+            ),
+        ]:
+            with pytest.raises(ValueError) as excinfo:
+                Router.from_args(RouterArgs(worker_urls=worker_urls, **kwargs))
+            text = str(excinfo.value)
+            assert setting in text and str(tmp_path) in text and reason in text, text
             assert "first-secret" not in text
 
     def test_tenant_entries_from_the_environment_are_checked_like_the_flags(self, monkeypatch):
@@ -2618,8 +2660,8 @@ class TestSecretSources:
 
         args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
 
-        assert args.api_key == "file-shared-key"
-        assert args.tenant_api_keys == [("red", "file-red")]
+        assert args.api_key is None and args.api_key_file == str(api_key)
+        assert args.tenant_api_keys == [] and args.tenant_api_keys_file == str(tenants)
 
     def test_the_help_names_the_sources_and_shows_no_value(self, monkeypatch):
         """The launcher's --help prints every default, so a secret from the
@@ -2704,25 +2746,80 @@ class TestPdPairingMode:
         assert _rust_router_kwargs(pd_pairing_mode="strict")["pd_pairing_mode"] == "strict"
 
 
-class TestPolicyEngine:
-    """--policy-engine takes the Rust CLI's two values with its default (legacy) and
-    reaches the Rust router; a launcher-started router decided through the legacy path."""
+class TestGrandCentral:
+    def test_the_switch_and_document_have_defaults(self):
+        for args in (RouterArgs(), parse_router_args([])):
+            assert args.grand_central == "off"
+            assert args.policy_spec is None
 
-    def test_default_is_the_rust_cli_default(self):
-        assert RouterArgs().policy_engine == "legacy"
-        assert parse_router_args([]).policy_engine == "legacy"
+    @pytest.mark.parametrize("value", ["on", "off"])
+    def test_the_switch_parses_each_choice(self, value):
+        assert parse_router_args(["--grand-central", value]).grand_central == value
+        assert _prefixed(["--router-grand-central", value]).grand_central == value
 
-    @pytest.mark.parametrize("mode", ["legacy", "engine"])
-    def test_each_choice_parses(self, mode):
-        assert parse_router_args(["--policy-engine", mode]).policy_engine == mode
-        assert _prefixed(["--router-policy-engine", mode]).policy_engine == mode
-
-    def test_an_unknown_value_is_refused_at_parse_time(self):
+    def test_an_unknown_switch_value_is_refused(self):
         with pytest.raises(SystemExit):
-            parse_router_args(["--policy-engine", "remote"])
+            parse_router_args(["--grand-central", "other"])
 
-    def test_reaches_the_rust_router(self):
-        assert _rust_router_kwargs(policy_engine="engine")["policy_engine"] == "engine"
+    def test_the_document_path_survives_parsing(self):
+        assert parse_router_args(["--policy-spec", "routing.yaml"]).policy_spec == "routing.yaml"
+        assert _prefixed(["--router-policy-spec", "routing.yaml"]).policy_spec == "routing.yaml"
+
+    def test_the_switch_and_document_reach_the_native_constructor(self):
+        keywords = _rust_router_kwargs(grand_central="on", policy_spec="routing.yaml")
+        assert keywords["grand_central"] == "on"
+        assert keywords["policy_spec"] == "routing.yaml"
+
+    def test_an_omitted_policy_stays_unset_through_parsing_and_keyword_conversion(self):
+        assert parse_router_args([]).policy is None
+        assert _prefixed([]).policy is None
+        assert _rust_router_kwargs()["policy"] is None
+        assert _prefixed(["--router-policy", "cache_aware"]).policy == "cache_aware"
+
+    @pytest.mark.parametrize(
+        ("policies", "message"),
+        [
+            (
+                {"prefill_policy": "random"},
+                "Using --prefill-policy 'random' for prefill nodes and --policy 'cache_aware' for decode nodes.",
+            ),
+            (
+                {"decode_policy": "random"},
+                "Using --policy 'cache_aware' for prefill nodes and --decode-policy 'random' for decode nodes.",
+            ),
+            (
+                {"prefill_policy": "random", "decode_policy": "random"},
+                "Both --prefill-policy and --decode-policy are specified. "
+                "The main --policy flag will be ignored for PD mode.",
+            ),
+        ],
+    )
+    def test_pd_policy_messages_use_the_default_without_a_document(self, caplog, policies, message):
+        args = RouterArgs(pd_disaggregation=True, **policies)
+        with caplog.at_level(logging.INFO):
+            args._validate_router_args()
+            assert caplog.messages == [message]
+            caplog.clear()
+            args.policy_spec = "routing.yaml"
+            args._validate_router_args()
+            assert caplog.messages == []
+
+    @pytest.mark.parametrize(
+        ("flags", "policy"),
+        [
+            ([], "passthrough"),
+            (["--router-grand-central", "on", "--router-policy-spec", "routing.yaml"], None),
+        ],
+    )
+    def test_single_worker_serve_preserves_the_policy_when_given_a_document(self, flags, policy):
+        from smg.serve import ServeOrchestrator
+
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        args = parser.parse_args(flags)
+        args.data_parallel_size = 1
+        with patch("smg.serve.BACKEND_LAUNCHERS", {"worker": object}):
+            assert ServeOrchestrator("worker", args, [])._build_router_args().policy == policy
 
 
 class TestPowerOfTwoLoadMetric:
@@ -2736,6 +2833,28 @@ class TestPowerOfTwoLoadMetric:
     def test_resident_tokens_without_a_cost_is_refused(self):
         with pytest.raises(SystemExit):
             parse_router_args(["--power-of-two-load-metric", "resident_tokens"])
+
+
+class TestGroupedDpSticky:
+    """--grouped-dp-sticky takes the Rust CLI's choices with its default (off: no
+    request is pinned to an engine of a grouped worker) and reaches the Rust router."""
+
+    def test_default_is_the_rust_cli_default(self):
+        assert RouterArgs().grouped_dp_sticky == "off"
+        assert parse_router_args([]).grouped_dp_sticky == "off"
+
+    @pytest.mark.parametrize("mode", ["off", "hash"])
+    def test_each_choice_parses(self, mode):
+        assert parse_router_args(["--grouped-dp-sticky", mode]).grouped_dp_sticky == mode
+        assert _prefixed(["--router-grouped-dp-sticky", mode]).grouped_dp_sticky == mode
+
+    def test_an_unknown_mode_is_refused_at_parse_time(self):
+        with pytest.raises(SystemExit):
+            parse_router_args(["--grouped-dp-sticky", "round_robin"])
+
+    def test_reaches_the_rust_router(self):
+        assert _rust_router_kwargs(grouped_dp_sticky="hash")["grouped_dp_sticky"] == "hash"
+        assert _rust_router_kwargs()["grouped_dp_sticky"] == "off"
 
 
 class TestRuntimeWorkerThreads:

@@ -1,5 +1,7 @@
 //! Streaming response accumulator for persisting responses.
 
+use std::borrow::Cow;
+
 use openai_protocol::event_types::{OutputItemEvent, ResponseEvent};
 use serde_json::Value;
 use tracing::warn;
@@ -38,6 +40,24 @@ impl StreamingResponseAccumulator {
         self.process_block(block);
     }
 
+    /// Feed the accumulator one event already split into its name and data
+    /// payload; the payload is parsed here.
+    pub fn ingest_event(&mut self, event_name: Option<&str>, data: &str) {
+        if data.trim().is_empty() {
+            return;
+        }
+        match serde_json::from_str::<Value>(data) {
+            Ok(parsed) => self.record_event(event_name, Cow::Owned(parsed)),
+            Err(err) => warn!("Failed to parse streaming event JSON: {}", err),
+        }
+    }
+
+    /// Feed the accumulator one event whose data payload the caller has
+    /// parsed already, so a relayed event is parsed once.
+    pub fn ingest_parsed(&mut self, event_name: Option<&str>, parsed: &Value) {
+        self.record_event(event_name, Cow::Borrowed(parsed));
+    }
+
     /// Consume the accumulator and produce the best-effort final response value.
     pub fn into_final_response(mut self) -> Option<Value> {
         if self.completed_response.is_some() {
@@ -58,28 +78,6 @@ impl StreamingResponseAccumulator {
             .and_then(|id| id.as_str())
     }
 
-    pub fn snapshot_final_response(&self) -> Option<Value> {
-        if let Some(resp) = &self.completed_response {
-            return Some(resp.clone());
-        }
-        self.build_fallback_response_snapshot()
-    }
-
-    fn build_fallback_response_snapshot(&self) -> Option<Value> {
-        let mut response = self.initial_response.clone()?;
-
-        if let Some(obj) = response.as_object_mut() {
-            obj.insert("status".to_string(), Value::String("completed".to_string()));
-
-            let mut output_items = self.output_items.clone();
-            output_items.sort_by_key(|(index, _)| *index);
-            let outputs: Vec<Value> = output_items.into_iter().map(|(_, item)| item).collect();
-            obj.insert("output".to_string(), Value::Array(outputs));
-        }
-
-        Some(response)
-    }
-
     fn process_block(&mut self, block: &str) {
         let trimmed = block.trim();
         if trimmed.is_empty() {
@@ -87,22 +85,13 @@ impl StreamingResponseAccumulator {
         }
 
         let (event_name, data) = parse_sse_block(trimmed);
-        if data.is_empty() {
-            return;
-        }
-
-        self.handle_event(event_name, &data);
+        self.ingest_event(event_name, &data);
     }
 
-    fn handle_event(&mut self, event_name: Option<&str>, data_payload: &str) {
-        let parsed: Value = match serde_json::from_str(data_payload) {
-            Ok(value) => value,
-            Err(err) => {
-                warn!("Failed to parse streaming event JSON: {}", err);
-                return;
-            }
-        };
-
+    /// Record what the final response needs from one parsed event; the
+    /// error event's payload is kept whole, so a borrowed one is copied there
+    /// and nowhere else.
+    fn record_event(&mut self, event_name: Option<&str>, parsed: Cow<'_, Value>) {
         match get_event_type(event_name, &parsed) {
             ResponseEvent::CREATED if self.initial_response.is_none() => {
                 if let Some(response) = parsed.get("response") {
@@ -122,7 +111,7 @@ impl StreamingResponseAccumulator {
                 }
             }
             "response.error" => {
-                self.encountered_error = Some(parsed);
+                self.encountered_error = Some(parsed.into_owned());
             }
             _ => {}
         }

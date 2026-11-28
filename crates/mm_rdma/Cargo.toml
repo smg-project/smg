@@ -10,10 +10,11 @@ repository = "https://github.com/smg-project/smg"
 default = []
 # Compile the real NIXL implementation. The default build uses a no-op stub so
 # ordinary gateway builds need no NIXL headers / clang / bindgen or libnixl.
-nixl = ["dep:nixl-sys"]
+nixl = ["dep:nixl-sys", "dep:tracing"]
 
 [dependencies]
-tracing.workspace = true
+# Read by the NIXL implementation alone (src/nixl.rs): the no-op stub build does not link it.
+tracing = { workspace = true, optional = true }
 # Pure slot bookkeeping (compiled for the `nixl` impl and for tests); lightweight,
 # no bindgen, so it stays a plain dependency rather than feature-gated.
 dashmap.workspace = true

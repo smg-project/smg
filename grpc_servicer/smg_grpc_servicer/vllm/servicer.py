@@ -6,6 +6,7 @@ Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 """
 
 import asyncio
+import inspect
 import itertools
 import json
 import os
@@ -32,6 +33,12 @@ from vllm.multimodal.inputs import (
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 
+from smg_grpc_servicer.constrained_decoding import (
+    VLLM_SCHEMA_BACKENDS,
+    answer_schema_in_place_of_tag,
+    answer_schema_the_engine_judges,
+    structural_tag_vocabulary,
+)
 from smg_grpc_servicer.kv_relay import Engine, relay
 from smg_grpc_servicer.load_record import engine_load_from
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
@@ -67,8 +74,9 @@ from smg_grpc_servicer.vllm.mm_processor import (
 )
 from smg_grpc_servicer.vllm.mm_salt import (
     engine_accepts_mm_inputs,
+    engine_cache_salt,
     has_preprocessed_mm_payload,
-    mm_identity_cache_salt,
+    request_cache_salt,
 )
 from smg_grpc_servicer.vllm.mm_tensors import tensor_from_proto
 from smg_grpc_servicer.vllm.model_info import (
@@ -101,6 +109,15 @@ try:
     from vllm.version import __version__ as VLLM_VERSION
 except Exception:  # pragma: no cover - version lookup is best-effort
     VLLM_VERSION = ""
+# The engine's own validation of a request under xgrammar, the features
+# xgrammar lacks and the conversion itself: a pinned xgrammar refuses by it
+# and `auto` falls back by it; None on a release that has none.
+try:
+    from vllm.v1.structured_output.backend_xgrammar import (
+        validate_xgrammar_grammar as _XGRAMMAR_VALIDATES,
+    )
+except Exception:  # pragma: no cover - a release without it still starts
+    _XGRAMMAR_VALIDATES = None
 
 
 def _valid_cpu_ec_handle(handle) -> bool:
@@ -120,6 +137,26 @@ def _prompt_length(prompt) -> int:
         ids = prompt.get("prompt_token_ids")
         return len(ids) if ids is not None else 0
     return 0
+
+
+def _takes_reasoning_ended(engine) -> bool:
+    """Whether the engine's generate() takes `reasoning_ended`.
+
+    Read off its signature rather than a version: an engine whose generate()
+    does not name the keyword is never handed it (see Generate).
+    """
+    generate = getattr(engine, "generate", None)
+    return generate is not None and "reasoning_ended" in inspect.signature(generate).parameters
+
+
+def _structured_outputs_backend(engine) -> str:
+    """The structured-outputs backend the engine was started with.
+
+    Read off its config rather than a version: an engine whose config names
+    none runs its default ("auto").
+    """
+    section = EngineConfigView(getattr(engine, "vllm_config", None)).structured_outputs
+    return str(section.backend or "auto")
 
 
 def _managed_ranks(engine) -> list[int]:
@@ -257,6 +294,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         settle_logging()
         self.engine = async_llm
         self.start_time = start_time
+        # Read once: the engine's signature does not change under a servicer.
+        self._takes_reasoning_ended = _takes_reasoning_ended(async_llm)
+        # Read once: the structured-outputs backend the engine was started
+        # with, which decides how an answer's structural tag is sent.
+        self._structured_outputs_backend = _structured_outputs_backend(async_llm)
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
@@ -403,6 +445,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         try:
             arrival_time = time.time()
             kv_transfer_params = params_from_request(request)
+            cache_salt = request_cache_salt(request)
             ec_json = getattr(request, "ec_transfer_params_json", "")
             ec_transfer_params = json.loads(ec_json) if ec_json else None
             if ec_json and not isinstance(ec_transfer_params, dict):
@@ -542,9 +585,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 # alias. Grid-carrying sides took the preprocessed path above.
                 batches = mm_batches(request)
                 if batches:
-                    cache_salt = mm_identity_cache_salt(mm_identity_hashes(batches))
-                    if cache_salt is not None:
-                        prompt["cache_salt"] = cache_salt
+                    cache_salt = engine_cache_salt(cache_salt, mm_identity_hashes(batches))
                     if uses_mrope(getattr(self.engine, "model_config", None)):
                         logger.warning(
                             "Request %s carries mm identity but no grid tensors on an "
@@ -555,11 +596,18 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             else:
                 prompt = request.text
 
+            # Every prompt shape carries the salt; text takes it in its dict form.
+            if cache_salt is not None:
+                if isinstance(prompt, str):
+                    prompt = {"prompt": prompt}
+                prompt["cache_salt"] = cache_salt
+
             # Build sampling params with detokenize=False
             sampling_params = self._sampling_params_from_proto(
                 request.sampling_params,
                 stream=request.stream,
                 kv_transfer_params=kv_transfer_params,
+                structured_outputs_backend=self._structured_outputs_backend,
             )
             if ec_transfer_params is not None:
                 sampling_params.extra_args = {
@@ -578,6 +626,19 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 generate_kwargs["reasoning_parser_kwargs"] = {
                     "chat_template_kwargs": template_kwargs
                 }
+            # A grammar the Router led with the model's thought for a worker
+            # whose grammar starts at the first token starts there whatever
+            # reasoning parser the engine runs: `reasoning_ended=True` is the
+            # engine's own switch for the gate behind its parser being passed,
+            # as the Rust servicer sets it. A request that constrains nothing,
+            # or whose grammar the Router did not shape, says nothing of it,
+            # and the engine starts the grammar where it does.
+            if (
+                request.sampling_params.grammar_from_first_token
+                and request.sampling_params.WhichOneof("constraint")
+                and self._takes_reasoning_ended
+            ):
+                generate_kwargs["reasoning_ended"] = True
 
             # Extract logprobs configuration
             num_logprobs = sampling_params.logprobs
@@ -1047,6 +1108,18 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         if "constrained_decoding_start" in info.DESCRIPTOR.fields_by_name:
             info.engine_reasoning_parser = engine_reasoning_parser(self.engine.vllm_config)
             info.constrained_decoding_start = constrained_decoding_start(self.engine.vllm_config)
+        # The cache partition fields Generate reads; likewise absent from an
+        # older package.
+        if "cache_partition_fields" in info.DESCRIPTOR.fields_by_name:
+            info.cache_partition_fields = "cache_salt"
+        # The vocabulary of structural-tag nodes the engine's grammar backend
+        # takes, as the Rust launcher reports it: the Router spells an older
+        # xgrammar's structural tags in the older vocabulary.
+        if "structural_tag_vocabulary" in info.DESCRIPTOR.fields_by_name:
+            view = EngineConfigView(self.engine.vllm_config)
+            info.structural_tag_vocabulary = structural_tag_vocabulary(
+                str(view.structured_outputs.backend or "auto")
+            )
         if "constrained_decoding" in info.DESCRIPTOR.fields_by_name:
             info.constrained_decoding = self._constrained_decoding
         ec_config = getattr(self.engine.vllm_config, "ec_transfer_config", None)
@@ -1281,6 +1354,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         params: vllm_engine_pb2.SamplingParams,
         stream: bool = True,
         kv_transfer_params: dict | None = None,
+        structured_outputs_backend: str = "auto",
     ) -> SamplingParams:
         """
         Convert protobuf SamplingParams to vLLM SamplingParams.
@@ -1289,6 +1363,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             params: Protobuf SamplingParams message
             stream: Whether streaming is enabled
             kv_transfer_params: Connector KV-transfer params dict (PD disaggregation)
+            structured_outputs_backend: The backend the engine was started with; a
+                structural tag that is a JSON answer's schema alone goes as that
+                schema to one the tag is not spelled for
 
         Returns:
             vLLM SamplingParams with detokenize=False and structured_outputs
@@ -1308,7 +1385,35 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             elif constraint_field == "grammar":
                 structured_outputs = StructuredOutputsParams(grammar=params.grammar)
             elif constraint_field == "structural_tag":
-                structured_outputs = StructuredOutputsParams(structural_tag=params.structural_tag)
+                schema = answer_schema_in_place_of_tag(
+                    params.structural_tag, structured_outputs_backend, VLLM_SCHEMA_BACKENDS
+                )
+                if schema is None:
+                    # The engine validates a request: it is handed one of its
+                    # own that holds the plain schema alone.
+                    schema = answer_schema_the_engine_judges(
+                        params.structural_tag,
+                        structured_outputs_backend,
+                        _XGRAMMAR_VALIDATES
+                        and (
+                            lambda plain: _XGRAMMAR_VALIDATES(
+                                SamplingParams(
+                                    structured_outputs=StructuredOutputsParams(json=plain)
+                                )
+                            )
+                        ),
+                    )
+                if schema is not None:
+                    logger.debug(
+                        "a structural tag that is a JSON answer's schema alone goes to the "
+                        "%s backend as that schema",
+                        structured_outputs_backend,
+                    )
+                    structured_outputs = StructuredOutputsParams(json=schema)
+                else:
+                    structured_outputs = StructuredOutputsParams(
+                        structural_tag=params.structural_tag
+                    )
             elif constraint_field == "json_object":
                 structured_outputs = StructuredOutputsParams(json_object=params.json_object)
             elif constraint_field == "choice":
@@ -1339,7 +1444,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             n=params.n if params.n > 0 else 1,
             logprobs=params.logprobs if params.HasField("logprobs") else None,
             prompt_logprobs=params.prompt_logprobs if params.HasField("prompt_logprobs") else None,
-            seed=params.seed if params.HasField("seed") else None,
+            # The seed word in its unsigned form: the engine reads a seed of -1 as
+            # "no seed" and derives each of n > 1 choices' seeds by an offset, so a
+            # word that is never negative keeps every choice seeded; the form is
+            # one-to-one, so distinct words stay distinct.
+            seed=(params.seed & 0xFFFFFFFF) if params.HasField("seed") else None,
             include_stop_str_in_output=params.include_stop_str_in_output,
             logit_bias=dict(params.logit_bias) if params.logit_bias else None,
             structured_outputs=structured_outputs,

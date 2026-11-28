@@ -46,7 +46,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
 
 [lints]
 workspace = true

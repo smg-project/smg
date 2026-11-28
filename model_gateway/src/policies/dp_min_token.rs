@@ -1,12 +1,13 @@
-//! dp minimum tokens policy
-//！
-//! Engine support external DP dispatch
-//！ this policy select dp_rank with the minimum number of tokens
+//! The DP minimum-tokens policy: for an engine that takes an external DP
+//! dispatch, the rank with the lowest token load. The pick adds the
+//! request's estimated tokens to that rank's cached load, so the picks
+//! before the next load report count what was already sent its way.
 
 use std::sync::Arc;
 
+use smg_worker::{identity::basic::Worker, load::monitor::WorkerLoadManager};
+
 use super::DPRankLoadPolicy;
-use crate::worker::{Worker, WorkerLoadManager};
 
 #[derive(Debug)]
 pub struct MinimumTokensPolicy {

@@ -12,7 +12,7 @@ use smg_grpc_client::{
 use tonic::{Request, Response, Status};
 
 use super::{embed, generate, info, State};
-use crate::{kv_events, rpc, servicer::RequestOrigin, BoxStream};
+use crate::{admin, kv_events, rpc, servicer::RequestOrigin, trace_context, BoxStream};
 
 /// What neither servicer serves: the msgpack wire has no adapter-loading
 /// message, and the Python servicer does not implement these RPCs either.
@@ -29,6 +29,23 @@ fn no_control_wire(rpc: &str) -> Status {
     Status::unimplemented(format!("{rpc} {NO_CONTROL_WIRE}"))
 }
 
+// Ordinary text uses the existing Generate/Abort lifecycle even in an EPD pool.
+// Media and the private control envelope still require the fenced control RPC.
+/// Separate native text generation from envelopes that require prepared-input ownership.
+fn requires_managed_control(request: &sg::GenerateRequest) -> bool {
+    request.mm_inputs.is_some()
+        || !request.extra_mm_inputs.is_empty()
+        || !request.input_embeds.is_empty()
+        || request.media_identity.is_some()
+        || !request.prepared_input.is_empty()
+        || request.sampling_params.as_ref().is_some_and(|params| {
+            params
+                .custom_params
+                .as_ref()
+                .is_some_and(|custom| custom.fields.contains_key("__smg_managed_epd_v1"))
+        })
+}
+
 #[tonic::async_trait]
 impl SglangScheduler for SglangService {
     type GenerateStream = BoxStream<sg::GenerateResponse>;
@@ -39,7 +56,15 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<sg::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        let trace_headers = crate::trace_context::trace_headers(request.metadata());
+        if !request.get_ref().prepared_control.is_empty() {
+            return super::native::generate(&self.state, request.into_inner()).map(Response::new);
+        }
+        if self.state.managed_config.is_some() && requires_managed_control(request.get_ref()) {
+            return Err(Status::failed_precondition(
+                "prepared-input metadata is required",
+            ));
+        }
+        let trace_headers = trace_context::trace_headers(request.metadata());
         let stream = generate::generate(
             &self.state,
             request.into_inner(),
@@ -117,7 +142,7 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<common::FlushCacheRequest>,
     ) -> Result<Response<common::FlushCacheResponse>, Status> {
-        crate::admin::flush_cache(&self.state.shared, request)
+        admin::flush_cache(&self.state.shared, request)
             .await
             .map(Response::new)
     }
@@ -126,7 +151,7 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<common::StartProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        crate::admin::start_profile(&self.state.shared, request.into_inner())
+        admin::start_profile(&self.state.shared, request.into_inner())
             .await
             .map(Response::new)
     }
@@ -135,7 +160,7 @@ impl SglangScheduler for SglangService {
         &self,
         _request: Request<common::StopProfileRequest>,
     ) -> Result<Response<common::ProfileResponse>, Status> {
-        crate::admin::stop_profile(&self.state.shared)
+        admin::stop_profile(&self.state.shared)
             .await
             .map(Response::new)
     }
@@ -172,6 +197,13 @@ impl SglangScheduler for SglangService {
         &self,
         _request: Request<sg::ListLoadedLoRaAdaptersRequest>,
     ) -> Result<Response<sg::ListLoadedLoRaAdaptersResponse>, Status> {
-        Err(no_control_wire("ListLoadedLoRAAdapters"))
+        self.state.shared.engine()?;
+        Ok(Response::new(sg::ListLoadedLoRaAdaptersResponse {
+            loaded_adapters: self.state.loras.adapters.clone(),
+        }))
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/sglang/service/tests.rs"]
+mod tests;

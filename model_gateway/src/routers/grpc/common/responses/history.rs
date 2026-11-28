@@ -13,10 +13,13 @@
 use std::sync::Arc;
 
 use axum::response::Response;
-use openai_protocol::responses::{
-    from_turn_boundary, generate_id, normalize_input_item, without_outputs_of_missing_calls,
-    McpToolCallError, ResponseContentPart, ResponseInput, ResponseInputOutputItem,
-    ResponsesRequest, StringOrContentParts,
+use openai_protocol::{
+    responses::{
+        from_turn_boundary, generate_id, normalize_input_item, without_calls_answered_by,
+        without_outputs_of_missing_calls, McpToolCallError, ResponseContentPart, ResponseInput,
+        ResponseInputOutputItem, ResponsesRequest, StringOrContentParts,
+    },
+    validated::Normalizable,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -26,8 +29,16 @@ use smg_data_connector::{
 };
 use tracing::{debug, warn};
 
-use super::{previous_response_chain, ResponsesContext};
-use crate::routers::{common::persistence_utils::split_stored_message_content, error};
+use super::{
+    previous_response_chain, utils::refuse_tools_without_a_direct_caller, ResponsesContext,
+};
+use crate::routers::{
+    common::{
+        persistence_utils::split_stored_message_content,
+        responses_compat::lower_responses_request_for_local_backend,
+    },
+    error,
+};
 
 /// How many of a conversation's stored items a request replays: its newest
 /// ones, oldest first; what is older is not in the prompt. A window this
@@ -91,7 +102,11 @@ pub(crate) async fn load_history(
 
     let mut loaded = request.clone();
     if continues {
-        history.extend(current_input_items(&request.input));
+        // The copy of the request's own input made just above is the one that
+        // joins the history, moved out of the loaded request; the normaliser
+        // reshapes it in place instead of copying every item a second time.
+        let own_input = std::mem::replace(&mut loaded.input, ResponseInput::Items(Vec::new()));
+        history.extend(current_input_items(own_input));
         loaded.input = ResponseInput::Items(history);
         loaded.previous_response_id = None;
     }
@@ -139,6 +154,18 @@ pub(crate) async fn load_history(
         }
     }
 
+    // Lower any inline `additional_tools` / `agent_message` items (from the
+    // loaded history or the current turn) into standard top-level `tools` and
+    // `user` messages for local backends, while keeping the caller's original
+    // `request` untouched for persistence so subsequent turns can replay them.
+    lower_responses_request_for_local_backend(&mut loaded)?;
+    if continues && loaded.tool_choice.is_none() {
+        loaded.normalize();
+    }
+    if let Some(error_response) = refuse_tools_without_a_direct_caller(loaded.tools.as_deref()) {
+        return Err(error_response);
+    }
+
     debug!(
         has_previous_response = request.previous_response_id.is_some(),
         has_conversation = request.conversation.is_some(),
@@ -150,17 +177,18 @@ pub(crate) async fn load_history(
 
 /// The request's own input as items: a text input is the user message it
 /// stands for; an item list is normalized (a bare `{role, content}` message
-/// becomes a message item), every other item kept as it came.
-pub(crate) fn current_input_items(input: &ResponseInput) -> Vec<ResponseInputOutputItem> {
+/// becomes a message item), every other item kept as it came. The input is
+/// taken by value: what is not reshaped moves, nothing is copied.
+pub(crate) fn current_input_items(input: ResponseInput) -> Vec<ResponseInputOutputItem> {
     match input {
         ResponseInput::Text(text) => vec![ResponseInputOutputItem::Message {
             id: generate_id("msg"),
             role: "user".to_string(),
-            content: vec![ResponseContentPart::InputText { text: text.clone() }],
+            content: vec![ResponseContentPart::InputText { text }],
             status: Some("completed".to_string()),
             phase: None,
         }],
-        ResponseInput::Items(items) => items.iter().map(normalize_input_item).collect(),
+        ResponseInput::Items(items) => items.into_iter().map(normalize_input_item).collect(),
     }
 }
 
@@ -199,15 +227,16 @@ fn replays(item: &ResponseInputOutputItem) -> bool {
 
 /// The pipeline a loaded history is replayed into. A stored message replays
 /// the content parts that pipeline carried when the turn was answered: the
-/// chat conversion never carried an `input_file` or an `input_image` without
-/// an `image_url` (a `file_id` is not resolvable here), the Harmony builder
-/// no `input_image` at all. Such parts are left out when the history loads,
-/// as an unreplayed item is ([`unreplayed_kind`]): the turn was answered
-/// without them, and a continuation refused on them until the client edits a
-/// chain it cannot edit is a conversation the client cannot carry on. A
-/// request's own input is not filtered and keeps its refusal, and so does a
-/// conversation item the client added itself (no response wrote it, so no
-/// pipeline ever answered without its parts).
+/// chat conversion never carried an `input_file`, an `input_image` without
+/// an `image_url` (a `file_id` is not resolvable here) or a media part of a
+/// `developer` message (the developer turn folds into the system text), the
+/// Harmony builder no `input_image` at all. Such parts are left out when the
+/// history loads, as an unreplayed item is ([`unreplayed_kind`]): the turn
+/// was answered without them, and a continuation refused on them until the
+/// client edits a chain it cannot edit is a conversation the client cannot
+/// carry on. A request's own input is not filtered and keeps its refusal, and
+/// so does a conversation item the client added itself (no response wrote
+/// it, so no pipeline ever answered without its parts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplayInto {
     /// The chat conversion (`responses_to_chat`).
@@ -217,12 +246,13 @@ pub(crate) enum ReplayInto {
 }
 
 impl ReplayInto {
-    /// Whether the pipeline carried `part` when a stored turn was answered.
-    fn carried(self, part: &ResponseContentPart) -> bool {
+    /// Whether the pipeline carried `part` of a message with `role` when a
+    /// stored turn was answered.
+    fn carried(self, role: &str, part: &ResponseContentPart) -> bool {
         match part {
             ResponseContentPart::InputFile { .. } => false,
             ResponseContentPart::InputImage { image_url, .. } => match self {
-                Self::Chat => image_url.is_some(),
+                Self::Chat => image_url.is_some() && role != "developer",
                 Self::Harmony => false,
             },
             ResponseContentPart::OutputText { .. }
@@ -235,9 +265,9 @@ impl ReplayInto {
 /// `item` with the content parts `into` never carried left out (see
 /// [`ReplayInto`]); an item that is not a message is returned as it is.
 fn replayed_parts(mut item: ResponseInputOutputItem, into: ReplayInto) -> ResponseInputOutputItem {
-    fn keep_carried(parts: &mut Vec<ResponseContentPart>, into: ReplayInto) {
+    fn keep_carried(role: &str, parts: &mut Vec<ResponseContentPart>, into: ReplayInto) {
         parts.retain(|part| {
-            let carried = into.carried(part);
+            let carried = into.carried(role, part);
             if !carried {
                 let part_type = match part {
                     ResponseContentPart::InputFile { .. } => "input_file",
@@ -252,11 +282,12 @@ fn replayed_parts(mut item: ResponseInputOutputItem, into: ReplayInto) -> Respon
         });
     }
     match &mut item {
-        ResponseInputOutputItem::Message { content, .. } => keep_carried(content, into),
+        ResponseInputOutputItem::Message { role, content, .. } => keep_carried(role, content, into),
         ResponseInputOutputItem::SimpleInputMessage {
+            role,
             content: StringOrContentParts::Array(parts),
             ..
-        } => keep_carried(parts, into),
+        } => keep_carried(role, parts, into),
         _ => {}
     }
     item
@@ -285,7 +316,14 @@ fn unreplayed_kind(item: &ResponseInputOutputItem) -> Option<&'static str> {
         ResponseInputOutputItem::ApplyPatchCallOutput { .. } => Some("apply_patch_call_output"),
         ResponseInputOutputItem::LocalShellCall { .. } => Some("local_shell_call"),
         ResponseInputOutputItem::LocalShellCallOutput { .. } => Some("local_shell_call_output"),
-        ResponseInputOutputItem::Message { .. }
+        ResponseInputOutputItem::Program { .. } => Some("program"),
+        ResponseInputOutputItem::ProgramOutput { .. } => Some("program_output"),
+        ResponseInputOutputItem::AdditionalTools { .. }
+        | ResponseInputOutputItem::AgentMessage { .. }
+        | ResponseInputOutputItem::ToolSearchCall { .. }
+        | ResponseInputOutputItem::ToolSearchOutput { .. }
+        | ResponseInputOutputItem::WebSearchCall { .. }
+        | ResponseInputOutputItem::Message { .. }
         | ResponseInputOutputItem::SimpleInputMessage { .. }
         | ResponseInputOutputItem::Reasoning { .. }
         | ResponseInputOutputItem::FunctionToolCall { .. }
@@ -334,17 +372,19 @@ pub(crate) fn hosted_call_result(
 /// content parts and the phase label it may carry, a reasoning row added
 /// through the conversations API from the bare content it stores, any other
 /// row from the whole item it stores. `None` for a row that has no input form
-/// (a built-in tool call, an older schema), which is left out.
-fn conversation_item_as_input(item: &ConversationItem) -> Option<ResponseInputOutputItem> {
+/// (a built-in tool call, an older schema), which is left out. The row is
+/// consumed: its strings become the item's, with no copy; a row that carries
+/// its id on the row only has that id written into the item.
+fn conversation_item_as_input(item: ConversationItem) -> Option<ResponseInputOutputItem> {
     match item.item_type.as_str() {
         "message" => {
-            let (content, phase) = split_stored_message_content(item.content.clone());
+            let (content, phase) = split_stored_message_content(item.content);
             match serde_json::from_value::<Vec<ResponseContentPart>>(content) {
                 Ok(content) => Some(ResponseInputOutputItem::Message {
-                    id: item.id.0.clone(),
-                    role: item.role.clone().unwrap_or_else(|| "user".to_string()),
+                    id: item.id.0,
+                    role: item.role.unwrap_or_else(|| "user".to_string()),
                     content,
-                    status: item.status.clone(),
+                    status: item.status,
                     phase,
                 }),
                 Err(e) => {
@@ -353,31 +393,36 @@ fn conversation_item_as_input(item: &ConversationItem) -> Option<ResponseInputOu
                 }
             }
         }
-        "reasoning" if item.content.is_array() => {
-            match serde_json::from_value(item.content.clone()) {
-                Ok(content) => Some(ResponseInputOutputItem::new_reasoning(
-                    item.id.0.clone(),
-                    vec![],
-                    content,
-                    item.status.clone(),
-                )),
-                Err(e) => {
-                    warn!(item_id = %item.id.0, error = %e, "Stored reasoning item has no readable content; left out of the history");
-                    None
-                }
+        "reasoning" if item.content.is_array() => match serde_json::from_value(item.content) {
+            Ok(content) => Some(ResponseInputOutputItem::new_reasoning(
+                item.id.0,
+                vec![],
+                content,
+                item.status,
+            )),
+            Err(e) => {
+                warn!(item_id = %item.id.0, error = %e, "Stored reasoning item has no readable content; left out of the history");
+                None
             }
-        }
+        },
         _ => {
             // A whole-item row keeps the item under its own fields; a row
             // added through the conversations API carries its id on the row
             // only, and an item is found by id when referenced.
-            let mut whole = item.content.clone();
+            let mut whole = item.content;
+            let id = item.id.0;
             if let Some(fields) = whole.as_object_mut() {
                 fields
                     .entry("id")
-                    .or_insert_with(|| Value::String(item.id.0.clone()));
+                    .or_insert_with(|| Value::String(id.clone()));
             }
-            stored_item_as_input(&whole)
+            match serde_json::from_value(whole) {
+                Ok(input) => Some(input),
+                Err(e) => {
+                    warn!(item_id = %id, item_type = %item.item_type, error = %e, "Stored item has no readable form; left out of the history");
+                    None
+                }
+            }
         }
     }
 }
@@ -393,7 +438,9 @@ fn stored_item_as_input(item: &Value) -> Option<ResponseInputOutputItem> {
 
 /// The replayable items of a conversation, its newest
 /// [`MAX_CONVERSATION_HISTORY_ITEMS`] oldest first, as the caller's `tenant`
-/// may see it: a conversation of another tenant is as missing.
+/// may see it: a conversation of another tenant is as missing. An
+/// `item_reference` row of the window is resolved as one of the request's own
+/// is ([`resolve_item_references`], its 404 and its 400 included).
 async fn conversation_items(
     stores: HistoryStores<'_>,
     conversation_id: &str,
@@ -450,33 +497,85 @@ async fn conversation_items(
     if cut {
         stored.drain(..stored.len() - MAX_CONVERSATION_HISTORY_ITEMS);
     }
+    let mut hidden = false;
+    // The rows the rule hid, converted: the call of an output among them is
+    // not replayed either.
+    let mut skipped = Vec::new();
     // A row a stored response wrote was answered without the parts the
     // pipeline never carried; a row the client added to the conversation
     // itself (no response id) was answered by nobody and keeps every part,
     // so the conversion refuses it as it would the request's own.
     let items: Vec<ResponseInputOutputItem> = stored
-        .iter()
+        .into_iter()
         .filter_map(|row| {
+            let visible = row.is_visible_to(tenant);
+            hidden |= !visible;
+            let answered = row.response_id.is_some();
             let item = conversation_item_as_input(row).filter(replays)?;
-            Some(if row.response_id.is_some() {
+            if !visible {
+                skipped.push(item);
+                return None;
+            }
+            Some(if answered {
                 replayed_parts(item, into)
             } else {
                 item
             })
         })
         .collect();
-    if !cut {
-        return Ok(items);
+    let mut items = without_calls_answered_by(items, &skipped);
+    if cut {
+        // The window is cut at the limit: it begins at its first turn boundary
+        // (the tail of the turn the cut split is not replayed), and an output
+        // whose call is before it is not either.
+        debug!(
+            conversation_id,
+            limit = MAX_CONVERSATION_HISTORY_ITEMS,
+            "Conversation history cut to its newest items"
+        );
+        items = from_turn_boundary(items);
     }
-    // The window is cut at the limit: it begins at its first turn boundary
-    // (the tail of the turn the cut split is not replayed), and an output
-    // whose call is before it is not either.
-    debug!(
-        conversation_id,
-        limit = MAX_CONVERSATION_HISTORY_ITEMS,
-        "Conversation history cut to its newest items"
-    );
-    Ok(without_outputs_of_missing_calls(from_turn_boundary(items)))
+    // The output of a call the rule hid is no history, as after a cut.
+    let lost_rows = cut || hidden;
+    // A call the window holds as an `item_reference` row pairs as a stored
+    // call does: what the boundary left is resolved before the outputs are
+    // matched with their calls.
+    let references: Vec<(usize, ResponseInputOutputItem)> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| matches!(item, ResponseInputOutputItem::ItemReference { .. }))
+        .map(|(at, item)| (at, item.clone()))
+        .collect();
+    if !references.is_empty() {
+        let mut marked = resolve_item_references(stores.responses.as_ref(), items, tenant).await?;
+        // Each reference row goes back in front of the item it named, as a
+        // mark: the pair rule passes it by, whatever it takes out.
+        for (at, row) in references.into_iter().rev() {
+            marked.insert(at, row);
+        }
+        if !cut {
+            // Not after a cut: the boundary may have dropped the output the
+            // first run kept a stored call for, and a run here would take
+            // that call from under the output the request brings.
+            marked = without_calls_answered_by(marked, &skipped);
+        }
+        // An output before a reference pairs with the calls before that
+        // reference alone: a call a reference names must not keep an
+        // older output of its id.
+        items = Vec::with_capacity(marked.len());
+        for item in marked {
+            if !matches!(item, ResponseInputOutputItem::ItemReference { .. }) {
+                items.push(item);
+            } else if lost_rows {
+                items = without_outputs_of_missing_calls(items);
+            }
+        }
+    }
+    Ok(if lost_rows {
+        without_outputs_of_missing_calls(items)
+    } else {
+        items
+    })
 }
 
 /// Replace every `item_reference` input item by the item it points to: an item
@@ -536,7 +635,7 @@ async fn resolve_item_references(
         };
         // a stored item that has no input form (a built-in tool call, an older
         // schema) exists but cannot be re-injected: say so, not "not found"
-        match serde_json::from_value::<ResponseInputOutputItem>(candidate.clone()) {
+        match ResponseInputOutputItem::deserialize(candidate) {
             Ok(found) => resolved.push(found),
             Err(e) => {
                 let item_type = candidate
@@ -561,15 +660,22 @@ async fn resolve_item_references(
 fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
     match item {
         ResponseInputOutputItem::Message { id, .. }
-        | ResponseInputOutputItem::Reasoning { id, .. }
         | ResponseInputOutputItem::McpApprovalRequest { id, .. }
-        | ResponseInputOutputItem::ImageGenerationCall { id, .. }
         | ResponseInputOutputItem::ComputerCall { id, .. }
-        | ResponseInputOutputItem::LocalShellCall { id, .. }
         | ResponseInputOutputItem::LocalShellCallOutput { id, .. }
         | ResponseInputOutputItem::McpCall { id, .. }
         | ResponseInputOutputItem::McpListTools { id, .. } => Some(id.as_str()),
-        ResponseInputOutputItem::FunctionToolCall { id, .. }
+        ResponseInputOutputItem::Reasoning { id, .. }
+        | ResponseInputOutputItem::AdditionalTools { id, .. }
+        | ResponseInputOutputItem::AgentMessage { id, .. }
+        | ResponseInputOutputItem::ToolSearchCall { id, .. }
+        | ResponseInputOutputItem::ToolSearchOutput { id, .. }
+        | ResponseInputOutputItem::WebSearchCall { id, .. }
+        | ResponseInputOutputItem::Program { id, .. }
+        | ResponseInputOutputItem::ProgramOutput { id, .. }
+        | ResponseInputOutputItem::ImageGenerationCall { id, .. }
+        | ResponseInputOutputItem::LocalShellCall { id, .. }
+        | ResponseInputOutputItem::FunctionToolCall { id, .. }
         | ResponseInputOutputItem::FunctionCallOutput { id, .. }
         | ResponseInputOutputItem::McpApprovalResponse { id, .. }
         | ResponseInputOutputItem::Compaction { id, .. }
@@ -588,1011 +694,5 @@ fn input_item_id(item: &ResponseInputOutputItem) -> Option<&str> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use axum::http;
-    use openai_protocol::{common::ConversationRef, responses::StringOrContentParts};
-    use serde_json::json;
-    use smg_data_connector::{
-        AddedAtSequence, ConversationItemId, MemoryConversationItemStorage,
-        MemoryConversationStorage, MemoryResponseStorage, NewConversation, NewConversationItem,
-    };
-
-    use super::*;
-    use crate::routers::common::persistence_utils::persist_conversation_items;
-
-    /// The stores of one gateway, in memory, with the conversation `conv_1`.
-    pub(crate) struct Stores {
-        pub responses: Arc<dyn ResponseStorage>,
-        pub conversations: Arc<dyn ConversationStorage>,
-        pub conversation_items: Arc<dyn ConversationItemStorage>,
-    }
-
-    impl Stores {
-        pub(crate) async fn with_conversation() -> Self {
-            let stores = Self {
-                responses: Arc::new(MemoryResponseStorage::new()),
-                conversations: Arc::new(MemoryConversationStorage::new()),
-                conversation_items: Arc::new(MemoryConversationItemStorage::new()),
-            };
-            stores
-                .conversations
-                .create_conversation(NewConversation {
-                    id: Some(ConversationId::from("conv_1")),
-                    metadata: None,
-                    tenant: None,
-                })
-                .await
-                .expect("the conversation is created");
-            stores
-        }
-
-        pub(crate) fn history(&self) -> HistoryStores<'_> {
-            HistoryStores {
-                responses: &self.responses,
-                conversations: self.conversations.as_ref(),
-                conversation_items: self.conversation_items.as_ref(),
-            }
-        }
-
-        /// Stores a turn as the gateway persists one: `request` answered by
-        /// a response of `output` items under `response_id`.
-        pub(crate) async fn store_turn(
-            &self,
-            response_id: &str,
-            request: &ResponsesRequest,
-            output: Value,
-        ) {
-            let response = json!({
-                "id": response_id,
-                "object": "response",
-                "model": "m",
-                "status": "completed",
-                "output": output,
-            });
-            persist_conversation_items(
-                self.conversations.clone(),
-                self.conversation_items.clone(),
-                self.responses.clone(),
-                &response,
-                request,
-                None,
-                None,
-            )
-            .await
-            .expect("the turn is stored");
-        }
-    }
-
-    /// Turn 1 of the tests: the user's question, answered by one function
-    /// call the client is to run.
-    pub(crate) fn function_call_output() -> Value {
-        json!([{
-            "type": "function_call", "id": "fc_1", "call_id": "call_A",
-            "name": "calc", "arguments": "{\"expr\":\"6*7\"}", "status": "completed"
-        }])
-    }
-
-    /// Turn 2 of the tests: the client answers call_A.
-    pub(crate) fn function_call_output_input() -> ResponseInput {
-        ResponseInput::Items(vec![ResponseInputOutputItem::FunctionCallOutput {
-            id: None,
-            call_id: "call_A".to_string(),
-            output: StringOrContentParts::String("42".to_string()),
-            status: None,
-        }])
-    }
-
-    /// The kinds of the items, with the call id of a tool item, for the
-    /// order assertions.
-    pub(crate) fn shape(items: &[ResponseInputOutputItem]) -> Vec<String> {
-        items
-            .iter()
-            .map(|item| match item {
-                ResponseInputOutputItem::Message { role, .. } => format!("message:{role}"),
-                ResponseInputOutputItem::FunctionToolCall {
-                    call_id, output, ..
-                } => format!(
-                    "function_call:{call_id}{}",
-                    if output.is_some() { "+output" } else { "" }
-                ),
-                ResponseInputOutputItem::FunctionCallOutput { call_id, .. } => {
-                    format!("function_call_output:{call_id}")
-                }
-                ResponseInputOutputItem::Reasoning { .. } => "reasoning".to_string(),
-                other => serde_json::to_value(other).expect("an item serializes")["type"]
-                    .as_str()
-                    .unwrap_or("?")
-                    .to_string(),
-            })
-            .collect()
-    }
-
-    /// The part types of a loaded message item, for the replay assertions.
-    fn part_types(item: &ResponseInputOutputItem) -> Vec<String> {
-        let ResponseInputOutputItem::Message { content, .. } = item else {
-            panic!("a message item: {item:?}");
-        };
-        content
-            .iter()
-            .map(|part| {
-                serde_json::to_value(part).expect("a part serializes")["type"]
-                    .as_str()
-                    .unwrap_or("?")
-                    .to_string()
-            })
-            .collect()
-    }
-
-    /// A stored turn whose message carried a part the pipeline never took
-    /// (an `input_file`; an `input_image` without a URL; on the Harmony path
-    /// any `input_image`) replays without that part, on the chain and in the
-    /// conversation alike: the turn was answered without it, and a chain
-    /// cannot be edited. The request's own input is not filtered.
-    #[tokio::test]
-    async fn a_stored_part_the_pipeline_never_carried_is_left_out_of_the_replay() {
-        let stores = Stores::with_conversation().await;
-        let user_turn: ResponseInputOutputItem = serde_json::from_value(json!({
-            "type": "message", "id": "msg_u1", "role": "user", "content": [
-                {"type": "input_text", "text": "Read this and look at that."},
-                {"type": "input_file", "filename": "notes.txt", "file_data": "aGVsbG8="},
-                {"type": "input_image", "file_id": "file_1"},
-                {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
-            ]
-        }))
-        .expect("a user message item");
-        let turn_1 = ResponsesRequest {
-            input: ResponseInput::Items(vec![user_turn.clone()]),
-            conversation: Some(ConversationRef::Id("conv_1".to_string())),
-            ..Default::default()
-        };
-        stores
-            .store_turn(
-                "resp_1",
-                &turn_1,
-                json!([{"type": "message", "id": "msg_1", "role": "assistant",
-                        "content": [{"type": "output_text", "text": "Read.", "annotations": []}]}]),
-            )
-            .await;
-
-        for (into, replayed) in [
-            (ReplayInto::Chat, vec!["input_text", "input_image"]),
-            (ReplayInto::Harmony, vec!["input_text"]),
-        ] {
-            for continuation in [
-                ResponsesRequest {
-                    input: ResponseInput::Items(vec![user_turn.clone()]),
-                    previous_response_id: Some("resp_1".to_string()),
-                    ..Default::default()
-                },
-                ResponsesRequest {
-                    input: ResponseInput::Items(vec![user_turn.clone()]),
-                    conversation: Some(ConversationRef::Id("conv_1".to_string())),
-                    ..Default::default()
-                },
-            ] {
-                let loaded = load_history(stores.history(), &continuation, None, into)
-                    .await
-                    .expect("the history loads");
-                let ResponseInput::Items(items) = &loaded.input else {
-                    panic!("the loaded input is an item list");
-                };
-                assert_eq!(
-                    shape(items),
-                    ["message:user", "message:assistant", "message:user"]
-                );
-                assert_eq!(part_types(&items[0]), replayed, "{into:?}: the stored turn");
-                assert_eq!(
-                    part_types(&items[2]),
-                    ["input_text", "input_file", "input_image", "input_image"],
-                    "{into:?}: the request's own input keeps every part"
-                );
-            }
-        }
-    }
-
-    fn turn_1_in_conversation() -> ResponsesRequest {
-        ResponsesRequest {
-            input: ResponseInput::Text("What is 6*7?".to_string()),
-            conversation: Some(ConversationRef::Id("conv_1".to_string())),
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn a_conversation_reload_keeps_the_stored_turns_function_call_and_the_output_in_order() {
-        let stores = Stores::with_conversation().await;
-        stores
-            .store_turn("resp_1", &turn_1_in_conversation(), function_call_output())
-            .await;
-        let turn_2 = ResponsesRequest {
-            input: function_call_output_input(),
-            conversation: Some(ConversationRef::Id("conv_1".to_string())),
-            ..Default::default()
-        };
-
-        let loaded = load_history(stores.history(), &turn_2, None, ReplayInto::Chat)
-            .await
-            .expect("the conversation loads");
-
-        let ResponseInput::Items(items) = &loaded.input else {
-            panic!("the loaded input is an item list");
-        };
-        assert_eq!(
-            shape(items),
-            [
-                "message:user",
-                "function_call:call_A",
-                "function_call_output:call_A"
-            ]
-        );
-        assert!(matches!(
-            &items[1],
-            ResponseInputOutputItem::FunctionToolCall { name, arguments, .. }
-                if name == "calc" && arguments == "{\"expr\":\"6*7\"}"
-        ));
-    }
-
-    /// A stored row of a kind no conversion replays (a hosted image
-    /// generation the gateway wrote, the client's approval turn) is left out
-    /// when the history loads, through `conversation` and through
-    /// `previous_response_id` alike, so the continuation goes on instead of
-    /// failing on the row until the client deletes it.
-    #[tokio::test]
-    async fn stored_kinds_no_conversion_replays_are_left_out_of_the_history() {
-        let stores = Stores::with_conversation().await;
-        stores
-            .store_turn(
-                "resp_1",
-                &turn_1_in_conversation(),
-                json!([
-                    {"type": "image_generation_call", "id": "ig_1", "status": "completed",
-                     "result": "aGVsbG8="},
-                    {"type": "message", "id": "msg_1", "role": "assistant",
-                     "content": [{"type": "output_text", "text": "Drawn.", "annotations": []}]}
-                ]),
-            )
-            .await;
-        let approval: ResponseInputOutputItem = serde_json::from_value(json!({
-            "type": "mcp_approval_response", "approval_request_id": "mcpr_1", "approve": true
-        }))
-        .expect("an approval response item");
-        // Turn 2 continues the conversation and the chain alike, so both
-        // loaders walk past the rows they do not replay.
-        let turn_2 = ResponsesRequest {
-            input: ResponseInput::Items(vec![approval]),
-            conversation: Some(ConversationRef::Id("conv_1".to_string())),
-            previous_response_id: Some("resp_1".to_string()),
-            ..Default::default()
-        };
-        stores
-            .store_turn(
-                "resp_2",
-                &turn_2,
-                json!([
-                    {"type": "message", "id": "msg_2", "role": "assistant",
-                     "content": [{"type": "output_text", "text": "Approved.", "annotations": []}]}
-                ]),
-            )
-            .await;
-        let expected = [
-            "message:user",
-            "message:assistant",
-            "message:assistant",
-            "message:user",
-        ];
-
-        let turn_3 = ResponsesRequest {
-            input: ResponseInput::Text("And now?".to_string()),
-            conversation: Some(ConversationRef::Id("conv_1".to_string())),
-            ..Default::default()
-        };
-        let loaded = load_history(stores.history(), &turn_3, None, ReplayInto::Chat)
-            .await
-            .expect("the conversation loads past the rows it does not replay");
-        let ResponseInput::Items(items) = &loaded.input else {
-            panic!("the loaded input is an item list");
-        };
-        assert_eq!(shape(items), expected);
-
-        let turn_3 = ResponsesRequest {
-            input: ResponseInput::Text("And now?".to_string()),
-            previous_response_id: Some("resp_2".to_string()),
-            ..Default::default()
-        };
-        let loaded = load_history(stores.history(), &turn_3, None, ReplayInto::Chat)
-            .await
-            .expect("the chain loads past the items it does not replay");
-        let ResponseInput::Items(items) = &loaded.input else {
-            panic!("the loaded input is an item list");
-        };
-        assert_eq!(shape(items), expected);
-    }
-
-    /// A stored hosted call replays its output; failing that, its failure
-    /// as text (never a successful empty result for a call that failed); a
-    /// call that has not run replays no result.
-    #[test]
-    fn a_stored_hosted_call_replays_its_output_else_its_failure() {
-        let execution = McpToolCallError::execution("wiki is down");
-        let http = McpToolCallError::HttpError {
-            code: 503,
-            message: "unavailable".to_string(),
-        };
-        assert_eq!(
-            hosted_call_result(Some("found"), None, Some("completed")).as_deref(),
-            Some("found")
-        );
-        assert_eq!(
-            hosted_call_result(Some("found"), Some(&execution), Some("failed")).as_deref(),
-            Some("found"),
-            "an output that is there is the result"
-        );
-        assert_eq!(
-            hosted_call_result(Some(""), Some(&execution), Some("failed")).as_deref(),
-            Some("The tool call failed: wiki is down")
-        );
-        assert_eq!(
-            hosted_call_result(None, Some(&http), None).as_deref(),
-            Some("The tool call failed (HTTP 503): unavailable")
-        );
-        assert_eq!(
-            hosted_call_result(None, None, Some("failed")).as_deref(),
-            Some("The tool call failed.")
-        );
-        assert_eq!(hosted_call_result(None, None, Some("in_progress")), None);
-        assert_eq!(
-            hosted_call_result(Some(""), None, Some("completed")).as_deref(),
-            Some(""),
-            "a completed call with an empty output keeps it"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_previous_response_reload_keeps_the_stored_turns_function_call_and_the_output_in_order(
-    ) {
-        let stores = Stores::with_conversation().await;
-        let turn_1 = ResponsesRequest {
-            input: ResponseInput::Text("What is 6*7?".to_string()),
-            ..Default::default()
-        };
-        stores
-            .store_turn("resp_1", &turn_1, function_call_output())
-            .await;
-        let turn_2 = ResponsesRequest {
-            input: function_call_output_input(),
-            previous_response_id: Some("resp_1".to_string()),
-            ..Default::default()
-        };
-
-        let loaded = load_history(stores.history(), &turn_2, None, ReplayInto::Chat)
-            .await
-            .expect("the chain loads");
-
-        assert_eq!(loaded.previous_response_id, None);
-        let ResponseInput::Items(items) = &loaded.input else {
-            panic!("the loaded input is an item list");
-        };
-        assert_eq!(
-            shape(items),
-            [
-                "message:user",
-                "function_call:call_A",
-                "function_call_output:call_A"
-            ]
-        );
-    }
-
-    /// Turn 3 after the client's answer was stored: the whole exchange comes
-    /// back, the call before its output, through both continuations.
-    #[tokio::test]
-    async fn a_stored_function_call_output_reloads_after_its_call() {
-        let stores = Stores::with_conversation().await;
-        stores
-            .store_turn("resp_1", &turn_1_in_conversation(), function_call_output())
-            .await;
-        let turn_2 = ResponsesRequest {
-            input: function_call_output_input(),
-            conversation: Some(ConversationRef::Id("conv_1".to_string())),
-            previous_response_id: Some("resp_1".to_string()),
-            ..Default::default()
-        };
-        stores
-            .store_turn(
-                "resp_2",
-                &turn_2,
-                json!([{
-                    "type": "message", "id": "msg_a2", "role": "assistant", "status": "completed",
-                    "content": [{"type": "output_text", "text": "42", "annotations": []}]
-                }]),
-            )
-            .await;
-        let expected = [
-            "message:user",
-            "function_call:call_A",
-            "function_call_output:call_A",
-            "message:assistant",
-            "message:user",
-        ];
-
-        for turn_3 in [
-            ResponsesRequest {
-                input: ResponseInput::Text("Thanks".to_string()),
-                conversation: Some(ConversationRef::Id("conv_1".to_string())),
-                ..Default::default()
-            },
-            ResponsesRequest {
-                input: ResponseInput::Text("Thanks".to_string()),
-                previous_response_id: Some("resp_2".to_string()),
-                ..Default::default()
-            },
-        ] {
-            let loaded = load_history(stores.history(), &turn_3, None, ReplayInto::Chat)
-                .await
-                .expect("the history loads");
-            let ResponseInput::Items(items) = &loaded.input else {
-                panic!("the loaded input is an item list");
-            };
-            assert_eq!(shape(items), expected, "{:?}", turn_3.conversation);
-        }
-    }
-
-    /// A function call added through the conversations API is stored whole,
-    /// its id on the row: it reloads under that id.
-    #[tokio::test]
-    async fn a_function_call_added_to_the_conversation_reloads_under_the_rows_id() {
-        let stores = Stores::with_conversation().await;
-        let conv_id = ConversationId::from("conv_1");
-        let row = stores
-            .conversation_items
-            .create_item(NewConversationItem {
-                id: None,
-                response_id: None,
-                item_type: "function_call".to_string(),
-                role: None,
-                content: json!({
-                    "type": "function_call", "call_id": "call_B", "name": "calc",
-                    "arguments": "{}", "status": "completed"
-                }),
-                status: Some("completed".to_string()),
-                tenant: None,
-            })
-            .await
-            .expect("the row is created");
-        stores
-            .conversation_items
-            .link_item(&conv_id, &row.id, chrono::Utc::now())
-            .await
-            .expect("the row is linked");
-        let items = replayed_items(&stores, "go on").await;
-        assert_eq!(shape(&items), ["function_call:call_B", "message:user"]);
-        assert_eq!(input_item_id(&items[0]), Some(row.id.0.as_str()));
-    }
-
-    /// A message the client added to the conversation itself (no response
-    /// wrote it) keeps every part when the history loads, so a generation
-    /// over that conversation meets the conversion's refusal instead of a
-    /// silent trim; the same parts in a turn a stored response wrote are
-    /// left out as never carried.
-    #[tokio::test]
-    async fn a_conversation_item_the_client_added_keeps_its_parts_for_the_refusal() {
-        let stores = Stores::with_conversation().await;
-        let conv_id = ConversationId::from("conv_1");
-        let parts = json!([
-            {"type": "input_text", "text": "Read this."},
-            {"type": "input_file", "filename": "notes.txt", "file_data": "aGVsbG8="},
-            {"type": "input_image", "file_id": "file_1"},
-            {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="}
-        ]);
-        for (response_id, expected) in [
-            (
-                None,
-                vec!["input_text", "input_file", "input_image", "input_image"],
-            ),
-            (
-                Some("resp_0".to_string()),
-                vec!["input_text", "input_image"],
-            ),
-        ] {
-            let row = stores
-                .conversation_items
-                .create_item(NewConversationItem {
-                    id: None,
-                    response_id: response_id.clone(),
-                    item_type: "message".to_string(),
-                    role: Some("user".to_string()),
-                    content: parts.clone(),
-                    status: Some("completed".to_string()),
-                    tenant: None,
-                })
-                .await
-                .expect("the row is created");
-            stores
-                .conversation_items
-                .link_item(&conv_id, &row.id, chrono::Utc::now())
-                .await
-                .expect("the row is linked");
-            let items = replayed_items(&stores, "go on").await;
-            let loaded = items
-                .iter()
-                .find(|item| input_item_id(item) == Some(row.id.0.as_str()))
-                .expect("the row reloads");
-            assert_eq!(part_types(loaded), expected, "response_id {response_id:?}");
-        }
-    }
-
-    /// The items a request that continues `conv_1` with the message `text`
-    /// replays: the loaded history's input, an item list.
-    async fn replayed_items(stores: &Stores, text: &str) -> Vec<ResponseInputOutputItem> {
-        let request = ResponsesRequest {
-            input: ResponseInput::Text(text.to_string()),
-            conversation: Some(ConversationRef::Id("conv_1".to_string())),
-            ..Default::default()
-        };
-        let loaded = load_history(stores.history(), &request, None, ReplayInto::Chat)
-            .await
-            .expect("the conversation loads");
-        let ResponseInput::Items(items) = loaded.input else {
-            panic!("the loaded input is an item list");
-        };
-        items
-    }
-
-    /// Links `rows` to `conv_1` in order, each stamped later than the one
-    /// before, as the conversations API does.
-    async fn link_rows(stores: &Stores, rows: Vec<NewConversationItem>) {
-        let conv_id = ConversationId::from("conv_1");
-        let mut stamps = AddedAtSequence::new();
-        for row in rows {
-            let created = stores
-                .conversation_items
-                .create_item(row)
-                .await
-                .expect("the row is created");
-            stores
-                .conversation_items
-                .link_item(&conv_id, &created.id, stamps.next_added_at())
-                .await
-                .expect("the row is linked");
-        }
-    }
-
-    /// Message `n` of a conversation: a user's for an odd `n`, the
-    /// assistant's for an even one, its text `item n`.
-    fn message_row(n: usize) -> NewConversationItem {
-        let (role, content) = if n % 2 == 1 {
-            (
-                "user",
-                json!([{"type": "input_text", "text": format!("item {n}")}]),
-            )
-        } else {
-            (
-                "assistant",
-                json!([{"type": "output_text", "text": format!("item {n}"), "annotations": []}]),
-            )
-        };
-        NewConversationItem {
-            id: None,
-            response_id: None,
-            item_type: "message".to_string(),
-            role: Some(role.to_string()),
-            content,
-            status: Some("completed".to_string()),
-            tenant: None,
-        }
-    }
-
-    fn call_row(call_id: &str) -> NewConversationItem {
-        NewConversationItem {
-            id: None,
-            response_id: None,
-            item_type: "function_call".to_string(),
-            role: None,
-            content: json!({
-                "type": "function_call", "call_id": call_id, "name": "calc",
-                "arguments": "{}", "status": "completed"
-            }),
-            status: Some("completed".to_string()),
-            tenant: None,
-        }
-    }
-
-    fn output_row(call_id: &str) -> NewConversationItem {
-        NewConversationItem {
-            id: None,
-            response_id: None,
-            item_type: "function_call_output".to_string(),
-            role: None,
-            content: json!({"type": "function_call_output", "call_id": call_id, "output": "42"}),
-            status: Some("completed".to_string()),
-            tenant: None,
-        }
-    }
-
-    /// The text of each message item, for the window assertions.
-    fn texts(items: &[ResponseInputOutputItem]) -> Vec<String> {
-        items
-            .iter()
-            .filter_map(|item| match item {
-                ResponseInputOutputItem::Message { content, .. } => {
-                    content.iter().find_map(|part| match part {
-                        ResponseContentPart::InputText { text }
-                        | ResponseContentPart::OutputText { text, .. } => Some(text.clone()),
-                        _ => None,
-                    })
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    /// A conversation of 120 items replays its newest 100, oldest first,
-    /// then the request's input: the first 20 are not in the prompt.
-    #[tokio::test]
-    async fn a_conversation_longer_than_the_limit_replays_its_newest_items() {
-        let stores = Stores::with_conversation().await;
-        link_rows(&stores, (1..=120).map(message_row).collect()).await;
-        let items = replayed_items(&stores, "item 121").await;
-        let expected: Vec<String> = (21..=121).map(|n| format!("item {n}")).collect();
-        assert_eq!(texts(&items), expected);
-    }
-
-    /// A conversation one item longer than the limit, whose first items are
-    /// two calls with their outputs: its window begins at the first output,
-    /// inside a turn whose request is before the window. The window replays
-    /// from its first client message; the output of the call before it and
-    /// the call with its output after it go with the turn the cut split.
-    #[tokio::test]
-    async fn a_cut_window_begins_at_its_first_client_message() {
-        let stores = Stores::with_conversation().await;
-        let mut rows = vec![
-            call_row("call_A"),
-            output_row("call_A"),
-            call_row("call_B"),
-            output_row("call_B"),
-        ];
-        rows.extend((5..=101).map(message_row));
-        link_rows(&stores, rows).await;
-        let items = replayed_items(&stores, "item 102").await;
-        let kinds = shape(&items);
-        assert_eq!(kinds[0], "message:user", "{kinds:?}");
-        assert!(
-            !kinds.iter().any(|kind| kind.starts_with("function_call")),
-            "{kinds:?}"
-        );
-        // the calls and outputs are the tail of the turn the cut split: the
-        // messages replay, then the request
-        assert_eq!(items.len(), 101 - 4 + 1);
-        let expected: Vec<String> = (5..=102).map(|n| format!("item {n}")).collect();
-        assert_eq!(texts(&items), expected);
-    }
-
-    /// A conversation of exactly the limit is not cut: every item replays,
-    /// an output whose call is not among them included (the window did not
-    /// begin after its call; a builder that refuses such an output says so).
-    #[tokio::test]
-    async fn a_conversation_of_exactly_the_limit_replays_whole() {
-        let stores = Stores::with_conversation().await;
-        let mut rows = vec![output_row("call_A")];
-        rows.extend((2..=100).map(message_row));
-        link_rows(&stores, rows).await;
-        let items = replayed_items(&stores, "item 101").await;
-        let kinds = shape(&items);
-        assert_eq!(kinds[0], "function_call_output:call_A", "{kinds:?}");
-        assert_eq!(items.len(), 100 + 1);
-        assert_eq!(kinds.last().map(String::as_str), Some("message:user"));
-    }
-
-    /// A message row keeps the phase label it was stored with, and a reasoning
-    /// row added through the conversations API (bare content) comes back as
-    /// the reasoning item.
-    #[test]
-    fn message_and_reasoning_rows_rebuild_their_items() {
-        let row = |item_type: &str, role: Option<&str>, content: Value| ConversationItem {
-            id: ConversationItemId::from(format!("{item_type}_1").as_str()),
-            response_id: None,
-            item_type: item_type.to_string(),
-            role: role.map(str::to_string),
-            content,
-            status: Some("completed".to_string()),
-            created_at: chrono::Utc::now(),
-            tenant: None,
-        };
-
-        let message = conversation_item_as_input(&row(
-            "message",
-            Some("assistant"),
-            json!({"content": [{"type": "output_text", "text": "hi", "annotations": []}], "phase": "final_answer"}),
-        ))
-        .expect("a message row rebuilds");
-        assert!(matches!(
-            message,
-            ResponseInputOutputItem::Message { ref id, ref role, phase: Some(openai_protocol::responses::MessagePhase::FinalAnswer), .. }
-                if id == "message_1" && role == "assistant"
-        ));
-
-        let reasoning = conversation_item_as_input(&row(
-            "reasoning",
-            None,
-            json!([{"type": "reasoning_text", "text": "thinking"}]),
-        ))
-        .expect("a reasoning row rebuilds");
-        assert!(matches!(
-            reasoning,
-            ResponseInputOutputItem::Reasoning { ref id, ref content, .. }
-                if id == "reasoning_1" && content.len() == 1
-        ));
-
-        // a row with no input form is left out, not an error
-        assert!(conversation_item_as_input(&row(
-            "web_search_call",
-            None,
-            json!({"type": "web_search_call", "status": "completed"})
-        ))
-        .is_none());
-    }
-
-    fn stored_response_with_message(item_id: &str, text: &str) -> StoredResponse {
-        let mut stored = StoredResponse::new(None);
-        stored.raw_response = json!({
-            "id": "resp_stored",
-            "output": [{
-                "type": "message", "id": item_id, "role": "assistant", "status": "completed",
-                "content": [{"type": "output_text", "text": text, "annotations": []}]
-            }]
-        });
-        stored
-    }
-
-    fn reference(id: &str) -> ResponseInputOutputItem {
-        serde_json::from_value(json!({"type": "item_reference", "id": id})).unwrap()
-    }
-
-    #[tokio::test]
-    async fn item_reference_resolves_a_stored_output_item() {
-        let storage = MemoryResponseStorage::new();
-        storage
-            .store_response(stored_response_with_message("msg_stored", "earlier answer"))
-            .await
-            .unwrap();
-        let user = normalize_input_item(
-            &serde_json::from_value(json!({"role": "user", "content": "continue"})).unwrap(),
-        );
-
-        let resolved = resolve_item_references(&storage, vec![reference("msg_stored"), user], None)
-            .await
-            .expect("a stored output item resolves");
-
-        assert_eq!(resolved.len(), 2);
-        match &resolved[0] {
-            ResponseInputOutputItem::Message {
-                id, role, content, ..
-            } => {
-                assert_eq!(id, "msg_stored");
-                assert_eq!(role, "assistant");
-                assert!(matches!(
-                    &content[0],
-                    ResponseContentPart::OutputText { text, .. } if text == "earlier answer"
-                ));
-            }
-            other => panic!("expected the stored message, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn an_item_reference_to_an_unstored_response_is_not_found() {
-        let storage = MemoryResponseStorage::new();
-        let mut unstored = stored_response_with_message("msg_unstored", "a background answer");
-        unstored.raw_response["store"] = json!(false);
-        storage.store_response(unstored).await.unwrap();
-
-        let refused = resolve_item_references(&storage, vec![reference("msg_unstored")], None)
-            .await
-            .expect_err("an unstored response's item is no stored item");
-
-        assert_eq!(refused.status(), http::StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn item_reference_prefers_an_item_already_loaded() {
-        let storage = MemoryResponseStorage::new();
-        let loaded = ResponseInputOutputItem::Message {
-            id: "msg_loaded".to_string(),
-            role: "assistant".to_string(),
-            content: vec![ResponseContentPart::OutputText {
-                text: "from the chain".to_string(),
-                annotations: vec![],
-                logprobs: None,
-            }],
-            status: Some("completed".to_string()),
-            phase: None,
-        };
-
-        let resolved =
-            resolve_item_references(&storage, vec![loaded, reference("msg_loaded")], None)
-                .await
-                .expect("an item already in the list resolves without storage");
-
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(input_item_id(&resolved[1]), Some("msg_loaded"));
-        assert!(!matches!(
-            resolved[1],
-            ResponseInputOutputItem::ItemReference { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn item_reference_to_a_stored_item_with_no_input_form_is_400() {
-        let storage = MemoryResponseStorage::new();
-        let mut stored = StoredResponse::new(None);
-        stored.raw_response = json!({
-            "id": "resp_stored",
-            "output": [{"type": "web_search_call", "id": "ws_1", "status": "completed"}]
-        });
-        storage.store_response(stored).await.unwrap();
-
-        let response = resolve_item_references(&storage, vec![reference("ws_1")], None)
-            .await
-            .expect_err("a stored item without an input form is refused");
-
-        assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn item_reference_finds_a_loaded_custom_tool_call_by_its_id() {
-        let storage = MemoryResponseStorage::new();
-        let loaded: ResponseInputOutputItem = serde_json::from_value(json!({
-            "type": "custom_tool_call", "id": "ctc_1", "call_id": "call_1",
-            "name": "lookup", "input": "weather"
-        }))
-        .unwrap();
-
-        let resolved = resolve_item_references(&storage, vec![loaded, reference("ctc_1")], None)
-            .await
-            .expect("an item already in the list resolves without storage");
-
-        assert_eq!(resolved.len(), 2);
-        assert_eq!(input_item_id(&resolved[1]), Some("ctc_1"));
-    }
-
-    /// An output item of another tenant's response is as unknown as a missing
-    /// one; the owner's reference resolves.
-    #[tokio::test]
-    async fn item_reference_to_another_tenants_output_item_is_404() {
-        let storage = MemoryResponseStorage::new();
-        let mut stored = stored_response_with_message("msg_a", "a's answer");
-        stored.tenant = Some("header:tenant-a".to_string());
-        storage.store_response(stored).await.unwrap();
-
-        for caller in [Some("header:tenant-b"), None] {
-            let response = resolve_item_references(&storage, vec![reference("msg_a")], caller)
-                .await
-                .expect_err("another tenant's item is refused");
-            assert_eq!(response.status(), http::StatusCode::NOT_FOUND, "{caller:?}");
-        }
-        let resolved =
-            resolve_item_references(&storage, vec![reference("msg_a")], Some("header:tenant-a"))
-                .await
-                .expect("the owner's reference resolves");
-        assert_eq!(input_item_id(&resolved[0]), Some("msg_a"));
-    }
-
-    #[tokio::test]
-    async fn item_reference_to_an_unknown_id_is_404() {
-        let storage = MemoryResponseStorage::new();
-
-        let response = resolve_item_references(&storage, vec![reference("msg_missing")], None)
-            .await
-            .expect_err("an unknown item is refused");
-
-        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
-    }
-    /// Reasoning step `k` of a turn, as the conversations API stores one.
-    fn reasoning_row(k: usize) -> NewConversationItem {
-        NewConversationItem {
-            id: None,
-            response_id: None,
-            item_type: "reasoning".to_string(),
-            role: None,
-            content: json!([{"type": "reasoning_text", "text": format!("step {k}")}]),
-            status: Some("completed".to_string()),
-            tenant: None,
-        }
-    }
-
-    /// A conversation of 150 messages replays its newest 100, items 51 to
-    /// 150 in order, then the request: the cut lands on a user message, a
-    /// turn boundary, so the window replays whole.
-    #[tokio::test]
-    async fn a_cut_that_lands_on_a_turn_boundary_replays_the_newest_items_whole() {
-        let stores = Stores::with_conversation().await;
-        link_rows(&stores, (1..=150).map(message_row).collect()).await;
-        let items = replayed_items(&stores, "item 151").await;
-        let expected: Vec<String> = (51..=151).map(|n| format!("item {n}")).collect();
-        assert_eq!(texts(&items), expected);
-    }
-
-    /// The rows of a conversation of agent turns, each the user's message,
-    /// the model's call, its output and the model's answer: 37 whole turns,
-    /// then a user message and an open call, 150 rows.
-    fn agent_turn_rows() -> Vec<NewConversationItem> {
-        let mut rows = Vec::new();
-        for turn in 1..=37 {
-            rows.push(message_row(4 * turn - 3));
-            rows.push(call_row(&format!("call_{turn}")));
-            rows.push(output_row(&format!("call_{turn}")));
-            rows.push(message_row(4 * turn));
-        }
-        rows.push(message_row(149));
-        rows.push(call_row("call_38"));
-        rows
-    }
-
-    /// A cut that lands inside a turn (row 51 is the output of turn 13's
-    /// call): the window begins at the next turn boundary, the user's
-    /// message of turn 14 (row 53); the output and the answer of turn 13
-    /// before it are not replayed.
-    #[tokio::test]
-    async fn a_cut_window_that_begins_inside_a_turn_starts_at_the_next_turn_boundary() {
-        let stores = Stores::with_conversation().await;
-        link_rows(&stores, agent_turn_rows()).await;
-        let items = replayed_items(&stores, "item 151").await;
-        let kinds = shape(&items);
-        assert_eq!(
-            &kinds[..4],
-            [
-                "message:user",
-                "function_call:call_14",
-                "function_call_output:call_14",
-                "message:assistant"
-            ],
-            "{kinds:?}"
-        );
-        assert!(
-            !kinds.contains(&"function_call_output:call_13".to_string()),
-            "{kinds:?}"
-        );
-        // rows 53 to 150, then the request
-        assert_eq!(items.len(), 150 - 52 + 1);
-        let mut expected: Vec<String> = (14..=37)
-            .flat_map(|turn| [4 * turn - 3, 4 * turn])
-            .map(|n| format!("item {n}"))
-            .collect();
-        expected.extend(["item 149".to_string(), "item 151".to_string()]);
-        assert_eq!(texts(&items), expected);
-    }
-
-    /// One turn longer than the window, the model's reasoning, call and
-    /// output step after step: the window begins at the first call whose
-    /// output it holds, with the reasoning that led to it; the output of the
-    /// step before, whose call is not in the window, is left out.
-    #[tokio::test]
-    async fn a_cut_window_with_no_user_message_starts_at_a_call_with_its_output() {
-        let stores = Stores::with_conversation().await;
-        let mut rows = vec![message_row(1)];
-        for step in 1..=50 {
-            rows.push(reasoning_row(step));
-            rows.push(call_row(&format!("call_{step}")));
-            rows.push(output_row(&format!("call_{step}")));
-        }
-        link_rows(&stores, rows).await;
-        let items = replayed_items(&stores, "go on").await;
-        let kinds = shape(&items);
-        // row 52 of 151 is the output of step 17: the window begins at step 18
-        assert_eq!(
-            &kinds[..3],
-            [
-                "reasoning",
-                "function_call:call_18",
-                "function_call_output:call_18"
-            ],
-            "{kinds:?}"
-        );
-        assert!(
-            !kinds.contains(&"function_call_output:call_17".to_string()),
-            "{kinds:?}"
-        );
-        assert_eq!(kinds.last().map(String::as_str), Some("message:user"));
-        // steps 18 to 50 whole, then the request
-        assert_eq!(items.len(), 33 * 3 + 1);
-    }
-}
+#[path = "../../../../../tests/unit/routers/grpc/common/responses/history/tests.rs"]
+pub(crate) mod tests;

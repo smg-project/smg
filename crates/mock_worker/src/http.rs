@@ -41,9 +41,11 @@ use tokio::{
 
 use crate::{
     admin_ops::{AdminOps, ProfileOptions},
+    bootstrap::{accept_and_close, bind},
     config::{Config, Role},
     drain::{InFlight, WorkerInFlight},
     engine::{self, Engine, NewRequest},
+    grpc::KV_TRANSPORT,
     script::{self, Answer, MatchedStop},
 };
 
@@ -136,7 +138,7 @@ pub async fn serve_with_listener_until(
     let bootstrap_port = port
         .checked_sub(cfg.http_base_port)
         .and_then(|index| cfg.bootstrap_port_for(index));
-    let bootstrap = match crate::bootstrap::bind(&cfg.host, bootstrap_port).await {
+    let bootstrap = match bind(&cfg.host, bootstrap_port).await {
         Ok(listener) => listener,
         Err(e) => {
             tracing::error!("http worker {port} {e}");
@@ -146,11 +148,12 @@ pub async fn serve_with_listener_until(
     // One simulated engine per listener (i.e. per virtual worker), registered
     // in the process fleet under `http:<port>` for the oracle and admin API.
     let name = format!("http:{port}");
-    script::register(&name);
+    // The count before the name: a fleet list that names the worker finds it.
     let ops = AdminOps::register(&name);
+    script::register(&name);
     let engine = cfg
         .realistic
-        .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
+        .then(|| Engine::spawn_named(cfg.engine_for(&name), name.clone(), true));
     let state = Arc::new(AppState {
         cfg,
         name,
@@ -176,7 +179,7 @@ pub async fn serve_with_listener_until(
     };
     let bootstrap = async {
         if let Some(listener) = bootstrap {
-            crate::bootstrap::accept_and_close(listener, stopped).await;
+            accept_and_close(listener, stopped).await;
         }
     };
     let server = async {
@@ -210,11 +213,14 @@ async fn models(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn loads(State(state): State<Arc<AppState>>) -> Response {
+    if let Some(status) = state.engine.as_ref().and_then(|e| e.load_refused()) {
+        return injected_error(status);
+    }
     let load = state
         .engine
         .as_ref()
         .map(|e| e.load().as_reported_by(state.cfg.loads_like));
-    let value = match load {
+    let mut value = match load {
         Some(s) => json!({
             "dp_rank": 0,
             "num_running_reqs": s.num_running_reqs,
@@ -251,6 +257,22 @@ async fn loads(State(state): State<Arc<AppState>>) -> Response {
             })
         }
     };
+    // The worker's named values (`--worker-load-values`), where it states
+    // any: a `values` key on its one entry, as a gRPC worker's rows carry.
+    let values = state.cfg.load_values(&state.name, 0);
+    if !values.is_empty() {
+        value["values"] = values
+            .iter()
+            .map(|stated| {
+                let mut entry =
+                    json!({ "name": stated.name, "unit": stated.unit, "value": stated.value });
+                if let Some(age_ms) = stated.age_ms {
+                    entry["age_ms"] = json!(age_ms);
+                }
+                entry
+            })
+            .collect();
+    }
     Json(json!({ "timestamp": "", "dp_rank_count": 1, "loads": [value] })).into_response()
 }
 
@@ -350,7 +372,7 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
     let mut info = json!({ "model_path": state.cfg.model_id });
     if let Some(role) = state.cfg.role {
         info["disaggregation_mode"] = json!(role.as_str());
-        info["disaggregation_transfer_backend"] = json!(crate::grpc::KV_TRANSPORT);
+        info["disaggregation_transfer_backend"] = json!(KV_TRANSPORT);
         if let Some(port) = state.bootstrap_port {
             info["disaggregation_bootstrap_port"] = json!(port);
         }
@@ -574,6 +596,7 @@ async fn submit_realistic(
         request_id,
         prompt_token_ids: prompt_ids,
         max_new,
+        choice: 0,
         events: tx,
     });
     Ok(Submitted {
@@ -589,6 +612,7 @@ async fn handle(route: Route, state: Arc<AppState>, body: Bytes) -> Response {
     // done, so a shutdown knows what it waits for and this worker's load
     // report counts it.
     let in_flight = InFlight::enter_on(&state.in_flight);
+    state.ops.record_request();
     let Incoming {
         parsed,
         stream_requested,
@@ -696,6 +720,7 @@ async fn handle(route: Route, state: Arc<AppState>, body: Bytes) -> Response {
 /// Messages form, so one answer is taken and none are read.
 async fn handle_messages(state: Arc<AppState>, body: Bytes) -> Response {
     let in_flight = InFlight::enter_on(&state.in_flight);
+    state.ops.record_request();
     let Incoming {
         parsed,
         stream_requested,
@@ -857,7 +882,11 @@ impl MessageAnswer {
         ];
         let tail = [
             content_block_stop_event(),
-            message_delta_event(self.stop_reason(), &self.stop_sequence, self.output_tokens),
+            message_delta_event(
+                self.stop_reason(),
+                self.stop_sequence.as_ref(),
+                self.output_tokens,
+            ),
             message_stop_event(),
         ];
         let delay = self.delay;
@@ -940,7 +969,7 @@ fn content_block_stop_event() -> Event {
 
 fn message_delta_event(
     stop_reason: &str,
-    stop_sequence: &Option<Value>,
+    stop_sequence: Option<&Value>,
     output_tokens: u32,
 ) -> Event {
     let delta = json!({
@@ -1080,7 +1109,7 @@ fn messages_realistic_frames(
                     served,
                     finish_reason,
                 } => (
-                    message_delta_event(stop_reason(finish_reason, false), &None, served),
+                    message_delta_event(stop_reason(finish_reason, false), None, served),
                     St::MessageStop,
                 ),
                 St::MessageStop => (message_stop_event(), St::Ended),
@@ -1297,7 +1326,7 @@ async fn scripted_response(
         .into_response();
     }
     // The pauses the choices' frames would take one after the other, as one wait.
-    let pauses: std::time::Duration = answers
+    let pauses: Duration = answers
         .iter()
         .map(|answer| {
             answer.delay
@@ -1842,6 +1871,89 @@ mod tests {
         assert_eq!(extract_prompt_text(&json!({"prompt": [1, 2, 3]})), "");
     }
 
+    /// The worker `--worker-load-values` names states its list on its one
+    /// `/v1/loads` entry, each value with its unit and the age it has. A
+    /// worker the flag does not name states no `values` key.
+    #[tokio::test]
+    async fn a_worker_states_its_named_values_on_the_loads_list() {
+        use smg_grpc_client::common_proto::NamedValue;
+        let value = |name: &str, unit: &str, value: f64, age_ms| NamedValue {
+            name: name.to_string(),
+            unit: unit.to_string(),
+            value,
+            age_ms,
+        };
+        let cfg = Arc::new(Config {
+            worker_load_values: [(
+                "http:65201".to_string(),
+                vec![
+                    value("queue_age", "ms", 6.5, Some(37)),
+                    value("read_rate", "items/s", 0.125, None),
+                ],
+            )]
+            .into(),
+            ..Config::default()
+        });
+        let entry = |name: &'static str| {
+            let state = Arc::new(AppState {
+                cfg: Arc::clone(&cfg),
+                name: name.to_string(),
+                engine: None,
+                in_flight: WorkerInFlight::default(),
+                ops: AdminOps::register(name),
+                bootstrap_port: None,
+            });
+            async move {
+                let body = loads(State(state)).await.into_body();
+                let bytes = axum::body::to_bytes(body, usize::MAX)
+                    .await
+                    .expect("a body");
+                let answer: Value = serde_json::from_slice(&bytes).expect("json");
+                answer["loads"][0].clone()
+            }
+        };
+        assert_eq!(
+            entry("http:65201").await["values"],
+            json!([
+                { "name": "queue_age", "unit": "ms", "value": 6.5, "age_ms": 37 },
+                { "name": "read_rate", "unit": "items/s", "value": 0.125 },
+            ])
+        );
+        assert!(entry("http:65202").await.get("values").is_none());
+    }
+
+    /// A worker under the load-fail hook answers `/v1/loads` with the hook's
+    /// status and the fault body, and a cleared hook has it report again.
+    #[tokio::test]
+    async fn a_load_fail_answers_the_loads_list_with_its_status() {
+        let engine = Engine::spawn(engine::EngineParams::default());
+        let state = Arc::new(AppState {
+            cfg: Arc::new(Config::default()),
+            name: "http:65203".to_string(),
+            engine: Some(engine.clone()),
+            in_flight: WorkerInFlight::default(),
+            ops: AdminOps::register("http:65203"),
+            bootstrap_port: None,
+        });
+        let poll = || async {
+            let answer = loads(State(Arc::clone(&state))).await;
+            let status = answer.status();
+            let bytes = axum::body::to_bytes(answer.into_body(), usize::MAX)
+                .await
+                .expect("a body");
+            let body: Value = serde_json::from_slice(&bytes).expect("json");
+            (status, body)
+        };
+        engine.fault_load_fail(501);
+        let (status, body) = poll().await;
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(body["error"]["type"], "fault");
+        engine.fault_load_fail(0);
+        let (status, body) = poll().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["loads"][0]["dp_rank"], 0);
+    }
+
     fn token() -> engine::GenEvent {
         engine::GenEvent::Token {
             token_id: 7,
@@ -2105,7 +2217,7 @@ mod tests {
             )
         };
         let answer = |stop: Value| {
-            script::Answer::parse(&json!({
+            Answer::parse(&json!({
                 "output_text": "apricot",
                 "finish_reason": "stop",
                 "matched_stop": stop,
@@ -2128,7 +2240,7 @@ mod tests {
         script::enqueue(
             "http:messages-stops",
             vec![
-                script::Answer::parse(&json!({"output_text": "x", "finish_reason": "error"}))
+                Answer::parse(&json!({"output_text": "x", "finish_reason": "error"}))
                     .expect("an answer"),
             ],
         )
@@ -2142,8 +2254,7 @@ mod tests {
     #[tokio::test]
     async fn a_prefill_worker_answers_the_prompt_side_alone_and_leaves_the_script_to_decode() {
         let state = state_of(Some(Role::Prefill), Some(8998), "http:prefill-test");
-        let scripted =
-            script::Answer::parse(&json!({"output_text": "apricot"})).expect("an answer");
+        let scripted = Answer::parse(&json!({"output_text": "apricot"})).expect("an answer");
         script::enqueue("http:prefill-test", vec![scripted]).expect("a known worker");
 
         for stream in [false, true] {
@@ -2253,7 +2364,7 @@ mod tests {
         // Scripted: the answer's text in the body and as the deltas, its finish
         // reason as the stop reason, its usage.
         let parse = || {
-            script::Answer::parse(&json!({"output_text": "apricot", "finish_reason": "length"}))
+            Answer::parse(&json!({"output_text": "apricot", "finish_reason": "length"}))
                 .expect("an answer")
         };
         let deltas = parse().answer.text_frames().len();
@@ -2508,10 +2619,7 @@ mod tests {
         .await;
         assert_eq!(prefill["disaggregation_mode"], "prefill");
         assert_eq!(prefill["disaggregation_bootstrap_port"], 8998);
-        assert_eq!(
-            prefill["disaggregation_transfer_backend"],
-            crate::grpc::KV_TRANSPORT
-        );
+        assert_eq!(prefill["disaggregation_transfer_backend"], KV_TRANSPORT);
         let decode = json_of(
             server_info(State(state_of(
                 Some(Role::Decode),

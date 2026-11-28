@@ -1,4 +1,5 @@
 mod hy_v4;
+mod random_filter;
 mod render_context;
 
 use super::*;
@@ -32,6 +33,28 @@ fn a_template_that_concatenates_tool_call_arguments_takes_them_as_text() {
         .raw_tool_call_arguments());
 }
 
+/// A render without a template says what the model lacks and that no request
+/// can supply it: a render call carries no template of its own. The failure is
+/// not the template's refusal, so a caller does not read it as its input's.
+#[test]
+fn a_render_without_a_template_says_that_the_model_has_none() {
+    let messages = [serde_json::json!({"role": "user", "content": "hi"})];
+    for state in [
+        ChatTemplateState::empty(),
+        ChatTemplateState::new(None).unwrap(),
+    ] {
+        let error = state
+            .apply(&messages, ChatTemplateParams::default())
+            .expect_err("a render without a template");
+        assert_eq!(
+            error.to_string(),
+            "The model has no chat template. One must be configured for the model; \
+             a request cannot supply it."
+        );
+        assert!(!TemplateRefusal::is(&error), "{error:#}");
+    }
+}
+
 /// A replacement template answers for itself.
 #[test]
 fn a_replacement_template_refreshes_the_tool_call_arguments_answer() {
@@ -41,6 +64,75 @@ fn a_replacement_template_refreshes_the_tool_call_arguments_answer() {
     assert!(state.raw_tool_call_arguments());
     state.set(SERIALIZING_CALLS.to_string()).unwrap();
     assert!(!state.raw_tool_call_arguments());
+}
+
+/// A state reads the names its templates read: a bare name anywhere in an
+/// expression of the default template, or of an alternate a request may
+/// render through. The gateway hands a request control to the template
+/// under its name only when the template reads it.
+#[test]
+fn a_state_reads_the_names_its_templates_read() {
+    let reading = "{% macro format(f) %}{{ f | tojson }}{% endmacro %}{% for m in messages %}\
+                   {{ m.content }}{% endfor %}{% if response_format is defined %}\
+                   {{ format(response_format) }}{% endif %}";
+    let state = ChatTemplateState::new(Some(reading.to_string())).unwrap();
+    assert!(state.reads("response_format"));
+    assert!(state.reads("messages"));
+    assert!(!state.reads("tool_choice"));
+
+    let plain = "{% for m in messages %}{{ m.content }}{% endfor %}";
+    let state = ChatTemplateState::new(Some(plain.to_string())).unwrap();
+    assert!(!state.reads("response_format"));
+    assert!(!state.reads("tool_choice"));
+
+    // An alternate's reads count: the `tool_use` template a request with
+    // tools renders through.
+    let state = ChatTemplateState::from_config(ConfigChatTemplates {
+        default: Some(plain.to_string()),
+        tool_use: Some(format!("{plain}{{{{ tool_choice }}}}")),
+    })
+    .unwrap();
+    assert!(state.reads("tool_choice"));
+    assert!(!state.reads("response_format"));
+
+    // A name read only as a call block's parameter default counts: the
+    // block's parameters are expressions of the template, as a macro's.
+    let call_block = "{% macro wrap() %}{{ caller() }}{% endmacro %}{% for m in messages %}\
+                      {{ m.content }}{% endfor %}{% call(fmt=response_format) wrap() %}\
+                      {{ fmt | tojson }}{% endcall %}";
+    let state = ChatTemplateState::new(Some(call_block.to_string())).unwrap();
+    assert!(state.reads("response_format"));
+    assert!(!state.reads("tool_choice"));
+
+    // The processor alternate's reads count too: a checkpoint's processor
+    // template, which a request without tools renders through.
+    let state = ChatTemplateState::from_checkpoint(
+        ConfigChatTemplates {
+            default: Some(plain.to_string()),
+            tool_use: None,
+        },
+        Some(format!("processor:{plain}{{{{ response_format }}}}")),
+    )
+    .unwrap();
+    assert!(format!("{state:?}").contains("has_processor: true"));
+    assert!(state.reads("response_format"));
+    assert!(!state.reads("tool_choice"));
+
+    // A replacement template answers for itself.
+    let mut state = ChatTemplateState::new(Some(plain.to_string())).unwrap();
+    state.set(reading.to_string()).unwrap();
+    assert!(state.reads("response_format"));
+
+    // No template: nothing to leave a name out of.
+    assert!(ChatTemplateState::empty().reads("response_format"));
+    assert!(ChatTemplateState::new(None).unwrap().reads("tool_choice"));
+
+    // A template the detector could not parse leaves the names unknown,
+    // and an unknown set reads every name rather than none.
+    assert!(detect_all("{% if %}").names_read.is_none());
+    let mut state = ChatTemplateState::new(Some(plain.to_string())).unwrap();
+    state.names_read = None;
+    assert!(state.reads("response_format"));
 }
 
 /// A template that writes a history call by string concatenation, as the
@@ -1482,6 +1574,68 @@ fn clear_thinking_is_not_a_thinking_switch() {
     }
 }
 
+/// The word `thinking` in what a template prints is not a switch: the
+/// MiniMax M3.1 template's system prose ("When thinking is enabled, wrap your
+/// reasoning in ...") stands in a string literal, and the template branches
+/// on no thinking variable, where the M3 template branched on
+/// `thinking_mode`. A comment or the raw text outside the blocks is not a
+/// switch either; the same words as code are.
+#[test]
+fn thinking_in_prose_or_a_comment_is_not_a_thinking_switch() {
+    let m31_shape = "{{- 'You have a thinking capability that allows you to reason step by step \
+                     before responding. When thinking is enabled, wrap your reasoning in ' ~ \
+                     think_begin_token ~ ' and ' ~ think_end_token }}\
+                     {%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                     {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+    for template in [
+        m31_shape,
+        "{{ \"When thinking is enabled, think.\" }}{% for m in messages %}{{ m.content }}{% endfor %}",
+        "{% set note = 'if thinking == true' %}{{ note }}",
+        "{# if thinking is defined #}{{ messages | length }}",
+        "When thinking is enabled, think.{% for m in messages %}{{ m.content }}{% endfor %}",
+        // A raw block prints its text as it is, switch-looking words included.
+        "{% raw %}{% if thinking %}on{% endif %}{% endraw %}{{ messages | length }}",
+    ] {
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::None, None),
+            "{template}"
+        );
+    }
+    let state = ChatTemplateState::new(Some(m31_shape.to_string())).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::None);
+    assert_eq!(state.thinking_key_name(), None);
+    assert!(!state.prefill_opens_think_block());
+
+    // The same words as code are the switch, after a literal and after a
+    // literal with an escaped quote in it.
+    for template in [
+        "{% if thinking is defined and thinking %}<think>{% endif %}",
+        "{{ 'When thinking is enabled' }}{% if thinking %}<think>{% endif %}",
+        "{{ 'it\\'s thinking' }}{% if thinking == true %}<think>{% endif %}",
+        "{{ \"a 'quoted' word\" }}{% set thinking = thinking %}",
+        // A nested dict literal's `}}` does not end the block before the switch.
+        "{{ {'a': {'b': '<think>'}}['a']['b'] if thinking else '' }}",
+    ] {
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::DefaultOn, Some(ThinkingKeyName::Thinking)),
+            "{template}"
+        );
+    }
+    // The M3 shape keeps its tri-state switch.
+    assert_eq!(
+        detect_thinking_toggle(
+            "{{- 'When thinking is enabled, wrap your reasoning.' }}\
+             {%- if thinking_mode is defined and thinking_mode == \"enabled\" -%}<think>{%- endif -%}"
+        ),
+        (
+            ThinkingToggle::DefaultOff,
+            Some(ThinkingKeyName::ThinkingMode)
+        )
+    );
+}
+
 #[test]
 fn test_chat_template_state_invalid_template() {
     let result = ChatTemplateState::new(Some("{% invalid".to_string()));
@@ -1514,13 +1668,639 @@ fn test_raise_exception_surfaces_template_validation_message() {
     assert!(error.contains("reasoning_effort is invalid"), "{error}");
 }
 
+/// A template's own `raise_exception` is typed as the template's refusal, from
+/// inside a macro too, under the text every render failure reads; an operation
+/// the template could not run is a render failure and no refusal.
+#[test]
+fn a_templates_own_refusal_is_typed_and_another_render_failure_is_not() {
+    let failure = |template: &str| {
+        ChatTemplateState::new(Some(template.to_string()))
+            .unwrap()
+            .apply(
+                &[serde_json::json!({"role": "user", "content": []})],
+                ChatTemplateParams::default(),
+            )
+            .unwrap_err()
+    };
+
+    let refused = failure("{{ raise_exception('the roles must alternate') }}");
+    assert!(TemplateRefusal::is(&refused), "{refused:#}");
+    assert!(
+        refused
+            .to_string()
+            .starts_with("Failed to render template: invalid operation: the roles must alternate"),
+        "{refused}"
+    );
+    let in_a_macro =
+        failure("{% macro check() %}{{ raise_exception('no') }}{% endmacro %}{{ check() }}");
+    assert!(TemplateRefusal::is(&in_a_macro), "{in_a_macro:#}");
+
+    let failed = failure("{{ 'user: ' + messages[0]['content'] }}");
+    assert!(!TemplateRefusal::is(&failed), "{failed:#}");
+    assert!(
+        failed
+            .to_string()
+            .starts_with("Failed to render template: invalid operation: "),
+        "{failed}"
+    );
+
+    // A continued message whose reasoning the fallback would lose says so
+    // after the failure of its render, which is typed as it was: the
+    // template's refusal a refusal, a render that stops on a value neither.
+    let thinking = [
+        serde_json::json!({"role": "user", "content": "hi"}),
+        serde_json::json!({
+            "role": "assistant",
+            "content": "Partial",
+            "reasoning_content": "still thinking"
+        }),
+    ];
+    let continued = |template: &str| {
+        let failed = render_failure(template, &thinking, serde_json::json!({}), true);
+        assert!(
+            failed
+                .to_string()
+                .ends_with("its reasoning_content would be lost"),
+            "{template}: {failed}"
+        );
+        failed
+    };
+    let refused = continued("{{ raise_exception('the roles must alternate') }}");
+    assert!(TemplateRefusal::is(&refused), "{refused:#}");
+    assert!(
+        refused
+            .to_string()
+            .starts_with("Failed to render template: invalid operation: the roles must alternate"),
+        "{refused}"
+    );
+    let failed = continued("{{ messages[2]['content'] }}");
+    assert!(!TemplateRefusal::is(&failed), "{failed:#}");
+    assert!(!TemplateFailure::is(&failed), "{failed:#}");
+    assert!(
+        failed
+            .to_string()
+            .starts_with("Failed to render template: undefined value"),
+        "{failed}"
+    );
+}
+
+/// The classes of the engine's error kinds, a kind at a time: the template's
+/// own where the template's source alone raises the kind, a plain failure
+/// where a value can. Three kinds are the template's own on a condition.
+/// Another template that is not there, where the source spells every name it
+/// asks for. A called name nothing defines, where the error names it and the
+/// source binds it nowhere. A filter or a test the engine does not have,
+/// where the source names it: looked up from an argument's value, the error
+/// has no detail.
+#[test]
+fn each_error_kind_is_classed_by_whether_a_value_can_raise_it() {
+    let environment = |source: &str| build_environment(source.to_string()).unwrap();
+    let spells = environment("{% include 'tools.jinja' %}{% macro helper() %}{% endmacro %}");
+    let reads = environment("{% include 'tools.jinja' %}{% include fragments %}");
+    let own = |environment: &Environment<'_>, error: MinijinjaError| {
+        is_the_templates_own(&error, &environment.get_template("chat").unwrap())
+    };
+    for kind in [
+        ErrorKind::SyntaxError,
+        ErrorKind::BadEscape,
+        ErrorKind::TemplateNotFound,
+        ErrorKind::UnknownBlock,
+        ErrorKind::UnknownFilter,
+        ErrorKind::UnknownTest,
+        ErrorKind::WriteFailure,
+    ] {
+        assert!(
+            own(&spells, MinijinjaError::new(kind, "a detail")),
+            "{kind:?}"
+        );
+    }
+    for kind in [
+        ErrorKind::InvalidOperation,
+        ErrorKind::UnknownMethod,
+        ErrorKind::UndefinedError,
+        ErrorKind::TooManyArguments,
+        ErrorKind::MissingArgument,
+        ErrorKind::CannotUnpack,
+        ErrorKind::BadSerialization,
+        ErrorKind::CannotDeserialize,
+        ErrorKind::NonPrimitive,
+        ErrorKind::NonKey,
+        ErrorKind::BadInclude,
+        ErrorKind::EvalBlock,
+    ] {
+        assert!(
+            !own(&spells, MinijinjaError::new(kind, "a detail")),
+            "{kind:?}"
+        );
+    }
+
+    assert!(
+        !own(
+            &reads,
+            MinijinjaError::new(ErrorKind::TemplateNotFound, "a detail")
+        ),
+        "a template name read from a value"
+    );
+    let unknown = |detail: &'static str| MinijinjaError::new(ErrorKind::UnknownFunction, detail);
+    assert!(own(&spells, unknown("late is unknown")));
+    for (error, why) in [
+        (unknown("helper is unknown"), "a name the source binds"),
+        (unknown("loop is unknown"), "a name the engine binds"),
+        (unknown("caller is unknown"), "a name the engine binds"),
+        (unknown("macro not found"), "a detail that names nothing"),
+        (ErrorKind::UnknownFunction.into(), "no detail"),
+        (ErrorKind::UnknownFilter.into(), "no detail"),
+        (ErrorKind::UnknownTest.into(), "no detail"),
+    ] {
+        assert!(!own(&spells, error), "{why}");
+    }
+}
+
+/// `conversation` rendered through `template` with `kwargs` as the caller's
+/// template arguments.
+fn rendered_with(
+    template: &str,
+    conversation: &[serde_json::Value],
+    kwargs: serde_json::Value,
+    continue_final_message: bool,
+) -> Result<String> {
+    let kwargs: HashMap<String, serde_json::Value> = serde_json::from_value(kwargs).unwrap();
+    ChatTemplateState::new(Some(template.to_string()))
+        .unwrap()
+        .apply(
+            conversation,
+            ChatTemplateParams {
+                template_kwargs: Some(&kwargs),
+                continue_final_message,
+                ..Default::default()
+            },
+        )
+}
+
+/// The failure of that render ([`rendered_with`]).
+fn render_failure(
+    template: &str,
+    conversation: &[serde_json::Value],
+    kwargs: serde_json::Value,
+    continue_final_message: bool,
+) -> anyhow::Error {
+    rendered_with(template, conversation, kwargs, continue_final_message).unwrap_err()
+}
+
+/// A render that stops on something the template's source alone decides is
+/// typed as the template's failure, under the text every render failure
+/// reads, a kind of the engine's at a time: another template it asks for,
+/// and a filter, a test, a function and a block the engine does not have. So
+/// is a template that is not there to look up. A continued render types it
+/// the same, and so does one of a message whose reasoning the fallback would
+/// lose, which says so after the failure.
+#[test]
+fn a_render_failure_the_templates_source_alone_decides_is_typed_as_the_templates() {
+    let user = serde_json::json!({"role": "user", "content": "hi"});
+    let partial = serde_json::json!({"role": "assistant", "content": "Partial"});
+    let thinking = serde_json::json!({
+        "role": "assistant",
+        "content": "Partial",
+        "reasoning_content": "still thinking"
+    });
+    let conversation = [user.clone(), partial.clone()];
+    for (template, kind) in [
+        ("{% include 'tools.jinja' %}", "template not found"),
+        ("{% extends 'base.jinja' %}", "template not found"),
+        (
+            "{% import 'macros.jinja' as macros %}",
+            "template not found",
+        ),
+        (
+            "{% from 'macros.jinja' import helper %}",
+            "template not found",
+        ),
+        (
+            "{% include ['tools.jinja', 'functions.jinja'] %}",
+            "template not found",
+        ),
+        ("{{ messages | no_such_filter }}", "unknown filter"),
+        (
+            "{% if messages is no_such_test %}x{% endif %}",
+            "unknown test",
+        ),
+        ("{{ no_such_function() }}", "unknown function"),
+        ("{{ self.no_such_block() }}", "unknown block"),
+    ] {
+        for (last, continued) in [(&partial, false), (&partial, true), (&thinking, true)] {
+            let conversation = [user.clone(), last.clone()];
+            let failed = render_failure(template, &conversation, serde_json::json!({}), continued);
+            assert!(TemplateFailure::is(&failed), "{template}: {failed:#}");
+            assert!(!TemplateRefusal::is(&failed), "{template}: {failed:#}");
+            assert!(
+                failed
+                    .to_string()
+                    .starts_with(&format!("Failed to render template: {kind}: ")),
+                "{template}: {failed}"
+            );
+            assert_eq!(
+                failed.to_string().ends_with(
+                    ": only its text could follow the generation prompt, and its \
+                     reasoning_content would be lost"
+                ),
+                std::ptr::eq(last, &thinking),
+                "{template}: {failed}"
+            );
+        }
+    }
+
+    // A block is the template's wherever its statement stands, under a
+    // branch that does not run too: no value makes a block the source has
+    // unknown.
+    let block_under_a_branch = "{% if messages | length > 2 %}{% block late %}here{% endblock %}\
+                                {% endif %}{{ self.late() }}";
+    assert_eq!(
+        rendered_with(
+            block_under_a_branch,
+            &conversation,
+            serde_json::json!({}),
+            false
+        )
+        .unwrap(),
+        "here"
+    );
+
+    let unnamed = render_messages(
+        &Environment::new(),
+        conversation.iter(),
+        ChatTemplateParams::default(),
+        &RenderedLength::default(),
+    )
+    .unwrap_err();
+    assert!(TemplateFailure::is(&unnamed), "{unnamed:#}");
+    assert!(
+        unnamed
+            .to_string()
+            .starts_with("Failed to get template: template not found: "),
+        "{unnamed}"
+    );
+
+    // A template whose source does not compile is refused when it loads,
+    // under the compiler's two kinds: no render meets either.
+    for (template, kind) in [
+        ("{% if %}", "syntax error"),
+        (r#"{{ "\uzzzz" }}"#, "bad string escape"),
+    ] {
+        let refused = ChatTemplateState::new(Some(template.to_string()))
+            .expect_err("a template that does not compile");
+        assert!(
+            refused
+                .to_string()
+                .starts_with(&format!("Failed to add template: {kind}")),
+            "{template}: {refused}"
+        );
+    }
+}
+
+/// A render that stops on a value stays the plain failure it was, neither
+/// the template's failure nor its refusal, a kind of the engine's at a time.
+/// A caller's template argument can break a sound template this way: one of
+/// the wrong kind, or one that takes the name of a function the template
+/// calls, its own `raise_exception` among them. A template that breaks on
+/// every conversation (it iterates over a number) fails with the same kind,
+/// which the render cannot tell from a caller's value, and stays plain too.
+/// So does a function the engine does not have where a macro calls it: the
+/// engine fails that call as an operation on an undefined value.
+#[test]
+fn a_render_failure_a_value_can_bring_about_stays_plain() {
+    let one_turn = [serde_json::json!({"role": "user", "content": "hi"})];
+    let parts = [serde_json::json!({"role": "user", "content": []})];
+    let none = || serde_json::json!({});
+    let calls_namespace = "{% set ns = namespace(found=false) %}{{ ns.found }}";
+    let refuses = "{{ raise_exception('the roles must alternate') }}";
+    let writes_a_date = "{{ 'Today Date: ' + date_string }}";
+    let cases = [
+        // A caller's template argument under the name of a function.
+        (
+            calls_namespace,
+            &one_turn[..],
+            serde_json::json!({"namespace": 0}),
+            "invalid operation",
+        ),
+        (
+            calls_namespace,
+            &one_turn[..],
+            serde_json::json!({"namespace": null}),
+            "invalid operation",
+        ),
+        (
+            refuses,
+            &one_turn[..],
+            serde_json::json!({"raise_exception": 0}),
+            "invalid operation",
+        ),
+        // A caller's template argument of the wrong kind.
+        (
+            writes_a_date,
+            &one_turn[..],
+            serde_json::json!({"date_string": 20_261_120}),
+            "invalid operation",
+        ),
+        // Content of a shape the template does not take.
+        (
+            "{{ 'user: ' + messages[0]['content'] }}",
+            &parts[..],
+            none(),
+            "invalid operation",
+        ),
+        // The template's own bug, on every conversation.
+        (
+            "{% for part in 42 %}{{ part }}{% endfor %}",
+            &one_turn[..],
+            none(),
+            "invalid operation",
+        ),
+        (
+            "{{ messages[0]['content'].no_such_method() }}",
+            &one_turn[..],
+            none(),
+            "unknown method",
+        ),
+        // A second message the conversation does not have.
+        (
+            "{{ messages[1]['content'] }}",
+            &one_turn[..],
+            none(),
+            "undefined value",
+        ),
+        (
+            "{{ raise_exception() }}",
+            &one_turn[..],
+            none(),
+            "missing argument",
+        ),
+        (
+            "{{ raise_exception('a', 'b') }}",
+            &one_turn[..],
+            none(),
+            "too many arguments",
+        ),
+        (
+            "{% for a, b, c in messages %}{% endfor %}",
+            &one_turn[..],
+            none(),
+            "cannot unpack",
+        ),
+        // The template includes itself: the wrapper around whatever stopped
+        // the included render.
+        (
+            "{% include 'chat' %}",
+            &one_turn[..],
+            none(),
+            "could not render include",
+        ),
+        // A function the engine does not have, called in a macro: the engine
+        // hands a macro each name it reads, this one as an undefined value.
+        (
+            "{% macro helper() %}{{ no_such_function() }}{% endmacro %}{{ helper() }}",
+            &one_turn[..],
+            none(),
+            "invalid operation",
+        ),
+        // A filter and a test named by an argument's value.
+        (
+            "{{ messages | map('no_such_filter') | list }}",
+            &one_turn[..],
+            none(),
+            "unknown filter",
+        ),
+        (
+            "{{ messages | select('no_such_test') | list }}",
+            &one_turn[..],
+            none(),
+            "unknown test",
+        ),
+    ];
+    for (template, conversation, kwargs, kind) in cases {
+        let failed = render_failure(template, conversation, kwargs.clone(), false);
+        assert!(
+            !TemplateFailure::is(&failed),
+            "{template} {kwargs}: {failed:#}"
+        );
+        assert!(
+            !TemplateRefusal::is(&failed),
+            "{template} {kwargs}: {failed:#}"
+        );
+        assert!(
+            failed
+                .to_string()
+                .starts_with(&format!("Failed to render template: {kind}")),
+            "{template} {kwargs}: {failed}"
+        );
+    }
+
+    // Without the argument that broke them, the templates above are sound:
+    // two render, and the third refuses in its own words.
+    let sound = |template: &str, kwargs: serde_json::Value| {
+        rendered_with(template, &one_turn, kwargs, false)
+    };
+    assert_eq!(sound(calls_namespace, none()).unwrap(), "False");
+    assert_eq!(
+        sound(
+            writes_a_date,
+            serde_json::json!({"date_string": "20 Nov 2026"})
+        )
+        .unwrap(),
+        "Today Date: 20 Nov 2026"
+    );
+    assert!(TemplateRefusal::is(&sound(refuses, none()).unwrap_err()));
+}
+
+/// Another template that is not there is the template's failure only where
+/// the source spells every name it asks for. A name read from a value is the
+/// caller's to get wrong, and an empty list of them renders. The error does
+/// not say which statement raised it, so one statement that reads its name
+/// keeps the failure plain: a value can hand it a name the source spells in
+/// another statement, one that did not run.
+#[test]
+fn a_missing_template_a_value_can_name_stays_plain() {
+    let one_turn = [serde_json::json!({"role": "user", "content": "hi"})];
+    let includes_fragments = "{% include fragments %}";
+    for (template, kwargs) in [
+        (
+            includes_fragments,
+            serde_json::json!({"fragments": ["missing.jinja"]}),
+        ),
+        (
+            includes_fragments,
+            serde_json::json!({"fragments": "missing.jinja"}),
+        ),
+        (
+            "{% extends parent %}",
+            serde_json::json!({"parent": "base.jinja"}),
+        ),
+        (
+            "{% import helpers as helper %}",
+            serde_json::json!({"helpers": "macros.jinja"}),
+        ),
+        (
+            "{% from helpers import helper %}",
+            serde_json::json!({"helpers": "macros.jinja"}),
+        ),
+        (
+            "{% if messages | length > 1 %}{% include 'tools.jinja' %}{% endif %}\
+             {% include fragments %}",
+            serde_json::json!({"fragments": ["tools.jinja"]}),
+        ),
+    ] {
+        let failed = render_failure(template, &one_turn, kwargs.clone(), false);
+        assert!(
+            !TemplateFailure::is(&failed),
+            "{template} {kwargs}: {failed:#}"
+        );
+        assert!(
+            failed
+                .to_string()
+                .starts_with("Failed to render template: template not found: "),
+            "{template} {kwargs}: {failed}"
+        );
+    }
+    let no_fragments = serde_json::json!({"fragments": []});
+    assert_eq!(
+        rendered_with(includes_fragments, &one_turn, no_fragments, false).unwrap(),
+        ""
+    );
+}
+
+/// A call of a name nothing defines is the template's failure only where the
+/// source binds the name on no branch. Where a macro, a `set`, a loop, a
+/// `with`, an import or a parameter binds it somewhere, a value decides
+/// whether the binding ran before the call, and the failure stays plain: the
+/// first template renders a conversation that opens with `hello` and fails
+/// any other. `loop` and `caller` are the engine's to bind and stay plain too.
+#[test]
+fn a_call_of_a_name_the_source_binds_on_some_branch_stays_plain() {
+    let greets_hello = "{% if messages[0].content == 'hello' %}{% macro greet() %}hi there\
+                        {% endmacro %}{% endif %}{{ greet() }}";
+    let one_turn = |content: &str| [serde_json::json!({"role": "user", "content": content})];
+    let none = || serde_json::json!({});
+    assert_eq!(
+        rendered_with(greets_hello, &one_turn("hello"), none(), false).unwrap(),
+        "hi there"
+    );
+    let long = "messages | length > 1";
+    let bound_somewhere = [
+        greets_hello.to_string(),
+        format!("{{% if {long} %}}{{% set late = namespace %}}{{% endif %}}{{{{ late() }}}}"),
+        format!("{{% if {long} %}}{{% set late %}}x{{% endset %}}{{% endif %}}{{{{ late() }}}}"),
+        format!("{{% if {long} %}}{{% set late, other = 1, 2 %}}{{% endif %}}{{{{ late() }}}}"),
+        "{% for late in messages %}{% endfor %}{{ late() }}".to_string(),
+        "{% for role, late in [] %}{% endfor %}{{ late() }}".to_string(),
+        "{% with late = namespace %}{% endwith %}{{ late() }}".to_string(),
+        "{% macro helper(late) %}{% endmacro %}{{ late() }}".to_string(),
+        "{% macro helper() %}{{ caller(1) }}{% endmacro %}\
+         {% call(late) helper() %}{% endcall %}{{ late() }}"
+            .to_string(),
+        format!("{{% if {long} %}}{{% import 'chat' as late %}}{{% endif %}}{{{{ late() }}}}"),
+        format!("{{% if {long} %}}{{% from 'chat' import late %}}{{% endif %}}{{{{ late() }}}}"),
+        "{% block body %}{% set late = namespace %}{% endblock %}{{ late() }}".to_string(),
+        "{{ loop(messages) }}".to_string(),
+        "{{ caller() }}".to_string(),
+    ];
+    for template in &bound_somewhere {
+        let failed = render_failure(template, &one_turn("hi"), none(), false);
+        assert!(!TemplateFailure::is(&failed), "{template}: {failed:#}");
+        assert!(
+            failed
+                .to_string()
+                .starts_with("Failed to render template: unknown function: "),
+            "{template}: {failed}"
+        );
+    }
+
+    // A name the source binds nowhere is the template's own to call, beside
+    // a binding of another name and under a branch a value picks.
+    for template in [
+        format!("{{% if {long} %}}{{% set other = namespace %}}{{% endif %}}{{{{ late() }}}}"),
+        "{% if messages[0].content != 'hello' %}{{ late() }}{% endif %}".to_string(),
+    ] {
+        let failed = render_failure(&template, &one_turn("hi"), none(), false);
+        assert!(TemplateFailure::is(&failed), "{template}: {failed:#}");
+        assert!(
+            failed
+                .to_string()
+                .starts_with("Failed to render template: unknown function: late is unknown"),
+            "{template}: {failed}"
+        );
+    }
+}
+
+/// The render's own checks of the request are not the template's failure,
+/// and not its refusal: a continuation asked for beside a generation prompt,
+/// one with no message to continue, and one of a message whose reasoning
+/// the fallback would lose, because the message has no text or because the
+/// template never writes it. A caller answers each as a request it could not
+/// render.
+#[test]
+fn the_renders_checks_of_the_request_are_not_typed_as_the_templates_failure() {
+    let state = |template: &str| ChatTemplateState::new(Some(template.to_string())).unwrap();
+    let every_turn = state("{% for m in messages %}{{ m.role }}: {{ m.content }}\n{% endfor %}");
+    let user_turns = state(
+        "{% for m in messages %}{% if m.role == 'user' %}{{ m.content }}\n{% endif %}{% endfor %}",
+    );
+    let continuing = || ChatTemplateParams {
+        continue_final_message: true,
+        ..Default::default()
+    };
+    let user = serde_json::json!({"role": "user", "content": "hi"});
+    let thinking = |content: serde_json::Value| {
+        serde_json::json!({
+            "role": "assistant",
+            "content": content,
+            "reasoning_content": "still thinking"
+        })
+    };
+    let lost = "only its text could follow the generation prompt, and its reasoning_content \
+                would be lost";
+    let cases = [
+        (
+            &every_turn,
+            vec![user.clone(), thinking("Partial".into())],
+            ChatTemplateParams {
+                add_generation_prompt: true,
+                ..continuing()
+            },
+            "continue_final_message and add_generation_prompt are not compatible".to_string(),
+        ),
+        (
+            &every_turn,
+            vec![],
+            continuing(),
+            "no final message to continue".to_string(),
+        ),
+        (
+            &every_turn,
+            vec![user.clone(), thinking(serde_json::Value::Null)],
+            continuing(),
+            format!("the final message has no text to continue: {lost}"),
+        ),
+        (
+            &user_turns,
+            vec![user.clone(), thinking("Partial".into())],
+            continuing(),
+            format!("the final message does not appear in the rendered chat: {lost}"),
+        ),
+    ];
+    for (state, messages, params, expected) in cases {
+        let error = state.apply(&messages, params).unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert!(!TemplateFailure::is(&error), "{expected}");
+        assert!(!TemplateRefusal::is(&error), "{expected}");
+    }
+}
+
 #[test]
 fn test_special_tokens_injected_into_context() {
     let template = "{{ bos_token }}{% for message in messages %}{{ message.content }}{% endfor %}{{ eos_token }}";
     let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
 
     let messages = vec![serde_json::json!({"role": "user", "content": "hello"})];
-    let special_tokens = crate::traits::SpecialTokens {
+    let special_tokens = SpecialTokens {
         bos_token: Some("<s>".to_string()),
         eos_token: Some("</s>".to_string()),
         ..Default::default()
@@ -1553,7 +2333,7 @@ fn test_special_tokens_partial() {
     let template = "{{ bos_token }}hello{% if eos_token is defined %}{{ eos_token }}{% endif %}";
     let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
 
-    let special_tokens = crate::traits::SpecialTokens {
+    let special_tokens = SpecialTokens {
         bos_token: Some("<s>".to_string()),
         eos_token: None,
         ..Default::default()
@@ -1660,6 +2440,142 @@ fn thinking_filter_on_other_values_does_not_change_the_switch_default() {
         ),
         (ThinkingToggle::DefaultOff, Some(ThinkingKeyName::Thinking))
     );
+}
+
+/// A template's thinking default is what it renders with the switch absent,
+/// whatever its source spells. A template that opens the thought, or asks
+/// for it, only where the switch is true defaults off: an undefined switch
+/// is not true. The text matcher knows two spellings of a default off and
+/// calls each of these three on.
+#[test]
+fn the_thinking_default_is_what_the_template_renders_with_the_switch_absent() {
+    let defined_and_true = "{%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                            {%- if add_generation_prompt -%}<|assistant|>\
+                            {%- if enable_thinking is defined and enable_thinking is true -%}\
+                            {{- '<think>\\n' -}}{%- else -%}{{- '<think>\\n\\n</think>\\n\\n' -}}\
+                            {%- endif -%}{%- endif -%}";
+    let truthy = "{%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                  {%- if add_generation_prompt -%}<|assistant|>\
+                  {%- if enable_thinking -%}<think>{%- endif -%}{%- endif -%}";
+    let in_the_system_prompt = "{%- if thinking -%}<|system|>Think before you answer.\
+                                {%- else -%}<|system|>Answer.{%- endif -%}\
+                                {%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                                {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+    for (template, key) in [
+        (defined_and_true, ThinkingKeyName::EnableThinking),
+        (truthy, ThinkingKeyName::EnableThinking),
+        (in_the_system_prompt, ThinkingKeyName::Thinking),
+    ] {
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::DefaultOn, Some(key)),
+            "the text matcher: {template}"
+        );
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(
+            state.thinking_toggle(),
+            ThinkingToggle::DefaultOff,
+            "{template}"
+        );
+        assert_eq!(state.thinking_key_name(), Some(key));
+    }
+
+    // A template that closes the thought only where the switch is false
+    // defaults on, and one the matcher reads as off renders off: both as
+    // before.
+    let defined_and_false = "{%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                             {%- if add_generation_prompt -%}<|assistant|>\
+                             {%- if enable_thinking is defined and enable_thinking is false -%}\
+                             {{- '<think>\\n\\n</think>\\n\\n' -}}{%- else -%}{{- '<think>\\n' -}}\
+                             {%- endif -%}{%- endif -%}";
+    let set_false = "{%- if enable_thinking is not defined -%}\
+                     {%- set enable_thinking = false -%}{%- endif -%}\
+                     {%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                     {%- if add_generation_prompt -%}<|assistant|>\
+                     {%- if enable_thinking -%}<think>{%- endif -%}{%- endif -%}";
+    for (template, default) in [
+        (defined_and_false, ThinkingToggle::DefaultOn),
+        (set_false, ThinkingToggle::DefaultOff),
+    ] {
+        assert_eq!(detect_thinking_toggle(template).0, default, "{template}");
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), default, "{template}");
+    }
+
+    // A replacement template answers for itself.
+    let mut state = ChatTemplateState::new(Some(defined_and_false.to_string())).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOn);
+    state.set(truthy.to_string()).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOff);
+}
+
+/// The three probe renders share one instant. A template that writes the
+/// time would otherwise separate them by the clock alone, and its default
+/// would fall back to the text matcher's answer: here the time is written to
+/// the nanosecond, so three reads of the clock never agree.
+#[test]
+fn the_probe_renders_share_one_instant() {
+    let writes_the_time = "{{- strftime_now('%H:%M:%S.%f') -}}\
+                           {%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                           {%- if add_generation_prompt -%}<|assistant|>\
+                           {%- if enable_thinking -%}<think>{%- endif -%}{%- endif -%}";
+    assert_eq!(
+        detect_thinking_toggle(writes_the_time),
+        (
+            ThinkingToggle::DefaultOn,
+            Some(ThinkingKeyName::EnableThinking)
+        ),
+        "the text matcher"
+    );
+    let state = ChatTemplateState::new(Some(writes_the_time.to_string())).unwrap();
+    assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOff);
+}
+
+/// Where the renders do not say, the text matcher's answer stands: a bare
+/// turn that does not render, a switch that moves nothing on a bare turn,
+/// and an absent render that equals neither the on nor the off render.
+#[test]
+fn the_text_matcher_answers_where_the_renders_do_not_say() {
+    // The template refuses a conversation with no system message.
+    let refuses = "{%- if messages[0].role != 'system' -%}\
+                   {{- raise_exception('a system message is required') -}}{%- endif -%}\
+                   {%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                   {%- if add_generation_prompt -%}<|assistant|>\
+                   {%- if enable_thinking -%}<think>{%- endif -%}{%- endif -%}";
+    // The switch only shapes an assistant message of the history.
+    let history_only = "{%- for m in messages -%}\
+                        {%- if m.role == 'assistant' and enable_thinking -%}\
+                        <think>{{ m.reasoning_content }}</think>{%- endif -%}\
+                        {{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+    // No thought marker with the switch absent; true opens the thought and
+    // false closes it.
+    let third = "{%- for m in messages -%}<|user|>{{ m.content }}{%- endfor -%}\
+                 {%- if add_generation_prompt -%}<|assistant|>\
+                 {%- if enable_thinking is defined and enable_thinking is true -%}\
+                 {{- '<think>\\n' -}}\
+                 {%- elif enable_thinking is defined and enable_thinking is false -%}\
+                 {{- '<think>\\n\\n</think>\\n\\n' -}}{%- endif -%}{%- endif -%}";
+    for template in [refuses, history_only, third] {
+        let matched = detect_thinking_toggle(template);
+        assert_eq!(
+            matched,
+            (
+                ThinkingToggle::DefaultOn,
+                Some(ThinkingKeyName::EnableThinking)
+            ),
+            "{template}"
+        );
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), matched.0, "{template}");
+    }
+    let bare = [serde_json::json!({"role": "user", "content": "probe"})];
+    let params = || ChatTemplateParams {
+        add_generation_prompt: true,
+        ..Default::default()
+    };
+    let state = ChatTemplateState::new(Some(refuses.to_string())).unwrap();
+    assert!(state.apply(&bare, params()).is_err(), "the bare turn");
 }
 
 #[test]

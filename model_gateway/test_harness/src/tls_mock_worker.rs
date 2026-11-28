@@ -89,19 +89,18 @@ impl TlsMockWorker {
         ensure_crypto_provider();
 
         let config = self.config.clone();
-        let port = config.read().await.port;
+        let configured_port = config.read().await.port;
         let require_client_cert = config.read().await.require_client_cert;
 
-        // If port is 0, find an available port
-        let port = if port == 0 {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-            let port = listener.local_addr()?.port();
-            drop(listener);
+        // Bound here and handed to the server below: a port of the system's
+        // choice (the config left it 0) is never released between the two,
+        // so no other test of the binary can be given it.
+        let listener =
+            std::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], configured_port)))?;
+        let port = listener.local_addr()?.port();
+        if configured_port == 0 {
             config.write().await.port = port;
-            port
-        } else {
-            port
-        };
+        }
 
         let app = Router::new()
             .route("/health", get(health_handler))
@@ -125,12 +124,11 @@ impl TlsMockWorker {
             build_tls_config(server_cert_path, server_key_path).await?
         };
 
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let server = axum_server::from_tcp_rustls(listener, rustls_config)?;
 
         // Spawn the server in a separate task
         let handle = tokio::spawn(async move {
-            let server =
-                axum_server::bind_rustls(addr, rustls_config).serve(app.into_make_service());
+            let server = server.serve(app.into_make_service());
 
             tokio::select! {
                 result = server => {

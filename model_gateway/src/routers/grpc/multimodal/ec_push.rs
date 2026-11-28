@@ -18,18 +18,17 @@ use std::sync::Arc;
 use axum::response::Response;
 use serde_json::json;
 use smg_grpc_client::vllm_proto as vllm;
+use smg_worker::identity::basic::Worker;
 use uuid::Uuid;
 
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            context::EncodeWorkerAssignment,
-            proto_wrapper::{ProtoGenerateRequest, ProtoGenerateResponse},
-            utils::tonic_ext::TonicStatusExt,
-        },
+use crate::routers::{
+    error,
+    grpc::{
+        backend_client::get_backend_client,
+        context::EncodeWorkerAssignment,
+        proto_wrapper::{ProtoGenerateRequest, ProtoGenerateResponse},
+        utils::tonic_ext::TonicStatusExt,
     },
-    worker::Worker,
 };
 
 mod images;
@@ -108,8 +107,7 @@ impl PushEncodePlan {
         };
         let (encoder, mut params) = encoder_request(original, worker, self.destination.as_deref());
         let cleanup = PushCleanup::new(&params);
-        let backend = worker
-            .get_backend_client()
+        let backend = get_backend_client(worker)
             .await
             .map_err(|e| error::service_unavailable("ec_encoder_connection", e.to_string()))?
             .ok_or_else(|| {
@@ -119,7 +117,7 @@ impl PushEncodePlan {
         let mut stream = client
             .generate(ProtoGenerateRequest::Vllm(Box::new(encoder)))
             .await
-            .map_err(|e| e.to_http_error("ec_encode_failed", e.message().to_string()))?;
+            .map_err(|e| encode_start_failure(&e))?;
         while let Some(reply) = stream.next().await {
             let reply =
                 reply.map_err(|e| e.to_http_error("ec_encode_failed", e.message().to_string()))?;
@@ -151,6 +149,14 @@ impl PushEncodePlan {
             "Encoder closed without a completion",
         ))
     }
+}
+
+/// The answer for an encode call the encoder did not start. The status of a
+/// dial that failed names the encoder's address, for the line here; the
+/// client's answer is the same failure without it.
+fn encode_start_failure(status: &tonic::Status) -> Response {
+    tracing::warn!(error = %status, "The encoder did not start the encode call");
+    status.to_http_error("ec_encode_failed", status.client_message().to_string())
 }
 
 /// A Mooncake consumer must advertise a destination before E reserves buffers.
@@ -445,258 +451,5 @@ async fn control_request(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The encoder's copy of the prompt carries its own id, no stream, no KV
-    /// transfer, one token of sampling, and one minted transfer id per media
-    /// hash when the consumer has a push destination; a pull connector's copy
-    /// carries an empty object.
-    #[test]
-    fn the_encoders_copy_of_the_prompt_mints_one_transfer_id_per_media_hash() {
-        use crate::worker::BasicWorkerBuilder;
-        let original = vllm::GenerateRequest {
-            request_id: "req-1".into(),
-            stream: true,
-            kv_transfer_params_json: Some("{}".into()),
-            mm_inputs: Some(vllm::MultimodalInputs {
-                mm_hashes: vec!["a".into(), "b".into()],
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let encoder: Arc<dyn Worker> =
-            Arc::new(BasicWorkerBuilder::new("grpc://127.0.0.1:9000").build());
-        let (request, params) =
-            encoder_request(&original, encoder.as_ref(), Some("tcp://127.0.0.1:9001"));
-        assert!(request.request_id.starts_with("req-1-encode-"));
-        assert!(!request.stream);
-        assert!(request.kv_transfer_params.is_none() && request.kv_transfer_params_json.is_none());
-        let sampling = request.sampling_params.expect("sampling params");
-        assert_eq!(
-            (sampling.max_tokens, sampling.n, sampling.ignore_eos),
-            (Some(1), 1, true)
-        );
-        assert_eq!(params["consumer_zmq"], "tcp://127.0.0.1:9001");
-        assert_eq!(params["ec_items"].as_array().map(Vec::len), Some(2));
-        assert_eq!(
-            request.ec_transfer_params_json.as_deref(),
-            Some(params.to_string().as_str())
-        );
-        let (request, params) = encoder_request(&original, encoder.as_ref(), None);
-        assert_eq!(params, json!({}));
-        assert_eq!(request.ec_transfer_params_json.as_deref(), Some("{}"));
-    }
-
-    /// A duplicate image retains two distinct PUSH reservations.
-    fn completion(handles: &str) -> vllm::GenerateComplete {
-        vllm::GenerateComplete {
-            media_identity: Some(vllm::MediaIdentity {
-                prompt_token_ids: vec![1, 2, 3],
-                mm_inputs: Some(vllm::MultimodalInputs {
-                    mm_hashes: vec!["h".into(), "h".into()],
-                    mm_placeholders: vec![
-                        vllm::PlaceholderRange {
-                            offset: 1,
-                            length: 1,
-                        },
-                        vllm::PlaceholderRange {
-                            offset: 2,
-                            length: 1,
-                        },
-                    ],
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            ec_transfer_params_json: Some(handles.into()),
-            ..Default::default()
-        }
-    }
-
-    /// A request still carrying media must remain intact on failed validation.
-    fn request() -> ProtoGenerateRequest {
-        ProtoGenerateRequest::Vllm(Box::new(vllm::GenerateRequest {
-            input: Some(vllm::generate_request::Input::Tokenized(
-                vllm::TokenizedInput {
-                    input_ids: vec![42],
-                    ..Default::default()
-                },
-            )),
-            media_refs: Some(vllm::MediaRefs::default()),
-            ..Default::default()
-        }))
-    }
-
-    /// An external-DP servicer's only endpoint can occupy any global rank slot.
-    #[test]
-    fn managed_rank_address() {
-        let addrs = vec![String::new(), "tcp://prefill:9002".into()];
-        assert_eq!(consumer_address(&addrs, None), Some("tcp://prefill:9002"));
-        assert_eq!(
-            consumer_address(&addrs, Some(1)),
-            Some("tcp://prefill:9002")
-        );
-        assert_eq!(consumer_address(&addrs, Some(0)), None);
-        assert_eq!(consumer_address(&["a".into(), "b".into()], None), None);
-    }
-
-    /// Missing PUSH discovery must fail before the encoder is contacted.
-    #[test]
-    fn mooncake_requires_a_destination() {
-        use crate::worker::BasicWorkerBuilder;
-        for connector in ["ECCPUConnector", "ECMooncakeConnector"] {
-            let worker = BasicWorkerBuilder::new("grpc://127.0.0.1:9000")
-                .label("ec_connector", connector)
-                .build();
-            assert_eq!(
-                push_destination(&worker).is_err(),
-                connector == "ECMooncakeConnector"
-            );
-        }
-        for addrs in ["[]", "invalid", r#"["tcp://unused:9001"]"#] {
-            let worker = BasicWorkerBuilder::new("grpc://127.0.0.1:9000")
-                .label("ec_connector", "ECCPUConnector")
-                .label("ec_zmq_addrs", addrs)
-                .build();
-            assert!(push_destination(&worker).unwrap().is_none());
-        }
-        let worker = BasicWorkerBuilder::new("grpc://127.0.0.1:9000")
-            .label("ec_connector", "ECMooncakeConnector")
-            .label("ec_zmq_addrs", r#"["tcp://127.0.0.1:9001"]"#)
-            .build();
-        assert_eq!(
-            push_destination(&worker).unwrap().as_deref(),
-            Some("tcp://127.0.0.1:9001")
-        );
-    }
-
-    /// Malformed PULL handles must not strip the original media.
-    #[test]
-    fn pull_handles_are_validated_before_rewriting() {
-        for handles in [
-            "[]",
-            "bad",
-            "{}",
-            r#"{"other":{"peer_host":"e","peer_port":1}}"#,
-            r#"{"h":{}}"#,
-            r#"{"h":{"peer_host":"e"}}"#,
-            r#"{"h":{"peer_host":"e","peer_port":0}}"#,
-        ] {
-            let mut request = request();
-            assert!(apply_completion(
-                &mut request,
-                completion(handles),
-                &mut json!({}),
-                "ECCPUConnector"
-            )
-            .is_err());
-            assert!(request.has_vllm_media_refs());
-        }
-        let mut request = request();
-        let handles = r#"{"h":{"peer_host":"host","peer_port":9000,"size_bytes":128}}"#;
-        apply_completion(
-            &mut request,
-            completion(handles),
-            &mut json!({}),
-            "ECCPUConnector",
-        )
-        .unwrap();
-        assert!(!request.has_vllm_media_refs());
-        let ProtoGenerateRequest::Vllm(request) = request else {
-            panic!("expected a vLLM request")
-        };
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&request.ec_transfer_params_json.unwrap())
-                .unwrap(),
-            serde_json::from_str::<serde_json::Value>(handles).unwrap()
-        );
-    }
-
-    /// PUSH reconstructs per-occurrence hashes without collapsing duplicate IDs.
-    #[test]
-    fn push_preserves_duplicate_ids_and_rejects_bad_metadata() {
-        let mut params = json!({"consumer_zmq":"tcp://p:9000", "ec_items":[{"transfer_id":"one"},{"transfer_id":"two"}]});
-        let mut request = request();
-        let mut bad = completion(r#"{"h":{"transfer_id":"two"}}"#);
-        bad.media_identity
-            .as_mut()
-            .unwrap()
-            .prompt_token_ids
-            .clear();
-        assert!(apply_completion(&mut request, bad, &mut params, "ECMooncakeConnector").is_err());
-        assert!(request.has_vllm_media_refs());
-        apply_completion(
-            &mut request,
-            completion(r#"{"h":{"transfer_id":"two"}}"#),
-            &mut params,
-            "ECMooncakeConnector",
-        )
-        .unwrap();
-        let ProtoGenerateRequest::Vllm(request) = request else {
-            panic!("expected a vLLM request")
-        };
-        let handles: serde_json::Value =
-            serde_json::from_str(&request.ec_transfer_params_json.unwrap()).unwrap();
-        assert_eq!(
-            handles["ec_items"],
-            json!([{"transfer_id":"one","mm_hash":"h"},{"transfer_id":"two","mm_hash":"h"}])
-        );
-    }
-
-    /// Cleanup speaks the real JSON/REQ protocol and releases all TP shards.
-    #[tokio::test]
-    async fn dropped_push_releases_every_shard() {
-        use zeromq::{Socket, SocketRecv, SocketSend};
-        for reject_first in [false, true] {
-            let mut first = zeromq::RepSocket::new();
-            let addr = first.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
-            let mut second = zeromq::RepSocket::new();
-            let other = second.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
-            let ports: Vec<u16> = [&addr, &other]
-                .iter()
-                .map(|a| a.rsplit_once(':').unwrap().1.parse().unwrap())
-                .collect();
-            let serve = async {
-                let message = first.recv().await.unwrap();
-                let message: serde_json::Value =
-                    serde_json::from_slice(message.get(0).unwrap()).unwrap();
-                assert_eq!(message["op"], "peers");
-                first
-                    .send(
-                        json!({"ok":true,"result":{"ports":ports}})
-                            .to_string()
-                            .into(),
-                    )
-                    .await
-                    .unwrap();
-                for (shard, socket) in [&mut first, &mut second].into_iter().enumerate() {
-                    for id in ["one", "two"] {
-                        let message = socket.recv().await.unwrap();
-                        let message: serde_json::Value =
-                            serde_json::from_slice(message.get(0).unwrap()).unwrap();
-                        assert_eq!(
-                            message,
-                            json!({"op":"cancel","transfer_id":id,"reservation_id":""})
-                        );
-                        socket
-                        .send(
-                            json!({"ok": !(reject_first && shard == 0 && id == "one"),"result":{"cancelled":true}})
-                                .to_string()
-                                .into(),
-                        )
-                        .await
-                        .unwrap();
-                    }
-                }
-            };
-            let cleanup = PushCleanup::new(
-                &json!({"consumer_zmq":addr,"ec_items":[{"transfer_id":"one"},{"transfer_id":"two"}]}),
-            );
-            drop(cleanup);
-            tokio::time::timeout(std::time::Duration::from_secs(5), serve)
-                .await
-                .unwrap();
-        }
-    }
-}
+#[path = "../../../../tests/unit/routers/grpc/multimodal/ec_push/tests.rs"]
+mod tests;

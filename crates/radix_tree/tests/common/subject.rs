@@ -112,7 +112,7 @@ impl Subject {
         // consumer iterating the Vec would then double-count), exactly
         // where the widest seed space runs.
         let mut out = BTreeMap::new();
-        for o in scratch.iter() {
+        for o in &*scratch {
             assert!(
                 out.insert(o.holder.parts().0 as usize, o.depth).is_none(),
                 "overlap emitted holder {} twice in the raw Vec",

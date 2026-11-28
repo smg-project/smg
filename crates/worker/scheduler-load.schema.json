@@ -1,0 +1,253 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "SchedulerLoadSnapshot",
+  "description": "The scheduler's load report for one data-parallel rank.",
+  "type": "object",
+  "properties": {
+    "worker": {
+      "description": "URL of the worker this rank belongs to. Set by a gateway serving a\nfleet-wide `/loads`; engines reporting their own load leave it unset.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "worker_type": {
+      "description": "`regular`, `prefill`, `decode`, or `encode`. Set alongside `worker`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "dp_rank": {
+      "type": "integer",
+      "format": "int32",
+      "default": 0
+    },
+    "num_running_reqs": {
+      "type": "integer",
+      "format": "int32",
+      "default": 0
+    },
+    "num_waiting_reqs": {
+      "type": "integer",
+      "format": "int32",
+      "default": 0
+    },
+    "num_waiting_uncached_tokens": {
+      "description": "Queued token-work: waiting-queue tokens not yet served from cache. 0 when\nthe backend does not report it — callers degrade gracefully.",
+      "type": "integer",
+      "format": "int32",
+      "default": 0
+    },
+    "num_total_reqs": {
+      "type": "integer",
+      "format": "int32",
+      "default": 0
+    },
+    "num_used_tokens": {
+      "type": "integer",
+      "format": "int32",
+      "default": 0
+    },
+    "max_total_num_tokens": {
+      "type": "integer",
+      "format": "int32",
+      "default": 0
+    },
+    "token_usage": {
+      "description": "Token usage ratio (0.0–1.0).",
+      "type": "number",
+      "format": "double",
+      "default": 0.0
+    },
+    "active_token_usage": {
+      "description": "Non-evictable KV occupancy, excluding retained, reclaimable prefix cache.\nOlder backends omit this; pressure then uses their legacy token usage.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "num_resident_tokens": {
+      "description": "Context tokens (prompt plus committed output) of every request the\nrank holds. Older backends omit this.",
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int64"
+    },
+    "gen_throughput": {
+      "type": "number",
+      "format": "double",
+      "default": 0.0
+    },
+    "prefill_throughput": {
+      "description": "Actual non-cached input tokens per active prefill second; unknown/stale is None.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "cache_hit_rate": {
+      "type": "number",
+      "format": "double",
+      "default": 0.0
+    },
+    "utilization": {
+      "type": "number",
+      "format": "double",
+      "default": 0.0
+    },
+    "max_running_requests": {
+      "type": "integer",
+      "format": "int32",
+      "default": 0
+    },
+    "memory": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/EngineMemoryMetricsSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "queues": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/EngineQueueMetricsSnapshot"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "kv_transfer_latency_ms": {
+      "description": "PD disaggregation signals, populated only when the backend reports a\n`disagg` section. `None` for HTTP or older engines. Canonical schema\nother engines map into; one engine derives the queue depths from its\nper-stage DisaggregationMetrics counters.",
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "kv_transfer_speed_gb_s": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "format": "double"
+    },
+    "prefill_queue_reqs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int32"
+    },
+    "decode_queue_reqs": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "format": "int32"
+    },
+    "disagg_mode": {
+      "description": "\"prefill\", \"decode\", or \"null\" as reported by the backend.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "values": {
+      "description": "Values the engine reports by name, as the one record or answer this snapshot was read from states them. A list takes the place of the rank's last: a name it leaves out is not in the snapshot, and that says nothing about the value. A report keeps the first 64 entries of a list, less each one with an empty name, a name over 63 bytes, a unit over 31 bytes, a value that is not finite, or a name an entry kept ahead of it states.",
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/NamedValue"
+      }
+    }
+  },
+  "$defs": {
+    "EngineMemoryMetricsSnapshot": {
+      "type": "object",
+      "properties": {
+        "weight_gb": {
+          "type": "number",
+          "format": "double",
+          "default": 0.0
+        },
+        "kv_cache_gb": {
+          "type": "number",
+          "format": "double",
+          "default": 0.0
+        },
+        "graph_gb": {
+          "type": "number",
+          "format": "double",
+          "default": 0.0
+        },
+        "token_capacity": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        }
+      }
+    },
+    "EngineQueueMetricsSnapshot": {
+      "type": "object",
+      "properties": {
+        "waiting": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "grammar": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "paused": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "retracted": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        }
+      }
+    },
+    "NamedValue": {
+      "description": "One value an engine reports by name alongside its fixed fields. The name\nand the unit are shared strings: a copy of an entry, which the load\nmonitor makes where several workers share one polled answer and where\nit publishes a pushed report, allocates none. A connection that knows a\nname ahead of its reports makes it once and clones it.",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "unit": {
+          "type": "string"
+        },
+        "value": {
+          "type": "number",
+          "format": "double"
+        },
+        "age_ms": {
+          "description": "Age of this value's sample in milliseconds, when the engine reports it.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint32",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "name",
+        "unit",
+        "value"
+      ]
+    }
+  }
+}

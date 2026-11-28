@@ -44,8 +44,8 @@ impl PoolKey {
                 url,
                 token,
                 headers,
-            } => (url.clone(), Self::hash_auth(token.as_ref(), headers)),
-            McpTransport::Sse {
+            }
+            | McpTransport::Sse {
                 url,
                 token,
                 headers,
@@ -91,19 +91,34 @@ impl PoolKey {
     }
 }
 
+/// Where a pooled connection's tool listing stands: not returned yet (the
+/// connection is pooled before its opener lists, so a hit meanwhile lists
+/// for itself), made, or failed with the server's message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Listing {
+    Pending,
+    Listed,
+    Failed(String),
+}
+
 /// Cached MCP connection.
 #[derive(Clone)]
 pub(crate) struct CachedConnection {
     pub client: Arc<McpClient>,
+    /// The connection's tool listing. It leaves the pool with the connection.
+    pub listing: Listing,
 }
 
 impl CachedConnection {
     pub fn new(client: Arc<McpClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            listing: Listing::Pending,
+        }
     }
 }
 
-/// Outcome of a URL-scoped pooled-connection lookup on the tool-execution path.
+/// Outcome of a URL-scoped pooled-connection lookup.
 ///
 /// Execution must never reuse a connection authenticated for a different caller.
 /// When a single URL is pooled under more than one [`PoolKey`] — i.e. the same
@@ -179,6 +194,11 @@ impl McpConnectionPool {
         }
     }
 
+    /// Sets the callback that is run with the key of an evicted connection.
+    ///
+    /// The callback runs only when the eviction leaves no earlier pooled
+    /// connection to that key's URL. The connection whose arrival caused the
+    /// eviction does not count as one.
     pub fn set_eviction_callback<F>(&mut self, callback: F)
     where
         F: Fn(&PoolKey) + Send + Sync + 'static,
@@ -210,11 +230,25 @@ impl McpConnectionPool {
         let cached = CachedConnection::new(Arc::clone(&client_arc));
         {
             let mut connections = self.connections.lock();
+            // Another connect may have pooled this key while this one was
+            // connecting: its connection stands, and this one is dropped.
+            if let Some(pooled) = connections.get(&key) {
+                return Ok(Arc::clone(&pooled.client));
+            }
             match connections.push(key, cached) {
                 Some((evicted_key, _)) => {
                     // Eviction: count stays the same (replaced one entry).
+                    // The callback clears what stands under the URL, so it runs
+                    // only once no connection pooled before this one holds that
+                    // URL. The connection just added does not count: it has
+                    // listed nothing yet.
                     if let Some(callback) = &self.eviction_callback {
-                        callback(&evicted_key);
+                        let url_still_held = connections.iter().any(|(pooled, held)| {
+                            !Arc::ptr_eq(&held.client, &client_arc) && pooled.url == evicted_key.url
+                        });
+                        if !url_still_held {
+                            callback(&evicted_key);
+                        }
                     }
                 }
                 None => {
@@ -248,6 +282,62 @@ impl McpConnectionPool {
         }
     }
 
+    /// Record where `client`'s tool listing stands. The record is the listing
+    /// connection's: a key the pool no longer holds, or holds for a connection
+    /// pooled since (the lister evicted during its listing), is left alone.
+    /// `store` puts the listed tools into the inventory and runs under the
+    /// pool's lock for that same connection alone: the tools of a connection
+    /// the pool holds no more stay out, since nothing would clear them.
+    /// Answers whether that connection was still pooled (whether `store` ran).
+    pub(crate) fn set_listing(
+        &self,
+        key: &PoolKey,
+        client: &Arc<McpClient>,
+        listing: Listing,
+        store: impl FnOnce(),
+    ) -> bool {
+        let mut connections = self.connections.lock();
+        let Some(cached) = connections
+            .peek_mut(key)
+            .filter(|cached| Arc::ptr_eq(&cached.client, client))
+        else {
+            return false;
+        };
+        store();
+        cached.listing = listing;
+        true
+    }
+
+    /// Takes `client` out of the pool when `key` still holds that very
+    /// connection, as an eviction does: the count goes down, and the callback
+    /// runs once no pooled connection holds the key's URL.
+    pub(crate) fn remove(&self, key: &PoolKey, client: &Arc<McpClient>) {
+        let mut connections = self.connections.lock();
+        if connections
+            .peek(key)
+            .is_none_or(|cached| !Arc::ptr_eq(&cached.client, client))
+        {
+            return;
+        }
+        connections.pop(key);
+        self.connection_count.fetch_sub(1, Ordering::Relaxed);
+        if let Some(callback) = &self.eviction_callback {
+            if !connections.iter().any(|(pooled, _)| pooled.url == key.url) {
+                callback(key);
+            }
+        }
+    }
+
+    /// Whether the connection under `key` is pooled with its tools listed
+    /// (a plain hit); false for a pending or failed listing and for a key the
+    /// pool does not hold. No promotion.
+    pub(crate) fn is_listed(&self, key: &PoolKey) -> bool {
+        matches!(
+            self.connections.lock().peek(key),
+            Some(cached) if cached.listing == Listing::Listed
+        )
+    }
+
     pub fn list_keys(&self) -> Vec<PoolKey> {
         self.connections
             .lock()
@@ -270,8 +360,8 @@ impl McpConnectionPool {
 
     /// Look up a connection by URL, failing closed when the URL is ambiguous.
     ///
-    /// The tool-execution path holds only the server URL, not the full
-    /// [`PoolKey`]. If exactly one pooled connection matches the URL it is
+    /// For a caller that holds the server URL alone; tool execution holds the
+    /// full [`PoolKey`]. If exactly one pooled connection matches the URL it is
     /// returned; if several do (same server, different credentials or tenants)
     /// the result is [`UrlLookup::Ambiguous`] so the caller never reuses another
     /// caller's authenticated connection. Callers that hold the full key should
@@ -316,231 +406,5 @@ pub struct PoolStats {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::config::{test_support::sse_server_with_headers, McpTransport};
-
-    // Helper to create test server config
-    fn create_test_config(url: &str) -> McpServerConfig {
-        McpServerConfig {
-            name: "test_server".to_string(),
-            transport: McpTransport::Streamable {
-                url: url.to_string(),
-                token: None,
-                headers: HashMap::new(),
-            },
-            proxy: None,
-            required: false,
-            tools: None,
-            builtin_type: None,
-            builtin_tool_name: None,
-            internal: false,
-        }
-    }
-
-    #[tokio::test]
-    async fn test_pool_creation() {
-        let pool = McpConnectionPool::new();
-        assert_eq!(pool.len(), 0);
-        assert!(pool.is_empty());
-    }
-
-    #[test]
-    fn test_pool_stats() {
-        let pool = McpConnectionPool::with_capacity(10);
-
-        let stats = pool.stats();
-        assert_eq!(stats.total_connections, 0);
-        assert_eq!(stats.capacity, 10);
-    }
-
-    #[test]
-    fn test_pool_clear() {
-        let pool = McpConnectionPool::new();
-        // Pool starts empty
-        assert_eq!(pool.len(), 0);
-        // Clear on empty pool should work
-        pool.clear();
-        assert!(pool.is_empty());
-    }
-
-    #[test]
-    fn test_pool_key_from_config() {
-        // No token
-        let config = create_test_config("http://localhost:3000");
-        let key = PoolKey::from_config(&config, None);
-        assert_eq!(key.url, "http://localhost:3000");
-        assert_eq!(key.auth_hash, 0);
-        assert_eq!(key.tenant_id, None);
-
-        // With token
-        let config_with_token = McpServerConfig {
-            name: "test".to_string(),
-            transport: McpTransport::Streamable {
-                url: "http://localhost:3000".to_string(),
-                token: Some("secret-token".to_string()),
-                headers: HashMap::new(),
-            },
-            proxy: None,
-            required: false,
-            tools: None,
-            builtin_type: None,
-            builtin_tool_name: None,
-            internal: false,
-        };
-        let key_with_token = PoolKey::from_config(&config_with_token, None);
-        assert_eq!(key_with_token.url, "http://localhost:3000");
-        assert_ne!(key_with_token.auth_hash, 0); // Token hashed
-
-        // With tenant
-        let key_with_tenant = PoolKey::from_config(&config, Some("tenant-123".to_string()));
-        assert_eq!(key_with_tenant.tenant_id, Some("tenant-123".to_string()));
-    }
-
-    #[test]
-    fn test_pool_key_different_tokens() {
-        let config1 = McpServerConfig {
-            name: "test".to_string(),
-            transport: McpTransport::Streamable {
-                url: "http://localhost:3000".to_string(),
-                token: Some("token-a".to_string()),
-                headers: HashMap::new(),
-            },
-            proxy: None,
-            required: false,
-            tools: None,
-            builtin_type: None,
-            builtin_tool_name: None,
-            internal: false,
-        };
-        let config2 = McpServerConfig {
-            name: "test".to_string(),
-            transport: McpTransport::Streamable {
-                url: "http://localhost:3000".to_string(),
-                token: Some("token-b".to_string()),
-                headers: HashMap::new(),
-            },
-            proxy: None,
-            required: false,
-            tools: None,
-            builtin_type: None,
-            builtin_tool_name: None,
-            internal: false,
-        };
-
-        let key1 = PoolKey::from_config(&config1, None);
-        let key2 = PoolKey::from_config(&config2, None);
-
-        // Same URL but different tokens = different keys
-        assert_eq!(key1.url, key2.url);
-        assert_ne!(key1.auth_hash, key2.auth_hash);
-        assert_ne!(key1, key2);
-    }
-
-    #[test]
-    fn test_pool_key_with_headers() {
-        let mut headers1 = HashMap::new();
-        headers1.insert("X-API-Key".to_string(), "key-1".to_string());
-
-        let mut headers2 = HashMap::new();
-        headers2.insert("X-API-Key".to_string(), "key-2".to_string());
-
-        let config1 = sse_server_with_headers("test", "http://localhost:3000", headers1);
-        let config2 = sse_server_with_headers("test", "http://localhost:3000", headers2);
-
-        let key1 = PoolKey::from_config(&config1, None);
-        let key2 = PoolKey::from_config(&config2, None);
-
-        // Same URL but different headers = different keys
-        assert_eq!(key1.url, key2.url);
-        assert_ne!(key1.auth_hash, key2.auth_hash);
-        assert_ne!(key1, key2);
-    }
-
-    #[test]
-    fn test_pool_with_global_proxy() {
-        use crate::core::config::McpProxyConfig;
-
-        // Create proxy config
-        let proxy = McpProxyConfig {
-            http: Some("http://proxy.example.com:8080".to_string()),
-            https: None,
-            no_proxy: Some("localhost,127.0.0.1".to_string()),
-            username: None,
-            password: None,
-        };
-
-        // Create pool with proxy
-        let pool = McpConnectionPool::with_full_config(100, Some(proxy.clone()));
-
-        // Verify proxy is stored
-        assert!(pool.global_proxy.is_some());
-        let stored_proxy = pool.global_proxy.as_ref().unwrap();
-        assert_eq!(
-            stored_proxy.http.as_ref().unwrap(),
-            "http://proxy.example.com:8080"
-        );
-        assert_eq!(
-            stored_proxy.no_proxy.as_ref().unwrap(),
-            "localhost,127.0.0.1"
-        );
-    }
-
-    #[test]
-    fn classify_url_match_distinguishes_none_unique_and_ambiguous() {
-        let url = "http://localhost:3000";
-        let other = PoolKey::new("http://other:9000", 1, None);
-        let a = PoolKey::new(url, 111, None);
-        // Same URL, different auth hash (two callers with different tokens).
-        let b_diff_auth = PoolKey::new(url, 222, None);
-        // Same URL and auth, different tenant.
-        let a_diff_tenant = PoolKey::new(url, 111, Some("tenant-2".to_string()));
-
-        assert_eq!(
-            classify_url_match([&other].into_iter(), url),
-            UrlMatch::None
-        );
-        assert_eq!(
-            classify_url_match([&other, &a].into_iter(), url),
-            UrlMatch::Unique
-        );
-        // Different credentials on the same URL must never resolve to one entry.
-        assert_eq!(
-            classify_url_match([&a, &b_diff_auth].into_iter(), url),
-            UrlMatch::Ambiguous
-        );
-        // Different tenants on the same URL are equally ambiguous.
-        assert_eq!(
-            classify_url_match([&a, &a_diff_tenant].into_iter(), url),
-            UrlMatch::Ambiguous
-        );
-    }
-
-    #[test]
-    fn get_unique_by_url_on_empty_pool_is_not_found() {
-        let pool = McpConnectionPool::new();
-        assert!(matches!(
-            pool.get_unique_by_url("http://localhost:3000"),
-            UrlLookup::NotFound
-        ));
-    }
-
-    #[test]
-    #[expect(deprecated, reason = "verifies the source-compatibility wrapper")]
-    fn deprecated_get_by_url_fails_closed_on_empty_pool() {
-        let pool = McpConnectionPool::new();
-        assert!(pool.get_by_url("http://localhost:3000").is_none());
-    }
-
-    #[test]
-    fn test_pool_proxy_from_env() {
-        // Note: This test depends on environment variables
-        // In production, proxy is loaded from MCP_HTTP_PROXY or HTTP_PROXY env vars
-        let pool = McpConnectionPool::new();
-
-        // Pool should either have proxy from env or None
-        // We can't assert specific value since it depends on test environment
-        // Just verify it doesn't panic
-        assert!(pool.global_proxy.is_some() || pool.global_proxy.is_none());
-    }
-}
+#[path = "../../tests/unit/core/pool/tests.rs"]
+mod tests;

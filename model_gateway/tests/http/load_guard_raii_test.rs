@@ -14,7 +14,8 @@ use axum::{body::Body, response::Response};
 use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use http_body_util::BodyExt;
-use smg::worker::{BasicWorkerBuilder, GuardedStream, Worker, WorkerLoadGuard};
+use smg::routers::{common::stream::GuardedStream, grpc::backend_client::BasicWorkerBuilder};
+use smg_worker::identity::basic::{Worker, WorkerLoadGuard};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 
@@ -52,7 +53,7 @@ async fn test_guard_dropped_when_response_body_consumed() {
     let worker = create_test_worker();
     assert_eq!(worker.load(), 0);
 
-    let guard = WorkerLoadGuard::new(worker.clone(), None);
+    let guard = WorkerLoadGuard::with_key(worker.clone(), None);
     assert_eq!(worker.load(), 1);
 
     let guarded_response = guarded_response(vec![Bytes::from("Hello, World!")], guard);
@@ -75,7 +76,7 @@ async fn test_guard_dropped_when_response_dropped_without_consumption() {
     assert_eq!(worker.load(), 0);
 
     {
-        let guard = WorkerLoadGuard::new(worker.clone(), None);
+        let guard = WorkerLoadGuard::with_key(worker.clone(), None);
         assert_eq!(worker.load(), 1);
 
         let _guarded_response = guarded_response(vec![Bytes::from("Hello, World!")], guard);
@@ -99,7 +100,7 @@ async fn test_streaming_guard_dropped_when_stream_ends() {
     // Create a channel for SSE streaming
     let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
 
-    let guard = WorkerLoadGuard::new(worker.clone(), None);
+    let guard = WorkerLoadGuard::with_key(worker.clone(), None);
     assert_eq!(worker.load(), 1);
 
     let guarded_response = guarded_sse_response(rx, guard);
@@ -145,7 +146,7 @@ async fn test_streaming_guard_dropped_on_client_disconnect() {
 
     let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
 
-    let guard = WorkerLoadGuard::new(worker.clone(), None);
+    let guard = WorkerLoadGuard::with_key(worker.clone(), None);
     assert_eq!(worker.load(), 1);
 
     let guarded_response = guarded_sse_response(rx, guard);
@@ -179,7 +180,7 @@ async fn test_guard_rides_in_the_body_not_the_head() {
     let worker = create_test_worker();
     let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
 
-    let guard = WorkerLoadGuard::new(worker.clone(), None);
+    let guard = WorkerLoadGuard::with_key(worker.clone(), None);
     let (parts, mut body) = guarded_sse_response(rx, guard).into_parts();
     drop(parts);
     assert_eq!(worker.load(), 1, "the head is gone, the body is not");
@@ -201,8 +202,8 @@ async fn test_multiple_guards_all_dropped() {
 
     {
         // Create guards for both workers (simulates dual prefill/decode)
-        let guard1 = WorkerLoadGuard::new(worker1.clone(), None);
-        let guard2 = WorkerLoadGuard::new(worker2.clone(), None);
+        let guard1 = WorkerLoadGuard::with_key(worker1.clone(), None);
+        let guard2 = WorkerLoadGuard::with_key(worker2.clone(), None);
         assert_eq!(worker1.load(), 1);
         assert_eq!(worker2.load(), 1);
 
@@ -224,7 +225,7 @@ async fn test_guard_with_empty_body() {
     assert_eq!(worker.load(), 0);
 
     {
-        let guard = WorkerLoadGuard::new(worker.clone(), None);
+        let guard = WorkerLoadGuard::with_key(worker.clone(), None);
         assert_eq!(worker.load(), 1);
 
         let guarded_response = guarded_response(Vec::new(), guard);

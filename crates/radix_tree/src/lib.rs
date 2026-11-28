@@ -338,7 +338,9 @@ impl Membership {
                 // drift upward over a long-lived index instead of
                 // tracking live sharing.
                 if buckets.len() == 1 && buckets[0].1.len() == 1 {
-                    let (lineage, set) = buckets.pop().expect("one bucket");
+                    let Some((lineage, set)) = buckets.pop() else {
+                        return false;
+                    };
                     let holder = set[0];
                     interner.release(set);
                     *self = Membership::One { lineage, holder };
@@ -467,6 +469,10 @@ impl FlatTree {
         }
         self.clear(id);
         let slot = &mut self.slots[id.index as usize];
+        #[expect(
+            clippy::expect_used,
+            reason = "checked live at the call's entry, and `clear` leaves the state in place"
+        )]
         let state = slot.state.take().expect("checked live");
         self.by_name.remove(&state.name);
         slot.generation = slot.generation.wrapping_add(1);
@@ -503,10 +509,7 @@ impl FlatTree {
                 duplicates: 0,
             });
         }
-        let state = self.slots[id.index as usize]
-            .state
-            .as_ref()
-            .expect("checked live");
+        let state = Self::checked_live(&self.slots, id.index);
         // Resolve the anchor BEFORE any mutation (all-or-nothing).
         let (start_pos, mut lineage_prev) = match parent {
             Some(parent_key) => match state.registry.get(&parent_key) {
@@ -539,10 +542,7 @@ impl FlatTree {
                 content,
                 lineage,
             };
-            let state = self.slots[id.index as usize]
-                .state
-                .as_mut()
-                .expect("checked live");
+            let state = Self::checked_live_mut(&mut self.slots, id.index);
             match state.registry.get(&key) {
                 Some(existing) if *existing == info => {
                     duplicates += 1;
@@ -565,13 +565,7 @@ impl FlatTree {
                 duplicates += 1;
                 continue;
             }
-            if let Some(&existing) = self.slots[id.index as usize]
-                .state
-                .as_ref()
-                .expect("checked live")
-                .registry
-                .get(&key)
-            {
+            if let Some(&existing) = Self::checked_live(&self.slots, id.index).registry.get(&key) {
                 // §4: re-registration MOVES the block.
                 Self::unindex(
                     &mut self.entries,
@@ -580,20 +574,14 @@ impl FlatTree {
                     id.index,
                     existing,
                 );
-                self.slots[id.index as usize]
-                    .state
-                    .as_mut()
-                    .expect("checked live")
+                Self::checked_live_mut(&mut self.slots, id.index)
                     .registry
                     .remove(&key);
                 self.holder_blocks_total -= 1;
             }
             let inserted = self.index_block(id.index, info);
             debug_assert!(inserted, "alias pre-check guarantees insertion");
-            let state = self.slots[id.index as usize]
-                .state
-                .as_mut()
-                .expect("checked live");
+            let state = Self::checked_live_mut(&mut self.slots, id.index);
             state.registry.insert(key, info);
             self.holder_blocks_total += 1;
             applied += 1;
@@ -630,10 +618,7 @@ impl FlatTree {
         if blocks.is_empty() {
             return (0, true);
         }
-        let state = self.slots[id.index as usize]
-            .state
-            .as_ref()
-            .expect("checked live");
+        let state = Self::checked_live(&self.slots, id.index);
         let (start_pos, mut lineage_prev) = match parent {
             Some(parent_key) => match state.registry.get(&parent_key) {
                 None => return (0, false),
@@ -685,10 +670,7 @@ impl FlatTree {
         }
         let mut removed = 0u32;
         for &key in keys {
-            let state = self.slots[id.index as usize]
-                .state
-                .as_mut()
-                .expect("checked live");
+            let state = Self::checked_live_mut(&mut self.slots, id.index);
             let Some(info) = state.registry.remove(&key) else {
                 continue;
             };
@@ -712,21 +694,21 @@ impl FlatTree {
         if self.live(id).is_none() {
             return 0;
         }
-        let state = self.slots[id.index as usize]
-            .state
-            .as_mut()
-            .expect("checked live");
+        let state = Self::checked_live_mut(&mut self.slots, id.index);
         if state.registry.len() as u64 <= keep {
             return 0;
         }
         let mut ordered = state.ordered();
         let mut dropped = 0u64;
         while ordered.len() as u64 > keep {
-            let (pos, key) = ordered.pop().expect("non-empty");
-            let state = self.slots[id.index as usize]
-                .state
-                .as_mut()
-                .expect("checked live");
+            let Some((pos, key)) = ordered.pop() else {
+                break;
+            };
+            let state = Self::checked_live_mut(&mut self.slots, id.index);
+            #[expect(
+                clippy::expect_used,
+                reason = "`ordered` is drawn from this registry; a missing key is a broken index invariant"
+            )]
             let info = state.registry.remove(&key).expect("derived from registry");
             debug_assert_eq!(info.pos, pos);
             self.holder_blocks_total -= 1;
@@ -748,10 +730,7 @@ impl FlatTree {
         if self.live(id).is_none() {
             return;
         }
-        let state = self.slots[id.index as usize]
-            .state
-            .as_mut()
-            .expect("checked live");
+        let state = Self::checked_live_mut(&mut self.slots, id.index);
         let registry = std::mem::take(&mut state.registry);
         self.holder_blocks_total -= registry.len() as u64;
         for (_, info) in registry {
@@ -822,7 +801,7 @@ impl FlatTree {
                         RunProbe::One(*holder)
                     } else {
                         RunProbe::Miss
-                    })
+                    });
                 }
                 Some(Membership::Many(buckets)) => {
                     let run = if buckets.len() == 1 {
@@ -923,7 +902,7 @@ impl FlatTree {
             survivors_depth = p as u32 + 1;
         }
         // Holders still active survived every visited position.
-        for &h in active.iter() {
+        for &h in &active {
             self.push_answer(h, survivors_depth, out);
         }
         drop(probes);
@@ -940,6 +919,10 @@ impl FlatTree {
         let state = self.live(id);
         let ordered = state.map(|s| s.ordered()).unwrap_or_default();
         ordered.into_iter().map(move |(pos, key)| {
+            #[expect(
+                clippy::expect_used,
+                reason = "`ordered` is non-empty only for a live holder and names its registry's keys"
+            )]
             let info = state
                 .expect("ordered non-empty implies live")
                 .registry
@@ -1179,6 +1162,25 @@ impl FlatTree {
         slot.state.as_ref()
     }
 
+    /// The state of a holder the caller checked live (`live(id)` at the
+    /// call's entry). Over the slot table rather than `self`, so a caller
+    /// holding the state keeps its other fields free to borrow.
+    #[expect(
+        clippy::expect_used,
+        reason = "checked live at the call's entry; a missing state is a broken index invariant"
+    )]
+    fn checked_live(slots: &[HolderSlot], index: u32) -> &HolderState {
+        slots[index as usize].state.as_ref().expect("checked live")
+    }
+
+    #[expect(
+        clippy::expect_used,
+        reason = "checked live at the call's entry; a missing state is a broken index invariant"
+    )]
+    fn checked_live_mut(slots: &mut [HolderSlot], index: u32) -> &mut HolderState {
+        slots[index as usize].state.as_mut().expect("checked live")
+    }
+
     fn push_answer(&self, holder: u32, depth: u32, out: &mut Vec<Overlap>) {
         if depth == 0 {
             return;
@@ -1203,9 +1205,11 @@ impl FlatTree {
     /// key — the caller then treats the store as a duplicate and the
     /// new key is never registered (deterministic; audited).
     fn index_block(&mut self, holder: u32, info: BlockInfo) -> bool {
+        use std::collections::hash_map::Entry;
+
         let interner = &mut self.interner;
         match self.entries.entry((info.pos, info.content)) {
-            std::collections::hash_map::Entry::Vacant(vacant) => {
+            Entry::Vacant(vacant) => {
                 vacant.insert(Membership::One {
                     lineage: info.lineage,
                     holder,
@@ -1213,7 +1217,7 @@ impl FlatTree {
                 self.distinct_lineage_entries += 1;
                 true
             }
-            std::collections::hash_map::Entry::Occupied(mut occupied) => {
+            Entry::Occupied(mut occupied) => {
                 match occupied.get_mut().insert(info.lineage, holder, interner) {
                     Inserted::Existing => false,
                     Inserted::AddedToExistingLineage => true,

@@ -61,20 +61,17 @@ pub async fn forward_realtime_rest(
         }
     };
 
-    let auth = match extract_auth_header(headers, worker.api_key()) {
-        Some(v) => v,
-        None => {
-            Metrics::record_router_error(
-                labels.router,
-                labels.backend,
-                metrics_labels::CONNECTION_HTTP,
-                model,
-                endpoint_label,
-                metrics_labels::ERROR_VALIDATION,
-                metrics_labels::REASON_INVALID_REQUEST,
-            );
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
+    let Some(auth) = extract_auth_header(headers, worker.api_key()) else {
+        Metrics::record_router_error(
+            labels.router,
+            labels.backend,
+            metrics_labels::CONNECTION_HTTP,
+            model,
+            endpoint_label,
+            metrics_labels::ERROR_VALIDATION,
+            metrics_labels::REASON_INVALID_REQUEST,
+        );
+        return StatusCode::UNAUTHORIZED.into_response();
     };
 
     // Track load for the duration of the upstream request
@@ -120,7 +117,12 @@ pub async fn forward_realtime_rest(
         }
         Err(e) => {
             worker.record_outcome(502);
-            error!(error = %e, endpoint, "Failed to forward realtime REST request");
+            error!(
+                url = %worker.redacted_url(),
+                error = %e.without_url(),
+                endpoint,
+                "Failed to forward realtime REST request"
+            );
             Metrics::record_router_error(
                 labels.router,
                 labels.backend,
@@ -154,57 +156,12 @@ pub async fn proxy_response(resp: reqwest::Response, model: &str) -> Response {
     match resp.bytes().await {
         Ok(body) => (status, [(http::header::CONTENT_TYPE, content_type)], body).into_response(),
         Err(e) => {
-            error!(error = %e, "Failed to read upstream response body");
+            error!(model, error = %e.without_url(), "Failed to read upstream response body");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use axum::http::header::CONTENT_TYPE;
-
-    use super::*;
-    use crate::test_support::{text_of, upstream};
-
-    /// The provider's error envelope as its realtime REST endpoints answer
-    /// it: the message names the operator's organization and project.
-    const REALTIME_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for realtime-model in organization org-abc123 project proj_xyz789 on requests per min (RPM): Limit 3, Used 3, Requested 1.","type":"requests","param":null,"code":"rate_limit_exceeded"}}"#;
-
-    /// A refusal of a realtime REST call reaches the caller under its status
-    /// and content type with the operator's organization and project gone
-    /// and the rest of the message kept.
-    #[tokio::test]
-    async fn a_realtime_refusal_reaches_the_caller_without_the_operators_identifiers() {
-        let response = proxy_response(
-            upstream(429, Some("application/json"), REALTIME_REFUSAL),
-            "realtime-model",
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
-        let text = text_of(response).await;
-        assert!(!text.contains("org-abc123"), "{text}");
-        assert!(!text.contains("proj_xyz789"), "{text}");
-        assert!(
-            text.contains("Rate limit reached for realtime-model"),
-            "{text}"
-        );
-        assert!(text.contains(r#""code":"rate_limit_exceeded""#), "{text}");
-    }
-
-    /// A success passes as it came, byte for byte.
-    #[tokio::test]
-    async fn a_realtime_success_passes_as_it_came() {
-        const SESSION: &str =
-            r#"{"id":"sess_1","object":"realtime.session","client_secret":{"value":"ek_test"}}"#;
-        let response = proxy_response(
-            upstream(200, Some("application/json"), SESSION),
-            "realtime-model",
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers()[CONTENT_TYPE], "application/json");
-        assert_eq!(text_of(response).await, SESSION);
-    }
-}
+#[path = "../../tests/unit/realtime/rest/tests.rs"]
+mod tests;

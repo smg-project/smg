@@ -45,17 +45,18 @@ use crate::vision::{
     preprocessor_config::PreProcessorConfig,
     processor::{ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor},
     transforms::{
-        center_crop, crop_rgb, expand_to_square, mean_to_rgb, paste_rgb, pil_to_filter, resize,
-        resize_bicubic_torch_aa, resize_bicubic_torch_aa_cropped, stack_batch, to_tensor_by_table,
+        center_crop, crop_rgb, expand_to_square, extend_planes_by_table, mean_to_rgb, paste_rgb,
+        pil_to_filter, resize, resize_bicubic_torch_aa, resize_bicubic_torch_aa_cropped,
+        resize_bicubic_torch_aa_squared, rgb_bytes, stack_batch, to_tensor_by_table,
         TransformError,
     },
 };
 
 /// CLIP normalization mean values used by LLaVA models.
-pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
+pub(crate) const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
 
 /// CLIP normalization std values used by LLaVA models.
-pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
+pub(crate) const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
 
 /// The reference processor's default grid pinpoints, `[[336, 672], [672, 336],
 /// [672, 672], [1008, 336], [336, 1008]]` as `[height, width]`, here as
@@ -186,20 +187,10 @@ impl LlavaProcessor {
         }
     }
 
-    /// Create a processor with custom settings.
-    pub fn with_config(patch_size: u32, image_size: u32, aspect_ratio: ImageAspectRatio) -> Self {
-        Self {
-            transforms: LlavaTransforms::new(&PreProcessorConfig::default()),
-            patch_size,
-            image_size,
-            aspect_ratio,
-        }
-    }
-
     /// Create a processor from model config JSON.
     ///
     /// Extracts patch_size, image_size, and image_aspect_ratio from config.
-    pub fn from_config(config: &Value) -> Self {
+    pub(crate) fn from_config(config: &Value) -> Self {
         let patch_size = config
             .get("vision_config")
             .and_then(|v| v.get("patch_size"))
@@ -241,6 +232,24 @@ impl LlavaProcessor {
         self
     }
 
+    /// Refuse a patch size of zero: the token count divides by it.
+    pub(crate) fn validate(&self) -> Result<(), TransformError> {
+        if self.patch_size == 0 {
+            return Err(TransformError::ShapeError(
+                "LLaVA patch_size must be positive".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The side of the square target: the configured size, else the model's
+    /// image size.
+    fn target_side(&self) -> u32 {
+        self.transforms
+            .target_size
+            .map_or(self.image_size, |(h, _w)| h)
+    }
+
     /// Process a single image through the LLaVA 1.5 pipeline.
     ///
     /// The processing flow depends on `self.aspect_ratio`:
@@ -250,11 +259,7 @@ impl LlavaProcessor {
         let transforms = &self.transforms;
         let filter = transforms.filter;
 
-        // Get target size from config or use default
-        let target_size = transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.image_size);
+        let target_size = self.target_side();
 
         // Get crop size (may be different from target_size)
         let crop_size = transforms.crop_size.map(|(h, _w)| h).unwrap_or(target_size);
@@ -263,6 +268,18 @@ impl LlavaProcessor {
             ImageAspectRatio::Pad => {
                 // Pad mode: expand to square with mean color padding, then resize
                 let (w, h) = image.dimensions();
+                // On x86-64 the square of an RGB image is resized without
+                // the square: the same bytes.
+                if let (DynamicImage::ImageRgb8(rgb), true, FilterType::CatmullRom) =
+                    (image, transforms.do_resize, filter)
+                {
+                    let color = mean_to_rgb(&transforms.mean);
+                    if let Some(resized) = resize_bicubic_torch_aa_squared(rgb, color, target_size)
+                    {
+                        let resized = DynamicImage::ImageRgb8(resized);
+                        return to_tensor_by_table(&resized, &transforms.table);
+                    }
+                }
                 let squared = if w == h {
                     Cow::Borrowed(image)
                 } else {
@@ -338,9 +355,7 @@ impl VisionPreProcessor for LlavaProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
         // Store original sizes
         let item_sizes: Vec<(u32, u32)> = images.iter().map(|img| img.dimensions()).collect();
@@ -370,11 +385,7 @@ impl VisionPreProcessor for LlavaProcessor {
     fn calculate_num_tokens(&self, _width: u32, _height: u32) -> Result<usize, TransformError> {
         // For LLaVA 1.5, token count is based on processed image size and patch size
         let patch_size = self.patch_size;
-        let image_size = self
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.image_size);
+        let image_size = self.target_side();
 
         let patches_per_side = image_size / patch_size;
         Ok((patches_per_side * patches_per_side) as usize)
@@ -385,11 +396,7 @@ impl VisionPreProcessor for LlavaProcessor {
     }
 
     fn get_processed_size(&self) -> Option<(u32, u32)> {
-        let size = self
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.image_size);
+        let size = self.target_side();
         Some((size, size))
     }
 }
@@ -431,37 +438,53 @@ impl Default for LlavaNextProcessor {
 
 impl LlavaNextProcessor {
     /// Resolve model geometry and image transforms once for a loaded model.
-    pub fn from_configs(model_config: &Value, config: &PreProcessorConfig) -> Self {
+    pub(crate) fn from_configs(model_config: &Value, config: &PreProcessorConfig) -> Self {
         Self::from_config(model_config).with_preprocessor_config(config)
     }
 
     /// Resolve the image transforms from `config`, keeping this processor's
     /// model geometry.
-    pub fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
+    pub(crate) fn with_preprocessor_config(mut self, config: &PreProcessorConfig) -> Self {
         self.base.transforms = LlavaTransforms::new(config);
         self
+    }
+
+    /// Refuse a size of zero the token count, the anyres grid or the sample
+    /// crops divide by.
+    pub(crate) fn validate(&self) -> Result<(), TransformError> {
+        self.base.validate()?;
+        let crop = self.sample_crop();
+        let zero = if self.base.image_size == 0 {
+            "image_size"
+        } else if crop.0 == 0 || crop.1 == 0 {
+            "crop_size (or size, when it is absent)"
+        } else {
+            return Ok(());
+        };
+        Err(TransformError::ShapeError(format!(
+            "LLaVA-NeXT {zero} must be positive"
+        )))
+    }
+
+    /// The crop a sample ends as, `(height, width)`: `crop_size`, else the
+    /// square target.
+    fn sample_crop(&self) -> (u32, u32) {
+        let target = self.base.target_side();
+        self.base.transforms.crop_size.unwrap_or((target, target))
     }
 
     /// Create a new LLaVA-NeXT processor with default settings.
     ///
     /// Default grid pinpoints are common LLaVA-NeXT resolutions.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             base: LlavaProcessor::new(),
             image_grid_pinpoints: DEFAULT_GRID_PINPOINTS.to_vec(),
         }
     }
 
-    /// Create a processor with custom grid pinpoints.
-    pub fn with_grid_pinpoints(grid_pinpoints: Vec<(u32, u32)>) -> Self {
-        Self {
-            base: LlavaProcessor::new(),
-            image_grid_pinpoints: grid_pinpoints,
-        }
-    }
-
     /// Create a processor from model config.
-    pub fn from_config(config: &Value) -> Self {
+    pub(crate) fn from_config(config: &Value) -> Self {
         let base = LlavaProcessor::from_config(config);
 
         let grid_pinpoints = config
@@ -489,7 +512,7 @@ impl LlavaNextProcessor {
     /// Select the best resolution from grid pinpoints for the given image.
     ///
     /// Minimizes wasted pixels while maximizing effective resolution.
-    pub fn select_best_resolution(&self, original_size: (u32, u32)) -> (u32, u32) {
+    pub(crate) fn select_best_resolution(&self, original_size: (u32, u32)) -> (u32, u32) {
         select_best_resolution(original_size, &self.image_grid_pinpoints)
     }
 
@@ -497,18 +520,9 @@ impl LlavaNextProcessor {
     ///
     /// Returns (grid_width, grid_height) — the number of 336×336 crops along
     /// each axis of the best-fit resolution.
-    pub fn get_anyres_grid_shape(&self, image_size: (u32, u32)) -> (u32, u32) {
+    pub(crate) fn get_anyres_grid_shape(&self, image_size: (u32, u32)) -> (u32, u32) {
         let (width, height) = self.select_best_resolution(image_size);
         (width / self.base.image_size, height / self.base.image_size)
-    }
-
-    /// Calculate unpad dimensions based on original aspect ratio.
-    #[expect(
-        clippy::unused_self,
-        reason = "method logically belongs to the processor; keeps API consistent"
-    )]
-    pub fn calculate_unpad(&self, grid_shape: (u32, u32), original_size: (u32, u32)) -> (u32, u32) {
-        calculate_unpad(grid_shape, original_size)
     }
 
     /// Resize and pad image to target resolution, maintaining aspect ratio.
@@ -516,25 +530,22 @@ impl LlavaNextProcessor {
         resize_and_pad_image(image, target, self.base.transforms.filter)
     }
 
-    /// Divide image into crops of specified size.
+    /// Divide image into square crops of `side`.
     #[expect(
         clippy::unused_self,
         reason = "method logically belongs to the processor; keeps API consistent"
     )]
-    fn divide_to_samples(&self, image: &DynamicImage, crop_size: (u32, u32)) -> Vec<DynamicImage> {
-        divide_to_samples(image, crop_size)
+    fn divide_to_samples(&self, image: &DynamicImage, side: u32) -> Vec<DynamicImage> {
+        divide_to_samples(image, side)
     }
 
-    /// Process a single patch/crop.
-    fn process_patch(&self, image: &DynamicImage) -> Array3<f32> {
+    /// A patch's pixels as the model takes them: resized to the target size
+    /// and center-cropped as configured (a crop of that size stays as it is).
+    fn patch_pixels<'a>(&self, image: &'a DynamicImage) -> Cow<'a, DynamicImage> {
         let transforms = &self.base.transforms;
         let filter = transforms.filter;
 
-        // Get target size for patches
-        let target_size = transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.base.image_size);
+        let target_size = self.base.target_side();
 
         // Resize patch to target size (a crop of that size stays as it is)
         let resized = if transforms.do_resize {
@@ -544,7 +555,7 @@ impl LlavaNextProcessor {
         };
 
         // Center crop if configured (skip if image already fits)
-        let cropped = if transforms.do_center_crop {
+        if transforms.do_center_crop {
             if let Some((crop_h, crop_w)) = transforms.crop_size {
                 let (rw, rh) = resized.dimensions();
                 if crop_w >= rw && crop_h >= rh {
@@ -557,9 +568,7 @@ impl LlavaNextProcessor {
             }
         } else {
             resized
-        };
-
-        to_tensor_by_table(&cropped, &transforms.table)
+        }
     }
 }
 
@@ -576,26 +585,16 @@ impl VisionPreProcessor for LlavaNextProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
 
-        let mut patches_per_image: Vec<Vec<Array3<f32>>> = Vec::with_capacity(images.len());
+        let mut samples_per_image: Vec<Vec<DynamicImage>> = Vec::with_capacity(images.len());
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
 
         let filter = self.base.transforms.filter;
-        let target_size = self
-            .base
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.base.image_size);
-        let crop_size = self
-            .base
-            .transforms
-            .crop_size
-            .unwrap_or((target_size, target_size));
+        let target_size = self.base.target_side();
+        // The reference cuts squares of the crop height.
+        let (sample_side, _) = self.sample_crop();
 
         for image in images {
             let original_size = image.dimensions();
@@ -607,25 +606,20 @@ impl VisionPreProcessor for LlavaNextProcessor {
                 resize_as_reference(image, target_size, target_size, filter).into_owned();
 
             let mut samples = vec![image_original_resize];
-            samples.extend(self.divide_to_samples(&image_padded, crop_size));
+            samples.extend(self.divide_to_samples(&image_padded, sample_side));
 
-            let patches: Vec<Array3<f32>> = samples.iter().map(|s| self.process_patch(s)).collect();
-            patches_per_image.push(patches);
+            samples_per_image.push(samples);
 
             feature_token_counts.push(self.calculate_num_tokens(original_size.0, original_size.1)?);
         }
 
         // Build 5D encoder_input [num_images, max_patches, C, H, W] matching the
         // HF LlavaNextImageProcessor output the engine expects with Batched layout.
-        let (c, h, w) = if let Some(first) = patches_per_image.iter().find_map(|p| p.first()) {
-            let s = first.shape();
-            (s[0], s[1], s[2])
-        } else {
-            return Err(TransformError::EmptyBatch);
-        };
-
         let num_images = images.len();
-        let encoder_input = stack_patches(&patches_per_image, (c, h, w))?;
+        let table = &self.base.transforms.table;
+        let encoder_input = batch_patches(&samples_per_image, table, |sample| {
+            self.patch_pixels(sample)
+        })?;
 
         // Build model-specific image_sizes tensor as [num_images, 2] in (height, width) order
         // to match the HF LlavaNextImageProcessor output format the engine expects.
@@ -647,12 +641,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
         let original_size = (width, height);
 
         // Use effective geometry from config, falling back to base defaults.
-        let image_size = self
-            .base
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.base.image_size);
+        let image_size = self.base.target_side();
         let patch_size = self.base.patch_size;
 
         // Base feature tokens (from original resized image through ViT).
@@ -702,12 +691,7 @@ impl VisionPreProcessor for LlavaNextProcessor {
     fn get_processed_size(&self) -> Option<(u32, u32)> {
         // LLaVA-NeXT has variable output size based on crops
         // Return the base patch size
-        let size = self
-            .base
-            .transforms
-            .target_size
-            .map(|(h, _w)| h)
-            .unwrap_or(self.base.image_size);
+        let size = self.base.target_side();
         Some((size, size))
     }
 }
@@ -761,26 +745,6 @@ fn select_best_resolution(
 /// as that integer and anything else rounds down.
 fn unpadded_side(value: f64) -> f64 {
     ((value * 1e7).round() / 1e7).floor()
-}
-
-/// Calculate unpad dimensions based on aspect ratio.
-fn calculate_unpad(size: (u32, u32), original_size: (u32, u32)) -> (u32, u32) {
-    let (original_width, original_height) = original_size;
-    let (current_width, current_height) = size;
-    let original_aspect_ratio = original_width as f32 / original_height as f32;
-    let current_aspect_ratio = current_width as f32 / current_height as f32;
-
-    if original_aspect_ratio > current_aspect_ratio {
-        let scale_factor = current_width as f32 / original_width as f32;
-        let new_height = (original_height as f32 * scale_factor).floor() as u32;
-        let padding = (current_height - new_height) / 2;
-        (current_width, current_height - 2 * padding)
-    } else {
-        let scale_factor = current_height as f32 / original_height as f32;
-        let new_width = (original_width as f32 * scale_factor).floor() as u32;
-        let padding = (current_width - new_width) / 2;
-        (current_width - 2 * padding, current_height)
-    }
 }
 
 /// Resize and pad image to target resolution, centering the image.
@@ -876,20 +840,20 @@ fn resize_as_reference(
     })
 }
 
-/// Divide image into crops of specified size.
-fn divide_to_samples(image: &DynamicImage, crop_size: (u32, u32)) -> Vec<DynamicImage> {
+/// Divide image into square crops of `side`.
+fn divide_to_samples(image: &DynamicImage, side: u32) -> Vec<DynamicImage> {
     let (width, height) = image.dimensions();
     let mut samples = Vec::new();
 
-    for y in (0..height).step_by(crop_size.1 as usize) {
-        for x in (0..width).step_by(crop_size.0 as usize) {
+    for y in (0..height).step_by(side as usize) {
+        for x in (0..width).step_by(side as usize) {
             let patch = match image {
                 // Row copies out of the image's own bytes; the generic crop
                 // fills a zeroed image pixel by pixel.
                 DynamicImage::ImageRgb8(rgb) => {
-                    DynamicImage::ImageRgb8(crop_rgb(rgb, x, y, crop_size.0, crop_size.1))
+                    DynamicImage::ImageRgb8(crop_rgb(rgb, x, y, side, side))
                 }
-                other => other.crop_imm(x, y, crop_size.0, crop_size.1),
+                other => other.crop_imm(x, y, side, side),
             };
             samples.push(patch);
         }
@@ -897,41 +861,52 @@ fn divide_to_samples(image: &DynamicImage, crop_size: (u32, u32)) -> Vec<Dynamic
     samples
 }
 
-/// The batch tensor `[num_images, max_patches, c, h, w]`, `max_patches` the
+/// The batch tensor `[num_images, max_patches, 3, h, w]`, `max_patches` the
 /// widest image's patch count: every image's patches in order, then zero
-/// patches up to that width, every element written once (a zeroed tensor
-/// assigned patch by patch paid the allocator's page faults for a zero fill
-/// the copies then overwrote). A patch of another shape is refused rather
-/// than broadcast into its slot.
-fn stack_patches(
-    patches_per_image: &[Vec<Array3<f32>>],
-    (c, h, w): (usize, usize, usize),
+/// patches up to that width. `pixels` gives a sample's pixels as the model
+/// takes them, and their floats go through `table` straight into the batch's
+/// buffer, every element written once (a tensor per patch was zero-filled,
+/// written and then copied here: three passes over floats that take one). A
+/// patch of another shape than the first is refused rather than broadcast
+/// into its slot.
+fn batch_patches<'a>(
+    samples_per_image: &'a [Vec<DynamicImage>],
+    table: &[[f32; 256]; 3],
+    mut pixels: impl FnMut(&'a DynamicImage) -> Cow<'a, DynamicImage>,
 ) -> Result<ndarray::Array5<f32>, TransformError> {
-    let num_images = patches_per_image.len();
-    let max_patches = patches_per_image.iter().map(Vec::len).max().unwrap_or(0);
-    let patch_len = c * h * w;
+    let num_images = samples_per_image.len();
+    let max_patches = samples_per_image.iter().map(Vec::len).max().unwrap_or(0);
+    // The batch's patch shape is the first patch's, read before any float is
+    // written so that the buffer is allocated once at its size.
+    let mut first = samples_per_image.iter().flatten().next().map(&mut pixels);
+    let Some((w, h)) = first.as_ref().map(|patch| patch.dimensions()) else {
+        return Err(TransformError::EmptyBatch);
+    };
+    let patch_len = 3 * h as usize * w as usize;
     let mut data = Vec::with_capacity(num_images * max_patches * patch_len);
-    for patches in patches_per_image {
-        for patch in patches {
-            if patch.shape() != [c, h, w] {
+    for samples in samples_per_image {
+        for sample in samples {
+            // The first patch's pixels are the ones its shape was read from.
+            let patch = first.take().unwrap_or_else(|| pixels(sample));
+            let (patch_w, patch_h) = patch.dimensions();
+            if (patch_w, patch_h) != (w, h) {
                 return Err(TransformError::InvalidShape {
-                    expected: format!("[{c}, {h}, {w}]"),
-                    actual: patch.shape().to_vec(),
+                    expected: format!("[3, {h}, {w}]"),
+                    actual: vec![3, patch_h as usize, patch_w as usize],
                 });
             }
-            match patch.as_slice() {
-                Some(values) => data.extend_from_slice(values),
-                None => data.extend(patch.iter()),
-            }
+            let (_, _, raw) = rgb_bytes(&patch);
+            extend_planes_by_table(&mut data, &raw, table);
         }
-        data.resize(data.len() + (max_patches - patches.len()) * patch_len, 0.0);
+        data.resize(data.len() + (max_patches - samples.len()) * patch_len, 0.0);
     }
+    let shape = (num_images, max_patches, 3, h as usize, w as usize);
     #[expect(
         clippy::expect_used,
-        reason = "data holds num_images * max_patches * c * h * w elements by construction"
+        reason = "data holds num_images * max_patches * 3 * h * w elements by construction"
     )]
-    let tensor = ndarray::Array5::from_shape_vec((num_images, max_patches, c, h, w), data)
-        .expect("patch tensor matches its shape");
+    let tensor =
+        ndarray::Array5::from_shape_vec(shape, data).expect("patch tensor matches its shape");
     Ok(tensor)
 }
 
@@ -942,7 +917,7 @@ mod tests {
     use super::*;
     use crate::{
         encoder_inputs::EncoderDtype,
-        test_support::{create_test_image, hex, lcg_rgb_image},
+        test_support::{create_test_image, gradient_rgb, hex, lcg_rgb_image},
     };
 
     #[test]
@@ -1056,17 +1031,6 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_unpad() {
-        // Square grid, wide original -> should reduce width padding
-        let unpad = calculate_unpad((24, 24), (800, 400));
-        assert!(unpad.0 >= unpad.1); // Width should be >= height
-
-        // Square grid, tall original -> should reduce height padding
-        let unpad = calculate_unpad((24, 24), (400, 800));
-        assert!(unpad.1 >= unpad.0); // Height should be >= width
-    }
-
-    #[test]
     fn test_llava_next_processor_default() {
         let processor = LlavaNextProcessor::new();
         assert!(!processor.image_grid_pinpoints.is_empty());
@@ -1092,10 +1056,28 @@ mod tests {
         assert!(result.encoder_input.shape()[1] > 1);
     }
 
+    /// The anyres cut is a square of the crop height, whatever the crop
+    /// width: a 672x672 image gives four samples beside the resized
+    /// original, each center-cropped to the crop.
+    #[test]
+    fn the_anyres_cut_is_a_square_of_the_crop_height() {
+        let config = PreProcessorConfig::from_json(
+            r#"{"crop_size": {"height": 336, "width": 224}, "do_center_crop": true,
+                "do_resize": true, "size": {"shortest_edge": 336}}"#,
+        )
+        .unwrap();
+        let processor = LlavaNextProcessor::new().with_preprocessor_config(&config);
+
+        let image = create_test_image(672, 672, Rgb([128, 128, 128]));
+        let result = processor.preprocess(&[&image]).unwrap();
+
+        assert_eq!(result.encoder_input.shape(), &[1, 5, 3, 336, 224]);
+    }
+
     #[test]
     fn test_divide_to_samples() {
         let image = create_test_image(672, 672, Rgb([128, 128, 128]));
-        let samples = divide_to_samples(&image, (336, 336));
+        let samples = divide_to_samples(&image, 336);
 
         // 672x672 / 336x336 = 2x2 = 4 patches
         assert_eq!(samples.len(), 4);
@@ -1111,7 +1093,7 @@ mod tests {
         RgbImage::from_raw(
             width,
             height,
-            crate::test_support::gradient_rgb(width as usize, height as usize, seed),
+            gradient_rgb(width as usize, height as usize, seed),
         )
         .expect("gradient size")
     }
@@ -1178,7 +1160,7 @@ mod tests {
         // A grid of whole crops, a grid the image's edges clip, a column.
         for (width, height) in [(672, 672), (700, 500), (336, 1008)] {
             let image = DynamicImage::ImageRgb8(gradient(width, height, 5));
-            let samples = divide_to_samples(&image, (336, 336));
+            let samples = divide_to_samples(&image, 336);
             let mut expected = Vec::new();
             for y in (0..height).step_by(336) {
                 for x in (0..width).step_by(336) {
@@ -1199,11 +1181,15 @@ mod tests {
 
     #[test]
     fn a_patch_of_another_shape_is_refused_not_broadcast() {
-        // A degenerate `[3, 336, 1]` patch: a zeroed tensor's assign would
-        // have broadcast it across its slot; the copy refuses it.
-        let patches = vec![vec![Array3::<f32>::zeros((3, 336, 1))]];
+        // A one-pixel-wide patch after a full one: a zeroed tensor's assign
+        // would have broadcast it across its slot; the batch refuses it.
+        let samples = vec![vec![
+            DynamicImage::ImageRgb8(gradient(336, 336, 3)),
+            DynamicImage::ImageRgb8(gradient(1, 336, 5)),
+        ]];
+        let processor = LlavaNextProcessor::new();
         assert!(matches!(
-            stack_patches(&patches, (3, 336, 336)),
+            batch_patches(&samples, &processor.base.transforms.table, Cow::Borrowed),
             Err(TransformError::InvalidShape { .. })
         ));
     }
@@ -1233,11 +1219,14 @@ mod tests {
             let best_resolution = processor.select_best_resolution(image.dimensions());
             let padded = processor.resize_and_pad_image(image, best_resolution);
             let mut samples = vec![resize_as_reference(image, 336, 336, filter).into_owned()];
-            samples.extend(processor.divide_to_samples(&padded, (336, 336)));
+            samples.extend(processor.divide_to_samples(&padded, 336));
             for (j, sample) in samples.iter().enumerate() {
                 expected
                     .slice_mut(ndarray::s![i, j, .., .., ..])
-                    .assign(&processor.process_patch(sample));
+                    .assign(&to_tensor_by_table(
+                        &processor.patch_pixels(sample),
+                        &processor.base.transforms.table,
+                    ));
             }
         }
         assert_eq!(tensor.as_slice().unwrap(), expected.as_slice().unwrap());
@@ -1305,7 +1294,7 @@ mod tests {
 
     /// The reference's processors default to bicubic when a config omits
     /// `resample`, and the crate-wide fallback is bilinear: a processor built
-    /// without a config (`new()`, `with_grid_pinpoints`) resized, padded and
+    /// without a config (`new()`) resized, padded and
     /// patched through the other kernel.
     #[test]
     fn a_config_without_resample_resizes_bicubic_like_the_reference() {
@@ -1420,7 +1409,8 @@ mod tests {
 
     /// Two seeded images through the anyres pipeline (the base image plus the
     /// two crops of a 336x672 or 672x336 best fit, zero padding between)
-    /// against the reference processor's output on the same bytes.
+    /// against the reference processor's output on the same bytes, and a
+    /// third under a crop of height 336 and width 224.
     #[test]
     fn anyres_patches_match_the_reference_bit_for_bit() {
         let cases = [
@@ -1456,5 +1446,37 @@ mod tests {
             assert_eq!(result.encoder_input.shape(), &[1, 3, 3, 336, 336]);
             assert_pinned(&result.encoder_input.write_as(EncoderDtype::Float32), case);
         }
+
+        // The same pipeline under a crop that is not square: the cut stays a
+        // square of the crop height and every sample is center-cropped to
+        // the crop. No earlier code is pinned here: both columns of a
+        // witness hold the reference's value. The last two witnesses lie in
+        // the image of one cut sample each, not in its padding.
+        let narrow = Pinned {
+            width: 70,
+            height: 100,
+            seed: 31,
+            digest: "74409fd7d651d3fa92e934aea2555e6b7450880157db3013701913880b34c2c4",
+            witnesses: &[
+                (0, -0.9309554, -0.9309554),
+                (1, -1.2667192, -1.2667192),
+                (351_208, 0.5891146, 0.5891146),
+                (677_182, 0.7096704, 0.7096704),
+            ],
+        };
+        let mut config = reference_config();
+        config.crop_size = Some(
+            [("height".to_string(), 336), ("width".to_string(), 224)]
+                .into_iter()
+                .collect(),
+        );
+        let processor = LlavaNextProcessor::new().with_preprocessor_config(&config);
+        let image = lcg_rgb_image(narrow.width, narrow.height, narrow.seed);
+        let result = processor.preprocess(&[&image]).unwrap();
+        assert_eq!(result.encoder_input.shape(), &[1, 3, 3, 336, 224]);
+        assert_pinned(
+            &result.encoder_input.write_as(EncoderDtype::Float32),
+            &narrow,
+        );
     }
 }

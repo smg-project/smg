@@ -139,6 +139,8 @@ message GenerateRequest {
 }
 
 // Tokenized input from router
+// The gateway codec writes this message by hand around its field numbers and
+// GenerateRequest.tokenized = 2: change them together with crates/grpc_client/src/codec.rs.
 message TokenizedInput {
   // Original text (for debugging/logging only, not used for generation)
   string original_text = 1;
@@ -583,4 +585,15 @@ message GetServerInfoResponse {
   // derived, so a table that writes single-token markers still meets the
   // older compiler's refusal.
   string structural_tag_vocabulary = 7;
+
+  // Where the engine starts applying a request's grammar (structured outputs)
+  // on a prompt that ends inside the model's thinking block: "first_token"
+  // when a guided-decoding backend is set, since the engine's guided decoder
+  // builds a request's matcher before the first generated token and no
+  // reasoning parser gates it; "" when none is set (the engine refuses a
+  // guided request) or the servicer does not say. Flattened into the
+  // `constrained_decoding_start` worker label, which shapes the router's
+  // forced tool-call grammar: the thought and then the calls from the first
+  // token.
+  string constrained_decoding_start = 8;
 }

@@ -14,7 +14,7 @@ use llm_tokenizer::{traits::Encoder, HuggingFaceTokenizer};
 use serde_json::{json, Map, Value};
 use tokenizers::Tokenizer;
 
-use crate::common::FEW_MERGES;
+use crate::{common, common::FEW_MERGES};
 
 const BOS: &str = "<|startoftext|>";
 const EOS: &str = "<|endoftext|>";
@@ -35,7 +35,7 @@ const TEXTS: &[&str] = &[
 /// token: the shape of the checkpoints whose configuration alone asks for
 /// the BOS.
 fn byte_level_bpe() -> Tokenizer {
-    crate::common::byte_level_bpe(&FEW_MERGES, &[BOS, EOS])
+    common::byte_level_bpe(&FEW_MERGES, &[BOS, EOS])
 }
 
 /// A checkpoint directory: the tokenizer above as `tokenizer.json` and, when

@@ -228,6 +228,17 @@ def test_a_failure_of_the_retried_fallback_is_the_steps(tmp_path: Path) -> None:
     assert "failed after 3 attempts" in result.stderr
 
 
+def test_a_caller_that_retries_the_step_itself_asks_for_one_attempt(tmp_path: Path) -> None:
+    bed = Bed(tmp_path, exits=[100, 100])
+    bed.env["CI_APT_UPDATE_ATTEMPTS"] = "1"
+    bed.source("sources.list.d/ubuntu.sources", UBUNTU_SOURCES)
+    result = bed.run()
+    assert result.returncode == 100
+    # The update as configured, then the Ubuntu-only refresh once.
+    assert len(bed.call_lines()) == 2
+    assert "failed after 1 attempts" in result.stderr
+
+
 def test_a_blip_of_the_archive_during_the_fallback_is_retried(tmp_path: Path) -> None:
     bed = Bed(tmp_path, exits=[100, 100, 0])
     bed.source("sources.list.d/ubuntu.sources", UBUNTU_SOURCES)

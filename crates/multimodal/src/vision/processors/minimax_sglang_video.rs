@@ -3,6 +3,7 @@
 use super::MiniMaxM3VisionProcessor;
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
+    minimax_resize::sglang_dimensions,
     types::RgbFrameRef,
     vision::{
         processor::{VideoClipOptions, VisionPreProcessor},
@@ -42,7 +43,7 @@ impl MiniMaxM3VisionProcessor {
             ));
         }
         let cap = clip.max_long_side_pixel.unwrap_or(cap as u32);
-        let (stage_w, stage_h) = crate::minimax_resize::sglang_dimensions(width, height, cap)
+        let (stage_w, stage_h) = sglang_dimensions(width, height, cap)
             .map_err(|error| TransformError::ShapeError(error.to_string()))?;
         let total_pixels = u64::from(stage_w) * u64::from(stage_h) * frames.len() as u64;
         if total_pixels > 301_056_000 {
@@ -97,6 +98,8 @@ mod tests {
     use super::*;
     use crate::{
         encoder_inputs::{EncoderInput, ModelSpecificValue},
+        minimax_resize::SGLANG_RESIZE_KEY,
+        test_support::lcg_rgb_image,
         vision::{PreProcessorConfig, VisionPreProcessor},
     };
 
@@ -111,9 +114,7 @@ mod tests {
             do_resize: Some(false),
             ..PreProcessorConfig::default()
         };
-        config
-            .extra
-            .insert(crate::minimax_resize::SGLANG_RESIZE_KEY.into(), true.into());
+        config.extra.insert(SGLANG_RESIZE_KEY.into(), true.into());
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         let frames: Vec<_> = golden["sampled_indices"]
             .as_array()
@@ -171,6 +172,37 @@ mod tests {
             .unwrap();
         assert_eq!(fast.encoder_input.flat_f32(), flat);
     }
+
+    /// Frames whose containers are longer than their pixels are resized as
+    /// the exact frames are.
+    #[test]
+    fn frames_in_longer_containers_resize_as_their_images() {
+        let mut config = PreProcessorConfig {
+            do_resize: Some(false),
+            ..PreProcessorConfig::default()
+        };
+        config.extra.insert(SGLANG_RESIZE_KEY.into(), true.into());
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
+        let exact: Vec<_> = (0..4).map(|seed| lcg_rgb_image(320, 240, seed)).collect();
+        let longer: Vec<_> = exact
+            .iter()
+            .map(|frame| {
+                let mut container = frame.to_rgb8().into_raw();
+                container.extend_from_slice(&[0xAB; 7]);
+                image::DynamicImage::ImageRgb8(
+                    image::RgbImage::from_raw(320, 240, container).unwrap(),
+                )
+            })
+            .collect();
+        let clip = VideoClipOptions::sampled_at(1.0);
+        let of_longer = processor.preprocess_video(&longer, &clip).unwrap();
+        let of_exact = processor.preprocess_video(&exact, &clip).unwrap();
+        assert_eq!(
+            of_longer.encoder_input.flat_f32(),
+            of_exact.encoder_input.flat_f32()
+        );
+    }
+
     /// An explicit loader cap survives byte patchification without an area resize.
     #[test]
     fn sglang_explicit_video_cap_keeps_source_size_and_loader_grid() {
@@ -178,9 +210,7 @@ mod tests {
             do_resize: Some(false),
             ..PreProcessorConfig::default()
         };
-        config
-            .extra
-            .insert(crate::minimax_resize::SGLANG_RESIZE_KEY.into(), true.into());
+        config.extra.insert(SGLANG_RESIZE_KEY.into(), true.into());
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         let output = processor
             .preprocess_video(
@@ -204,9 +234,7 @@ mod tests {
             do_resize: Some(false),
             ..PreProcessorConfig::default()
         };
-        config
-            .extra
-            .insert(crate::minimax_resize::SGLANG_RESIZE_KEY.into(), true.into());
+        config.extra.insert(SGLANG_RESIZE_KEY.into(), true.into());
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         let output = processor
             .preprocess_video(

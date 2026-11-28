@@ -7,7 +7,7 @@ use crate::{
     parsers::helpers,
     partial_json::PartialJson,
     traits::ToolParser,
-    types::{FunctionCall, StreamingParseResult, ToolCall},
+    types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
 };
 
 /// Llama 3.2 format parser for tool calls
@@ -227,7 +227,7 @@ impl ToolParser for LlamaParser {
         text.contains("<|python_tag|>") || text.trim_start().starts_with('{')
     }
 
-    fn get_unstreamed_tool_args(&self) -> Option<Vec<crate::types::ToolCallItem>> {
+    fn get_unstreamed_tool_args(&self) -> Option<Vec<ToolCallItem>> {
         helpers::get_unstreamed_args(&self.prev_tool_call_arr, &self.streamed_args_for_tool)
     }
 

@@ -22,7 +22,7 @@ use engine_zmq_client::{
     ConnectedEngine,
 };
 use futures::Stream;
-use openai_protocol::worker::WorkerType;
+use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerType};
 use smg_grpc_client::{common_proto as common, tokenspeed_proto, vllm_proto as vllm};
 use tracing::warn;
 
@@ -32,8 +32,10 @@ use crate::{
     context_window::admit_prompt,
     fanout::fan_out_n,
     pin_yield::PinYieldNote,
-    stream::{map_slim_output, poll_mapped, MappedGenerateStream, StreamState},
-    structured_outputs::ConstraintRef,
+    stream::{
+        finish, map_slim_output, poll_mapped, FinishParts, MappedGenerateStream, StreamState,
+    },
+    structured_outputs::{ConstraintRef, StructuredOutputsSupport},
 };
 
 mod mrope;
@@ -85,54 +87,20 @@ impl TokenSpeedGenerateStream {
     pub fn engine_index(&self) -> Option<u32> {
         self.inner.engine_index()
     }
+}
 
-    /// Whether the engine already finished this choice and its terminal
-    /// `Complete` is parked behind the chunk just yielded (the finish tick
-    /// carried new tokens). A frontend that matched a stop on that chunk must
-    /// not synthesize its own `Complete`: the accumulated state has already
-    /// been drained into the parked one.
-    pub fn has_parked_complete(&self) -> bool {
-        self.pending.is_some()
+impl finish::Parts for TokenSpeedGenerateStream {
+    fn parked(&self) -> Option<&vllm::GenerateResponse> {
+        self.pending.as_ref()
     }
 
-    /// End this choice now on a frontend-matched string stop: the terminal
-    /// `Complete` built from the accumulated state, exactly as if the engine
-    /// had reported `stop` with that string. The engine-side request is
-    /// aborted when the stream is dropped, so the caller drops it next.
-    pub fn complete_with_matched_stop(&mut self, matched: String) -> vllm::GenerateResponse {
-        self.complete_with_finish(
-            "stop".to_string(),
-            Some(vllm::generate_complete::MatchedStop::MatchedStopStr(
-                matched,
-            )),
-        )
-    }
-
-    /// End this choice as aborted: the engine's own parked `Complete` when it
-    /// already finished, else the terminal `Complete` the Python servicer
-    /// yields after an `Abort` RPC (`finish_reason = "abort"`).
-    pub fn complete_aborted(&mut self) -> vllm::GenerateResponse {
-        if let Some(parked) = self.pending.take() {
-            return parked;
+    fn finish_parts(&mut self) -> FinishParts<'_> {
+        FinishParts {
+            state: &mut self.state,
+            index: self.index,
+            pending: &mut self.pending,
+            input_logprobs_emitted: &mut self.input_logprobs_emitted,
         }
-        self.complete_with_finish("abort".to_string(), None)
-    }
-
-    fn complete_with_finish(
-        &mut self,
-        finish_reason: String,
-        matched: Option<vllm::generate_complete::MatchedStop>,
-    ) -> vllm::GenerateResponse {
-        let mut pending = None;
-        // No new tokens on a frontend finish, so `emit_tick` yields the
-        // `Complete` directly and parks nothing.
-        self.state.emit_tick(
-            self.index,
-            Vec::new(),
-            None,
-            Some((finish_reason, matched)),
-            &mut pending,
-        )
     }
 }
 
@@ -399,22 +367,38 @@ impl GridTensors {
     }
 }
 
+/// What the translation of a request reads of its connection: the model's
+/// reading of a grid, the prompt bound and what the ranks declared at their
+/// handshakes.
+pub(crate) struct TokenSpeedConnection<'a> {
+    /// What a multimodal item's grid tensors are: the inputs of a position
+    /// table computed here, of one this wire cannot derive (refused), or a
+    /// patch layout that passes ([`GridTensors`]).
+    pub(crate) grid_tensors: GridTensors,
+    /// The bound the prompt admission applies ([`admit_prompt`]): the context
+    /// window the scheduler reported at the handshake, where an empty prompt,
+    /// or one that fills the window, is refused before it reaches the
+    /// scheduler; `0` bounds no prompt from above (a scheduler that reported
+    /// no window, or one that cuts a long prompt down itself).
+    pub(crate) max_model_len: u64,
+    /// How the connected attention data-parallel ranks are reached
+    /// ([`RankIndices`]), which places the request as the engine's own
+    /// dispatcher would ([`rendezvous_rank`]).
+    pub(crate) ranks: &'a RankIndices,
+    /// Which logprob columns every connected rank reports beside the sampled
+    /// tokens' ([`LogprobColumns`]): a request for prompt logprobs or top-k
+    /// candidates goes on when every rank declares the column and is refused
+    /// otherwise, rather than answered short.
+    pub(crate) logprobs: LogprobColumns,
+    /// The connection's note of a pin's yield to a room, logged at WARN once
+    /// and at DEBUG after.
+    pub(crate) yields: &'a PinYieldNote,
+}
+
 /// Translate a TokenSpeed proto `GenerateRequest` into the wire
-/// `TokenizedGenerateReqInput`. ZMQ mode requires pre-tokenized input (SMG
-/// tokenizes upstream). `grid_tensors` says what a multimodal item's grid
-/// tensors are: the inputs of a position table computed here, of one this
-/// wire cannot derive (refused), or a patch layout that passes
-/// ([`GridTensors`]). `max_model_len` is the context window the
-/// scheduler reported at the handshake: an empty prompt, or one that fills
-/// the window, is refused before it reaches the scheduler
-/// ([`admit_prompt`]). `ranks` is how the connected attention data-parallel
-/// ranks are reached ([`RankIndices`]), which places the request as the
-/// engine's own dispatcher would ([`rendezvous_rank`]), a pin's yield to a
-/// room logged on `yields`, the connection's note, at WARN once and at DEBUG
-/// after. `logprobs` is which logprob columns the engines report beside the
-/// sampled tokens' ([`LogprobColumns`]): prompt logprobs and top-k candidates
-/// ride to an engine that reports them and are refused by one that does not,
-/// rather than answered short.
+/// `TokenizedGenerateReqInput` for the connection it goes out on
+/// ([`TokenSpeedConnection`]). ZMQ mode requires pre-tokenized input (SMG
+/// tokenizes upstream).
 ///
 /// The disaggregation fields ride as the Python servicer forwards them: the
 /// prefill/decode rendezvous (`kv_bootstrap_info`) onto the request's
@@ -424,12 +408,15 @@ impl GridTensors {
 /// arrives out of band (an encode worker's, or the prefill side's KV).
 pub(crate) fn translate_request_tokenspeed_for(
     req: tokenspeed_proto::GenerateRequest,
-    grid_tensors: GridTensors,
-    max_model_len: u64,
-    ranks: &RankIndices,
-    logprobs: LogprobColumns,
-    yields: &PinYieldNote,
+    connection: &TokenSpeedConnection<'_>,
 ) -> Result<TokenizedGenerateReqInput, String> {
+    let &TokenSpeedConnection {
+        grid_tensors,
+        max_model_len,
+        ranks,
+        logprobs,
+        yields,
+    } = connection;
     let mut input_ids = match req.tokenized {
         Some(tokenized) => tokenized.input_ids,
         None => {
@@ -697,6 +684,57 @@ impl RankIndices {
     pub(crate) fn index_of(&self, rank: u32) -> Option<u32> {
         self.indices.get(usize::try_from(rank).ok()?).copied()
     }
+}
+
+/// What the ranks of a connection declared at their handshakes, as its
+/// generate path and its load report read it. A handshake is fixed for a
+/// connection, so this is read once, when the connection is made.
+#[derive(Debug)]
+pub(crate) struct TokenSpeedHandshakes {
+    /// Whether any rank takes generate requests; a disaggregated encode
+    /// worker lists `encode` alone and runs no language model.
+    pub(crate) takes_generate: bool,
+    /// How the ranks are reached ([`RankIndices`]).
+    pub(crate) ranks: RankIndices,
+    /// The logprob columns every rank reports ([`LogprobColumns`]).
+    pub(crate) logprobs: LogprobColumns,
+    /// What a multimodal item's grid tensors are by the facts the first rank
+    /// declared ([`GridTensors::declared`]), for a caller without the
+    /// launcher's; no rank keeps the conservative reading.
+    pub(crate) grid_tensors: GridTensors,
+}
+
+impl TokenSpeedHandshakes {
+    /// Read off the handshakes of `engines`.
+    pub(crate) fn declared(engines: &[ConnectedEngine]) -> Self {
+        Self {
+            takes_generate: engines
+                .iter()
+                .any(|engine| engine.ready_response.takes_generate()),
+            ranks: RankIndices::of(engines),
+            logprobs: LogprobColumns::of(engines),
+            grid_tensors: engines.first().map_or(GridTensors::Positions, |engine| {
+                GridTensors::declared(&engine.ready_response)
+            }),
+        }
+    }
+}
+
+/// The load of each rank of `ranks` that has one, numbered by rank:
+/// `load_of` reads an engine's by its index. A rank worker reads its own
+/// rank's entry, so the entries carry the number a pin reaches the rank by.
+pub(crate) fn loads_by_rank(
+    ranks: &RankIndices,
+    load_of: impl Fn(u32) -> Option<SchedulerLoadSnapshot>,
+) -> Vec<SchedulerLoadSnapshot> {
+    (0..ranks.len())
+        .filter_map(|rank| {
+            let rank = u32::try_from(rank).ok()?;
+            let mut load = load_of(ranks.index_of(rank)?)?;
+            load.dp_rank = i32::try_from(rank).ok()?;
+            Some(load)
+        })
+        .collect()
 }
 
 /// The attention data-parallel rank a request goes to, the engine's own
@@ -1054,10 +1092,9 @@ pub fn translate_encode_request(
 /// viewing the request's bytes rather than copying them: a tensor of the
 /// auxiliary size then travels to the engine as a frame sharing that view.
 /// SHM/remote payloads never reach this translate: ZMQ assembly runs with SHM
-/// disabled and RDMA staging off.
-pub(crate) fn wire_tensor_tokenspeed(
-    tensor: tokenspeed_proto::TensorData,
-) -> Result<WireTensor, String> {
+/// disabled and RDMA staging off. The mock worker reads a request's tensors
+/// through it too, so it refuses exactly the tensors this wire refuses.
+pub fn wire_tensor_tokenspeed(tensor: tokenspeed_proto::TensorData) -> Result<WireTensor, String> {
     let bytes = match tensor.payload {
         Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes)) => bytes,
         Some(_) => {
@@ -1088,8 +1125,9 @@ pub(crate) fn wire_tensor_tokenspeed(
 }
 
 /// Byte width of the wire dtypes the gateway emits; `None` for dtypes we do
-/// not recognize (passed through unvalidated rather than rejected).
-pub(crate) fn tensor_dtype_width(dtype: &str) -> Option<usize> {
+/// not recognize (passed through unvalidated rather than rejected). The mock
+/// worker reads an SHM handle's byte length with it.
+pub fn tensor_dtype_width(dtype: &str) -> Option<usize> {
     match dtype {
         "float64" | "int64" | "uint64" => Some(8),
         "float32" | "int32" | "uint32" => Some(4),
@@ -1173,6 +1211,23 @@ pub(crate) fn constraint_ref(sp: &tokenspeed_proto::SamplingParams) -> Option<Co
     })
 }
 
+/// A structural tag that is a JSON answer's schema alone, swapped for that
+/// schema where the engine's backend is not the one the tag is spelled for
+/// ([`crate::structured_outputs::answer_schema_in_place_of_tag`]); every
+/// other constraint stays as it came.
+pub(crate) fn send_answer_tag_as_schema(
+    sp: &mut tokenspeed_proto::SamplingParams,
+    support: StructuredOutputsSupport,
+) {
+    let schema =
+        crate::structured_outputs::answer_schema_in_place_of_tag(constraint_ref(sp), support);
+    if let Some(schema) = schema {
+        sp.constraint = Some(tokenspeed_proto::sampling_params::Constraint::JsonSchema(
+            schema,
+        ));
+    }
+}
+
 /// The words of an engine abort whose reason does not travel the wire: an
 /// engine that declares no finish-detail columns, or an abort the engine
 /// published without any.
@@ -1185,7 +1240,7 @@ pub(crate) const BARE_ENGINE_ABORT: &str =
 /// internal, with the engine's words when the wire carries them and
 /// [`BARE_ENGINE_ABORT`] when it does not. The caller's own abort never comes
 /// this way: it is answered from the parked completion
-/// ([`TokenSpeedGenerateStream::complete_aborted`]).
+/// ([`FrontendFinish::complete_aborted`](crate::FrontendFinish::complete_aborted)).
 pub(crate) fn engine_abort(status: Option<u16>, message: Option<String>) -> tonic::Status {
     engine_abort_status(
         status,
@@ -1230,11 +1285,13 @@ mod tests {
     ) -> Result<TokenizedGenerateReqInput, String> {
         translate_request_tokenspeed_for(
             req,
-            grid_tensors,
-            default_ready_response().max_model_len,
-            &RankIndices::new(vec![0]),
-            LogprobColumns::default(),
-            &PinYieldNote::default(),
+            &TokenSpeedConnection {
+                grid_tensors,
+                max_model_len: default_ready_response().max_model_len,
+                ranks: &RankIndices::new(vec![0]),
+                logprobs: LogprobColumns::default(),
+                yields: &PinYieldNote::default(),
+            },
         )
     }
 
@@ -1524,6 +1581,35 @@ mod tests {
         }
     }
 
+    /// A chat request's `min_tokens` survives the whole path to the engine:
+    /// the gateway's chat builder writes it to the proto, the translation
+    /// copies it, and the request decoded from the wire's bytes carries it.
+    #[test]
+    fn a_chat_requests_min_tokens_survive_the_wire() {
+        use engine_zmq_client::codec::{decode_msgpack, encode_msgpack};
+        use openai_protocol::chat::ChatCompletionRequest;
+        use smg_grpc_client::TokenSpeedSchedulerClient;
+
+        let chat: ChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}],
+            "min_tokens": 30, "max_tokens": 40
+        }))
+        .expect("a chat request");
+        let proto = TokenSpeedSchedulerClient::build_generate_request_from_chat(
+            "r1".to_string(),
+            &chat,
+            "hi".to_string(),
+            vec![1, 2, 3],
+            None,
+            Default::default(),
+        )
+        .expect("the chat builder");
+        let wire = translate_for(proto, GridTensors::Positions).expect("the translation");
+        let back: TokenizedGenerateReqInput =
+            decode_msgpack(&encode_msgpack(&wire).unwrap()).unwrap();
+        assert_eq!(back.sampling_params.min_new_tokens, 30);
+    }
+
     fn ts_tokenized_req(
         sampling: tokenspeed_proto::SamplingParams,
     ) -> tokenspeed_proto::GenerateRequest {
@@ -1536,6 +1622,42 @@ mod tests {
             sampling_params: Some(sampling),
             stream: true,
             ..Default::default()
+        }
+    }
+
+    /// A structural tag that is a JSON answer's schema alone reaches an engine
+    /// whose backend is pinned to another name than the tags are spelled for
+    /// as that schema, its keys in the order written; a call's tag reaches it
+    /// as it came.
+    #[tokio::test]
+    async fn an_answer_tag_reaches_a_pinned_other_backend_as_its_schema() {
+        use engine_zmq_client::codec::decode_msgpack;
+        use tokenspeed_proto::sampling_params::Constraint;
+
+        use crate::test_support::{answer_tag, call_tag, pinned_other_backend, ANSWER_SCHEMA};
+
+        let (client, engine, _dir) = connected_pair(RuntimeType::TokenSpeed).await;
+        client.set_structured_outputs_support(pinned_other_backend());
+        let (mut input, _output) = engine.split();
+        let mut streams = Vec::new();
+        for (id, tag, schema) in [
+            ("answer", answer_tag(), Some(ANSWER_SCHEMA)),
+            ("call", call_tag(), None),
+        ] {
+            let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams {
+                constraint: Some(Constraint::StructuralTag(tag.clone())),
+                ..Default::default()
+            });
+            req.request_id = id.to_string();
+            streams.push(client.generate_tokenspeed_streams(req).await.expect(id));
+            let frames = input.recv_frames().await.unwrap();
+            let sent: TokenizedGenerateReqInput = decode_msgpack(frames[1].as_ref()).unwrap();
+            assert_eq!(sent.sampling_params.json_schema.as_deref(), schema, "{id}");
+            assert_eq!(
+                sent.sampling_params.structural_tag,
+                schema.is_none().then_some(tag),
+                "{id}"
+            );
         }
     }
 
@@ -1595,11 +1717,13 @@ mod tests {
         let translate = |req| {
             translate_request_tokenspeed_for(
                 req,
-                GridTensors::Positions,
-                default_ready_response().max_model_len,
-                &RankIndices::new(vec![0]),
-                columns,
-                &PinYieldNote::default(),
+                &TokenSpeedConnection {
+                    grid_tensors: GridTensors::Positions,
+                    max_model_len: default_ready_response().max_model_len,
+                    ranks: &RankIndices::new(vec![0]),
+                    logprobs: columns,
+                    yields: &PinYieldNote::default(),
+                },
             )
         };
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
@@ -1906,11 +2030,13 @@ mod tests {
         req.data_parallel_rank = Some(1);
         let wire = translate_request_tokenspeed_for(
             req,
-            GridTensors::Positions,
-            window,
-            &reversed,
-            LogprobColumns::default(),
-            &PinYieldNote::default(),
+            &TokenSpeedConnection {
+                grid_tensors: GridTensors::Positions,
+                max_model_len: window,
+                ranks: &reversed,
+                logprobs: LogprobColumns::default(),
+                yields: &PinYieldNote::default(),
+            },
         )
         .expect("an in-range pin");
         assert_eq!(wire.data_parallel_rank, Some(0), "rank 1 is index 0");
@@ -1919,11 +2045,13 @@ mod tests {
         req.kv_bootstrap_info = Some(kv_bootstrap("10.0.0.7", 8998, 4));
         let wire = translate_request_tokenspeed_for(
             req,
-            GridTensors::Positions,
-            window,
-            &reversed,
-            LogprobColumns::default(),
-            &PinYieldNote::default(),
+            &TokenSpeedConnection {
+                grid_tensors: GridTensors::Positions,
+                max_model_len: window,
+                ranks: &reversed,
+                logprobs: LogprobColumns::default(),
+                yields: &PinYieldNote::default(),
+            },
         )
         .expect("a disaggregated request");
         assert_eq!(
@@ -1936,11 +2064,13 @@ mod tests {
         req.kv_bootstrap_info = Some(kv_bootstrap("10.0.0.7", 8998, 4));
         let wire = translate_request_tokenspeed_for(
             req,
-            GridTensors::Positions,
-            window,
-            &RankIndices::decode(vec![1, 0]),
-            LogprobColumns::default(),
-            &PinYieldNote::default(),
+            &TokenSpeedConnection {
+                grid_tensors: GridTensors::Positions,
+                max_model_len: window,
+                ranks: &RankIndices::decode(vec![1, 0]),
+                logprobs: LogprobColumns::default(),
+                yields: &PinYieldNote::default(),
+            },
         )
         .expect("a pinned decode request");
         assert_eq!(
@@ -1952,16 +2082,45 @@ mod tests {
         req.data_parallel_rank = Some(2);
         let error = translate_request_tokenspeed_for(
             req,
-            GridTensors::Positions,
-            window,
-            &reversed,
-            LogprobColumns::default(),
-            &PinYieldNote::default(),
+            &TokenSpeedConnection {
+                grid_tensors: GridTensors::Positions,
+                max_model_len: window,
+                ranks: &reversed,
+                logprobs: LogprobColumns::default(),
+                yields: &PinYieldNote::default(),
+            },
         )
         .expect_err("an out-of-range pin");
         assert!(
             error.contains("data_parallel_rank must be in [0, 2)"),
             "{error}"
+        );
+    }
+
+    /// A rank's load is numbered by the rank, not by the index its engine
+    /// dialled in at, and a rank that has not reported has no entry.
+    #[test]
+    fn loads_are_numbered_by_rank_not_by_engine_index() {
+        let load_of = |index: u32| {
+            (index != 7).then(|| SchedulerLoadSnapshot {
+                dp_rank: i32::try_from(index).unwrap(),
+                num_running_reqs: i32::try_from(index).unwrap() * 10,
+                ..Default::default()
+            })
+        };
+        let running_by_rank = |ranks: RankIndices| -> Vec<(i32, i32)> {
+            loads_by_rank(&ranks, load_of)
+                .into_iter()
+                .map(|load| (load.dp_rank, load.num_running_reqs))
+                .collect()
+        };
+        assert_eq!(
+            running_by_rank(RankIndices::new(vec![1, 0])),
+            vec![(0, 10), (1, 0)]
+        );
+        assert_eq!(
+            running_by_rank(RankIndices::new(vec![4, 7, 3])),
+            vec![(0, 40), (2, 30)]
         );
     }
 
@@ -2271,11 +2430,13 @@ mod tests {
                 req.tokenized.as_mut().unwrap().input_ids = vec![1; prompt_len];
                 let result = translate_request_tokenspeed_for(
                     req,
-                    GridTensors::Positions,
-                    max_model_len,
-                    &RankIndices::new(vec![0]),
-                    LogprobColumns::default(),
-                    &PinYieldNote::default(),
+                    &TokenSpeedConnection {
+                        grid_tensors: GridTensors::Positions,
+                        max_model_len,
+                        ranks: &RankIndices::new(vec![0]),
+                        logprobs: LogprobColumns::default(),
+                        yields: &PinYieldNote::default(),
+                    },
                 );
                 assert_eq!(
                     result.is_ok(),
@@ -2306,22 +2467,26 @@ mod tests {
         });
         let error = translate_request_tokenspeed_for(
             req.clone(),
-            GridTensors::Positions,
-            5,
-            &RankIndices::new(vec![0]),
-            LogprobColumns::default(),
-            &PinYieldNote::default(),
+            &TokenSpeedConnection {
+                grid_tensors: GridTensors::Positions,
+                max_model_len: 5,
+                ranks: &RankIndices::new(vec![0]),
+                logprobs: LogprobColumns::default(),
+                yields: &PinYieldNote::default(),
+            },
         )
         .expect_err("the prompt fills the window");
         assert!(error.contains("length 5"), "{error}");
         assert!(error.contains("model length of 5"), "{error}");
         let wire = translate_request_tokenspeed_for(
             req,
-            GridTensors::Positions,
-            6,
-            &RankIndices::new(vec![0]),
-            LogprobColumns::default(),
-            &PinYieldNote::default(),
+            &TokenSpeedConnection {
+                grid_tensors: GridTensors::Positions,
+                max_model_len: 6,
+                ranks: &RankIndices::new(vec![0]),
+                logprobs: LogprobColumns::default(),
+                yields: &PinYieldNote::default(),
+            },
         )
         .expect("one position left for output");
         assert_eq!(wire.input_ids.len(), 5);

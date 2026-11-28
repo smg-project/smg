@@ -1,9 +1,19 @@
-"""Engine-free multimodal helpers for tensor-stripped (PD decode) sides."""
+"""Engine-free multimodal helpers for tensor-stripped (PD decode) sides, and the cache salt."""
 
+import hashlib
 import logging
 from collections.abc import Sequence
 
 logger = logging.getLogger(__name__)
+
+# The reserved prefix, and the domain tag of the digest that follows it.
+_RESERVED_SALT_PREFIX = "mm:"
+_IDENTITY_SALT_DOMAIN = b"smg.vllm.mm-identity.v1\0"
+
+# The limits of vLLM's HTTP front end (`validate_cache_salt` of vLLM 0.31),
+# which gRPC bypasses.
+_MAX_CACHE_SALT_CHARS = 128
+_FORBIDDEN_CACHE_SALT_CHARS = frozenset("@/\\\0")
 
 
 def engine_accepts_mm_inputs(model_config) -> bool:
@@ -112,8 +122,28 @@ def has_preprocessed_mm_payload(mm_inputs) -> bool:
     return mm_inputs.HasField("pixel_values") or bool(mm_inputs.model_specific_tensors)
 
 
-def mm_identity_cache_salt(mm_hashes: Sequence[str]) -> str | None:
-    """Fold per-image content hashes into a deterministic cache salt.
+def request_cache_salt(request) -> str | None:
+    """The request salt, checked; None for a request without one.
+
+    A stub built from an older proto has no ``cache_salt``; it reads as none.
+    The error texts do not contain the salt. A salt can be a secret.
+    """
+    if "cache_salt" not in request.DESCRIPTOR.fields_by_name or not request.HasField("cache_salt"):
+        return None
+    salt = request.cache_salt
+    if not salt:
+        raise ValueError("cache_salt must not be empty")
+    if len(salt) > _MAX_CACHE_SALT_CHARS:
+        raise ValueError(f"cache_salt must be at most {_MAX_CACHE_SALT_CHARS} characters")
+    if not _FORBIDDEN_CACHE_SALT_CHARS.isdisjoint(salt):
+        raise ValueError("cache_salt must not contain '@', '/', '\\' or NUL")
+    if salt.startswith(_RESERVED_SALT_PREFIX):
+        raise ValueError("cache_salt must not start with the reserved prefix 'mm:'")
+    return salt
+
+
+def engine_cache_salt(request_salt: str | None, mm_hashes: Sequence[str]) -> str | None:
+    """The engine's salt for a request salt and the media hashes of a tensor-less side.
 
     The PD router strips multimodal tensors from the decode side (the KV
     arrives via the P/D transfer), keeping only the per-image content hashes.
@@ -122,7 +152,24 @@ def mm_identity_cache_salt(mm_hashes: Sequence[str]) -> str | None:
     rides ``cache_salt`` instead. Deterministic per image content: same-image
     reuse still hits the decode prefix cache, while different images behind
     the same text prefix no longer alias onto each other's KV.
+
+    The digest covers the request salt too, so requests with different salts
+    share no blocks. Its length is the same for any number of images. The Rust
+    servicer has the same rule (``vllm_cache_salt.rs`` of
+    ``engine_zmq_adapter``): change them together.
     """
     if not mm_hashes:
-        return None
-    return "mm:" + ",".join(mm_hashes)
+        return request_salt
+    digest = hashlib.sha256(_IDENTITY_SALT_DOMAIN)
+    if request_salt is None:
+        digest.update(b"\0")
+    else:
+        digest.update(b"\1" + _length_prefixed(request_salt))
+    for mm_hash in mm_hashes:
+        digest.update(_length_prefixed(mm_hash))
+    return _RESERVED_SALT_PREFIX + digest.hexdigest()
+
+
+def _length_prefixed(text: str) -> bytes:
+    data = text.encode()
+    return len(data).to_bytes(8, "little") + data

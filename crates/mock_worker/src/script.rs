@@ -28,8 +28,25 @@
 //! answers filed under one, is the text an HTTP worker was sent, and the ids
 //! decoded with the worker's tokenizer on the token wires: read only while
 //! such answers are filed for the worker.
+//!
+//! A recorded line (`--record` writes them) states under `recorded.asked`
+//! what its request asked beyond the prompt, and is filed under the prompt
+//! AND that: `<len>:<fold>/<ask>`, with `ask` the same fold over the object's
+//! text (`ask_fold`). The lines of one such key are served in turn, in file
+//! order, and from the first again; a line without `recorded.asked` is filed
+//! under its prompt alone, serves that prompt whatever is asked, and the last
+//! such line of a key is the one served. Once a recorded line is in the
+//! store, a gRPC worker fails a request that finds nothing with the key it
+//! missed (`INTERNAL`, the code of a request an engine took and failed on)
+//! instead of going on to its engine: a recording is replayed whole, or the
+//! test learns what was not recorded. The other wires do not read what a
+//! request asks, so no recorded line serves them. A recorded line names the
+//! gRPC wire it was read off (`recorded.wire`): a gRPC worker of that wire
+//! reports the completion count the line states, and one of another gRPC
+//! wire never a count below the line's output ids.
 
 use std::{
+    cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{
@@ -42,7 +59,7 @@ use std::{
 use llm_tokenizer::traits::Tokenizer;
 use serde_json::{json, Value};
 
-use crate::config::Config;
+use crate::config::{Config, SchedulerWire};
 
 /// The queue every worker falls back to, and the `{worker}` that names it.
 pub const ALL: &str = "all";
@@ -81,6 +98,10 @@ pub struct Answer {
     pub cached_tokens: u32,
     /// Prompt tokens reported; the request's own count when unset.
     pub prompt_tokens: Option<u32>,
+    /// Completion tokens reported (`completion_tokens`), as an engine counted
+    /// them: one more than the output where it took a matched stop token
+    /// off. Unset: the output's own count.
+    pub completion_tokens: Option<u32>,
     /// The sampled token's logprob per output token, sent when the request
     /// asks for logprobs.
     pub logprobs: Option<Vec<f32>>,
@@ -98,6 +119,51 @@ pub struct Answer {
     pub delay: Duration,
     /// Tokens per frame.
     pub chunk_tokens: usize,
+    /// The tokens of each frame in turn, as an engine cut a recorded answer
+    /// (`chunks`); they add up to the output's tokens, and a frame may hold
+    /// none. Cuts that hold none of an output (an empty list too) say the
+    /// engine sent it in its completion alone: a gRPC wire streams a frame
+    /// of no tokens for each. Unset: `chunk_tokens` per frame.
+    pub chunks: Option<Vec<usize>>,
+    /// The status a recorded engine ended the call with (`status`): a gRPC
+    /// wire ends the call with it, behind the frames the call's answers
+    /// hold. Beside the finish reason `error` (what a line with a status
+    /// reads when it states none) the engine left the choice open: its
+    /// frames are sent and no completion.
+    pub status: Option<Refusal>,
+    /// The gRPC wire a recorded line was read off (`recorded.wire`): the
+    /// count the line states is that wire's ([`Answer::counted_on`]).
+    pub(crate) recorded_wire: Option<SchedulerWire>,
+}
+
+/// The status an engine refused a request with, as a recorded line keeps it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Refusal {
+    /// The gRPC code.
+    pub code: i32,
+    /// The status's message.
+    pub message: String,
+    /// The trailers of the status that say what kind of failure the worker
+    /// reports (`trailers`, name and value; a recorder keeps the ones named
+    /// `smg-...`): a gateway answers its client by them.
+    pub trailers: Vec<(String, String)>,
+}
+
+impl Refusal {
+    /// The status a gRPC wire answers: the code, the message and the
+    /// trailers.
+    pub(crate) fn status(&self) -> tonic::Status {
+        let mut status = tonic::Status::new(tonic::Code::from(self.code), self.message.clone());
+        for (name, value) in &self.trailers {
+            if let (Ok(name), Ok(value)) = (
+                tonic::metadata::AsciiMetadataKey::from_bytes(name.as_bytes()),
+                value.parse::<tonic::metadata::AsciiMetadataValue>(),
+            ) {
+                status.metadata_mut().insert(name, value);
+            }
+        }
+        status
+    }
 }
 
 /// One frame of an answer as a wire delivers it: the tokens of the cut, their
@@ -172,8 +238,10 @@ impl Answer {
     /// {"key": "<len>:<fold>" | "input_ids": [...] | "prompt_contains": "...",
     ///  "output_ids": [...], "output_text": "..." | ["piece", ...],
     ///  "finish_reason": "stop", "matched_stop": 2 | "</s>",
-    ///  "cached_tokens": 0, "prompt_tokens": 12, "logprobs": [-0.1, ...],
-    ///  "token_id_logprobs": [-0.2, ...], "delay_ms": 0, "chunk_tokens": 1}
+    ///  "cached_tokens": 0, "prompt_tokens": 12, "completion_tokens": 3,
+    ///  "logprobs": [-0.1, ...],
+    ///  "token_id_logprobs": [-0.2, ...], "delay_ms": 0, "chunk_tokens": 1,
+    ///  "chunks": [2, 1], "status": {"code": 3, "message": "...", "trailers": {}}}
     /// ```
     ///
     /// Everything is optional but one of `output_ids` and `output_text`;
@@ -186,6 +254,10 @@ impl Answer {
     /// for. Beside ids, an empty string is one whole-text piece like any other.
     /// `token_id_logprobs` scores the token ids a request asks for, in the
     /// request's order: the answer of a prefill-only scoring request.
+    /// `chunks` states the tokens of each frame in turn (all of the output,
+    /// or none of it where the completion alone carries it), and `status` the
+    /// gRPC status the call ends with behind them: its `code` is the number
+    /// of a failure (1 to 16), and a line whose call ends well states none.
     pub fn parse(value: &Value) -> Result<Scripted, String> {
         let object = value.as_object().ok_or("an answer is a JSON object")?;
         let known = [
@@ -198,10 +270,17 @@ impl Answer {
             "matched_stop",
             "cached_tokens",
             "prompt_tokens",
+            "completion_tokens",
             "logprobs",
             "token_id_logprobs",
             "delay_ms",
             "chunk_tokens",
+            "chunks",
+            "status",
+            // What a recorded line says beside its answer (the recorder's
+            // facts of the exchange): `asked` joins the key, `wire` says
+            // whose count the line states, the rest is for people and tools.
+            "recorded",
         ];
         if let Some(unknown) = object.keys().find(|k| !known.contains(&k.as_str())) {
             return Err(format!("unknown field {unknown:?}"));
@@ -227,6 +306,20 @@ impl Answer {
             (Some(other), None) => return Err(format!("key: expected a string, got {other}")),
             (None, Some(input_ids)) => Some(script_key(&input_ids)),
             (None, None) => None,
+        };
+        // A recorded line is filed under its prompt and what its request
+        // asked beyond it.
+        let key = match (key, object.get("recorded").and_then(|r| r.get("asked"))) {
+            (Some(key), Some(asked)) if !asked.is_null() => Some(asked_key(&key, ask_fold(asked))),
+            (key, _) => key,
+        };
+        let recorded_wire = match object.get("recorded").and_then(|r| r.get("wire")) {
+            None | Some(Value::Null) => None,
+            Some(Value::String(wire)) => Some(
+                wire.parse::<SchedulerWire>()
+                    .map_err(|_| format!("recorded.wire: {wire:?} is no gRPC wire"))?,
+            ),
+            Some(other) => return Err(format!("recorded.wire: expected a string, got {other}")),
         };
         let prompt_contains = match object.get("prompt_contains") {
             None | Some(Value::Null) => None,
@@ -279,6 +372,11 @@ impl Answer {
             }
         }
         let finish_reason = match object.get("finish_reason") {
+            // A status ends a choice the engine left open, unless the line
+            // says how the choice completed ahead of it.
+            None | Some(Value::Null) if object.get("status").is_some_and(|s| !s.is_null()) => {
+                "error".to_string()
+            }
             None | Some(Value::Null) => "stop".to_string(),
             Some(Value::String(reason)) => reason.clone(),
             Some(other) => return Err(format!("finish_reason: expected a string, got {other}")),
@@ -316,6 +414,9 @@ impl Answer {
         let prompt_tokens = count("prompt_tokens")?
             .map(|n| to_u32("prompt_tokens", n))
             .transpose()?;
+        let completion_tokens = count("completion_tokens")?
+            .map(|n| to_u32("completion_tokens", n))
+            .transpose()?;
         let mut sampled_logprobs = false;
         let logprobs = match object.get("logprobs") {
             None | Some(Value::Null) => None,
@@ -327,10 +428,7 @@ impl Answer {
                 let logprobs = values
                     .iter()
                     .map(|value| {
-                        value
-                            .as_f64()
-                            .map(|v| v as f32)
-                            .ok_or_else(|| format!("logprobs: {value} is not a number"))
+                        logprob(value).ok_or_else(|| format!("logprobs: {value} is not a number"))
                     })
                     .collect::<Result<Vec<f32>, String>>()?;
                 let units = if output_ids.is_empty() {
@@ -358,9 +456,7 @@ impl Answer {
                 values
                     .iter()
                     .map(|value| {
-                        value
-                            .as_f64()
-                            .map(|v| v as f32)
+                        logprob(value)
                             .ok_or_else(|| format!("token_id_logprobs: {value} is not a number"))
                     })
                     .collect::<Result<Vec<f32>, String>>()?,
@@ -377,6 +473,78 @@ impl Answer {
                 usize::try_from(n).map_err(|_| format!("chunk_tokens: {n} is out of range"))?
             }
         };
+        let units = if output_ids.is_empty() {
+            output_text.as_ref().map_or(0, Vec::len)
+        } else {
+            output_ids.len()
+        };
+        let chunks = match object.get("chunks") {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(sizes)) => {
+                let sizes = sizes
+                    .iter()
+                    .map(|size| {
+                        size.as_u64()
+                            .and_then(|size| usize::try_from(size).ok())
+                            .ok_or_else(|| format!("chunks: {size} is not a count"))
+                    })
+                    .collect::<Result<Vec<usize>, String>>()?;
+                // The cuts hold the whole output, or none of it: what an
+                // engine sent in its completion alone.
+                if total(&sizes) != Some(units) && total(&sizes) != Some(0) {
+                    return Err(format!(
+                        "chunks add up to {} for {units} output tokens",
+                        total(&sizes).map_or_else(
+                            || "more than a count holds".to_string(),
+                            |n| n.to_string()
+                        )
+                    ));
+                }
+                Some(sizes)
+            }
+            Some(other) => return Err(format!("chunks: expected an array, got {other}")),
+        };
+        let status = match object.get("status") {
+            None | Some(Value::Null) => None,
+            Some(status) => Some(Refusal {
+                // The code of a failure: 0 is OK, which ends no call ahead
+                // of its answer, and a number past 16 names no code.
+                code: status
+                    .get("code")
+                    .and_then(Value::as_i64)
+                    .filter(|code| (1..=16).contains(code))
+                    .and_then(|code| i32::try_from(code).ok())
+                    .ok_or(
+                        "status: expected {\"code\": <the gRPC code of a failure, 1 to 16>, \
+                         \"message\": ...}",
+                    )?,
+                message: status
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                trailers: match status.get("trailers") {
+                    None | Some(Value::Null) => Vec::new(),
+                    Some(Value::Object(trailers)) => trailers
+                        .iter()
+                        .map(|(name, value)| {
+                            let text = value.as_str().filter(|text| {
+                                tonic::metadata::AsciiMetadataKey::from_bytes(name.as_bytes())
+                                    .is_ok()
+                                    && text.parse::<tonic::metadata::AsciiMetadataValue>().is_ok()
+                            });
+                            text.map(|text| (name.clone(), text.to_string()))
+                                .ok_or_else(|| {
+                                    format!("status: {name}: {value} is not a gRPC trailer")
+                                })
+                        })
+                        .collect::<Result<Vec<(String, String)>, String>>()?,
+                    Some(other) => {
+                        return Err(format!("status: trailers: expected an object, got {other}"))
+                    }
+                },
+            }),
+        };
         Ok(Scripted {
             key,
             prompt_contains,
@@ -387,11 +555,15 @@ impl Answer {
                 matched_stop,
                 cached_tokens,
                 prompt_tokens,
+                completion_tokens,
                 logprobs,
                 sampled_logprobs,
                 token_id_logprobs,
                 delay,
                 chunk_tokens,
+                chunks,
+                status,
+                recorded_wire,
             },
         })
     }
@@ -461,7 +633,29 @@ impl Answer {
         }
         self.finish_reason = "length".to_string();
         self.matched_stop = None;
+        self.chunks = None;
+        self.completion_tokens = None;
         self
+    }
+
+    /// The answer as a gRPC worker of `wire` counts it. A recorded line
+    /// states its completion tokens as the wire it was read off carried
+    /// them, and a worker of that wire reports the count as it stands. A
+    /// wire whose stream a gateway counts frame by frame may state the last
+    /// frame's tokens alone, where the completion of the other two carries
+    /// the total: on another wire the count is never below the output's ids.
+    pub(crate) fn counted_on(mut self, wire: SchedulerWire) -> Self {
+        if self.recorded_wire.is_some_and(|recorded| recorded != wire) {
+            let carried = u32::try_from(self.output_ids.len()).unwrap_or(u32::MAX);
+            self.completion_tokens = self.completion_tokens.map(|stated| stated.max(carried));
+        }
+        self
+    }
+
+    /// Whether the engine left this choice open: the call ended with a
+    /// status ahead of the choice's completion.
+    pub(crate) fn left_open(&self) -> bool {
+        self.status.is_some() && self.finish_reason == "error"
     }
 
     /// The prompt tokens to report for a prompt of `prompt_len` ids.
@@ -470,9 +664,12 @@ impl Answer {
             .unwrap_or_else(|| u32::try_from(prompt_len).unwrap_or(u32::MAX))
     }
 
-    /// The completion tokens to report: the output ids, or the text pieces
-    /// when the answer has no ids.
+    /// The completion tokens to report: the count the answer states, else
+    /// the output ids, or the text pieces when the answer has no ids.
     pub fn completion_tokens(&self) -> u32 {
+        if let Some(stated) = self.completion_tokens {
+            return stated;
+        }
         let units = if self.output_ids.is_empty() {
             self.output_text.as_ref().map_or(0, Vec::len)
         } else {
@@ -514,6 +711,27 @@ impl Answer {
                 _ => Vec::new(),
             },
         )
+    }
+
+    /// The frames a gRPC wire streams ahead of its completion: the token
+    /// frames, or, where the cuts hold none of an output that has ids (an
+    /// engine that sent its output in the completion alone), a frame of no
+    /// tokens for each cut.
+    pub(crate) fn chunk_frames(&self) -> Vec<Frame> {
+        match &self.chunks {
+            Some(cuts) if !self.output_ids.is_empty() && total(cuts) == Some(0) => {
+                let count = cuts.len();
+                (1..=count)
+                    .map(|n| Frame {
+                        ids: Vec::new(),
+                        pieces: Vec::new(),
+                        logprobs: Vec::new(),
+                        last: n == count,
+                    })
+                    .collect()
+            }
+            _ => self.token_frames(),
+        }
     }
 
     /// The frames of the text wire: `chunk_tokens` pieces per frame, with
@@ -590,12 +808,26 @@ impl Answer {
         pieces: impl Fn(std::ops::Range<usize>) -> Vec<String>,
     ) -> Vec<Frame> {
         let step = self.chunk_tokens.max(1);
-        let cuts: Vec<usize> = (0..units).step_by(step).collect();
+        // The recorded cuts where the answer has them, else even ones.
+        let cuts: Vec<(usize, usize)> = match &self.chunks {
+            Some(sizes) if total(sizes) == Some(units) => sizes
+                .iter()
+                .scan(0, |start, size| {
+                    let cut = (*start, *start + size);
+                    *start += size;
+                    Some(cut)
+                })
+                .collect(),
+            _ => (0..units)
+                .step_by(step)
+                .map(|start| (start, (start + step).min(units)))
+                .collect(),
+        };
         let count = cuts.len();
         cuts.into_iter()
             .enumerate()
-            .map(|(n, start)| {
-                let range = start..(start + step).min(units);
+            .map(|(n, (start, end))| {
+                let range = start..end;
                 let logprobs = match &self.logprobs {
                     Some(logprobs) if logprobs.len() == units => logprobs[range.clone()].to_vec(),
                     _ => Vec::new(),
@@ -620,10 +852,152 @@ pub fn script_key(ids: &[u32]) -> String {
     format!("{}:{}", ids.len(), h)
 }
 
+/// What a request asks with the three fields the wires state differently
+/// for one client request brought to one form, so that a line recorded on
+/// one wire is found on the other two: a temperature left unstated reads 1.0
+/// (two wires state that default, one leaves it out), a `top_k` that is off
+/// reads 0 (one wire states 0, two state -1), and the seed is left out (one
+/// wire carries none). The price: requests that differ only in their seed,
+/// or in stating a temperature of 1.0, share a key and are served in turn.
+fn wire_neutral(asked: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    let mut asked = asked.clone();
+    asked.remove("seed");
+    if asked.get("temperature").is_some_and(Value::is_null) {
+        asked.insert("temperature".to_string(), json!(1.0));
+    }
+    let off = |top_k: &Value| top_k.is_null() || top_k.as_i64().is_some_and(|k| k <= 0);
+    if asked.get("top_k").is_some_and(off) {
+        asked.insert("top_k".to_string(), json!(0));
+    }
+    asked
+}
+
+/// The fold of what a request asks beyond its prompt (a recorded line's
+/// `recorded.asked`, and what a gRPC wire reads off its request): the script
+/// key's fold over the object's text, written with every object's names in
+/// order so that it reads the same whatever order a writer kept them in.
+pub(crate) fn ask_fold(asked: &Value) -> u64 {
+    fn write(value: &Value, text: &mut String) {
+        match value {
+            Value::Object(fields) => {
+                let mut names: Vec<&String> = fields.keys().collect();
+                names.sort();
+                text.push('{');
+                for name in names {
+                    text.push_str(&Value::from(name.as_str()).to_string());
+                    text.push(':');
+                    write(&fields[name], text);
+                    text.push(',');
+                }
+                text.push('}');
+            }
+            Value::Array(items) => {
+                text.push('[');
+                for item in items {
+                    write(item, text);
+                    text.push(',');
+                }
+                text.push(']');
+            }
+            other => text.push_str(&other.to_string()),
+        }
+    }
+    let mut text = String::new();
+    match asked {
+        Value::Object(fields) => write(&Value::Object(wire_neutral(fields)), &mut text),
+        other => write(other, &mut text),
+    }
+    fold_bytes(text.as_bytes())
+}
+
+/// The sum of an answer's cuts, `None` where it passes what a count holds:
+/// cuts that wrap around to the output's own count are no cuts of it.
+fn total(sizes: &[usize]) -> Option<usize> {
+    sizes
+        .iter()
+        .try_fold(0_usize, |sum, size| sum.checked_add(*size))
+}
+
+/// The fold of the bytes of an identity this crate alone reads (what a
+/// request asks, a media item's reference): the step of the
+/// prompt key's fold, from the FNV offset basis, so that a zero byte moves
+/// it wherever it stands. The prompt's key keeps its own start: its length
+/// stands beside its fold.
+pub(crate) fn fold_bytes(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |h, byte| {
+        h.wrapping_mul(1_099_511_628_211) ^ u64::from(*byte)
+    })
+}
+
+/// The key of a recorded line: its prompt's key and the fold of what its
+/// request asked.
+fn asked_key(key: &str, ask: u64) -> String {
+    format!("{key}/{ask:016x}")
+}
+
+/// Whether a key names what its request asked ([`asked_key`]).
+fn names_an_ask(key: &str) -> bool {
+    key.contains('/')
+}
+
+/// A logprob as a line states it: a number, or one of the three values JSON
+/// has no number for as the recorder writes them (`"NaN"`, `"inf"`, `"-inf"`).
+fn logprob(value: &Value) -> Option<f32> {
+    match value.as_str() {
+        Some(text @ ("NaN" | "inf" | "-inf")) => text.parse().ok(),
+        Some(_) => None,
+        None => value.as_f64().map(|v| v as f32),
+    }
+}
+
+/// The lines of an info file: the gRPC path of each call and the bytes of
+/// its answer.
+type InfoAnswers = Vec<(String, Vec<u8>)>;
+
+/// The info answers a recorder kept beside the record file `path`: the file
+/// `path` with its extension replaced by `info.jsonl`, one
+/// `{"path", "answer_hex"}` line
+/// a call (the call's gRPC path and the bytes of its answer). `None` where no
+/// such file stands, as beside a hand-written script.
+fn info_beside(path: &Path) -> Result<Option<InfoAnswers>, String> {
+    let path = path.with_extension("info.jsonl");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let mut answers = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let bad = |what: &str| format!("{}:{}: {what}", path.display(), n + 1);
+        let value: Value = serde_json::from_str(line).map_err(|e| bad(&e.to_string()))?;
+        let field = |name: &str| value.get(name).and_then(Value::as_str);
+        let call = field("path").ok_or_else(|| bad("an info line needs path"))?;
+        let hex = field("answer_hex").ok_or_else(|| bad("an info line needs answer_hex"))?;
+        let bytes = (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok())
+            .collect::<Option<Vec<u8>>>()
+            .ok_or_else(|| bad("answer_hex is not hex"))?;
+        answers.push((call.to_string(), bytes));
+    }
+    Ok(Some(answers))
+}
+
 #[derive(Default)]
 struct Store {
-    /// Answers by prompt key, from `--script` lines and keyed enqueues.
-    keyed: HashMap<String, Answer>,
+    /// Answers by key, from `--script` lines and keyed enqueues, with how
+    /// many of a key were served so far. Under a prompt's key: one answer,
+    /// the last one stated. Under a recorded line's key ([`asked_key`]): the
+    /// lines in file order, served in turn and from the first again (a
+    /// recorded request sent many times).
+    keyed: HashMap<String, (Vec<Answer>, usize)>,
+    /// Whether a recording was ever loaded: a recorded line, or a record
+    /// file with no line beside its recorder's info file. A gRPC worker
+    /// fails a request that finds nothing from then on ([`not_recorded`]).
+    recorded: bool,
     /// Answers in order, per worker name; [`ALL`] is the shared queue.
     queues: HashMap<String, VecDeque<Answer>>,
     /// Answers filed under a text the prompt must hold, in order, per worker
@@ -635,6 +1009,9 @@ struct Store {
     active: bool,
     /// The script files loaded so far, each once, with their answer counts.
     loaded: HashMap<PathBuf, usize>,
+    /// The info answers a recorder kept beside a record file, by the path of
+    /// their call: the bytes of the first answer of each ([`info_beside`]).
+    info: HashMap<String, Vec<u8>>,
     /// The workers that started in this process, by name: what the admin
     /// routes accept besides [`ALL`].
     workers: HashSet<String>,
@@ -666,10 +1043,35 @@ impl Store {
             })?;
             answers.push((key, scripted.answer));
         }
+        // A recorder's info file stands beside a record file: one that holds
+        // a recorded line, or none at all (a session of info calls alone, or
+        // of no call). A file of hand-written answers is read alone, whatever
+        // stands beside it.
+        if answers.is_empty() || answers.iter().any(|(key, _)| names_an_ask(key)) {
+            if let Some(info) = info_beside(path)? {
+                for (call, answer) in info {
+                    self.info.entry(call).or_insert(answer);
+                }
+                // A file with no line beside that info file is a recording
+                // that holds nothing: every request misses it.
+                if answers.is_empty() {
+                    self.recorded = true;
+                    RECORDED.store(true, Ordering::Release);
+                }
+            }
+        }
         self.activate();
         let count = answers.len();
         self.loaded.insert(path.to_path_buf(), count);
-        self.keyed.extend(answers);
+        for (key, answer) in answers {
+            if names_an_ask(&key) {
+                self.keyed.entry(key).or_default().0.push(answer);
+                self.recorded = true;
+                RECORDED.store(true, Ordering::Release);
+            } else {
+                self.keyed.insert(key, (vec![answer], 0));
+            }
+        }
         Ok(count)
     }
 
@@ -684,7 +1086,7 @@ impl Store {
     /// reads `prompt_text`.
     fn take(&mut self, worker: &str, key: &str, prompt_text: Option<&str>) -> Option<Answer> {
         // One choice never runs short: the queues hold it or the key does.
-        self.take_n(worker, key, prompt_text, 1)
+        self.take_n(worker, key, None, prompt_text, 1)
             .ok()
             .flatten()
             .and_then(|mut answers| answers.pop())
@@ -714,19 +1116,22 @@ impl Store {
     }
 
     /// The answers for the `n` choices of `worker`'s next request whose
-    /// prompt has `key` and reads `prompt_text` (`None`: unread, no answer
-    /// filed under a text is looked at), taken under this one lock: the
-    /// worker's queue, then the shared one, then the answer filed under a
-    /// text the prompt holds (served once) or the keyed answer for the rest.
-    /// `None` when nothing is scripted for the first choice (the request
-    /// takes the worker's other mode, whatever `n`); an `Err` when `n` is
-    /// above [`CHOICES_LIMIT`], or naming the counts when the queues hold
-    /// some of the choices but not all and nothing fills the rest, with the
-    /// queues as they were.
+    /// prompt has `key`, asks `ask` beyond it (`None`: a wire that does not
+    /// say) and reads `prompt_text` (`None`: unread, no answer filed under a
+    /// text is looked at), taken under this one lock: the worker's queue,
+    /// then the shared one, then the answer filed under a text the prompt
+    /// holds (served once) or the keyed answers for the rest (the one under
+    /// the prompt's key, else the recorded ones under the prompt and the
+    /// ask, in turn). `None` when nothing is scripted for the first choice
+    /// (the request takes the worker's other mode, whatever `n`); an `Err`
+    /// when `n` is above [`CHOICES_LIMIT`], or naming the counts when the
+    /// queues hold some of the choices but not all and nothing fills the
+    /// rest, with the queues as they were.
     fn take_n(
         &mut self,
         worker: &str,
         key: &str,
+        ask: Option<u64>,
         prompt_text: Option<&str>,
         n: usize,
     ) -> Result<Option<Vec<Answer>>, String> {
@@ -735,7 +1140,14 @@ impl Store {
             .map(|queue| self.queues.get(*queue).map_or(0, VecDeque::len))
             .sum::<usize>();
         let marked = prompt_text.and_then(|text| self.marked_for(worker, text));
-        let keyed = self.keyed.get(key);
+        let asked = ask.map(|ask| asked_key(key, ask));
+        let keyed = if self.keyed.contains_key(key) {
+            Some(key)
+        } else {
+            asked
+                .as_deref()
+                .filter(|asked| self.keyed.contains_key(*asked))
+        };
         if queued == 0 && marked.is_none() && keyed.is_none() {
             if self.active {
                 *self.misses.entry(worker.to_string()).or_insert(0) += 1;
@@ -768,9 +1180,19 @@ impl Store {
                 let filed = self.marked.get_mut(&scope)?;
                 (at < filed.len()).then(|| filed.remove(at).1)
             });
-            if let Some(answer) = filed.as_ref().or(keyed) {
+            if let Some(answer) = filed.as_ref() {
                 while answers.len() < n {
                     answers.push(answer.clone());
+                }
+            } else if let Some((listed, served)) = keyed.and_then(|key| self.keyed.get_mut(key)) {
+                if !listed.is_empty() {
+                    // The turn moves by a whole call: where the queues
+                    // answered the first choices, the rest read their own
+                    // lines of this call, and the next call reads its own.
+                    for at in answers.len()..n {
+                        answers.push(listed[(*served + at) % listed.len()].clone());
+                    }
+                    *served += n;
                 }
             }
         }
@@ -789,7 +1211,11 @@ impl Store {
         for scripted in answers {
             match (scripted.key, scripted.prompt_contains) {
                 (Some(key), _) => {
-                    self.keyed.insert(key, scripted.answer);
+                    if names_an_ask(&key) {
+                        self.recorded = true;
+                        RECORDED.store(true, Ordering::Release);
+                    }
+                    self.keyed.insert(key, (vec![scripted.answer], 0));
                 }
                 (None, Some(text)) => self
                     .marked
@@ -822,7 +1248,7 @@ impl Store {
             "marked": marked,
             "hits": hits,
             "misses": misses,
-            "keyed": self.keyed.len(),
+            "keyed": self.keyed.values().map(|(listed, _)| listed.len()).sum::<usize>(),
         })
     }
 
@@ -835,12 +1261,26 @@ impl Store {
             self.marked.remove(worker);
         }
     }
+
+    /// A worker starts under `worker`: the name is known to the admin
+    /// routes, with nothing queued or filed for it and its counters at
+    /// zero, whatever a worker of that name left before.
+    fn start(&mut self, worker: &str) {
+        self.queues.remove(worker);
+        self.marked.remove(worker);
+        self.hits.remove(worker);
+        self.misses.remove(worker);
+        self.workers.insert(worker.to_string());
+    }
 }
 
 static STORE: OnceLock<Mutex<Store>> = OnceLock::new();
 /// Whether anything was ever scripted in the process, readable without the
 /// lock: until then a request's path does not touch the store at all.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Whether a recording was ever loaded in the process, readable without
+/// the lock: until then a gRPC wire does not read what a request asks.
+static RECORDED: AtomicBool = AtomicBool::new(false);
 
 /// The process-wide store every worker and the admin API share.
 fn store() -> std::sync::MutexGuard<'static, Store> {
@@ -857,10 +1297,65 @@ pub fn active() -> bool {
     ACTIVE.load(Ordering::Acquire)
 }
 
+/// Whether a recording was ever loaded in the process (a recorded line, or
+/// a record file with no line): a gRPC wire reads what a request asks beyond
+/// its prompt ([`ask_fold`]) only then, and fails a request no line answers
+/// ([`not_recorded`]).
+pub(crate) fn recorded() -> bool {
+    RECORDED.load(Ordering::Acquire)
+}
+
+/// The bytes a recorded engine answered the info call `call` with (its gRPC
+/// path), where a record file with an info file beside it is loaded: a wire
+/// answers that call with them, so that a gateway reads of a replay what it
+/// read of the engine (the sampling defaults, the context length and the
+/// rest that shape the requests it sends on).
+pub(crate) fn recorded_info(call: &str) -> Option<Vec<u8>> {
+    // Whatever the record file holds beside them: a session of info calls
+    // alone leaves no recorded line.
+    if !active() {
+        return None;
+    }
+    store().info.get(call).cloned()
+}
+
+/// Why a request with `prompt_ids` that asks `ask` beyond them and found
+/// nothing fails, once the process's store holds a recording: the key it
+/// missed, and whether its prompt is recorded asked otherwise. `None` while
+/// the store holds no recording: the request goes on to the engine.
+#[cold]
+pub(crate) fn not_recorded(prompt_ids: &[u32], ask: u64) -> Option<String> {
+    let store = store();
+    if !store.recorded {
+        return None;
+    }
+    let key = script_key(prompt_ids);
+    let prompt = store.keyed.keys().any(|held| {
+        held.strip_prefix(key.as_str())
+            .is_some_and(|ask| ask.starts_with('/'))
+    });
+    Some(format!(
+        "mock-worker: no recorded answer under the key {}: {}",
+        asked_key(&key, ask),
+        if prompt {
+            "this prompt is recorded, asked otherwise (the lines of the record file with these \
+             input_ids say how under recorded.asked)"
+        } else {
+            "this prompt is not in the record file"
+        }
+    ))
+}
+
 /// A worker that started, by name (`grpc:<port>`, `http:<port>`,
-/// `zmq:<index>`): the admin routes accept it from then on.
+/// `zmq:<index>`): the admin routes accept it from then on. The name starts
+/// clean: a port a stopped worker of this process had, bound again, hands
+/// its successor no queued or filed answers and no hits or misses. The name
+/// must be one live worker's: a port is, as the bind precedes the start, and
+/// a ZMQ rank's index is the caller's to keep unique, since a second live
+/// rank of one index would start the first rank's entry clean while it
+/// still serves.
 pub fn register(worker: &str) {
-    store().workers.insert(worker.to_string());
+    store().start(worker);
 }
 
 /// The workers that started in this process, by name, sorted: every listener
@@ -886,22 +1381,106 @@ pub fn tokenizer(cfg: &Config) -> LoadedTokenizer {
         .unwrap_or_else(PoisonError::into_inner);
     loaded
         .entry(cfg.tokenizer_path.clone())
+        .or_insert_with(|| load_tokenizer(cfg))
+        .clone()
+}
+
+fn load_tokenizer(cfg: &Config) -> LoadedTokenizer {
+    // Local files only: the mock encodes with the files the gateway
+    // was pointed at, and never fetches a tokenizer from a hub (the
+    // hub loader blocks on a runtime of its own, which a worker's
+    // request path must not do).
+    let path = Path::new(&cfg.tokenizer_path);
+    if !path.exists() {
+        return Err(format!(
+            "tokenizer {}: not a local file or directory",
+            cfg.tokenizer_path
+        ));
+    }
+    llm_tokenizer::factory::create_tokenizer_from_file(&cfg.tokenizer_path)
+        .map_err(|e| format!("tokenizer {}: {e}", cfg.tokenizer_path))
+}
+
+type OutputTable = Option<Arc<[u32]>>;
+
+/// What a realistic engine of the worker sends for each id of its synthetic
+/// draw ([`crate::engine::output_table`]), built once per tokenizer path: an
+/// id decodes where the worker's tokenizer gives text for it alone (special
+/// tokens skipped; a part of a character is no text) and it is no
+/// end-of-sequence id. `None` where the tokenizer does not load from local
+/// files: the ids are then the ids drawn. A load that fails here is not
+/// kept, so [`tokenizer`] still loads at its first use. Local files that give
+/// no table are warned of where the table of their path is built.
+pub(crate) fn output_table(cfg: &Config) -> OutputTable {
+    static TABLES: OnceLock<Mutex<HashMap<String, OutputTable>>> = OnceLock::new();
+    TABLES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(cfg.tokenizer_path.clone())
         .or_insert_with(|| {
-            // Local files only: the mock encodes with the files the gateway
-            // was pointed at, and never fetches a tokenizer from a hub (the
-            // hub loader blocks on a runtime of its own, which a worker's
-            // request path must not do).
-            let path = Path::new(&cfg.tokenizer_path);
-            if !path.exists() {
-                return Err(format!(
-                    "tokenizer {}: not a local file or directory",
-                    cfg.tokenizer_path
-                ));
+            let (table, warning) = build_output_table(cfg);
+            if let Some(warning) = warning {
+                tracing::warn!("{warning}");
             }
-            llm_tokenizer::factory::create_tokenizer_from_file(&cfg.tokenizer_path)
-                .map_err(|e| format!("tokenizer {}: {e}", cfg.tokenizer_path))
+            table
         })
         .clone()
+}
+
+/// The table of `cfg`'s tokenizer path, and the warning owed where local
+/// files give none: files that do not load, and a tokenizer that decodes no
+/// id of the draw. A path that is no local file (a model id of a hub) is
+/// expected to give no table and owes no warning.
+fn build_output_table(cfg: &Config) -> (OutputTable, Option<String>) {
+    let mut loaded = TOKENIZERS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let kept = match loaded.get(&cfg.tokenizer_path) {
+        Some(kept) => kept.clone(),
+        None => {
+            let fresh = load_tokenizer(cfg);
+            if let Ok(tokenizer) = &fresh {
+                loaded.insert(cfg.tokenizer_path.clone(), Ok(Arc::clone(tokenizer)));
+            }
+            fresh
+        }
+    };
+    drop(loaded);
+    let tokenizer = match kept {
+        Ok(tokenizer) => tokenizer,
+        Err(e) => {
+            let local = Path::new(&cfg.tokenizer_path).exists();
+            let warning = local.then(|| format!("{e}: synthetic output keeps the IDs drawn"));
+            return (None, warning);
+        }
+    };
+    let (table, any_decodes) = output_table_of(tokenizer.as_ref());
+    let warning = (!any_decodes).then(|| {
+        format!(
+            "tokenizer {}: decodes no ID of the synthetic output range: \
+             synthetic output keeps the IDs drawn",
+            cfg.tokenizer_path
+        )
+    });
+    (table, warning)
+}
+
+/// The table of `tokenizer`, and whether any id of the draw decodes under it
+/// (no table stands for both ends: every id decodes, or none does).
+fn output_table_of(tokenizer: &dyn Tokenizer) -> (OutputTable, bool) {
+    let eos = tokenizer.eos_token_ids();
+    let any_decodes = Cell::new(false);
+    let table = crate::engine::output_table(|id| {
+        let decodes = !eos.contains(&id)
+            && tokenizer
+                .decode(&[id], true)
+                .is_ok_and(|text| !text.is_empty() && !text.contains('\u{fffd}'));
+        any_decodes.set(any_decodes.get() || decodes);
+        decodes
+    });
+    (table, any_decodes.get())
 }
 
 /// The prompt's text for the answers filed under one: the rendered text the
@@ -1001,9 +1580,20 @@ pub fn take_per_choice(
     if !active() {
         return Ok(None);
     }
+    take_asked(worker, prompt_ids, None, prompt_text, n)
+}
+
+/// [`take_per_choice`] for a request that asks `ask` beyond its prompt.
+fn take_asked(
+    worker: &str,
+    prompt_ids: &[u32],
+    ask: Option<u64>,
+    prompt_text: Option<&str>,
+    n: usize,
+) -> Result<Option<Vec<Answer>>, String> {
     let key = script_key(prompt_ids);
     store()
-        .take_n(worker, &key, prompt_text, n.max(1))
+        .take_n(worker, &key, ask, prompt_text, n.max(1))
         .map_err(|why| {
             tracing::error!("{worker}: {why}");
             why
@@ -1013,19 +1603,22 @@ pub fn take_per_choice(
 /// [`take_per_choice`] on a token wire: the prompt read for the answers
 /// filed under a text (`rendered`, the text the request carries beside its
 /// ids, else the ids decoded), and the text-only answers encoded for the
-/// wire (outside the lock), as [`take_ids`] reads and encodes.
+/// wire (outside the lock), as [`take_ids`] reads and encodes. `ask` is the
+/// fold of what the request asks beyond its prompt (`ask_fold`), for the
+/// recorded lines; `None` on a wire that does not read it.
 pub fn take_ids_per_choice(
     cfg: &Config,
     worker: &str,
     prompt_ids: &[u32],
     rendered: &str,
     n: usize,
+    ask: Option<u64>,
 ) -> Result<Option<Vec<Answer>>, String> {
     if !active() {
         return Ok(None);
     }
     let prompt_text = prompt_text_when_marked(cfg, worker, prompt_ids, rendered)?;
-    let Some(answers) = take_per_choice(worker, prompt_ids, prompt_text.as_deref(), n)? else {
+    let Some(answers) = take_asked(worker, prompt_ids, ask, prompt_text.as_deref(), n)? else {
         return Ok(None);
     };
     answers
@@ -1176,7 +1769,9 @@ mod tests {
             r#"{"output_ids": [1], "matched_stop": true}"#,
             r#"{"output_ids": [1], "delay": 5}"#,
             r#"{"output_ids": ["x"]}"#,
-            r#"[1]"#,
+            r#"{"output_ids": [1], "recorded": {"wire": "http"}}"#,
+            r#"{"output_ids": [1], "recorded": {"wire": 1}}"#,
+            r"[1]",
         ] {
             assert!(parse(bad).is_err(), "{bad}");
         }
@@ -1310,6 +1905,118 @@ mod tests {
         );
     }
 
+    /// A worker's port, bound again by a later worker of the same process,
+    /// names the same entry: the new worker starts it clean, so the counts
+    /// it reports are its own (two filed answers served and one miss read as
+    /// two hits and one miss, not the predecessor's hit on top).
+    #[test]
+    fn a_name_bound_again_starts_with_nothing_of_its_predecessor() {
+        let mut store = Store::default();
+        let worker = "grpc:19002";
+        let marked = |text: &str, id: u32| {
+            parse(&format!(
+                r#"{{"prompt_contains": "{text}", "output_ids": [{id}]}}"#
+            ))
+            .expect("an answer filed under a text")
+        };
+        let key = script_key(&[9]);
+        store.start(worker);
+        store.enqueue(
+            worker,
+            vec![
+                parse(r#"{"output_ids": [1]}"#).expect("queued"),
+                marked("quince", 4),
+            ],
+        );
+        assert!(
+            store.take(worker, &key, None).is_some(),
+            "the queued answer"
+        );
+        assert!(store.take(worker, &key, None).is_none(), "a miss");
+        let before = store.status(worker);
+        assert_eq!(
+            (
+                before["hits"].as_u64(),
+                before["misses"].as_u64(),
+                before["marked"].as_u64()
+            ),
+            (Some(1), Some(1), Some(1)),
+            "{before}"
+        );
+
+        store.start(worker);
+        let after = store.status(worker);
+        assert!(store.knows(worker), "still a worker of the process");
+        assert_eq!(
+            (after["queued"].as_u64(), after["marked"].as_u64()),
+            (Some(0), Some(0)),
+            "{after}"
+        );
+        assert_eq!(
+            (after["hits"].as_u64(), after["misses"].as_u64()),
+            (Some(0), Some(0)),
+            "{after}"
+        );
+
+        store.enqueue(worker, vec![marked("apricot", 20), marked("bramble", 30)]);
+        let ids = |answer: Option<Answer>| answer.map(|a| a.output_ids);
+        assert_eq!(
+            ids(store.take(worker, &key, Some("say bramble"))),
+            Some(vec![30])
+        );
+        assert_eq!(
+            ids(store.take(worker, &key, Some("say apricot"))),
+            Some(vec![20])
+        );
+        assert!(
+            store.take(worker, &key, Some("say say")).is_none(),
+            "a miss"
+        );
+        let state = store.status(worker);
+        assert_eq!(
+            (
+                state["marked"].as_u64(),
+                state["hits"].as_u64(),
+                state["misses"].as_u64()
+            ),
+            (Some(0), Some(2), Some(1)),
+            "{state}"
+        );
+    }
+
+    /// The seam the workers use: `register` starts the name clean on the
+    /// process-wide store, whatever a worker of that name left.
+    #[test]
+    fn registering_a_name_again_starts_it_clean_on_the_process_store() {
+        let worker = "grpc:19003";
+        register(worker);
+        enqueue(
+            worker,
+            vec![parse(r#"{"output_ids": [1]}"#).expect("queued")],
+        )
+        .expect("a known worker");
+        assert!(take(worker, &[9]).is_some(), "the queued answer");
+        assert!(take(worker, &[9]).is_none(), "a miss");
+        let before = status(worker).expect("a known worker");
+        assert_eq!(
+            (before["hits"].as_u64(), before["misses"].as_u64()),
+            (Some(1), Some(1)),
+            "{before}"
+        );
+
+        register(worker);
+        let after = status(worker).expect("still a known worker");
+        assert_eq!(
+            (
+                after["queued"].as_u64(),
+                after["hits"].as_u64(),
+                after["misses"].as_u64()
+            ),
+            (Some(0), Some(0), Some(0)),
+            "{after}"
+        );
+    }
+
     #[test]
     fn an_answer_filed_under_a_text_serves_the_first_prompt_that_holds_it_once() {
         let mut store = Store::default();
@@ -1363,7 +2070,7 @@ mod tests {
             "the queues come first"
         );
         let two = store
-            .take_n(worker, &key, Some("say apricot"), 2)
+            .take_n(worker, &key, None, Some("say apricot"), 2)
             .expect("filled")
             .expect("scripted");
         assert_eq!(
@@ -1474,6 +2181,180 @@ mod tests {
         assert_eq!(answer.token_frames().len(), 2, "one logprob per frame");
     }
 
+    /// The table of a tokenizer keeps each id of the draw the tokenizer
+    /// decodes and gives every other one an id that decodes: an id outside
+    /// the vocabulary, a special token, and the end-of-sequence id whatever
+    /// its text.
+    #[test]
+    fn the_output_table_holds_the_ids_the_tokenizer_decodes() {
+        use llm_tokenizer::MockTokenizer;
+        let words: Vec<(String, u32)> = (100..164).map(|id| (format!("w{id}"), id)).collect();
+        let words: Vec<(&str, u32)> = words
+            .iter()
+            .map(|(word, id)| (word.as_str(), *id))
+            .collect();
+        // The mock tokenizer holds `<bos>` (1,000), which it skips as a
+        // special token, and three plain tokens from 1,001; `</s>` takes the
+        // end-of-sequence id (999) and decodes to its text.
+        let tokenizer = MockTokenizer::new()
+            .with_tokens(&words)
+            .with_tokens(&[("\u{fffd}", 2_500)])
+            .with_eos_token("</s>");
+        let table = output_table_of(&tokenizer).0.expect("a table");
+        assert_eq!(table.len(), 30_000);
+        assert!(
+            table
+                .iter()
+                .all(|id| (100..164).contains(id) || (1_001..1_004).contains(id)),
+            "only ids that decode"
+        );
+        let kept: Vec<u32> = (100..164).collect();
+        assert_eq!(&table[..64], &kept[..], "an id that decodes stays");
+        assert_eq!(table[1_001 - 100], 1_001);
+        assert_ne!(table[999 - 100], 999, "the end-of-sequence id");
+        assert_ne!(table[1_000 - 100], 1_000, "a special token");
+        assert_ne!(table[2_500 - 100], 2_500, "a part of a character");
+    }
+
+    /// A worker whose `--tokenizer` names local files takes the table of
+    /// that tokenizer for its engine; one whose tokenizer is no local file
+    /// takes none, and its engine sends the ids it draws.
+    #[test]
+    fn a_workers_engine_takes_the_table_of_its_local_tokenizer() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // A folder that holds no tokenizer yet gives no table, and the load
+        // that failed is not kept: the files written later load.
+        let late = Config {
+            tokenizer_path: dir.path().join("late").display().to_string(),
+            ..Config::default()
+        };
+        std::fs::create_dir(&late.tokenizer_path).expect("a folder");
+        assert!(late.engine_for("grpc:19000").output_table.is_none());
+        let vocab: Vec<String> = (0..300).map(|id| format!(r#""w{id}":{id}"#)).collect();
+        let special = r#"{"id":300,"content":"</s>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}"#;
+        let model = format!(
+            r#"{{"type":"WordLevel","vocab":{{{}}},"unk_token":"w0"}}"#,
+            vocab.join(",")
+        );
+        let json = format!(
+            r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{special}],"normalizer":null,"pre_tokenizer":{{"type":"Whitespace"}},"post_processor":null,"decoder":null,"model":{model}}}"#
+        );
+        std::fs::write(dir.path().join("tokenizer.json"), &json).expect("tokenizer.json");
+        std::fs::write(
+            Path::new(&late.tokenizer_path).join("tokenizer.json"),
+            &json,
+        )
+        .expect("tokenizer.json");
+        assert!(tokenizer(&late).is_ok(), "the files written later load");
+        let cfg = Config {
+            tokenizer_path: dir.path().display().to_string(),
+            ..Config::default()
+        };
+        let table = cfg.engine_for("grpc:19000").output_table.expect("a table");
+        assert_eq!(table.len(), 30_000);
+        assert!(
+            table.iter().all(|id| (100..300).contains(id)),
+            "ids of the vocabulary, its special token left out"
+        );
+        assert_eq!(table[0], 100, "an id that decodes stays");
+
+        let unnamed = Config {
+            tokenizer_path: "no-such-tokenizer".to_string(),
+            ..Config::default()
+        };
+        assert!(unnamed.engine_for("grpc:19000").output_table.is_none());
+    }
+
+    /// Writes into the folder `dir` the files of a tokenizer whose
+    /// vocabulary is the ids under `size`, one word an id.
+    fn write_word_tokenizer(dir: &str, size: u32) {
+        let vocab: Vec<String> = (0..size).map(|id| format!(r#""w{id}":{id}"#)).collect();
+        let json = format!(
+            r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":{{"type":"Whitespace"}},"post_processor":null,"decoder":null,"model":{{"type":"WordLevel","vocab":{{{}}},"unk_token":"w0"}}}}"#,
+            vocab.join(",")
+        );
+        std::fs::write(Path::new(dir).join("tokenizer.json"), json).expect("tokenizer.json");
+    }
+
+    /// Local tokenizer files that give the synthetic output no table owe a
+    /// warning: files that do not load, and a tokenizer that decodes no id
+    /// of the draw. Files that give a table owe none, and neither does a
+    /// path that is no local file, which is expected to give no table.
+    #[test]
+    fn local_tokenizer_files_that_give_no_table_owe_a_warning() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let at = |name: &str| {
+            let cfg = Config {
+                tokenizer_path: dir.path().join(name).display().to_string(),
+                ..Config::default()
+            };
+            std::fs::create_dir(&cfg.tokenizer_path).expect("a folder");
+            cfg
+        };
+
+        let unloadable = at("unloadable");
+        let (table, warning) = build_output_table(&unloadable);
+        assert!(table.is_none());
+        let warning = warning.expect("files that do not load");
+        assert!(
+            warning.starts_with(&format!("tokenizer {}: ", unloadable.tokenizer_path)),
+            "{warning}"
+        );
+        assert!(
+            warning.ends_with(": synthetic output keeps the IDs drawn"),
+            "{warning}"
+        );
+
+        // A vocabulary that ends under the first id of the draw.
+        let small = at("small");
+        write_word_tokenizer(&small.tokenizer_path, 50);
+        let (table, warning) = build_output_table(&small);
+        assert!(table.is_none());
+        assert_eq!(
+            warning,
+            Some(format!(
+                "tokenizer {}: decodes no ID of the synthetic output range: \
+                 synthetic output keeps the IDs drawn",
+                small.tokenizer_path
+            ))
+        );
+
+        let decoding = at("decoding");
+        write_word_tokenizer(&decoding.tokenizer_path, 300);
+        let (table, warning) = build_output_table(&decoding);
+        assert!(table.is_some());
+        assert_eq!(warning, None, "files that give a table");
+
+        let hub = Config {
+            tokenizer_path: "no-such-org/no-such-model".to_string(),
+            ..Config::default()
+        };
+        assert_eq!(build_output_table(&hub), (None, None), "no local file");
+    }
+
+    /// An HTTP worker sends text and no ids: its engine takes no table and
+    /// builds none, so nothing is kept for its tokenizer path.
+    #[test]
+    fn an_http_workers_engine_builds_no_table() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cfg = Config {
+            tokenizer_path: dir.path().display().to_string(),
+            ..Config::default()
+        };
+        // The folder holds no tokenizer yet: a table built now would be kept
+        // as none for the path, and the files written next would give none.
+        assert!(cfg.engine_for("http:18000").output_table.is_none());
+        write_word_tokenizer(&cfg.tokenizer_path, 300);
+        assert!(
+            cfg.engine_for("grpc:19000").output_table.is_some(),
+            "the HTTP worker built none"
+        );
+        assert!(
+            cfg.engine_for("http:18000").output_table.is_none(),
+            "the HTTP worker takes none"
+        );
+    }
+
     #[test]
     fn a_text_only_answer_takes_its_ids_from_the_tokenizer() {
         use llm_tokenizer::{traits::Encoder, MockTokenizer};
@@ -1552,5 +2433,274 @@ mod tests {
             .expect_err("a line without a key is refused");
         assert!(error.contains("needs key or input_ids"), "{error}");
         assert!(store.load(&dir.path().join("missing.jsonl")).is_err());
+    }
+
+    #[test]
+    fn a_file_of_hand_written_answers_is_read_alone() {
+        // A sibling under the name a recorder gives its info file is another
+        // script here: nothing of it is read.
+        let mut store = Store::default();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("answers.jsonl");
+        let row = "{\"input_ids\": [5, 6], \"output_ids\": [8, 9]}\n";
+        std::fs::write(&path, row).expect("write");
+        std::fs::write(dir.path().join("answers.info.jsonl"), row).expect("write");
+        assert_eq!(store.load(&path).expect("loads"), 1);
+        assert!(store.info.is_empty());
+    }
+
+    #[test]
+    fn a_file_with_no_line_is_a_recording_beside_the_info_file_of_a_recorder() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        // What a recorder leaves of a session with no call: both files, no
+        // line in either.
+        let record = dir.path().join("record.jsonl");
+        std::fs::write(&record, "").expect("write");
+        std::fs::write(dir.path().join("record.info.jsonl"), "").expect("write");
+        let mut store = Store::default();
+        assert_eq!(store.load(&record).expect("loads"), 0);
+        assert!(store.recorded, "every request misses this recording");
+        // A script with no line and nothing beside it holds no answer, and
+        // fails no request.
+        let script = dir.path().join("script.jsonl");
+        std::fs::write(&script, "").expect("write");
+        let mut store = Store::default();
+        assert_eq!(store.load(&script).expect("loads"), 0);
+        assert!(!store.recorded);
+    }
+
+    #[test]
+    fn a_recorded_line_is_filed_under_its_prompt_and_what_its_request_asked() {
+        let streamed = json!({"stream": true, "max_new_tokens": 16});
+        // The same ask as a writer that keeps another order of names puts it.
+        let reordered: Value =
+            serde_json::from_str(r#"{"max_new_tokens": 16, "stream": true}"#).expect("json");
+        assert_eq!(ask_fold(&streamed), ask_fold(&reordered));
+        let plain = json!({"stream": false, "max_new_tokens": 16});
+        assert_ne!(ask_fold(&streamed), ask_fold(&plain));
+        // One client request as two wires state it folds alike: a default
+        // temperature stated or left out, `top_k` off as 0 or -1, a seed or
+        // none. A temperature that is not the default is another ask.
+        let on_one_wire = json!({"temperature": null, "top_k": 0, "seed": 7, "top_p": 0.95});
+        let on_another = json!({"temperature": 1.0, "top_k": -1, "seed": null, "top_p": 0.95});
+        let cooler = json!({"temperature": 0.5, "top_k": 0, "seed": 7, "top_p": 0.95});
+        assert_eq!(ask_fold(&on_one_wire), ask_fold(&on_another));
+        assert_ne!(ask_fold(&on_one_wire), ask_fold(&cooler));
+
+        let mut store = Store::default();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("record.jsonl");
+        let line = |output: u32, asked: &Value| {
+            json!({"input_ids": [5, 6], "output_ids": [output], "recorded": {"asked": asked}})
+                .to_string()
+        };
+        std::fs::write(
+            &path,
+            [
+                line(1, &streamed),
+                line(2, &plain),
+                line(3, &reordered),
+                // Lines written by hand: their prompt alone, the last one.
+                r#"{"input_ids": [7], "output_ids": [8]}"#.to_string(),
+                r#"{"input_ids": [7], "output_ids": [9]}"#.to_string(),
+            ]
+            .join("\n"),
+        )
+        .expect("write");
+        // The info answers the recorder kept beside the file load with it.
+        std::fs::write(
+            dir.path().join("record.info.jsonl"),
+            r#"{"path": "/a.Service/GetModelInfo", "answer_hex": "0a01ff"}"#,
+        )
+        .expect("write");
+        assert_eq!(store.load(&path).expect("loads"), 5);
+        assert!(store.recorded);
+        assert_eq!(
+            store.info.get("/a.Service/GetModelInfo"),
+            Some(&vec![0x0a, 0x01, 0xff])
+        );
+
+        let worker = "grpc:9000";
+        let key = script_key(&[5, 6]);
+        let mut served = |ask: &Value| {
+            store
+                .take_n(worker, &key, Some(ask_fold(ask)), None, 1)
+                .expect("one choice")
+                .map(|answers| answers[0].output_ids.clone())
+        };
+        // Whatever order the requests arrive in, each reads a line recorded
+        // for what it asks: the lines of one ask in turn, then from the
+        // first again.
+        assert_eq!(served(&plain), Some(vec![2]));
+        assert_eq!(served(&streamed), Some(vec![1]));
+        assert_eq!(served(&streamed), Some(vec![3]));
+        assert_eq!(served(&streamed), Some(vec![1]));
+        assert_eq!(served(&plain), Some(vec![2]));
+        // The prompt asked otherwise, and the prompt on a wire that states
+        // no ask: nothing is filed for either.
+        assert_eq!(served(&json!({"stream": true, "max_new_tokens": 17})), None);
+        assert!(store.take(worker, &key, None).is_none());
+        assert_eq!(store.misses.get(worker), Some(&2));
+
+        // A line written by hand serves its prompt whatever is asked.
+        let by_hand = script_key(&[7]);
+        for ask in [None, Some(ask_fold(&streamed))] {
+            let answers = store
+                .take_n(worker, &by_hand, ask, None, 1)
+                .expect("one choice")
+                .expect("the keyed answer");
+            assert_eq!(answers[0].output_ids, vec![9]);
+        }
+    }
+
+    /// Cuts whose sum wraps around to the output's own count are refused at
+    /// the load, and an answer built with such cuts streams even frames: no
+    /// frame is sliced by them.
+    #[test]
+    fn cuts_that_add_up_past_any_count_are_refused() {
+        let wrapped = format!(
+            r#"{{"output_ids": [1, 2, 3], "chunks": [{}, 4]}}"#,
+            usize::MAX
+        );
+        assert!(parse(&wrapped).is_err());
+
+        let mut built = parse(r#"{"output_ids": [1, 2, 3]}"#)
+            .expect("an answer of three tokens")
+            .answer;
+        built.chunks = Some(vec![usize::MAX, 4]);
+        let streamed: usize = (built.token_frames().iter())
+            .map(|frame| frame.ids.len())
+            .sum();
+        assert_eq!(streamed, 3);
+    }
+
+    #[test]
+    fn a_status_states_the_code_of_a_failure() {
+        // OK ends no call ahead of its answer and a number past the last
+        // code names none: a line that states either is refused.
+        let stating = |code: i32| {
+            parse(&format!(
+                r#"{{"output_text": "", "status": {{"code": {code}}}}}"#
+            ))
+        };
+        for code in [0, 17, -1] {
+            assert!(
+                stating(code).is_err_and(|refused| refused.contains("1 to 16")),
+                "code {code} is no code of a failure"
+            );
+        }
+        for code in [1, 16] {
+            let status = stating(code).expect("the code of a failure").answer.status;
+            assert_eq!(status.map(|status| status.code), Some(code));
+        }
+    }
+
+    #[test]
+    fn a_cut_of_no_tokens_is_a_frame_and_a_stated_count_is_the_one_reported() {
+        // An engine's stream whose one token was the stop it trimmed: an
+        // empty chunk opens the choice, and the completion counts the token.
+        let opened = parse(r#"{"output_text": "", "chunks": [0], "completion_tokens": 1}"#)
+            .expect("a cut of no tokens")
+            .answer;
+        let frames = opened.token_frames();
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].ids.is_empty() && frames[0].last);
+        assert_eq!(opened.completion_tokens(), 1);
+
+        // The cuts still add up to the output's tokens, the empty ones among
+        // them; with no count stated the output's own is reported.
+        let cuts = parse(r#"{"output_ids": [1, 2, 3], "chunks": [0, 2, 0, 1]}"#)
+            .expect("empty cuts among the others")
+            .answer;
+        let sizes: Vec<usize> = (cuts.token_frames().iter())
+            .map(|frame| frame.ids.len())
+            .collect();
+        assert_eq!(sizes, [0, 2, 0, 1]);
+        assert_eq!(cuts.completion_tokens(), 3);
+        assert!(parse(r#"{"output_ids": [1, 2], "chunks": [1]}"#).is_err());
+
+        // Cuts that hold none of an output: the engine sent it in its
+        // completion alone. A gRPC wire streams a frame of no tokens for
+        // each cut (none for an empty list); the frames of the other wires
+        // are the output, so they deliver it in even cuts.
+        for (stated, empty_frames) in [("[]", 0), ("[0]", 1), ("[0, 0]", 2)] {
+            let alone = parse(&format!(
+                r#"{{"output_ids": [7, 8, 9], "chunks": {stated}}}"#
+            ))
+            .expect("cuts that hold none of the output")
+            .answer;
+            let frames = alone.chunk_frames();
+            assert_eq!(frames.len(), empty_frames, "{stated}");
+            assert!(frames.iter().all(|frame| frame.ids.is_empty()), "{stated}");
+            assert_eq!(
+                frames.last().map(|frame| frame.last),
+                (empty_frames > 0).then_some(true)
+            );
+            let sizes: Vec<usize> = (alone.token_frames().iter())
+                .map(|frame| frame.ids.len())
+                .collect();
+            assert_eq!(sizes, [1, 1, 1], "{stated}");
+            assert_eq!(alone.completion_tokens(), 3);
+        }
+        // Cuts that hold the output are the frames of every wire.
+        assert_eq!(cuts.chunk_frames(), cuts.token_frames());
+        // An output of text alone has no ids for a frame of a gRPC wire, so
+        // cuts that hold none of it are its frames too, one of no tokens each.
+        let text = parse(r#"{"output_text": "ab", "chunks": [0, 0]}"#)
+            .expect("cuts that hold none of a text output")
+            .answer;
+        let sizes: Vec<usize> = (text.chunk_frames().iter())
+            .map(|frame| frame.ids.len() + frame.pieces.len())
+            .collect();
+        assert_eq!(sizes, [0, 0]);
+
+        // A request's limit cuts the answer short of the count it stated.
+        let cut = parse(r#"{"output_ids": [1, 2, 3], "completion_tokens": 4}"#)
+            .expect("a stated count")
+            .answer
+            .cut_to(Some(2));
+        assert_eq!(cut.completion_tokens(), 2);
+    }
+
+    #[test]
+    fn a_queued_answer_leaves_the_calls_of_a_key_whole() {
+        // Two recorded calls of two choices under one key, and one answer
+        // queued ahead of them.
+        let mut store = Store::default();
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("record.jsonl");
+        let asked = json!({"n": 2});
+        let lines: Vec<String> = (1..=4)
+            .map(|output| {
+                json!({"input_ids": [5, 6], "output_ids": [output], "recorded": {"asked": asked}})
+                    .to_string()
+            })
+            .collect();
+        std::fs::write(&path, lines.join("\n")).expect("write");
+        assert_eq!(store.load(&path).expect("loads"), 4);
+        let worker = "grpc:9000";
+        let queued = parse(r#"{"output_ids": [9]}"#).expect("an answer");
+        store.enqueue(worker, vec![queued]);
+        let key = script_key(&[5, 6]);
+        let mut call = || {
+            let answers = store
+                .take_n(worker, &key, Some(ask_fold(&asked)), None, 2)
+                .expect("two choices")
+                .expect("the recorded call");
+            [answers[0].output_ids[0], answers[1].output_ids[0]]
+        };
+        // The queued answer stands for the first choice of its call; the
+        // call behind it reads its own two lines, not one of each call.
+        assert_eq!([call(), call(), call()], [[9, 2], [3, 4], [1, 2]]);
+    }
+
+    #[test]
+    fn a_logprob_json_has_no_number_for_reads_back_as_written() {
+        // What the recorder writes for a value JSON cannot state.
+        let scored = parse(r#"{"output_ids": [1, 2], "logprobs": ["-inf", -0.5]}"#)
+            .expect("a logprob of no number")
+            .answer;
+        assert_eq!(scored.logprobs, Some(vec![f32::NEG_INFINITY, -0.5]));
+        assert!(parse(r#"{"output_ids": [1], "logprobs": ["-0.5"]}"#).is_err());
     }
 }

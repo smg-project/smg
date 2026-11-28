@@ -41,6 +41,9 @@
 #                        label the gateway's decode rooms read [8]
 #   PREFILL_WINDOW       the gateway's in-flight bound per prefill engine (--prefill-max-inflight-requests-per-worker,
 #                        the prefill admission queue); 0 leaves the bound off [8]
+#   DECODE_POLICY        the decode pool's policy (--decode-policy). The prefill pool stays under GW_POLICY, the
+#                        fleet's --policy. A load policy unless named, as in the launcher's own example; GW_POLICY's
+#                        value here passes no role flag, so both pools run under --policy [power_of_two]
 set -u
 cmd=${1:-}
 [ -n "$cmd" ] || { echo "usage: bed.sh up|down|status" >&2; exit 2; }
@@ -58,6 +61,7 @@ PREFILL_BASE=${PREFILL_BASE:-$((MOCK_BASE + WORKERS))}
 BOOTSTRAP_BASE=${BOOTSTRAP_BASE:-$((PREFILL_BASE + PREFILL_WORKERS))}
 PREFILL_ADMIN_PORT=${PREFILL_ADMIN_PORT:-$((ADMIN_PORT - 1))}
 DECODE_WINDOW=${DECODE_WINDOW:-8}; PREFILL_WINDOW=${PREFILL_WINDOW:-8}
+DECODE_POLICY=${DECODE_POLICY:-power_of_two}
 MODEL=${MODEL:-mock-model}; BLOCK=${BLOCK:-16}
 GW_CORES=${GW_CORES:-}; MOCK_CORES=${MOCK_CORES:-}; GW_THREADS=${GW_THREADS:-8}
 ENGINE_ARGS=${ENGINE_ARGS:---engine realistic --timing linear --prefill-tps 2000000 --decode-base-ms 10 --decode-per-req-ms 0 --max-running 4096 --max-batched-tokens 1000000 --context-length 262144 --kv-tokens 2097152}
@@ -194,8 +198,11 @@ case "$cmd" in
       start_fleet mock grpc "$MOCK_BASE" "$WORKERS" "$ADMIN_PORT" --worker-type decode $ENGINE_ARGS --max-running "$DECODE_WINDOW" \
         || bail "the decode fleet did not come up"
       # The multi-router gateway serves the roles on its prefill-decode router by itself; the mode flag is what
-      # admits the prefill in-flight bound (and the per-role policies), with no static worker list.
+      # admits the prefill in-flight bound (and the per-role policies), with no static worker list. The decode
+      # pool takes a policy of its own; under the fleet's own policy it stays on --policy, as the prefill pool
+      # does, so every value --policy takes can run both pools.
       gw_flags+=(--pd-disaggregation)
+      [ "$DECODE_POLICY" = "$GW_POLICY" ] || gw_flags+=(--decode-policy "$DECODE_POLICY")
       [ "$PREFILL_WINDOW" -gt 0 ] && gw_flags+=(--prefill-max-inflight-requests-per-worker "$PREFILL_WINDOW")
     else
       # shellcheck disable=SC2086
@@ -243,7 +250,7 @@ case "$cmd" in
     [ "$ok" = 1 ] || { cat "$BED/probe.json" >&2; tail -20 "$BED/gateway.log" >&2; bail "the probe request did not succeed"; }
     cgroup=$(cut -d: -f3 "/proc/$gw_pid/cgroup" 2>/dev/null | head -1)
     if [ "$FLEET" = prefill-decode ]; then
-      prefill_json="\"prefill_pid\": $(cat "$BED/prefill.pid"), \"prefill_workers\": $PREFILL_WORKERS, \"prefill_admin_url\": \"http://127.0.0.1:$PREFILL_ADMIN_PORT\","
+      prefill_json="\"prefill_pid\": $(cat "$BED/prefill.pid"), \"prefill_workers\": $PREFILL_WORKERS, \"prefill_admin_url\": \"http://127.0.0.1:$PREFILL_ADMIN_PORT\", \"decode_policy\": \"$DECODE_POLICY\","
       shape="$PREFILL_WORKERS prefill on $PREFILL_BASE.. and $WORKERS decode on $MOCK_BASE.."
     else
       prefill_json=""

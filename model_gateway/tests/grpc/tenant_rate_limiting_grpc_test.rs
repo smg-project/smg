@@ -3,8 +3,8 @@
 //! a real (mock) gRPC backend rather than by driving `RateLimitReserveStage`
 //! in isolation.
 //!
-//! Calls `RouterTrait` methods directly, mirroring
-//! `routers/grpc/router.rs`'s own `tests` module (`router/tests.rs`), rather than going
+//! Calls `RouterTrait` methods directly, mirroring `routers/grpc/router.rs`'s own `tests`
+//! module (`tests/unit/routers/grpc/router/tests.rs`), rather than going
 //! through the full HTTP app: `test_harness/src/test_app.rs`'s lightweight test
 //! app doesn't wire the tenant-resolution middleware that would otherwise
 //! populate `tenant_request_meta`, so a real per-request tenant identity is
@@ -60,9 +60,9 @@ use smg::{
     },
     routers::RouterTrait,
     tenant::TenantKey,
-    worker::{RuntimeType, Worker, WorkerType},
 };
 use smg_grpc_client::vllm_proto as proto;
+use smg_worker::identity::basic::{RuntimeType, Worker, WorkerType};
 use tokio::time::timeout;
 use tonic::{Request, Response, Status};
 use uuid::Uuid;
@@ -889,7 +889,7 @@ async fn responses_take_the_tenant_request_budget_as_chat_does() {
 
         for _ in 0..2 {
             let response = router
-                .route_chat(None, &fresh_tenant(), chat_request(), MODEL)
+                .route_chat(None, &fresh_tenant(), Arc::new(chat_request()), MODEL)
                 .await;
             assert_eq!(response.status(), http::StatusCode::OK);
         }

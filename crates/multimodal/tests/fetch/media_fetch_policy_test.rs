@@ -119,7 +119,7 @@ fn connector(allowed: Option<&[&str]>, allow_private_hosts: bool) -> MediaConnec
 
 async fn fetch(connector: &MediaConnector, url: String) -> Result<(u32, u32), MediaConnectorError> {
     connector
-        .fetch_image(MediaSource::Url(url), ImageFetchConfig::default())
+        .fetch_image(MediaSource::Url(url.into()), ImageFetchConfig::default())
         .await
         .map(|frame| (frame.size().width, frame.size().height))
 }
@@ -333,7 +333,8 @@ async fn a_redirect_to_a_non_http_target_is_refused() {
         matches!(
             &error,
             MediaConnectorError::DisallowedRedirect { target, reason, .. }
-                if target == "file:///etc/hostname" && reason.contains("unsupported media scheme: file")
+                if target == "file:///etc/hostname"
+                    && *reason == MediaConnectorError::UnsupportedScheme("file".to_string()).to_string()
         ),
         "{error}"
     );

@@ -10,6 +10,14 @@ inputs:
       features) should use its own key to keep its artifacts warm.
     required: false
     default: 'rust-cache'
+  cache:
+    description: >-
+      'false' leaves the Rust cache step out: the job builds cold and
+      neither restores nor saves an entry. For a job whose entry takes
+      more of the repository's 10 GB cache than its restore saves in
+      minutes. Incremental compilation stays off, as the step sets it.
+    required: false
+    default: 'true'
 
 runs:
   using: 'composite'
@@ -27,15 +35,10 @@ runs:
     # cache never outlives its job, and the Actions-cache backend was taken out
     # for its request volume. The Rust cache is the whole of the caching.
     - name: Rust cache
+      if: ${{ inputs.cache != 'false' }}
       uses: Swatinem/rust-cache@v2
       with:
         workspaces: .
-        # The Go FFI build (bindings/golang/Makefile) overrides CARGO_TARGET_DIR
-        # to bindings/golang/target, which `workspaces: .` does not cover — so
-        # its dependency compilation was never cached. Cache that dir explicitly
-        # so the Go FFI build is incremental across runs like the wheel build.
-        cache-directories: |
-          bindings/golang/target
         shared-key: ${{ inputs.cache-key }}
         cache-all-crates: true
         # Only a job that completed, on main, saves (smg-project/smg-lab#157):
@@ -56,3 +59,12 @@ runs:
         # seldom complete between merges.
         cache-on-failure: false
         save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    # The Rust cache step also turns incremental compilation off for the
+    # rest of its job, where .cargo/config.toml turns it on. A job that
+    # leaves the step out sets the same here, so its cold build writes no
+    # incremental state.
+    - name: Incremental compilation off
+      if: ${{ inputs.cache == 'false' }}
+      shell: bash
+      run: echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"

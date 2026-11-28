@@ -16,9 +16,9 @@ use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use serde_json::{json, Value};
 use smg::{
     config::{RouterConfig, RoutingMode},
-    routers::RouterFactory,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
 };
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
@@ -217,7 +217,7 @@ fn cross_tenant_calls(
             Method::POST,
             "/v1/responses".to_string(),
             Some(json!({"model": MODEL, "input": "Hello", "previous_response_id": response_id})),
-            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
             "previous_response_not_found",
         ),
         (

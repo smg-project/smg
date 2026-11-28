@@ -18,10 +18,12 @@ use openai_protocol::worker::WorkerErrorResponse;
 use smg::{
     app_context::AppContext,
     config::RouterConfig,
-    health::ProbeState,
     policies::PolicyRegistry,
-    routers::RouterFactory,
-    server::{build_app, AppState},
+    routers::{
+        common::snapshot::{WorkerMonitor, WorkerRegistry},
+        RouterFactory,
+    },
+    server::{build_app, health::ProbeState, AppState},
     wasm::{
         module::{
             MiddlewareAttachPoint, WasmModuleAddRequest, WasmModuleAddResponse,
@@ -30,7 +32,6 @@ use smg::{
         },
         module_manager::WasmModuleManager,
     },
-    worker::{WorkerMonitor, WorkerRegistry},
 };
 use smg_data_connector::{
     MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,

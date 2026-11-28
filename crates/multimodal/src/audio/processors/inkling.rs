@@ -57,7 +57,7 @@ impl Default for InklingAudioEncoderParams {
 }
 
 impl InklingAudioEncoderParams {
-    pub fn from_model_config(config: &serde_json::Value) -> Self {
+    pub(crate) fn from_model_config(config: &serde_json::Value) -> Self {
         let mut params = Self::default();
         let Some(audio_config) = config.get("audio_config") else {
             return params;
@@ -128,7 +128,7 @@ impl InklingAudioProcessor {
         }
     }
 
-    pub fn from_model_config(config: &serde_json::Value) -> Self {
+    pub(crate) fn from_model_config(config: &serde_json::Value) -> Self {
         Self::with_params(InklingAudioEncoderParams::from_model_config(config))
     }
 
@@ -140,9 +140,7 @@ impl InklingAudioProcessor {
         &self,
         clips: &[&DecodedAudio],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if clips.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(clips)?;
         let frontend = self.frontend()?;
         let mut waveforms: Vec<Cow<'_, [f32]>> = Vec::with_capacity(clips.len());
         for clip in clips {
@@ -198,10 +196,8 @@ impl InklingAudioProcessor {
     }
 
     /// The dMel bin ids of one clip, `[frames, n_mels]`.
-    pub fn preprocess_decoded(
-        &self,
-        decoded: &DecodedAudio,
-    ) -> Result<Array2<f32>, TransformError> {
+    #[cfg(test)]
+    fn preprocess_decoded(&self, decoded: &DecodedAudio) -> Result<Array2<f32>, TransformError> {
         let frontend = self.frontend()?;
         let waveform = self.at_frontend_rate(decoded)?;
         let frames = frontend.frame_count(waveform.len());

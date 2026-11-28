@@ -1,18 +1,25 @@
 //! Unified worker registration step.
 
-use std::{collections::HashSet, sync::Arc};
-
-use async_trait::async_trait;
-use tracing::debug;
-use wfaas::{
-    StepExecutor, StepId, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
 };
 
-use super::{pool_group, refresh_worker_pool_sizes, PoolGroups};
+use async_trait::async_trait;
+use smg_worker::{health::bootstrap_probe, identity::basic::Worker, registry::WorkerId};
+use tracing::debug;
+use wfaas::{
+    StepExecutor, StepId, StepResult, StepStatus, WorkflowContext, WorkflowData, WorkflowError,
+    WorkflowResult, WorkflowState,
+};
+
 use crate::{
-    routers::{common::pd_admission, grpc::regular::symphony::telemetry},
-    worker::{bootstrap_probe, registry::WorkerId, Worker, WorkerRegistry},
-    workflow::data::{WorkerRegistrationData, WorkerRegistrationMode},
+    app_context::AppContext,
+    routers::{
+        common::{pd_admission, snapshot::WorkerRegistry},
+        grpc::regular::symphony::telemetry,
+    },
+    workflow::data::{require_app_context, WorkerRegistrationData, WorkerRegistrationMode},
 };
 
 /// Unified step to register workers in the registry.
@@ -22,9 +29,46 @@ use crate::{
 /// Works with any workflow data type that implements `WorkerRegistrationData`.
 pub struct RegisterWorkersStep;
 
+/// The step's id in the registration DAGs.
+pub(crate) const REGISTER_WORKERS_STEP: &str = "register_workers";
+
+/// Whether the registry step of `state` completed: the registration's workers
+/// are in the registry, whatever the workflow did after it (a cancellation or
+/// a later step's failure leaves them there).
+pub fn registered_in<D: WorkflowData>(state: &WorkflowState<D>) -> bool {
+    state
+        .step_states
+        .get(&StepId::new(REGISTER_WORKERS_STEP))
+        .is_some_and(|step| step.status == StepStatus::Succeeded)
+}
+
+/// The registration's workers that are the registry's entries under their
+/// URLs now, by id and revision: what a removal queued for this registration
+/// may take. A worker registered or replaced since is not among them, and a
+/// registration whose registry step the state does not record as succeeded
+/// (a cancellation written while the step ran) is still read from the
+/// registry itself.
+pub fn registered_entries<D: WorkerRegistrationData>(
+    registry: &WorkerRegistry,
+    state: &WorkflowState<D>,
+) -> HashMap<String, u64> {
+    state
+        .context
+        .data
+        .get_actual_workers()
+        .into_iter()
+        .flatten()
+        .filter_map(|worker| {
+            let id = registry.get_id_by_url(worker.url())?;
+            let entry = registry.get(&id)?;
+            Arc::ptr_eq(&entry, worker).then(|| (id.as_str().to_string(), entry.revision()))
+        })
+        .collect()
+}
+
 fn step_failed(message: String) -> WorkflowError {
     WorkflowError::StepFailed {
-        step_id: StepId::new("register_workers"),
+        step_id: StepId::new(REGISTER_WORKERS_STEP),
         message,
     }
 }
@@ -46,7 +90,7 @@ fn check_batch(
                 if registry.get_by_url(worker.url()).is_some() {
                     return Err(step_failed(format!(
                         "Worker {} already exists",
-                        worker.url()
+                        worker.redacted_url()
                     )));
                 }
                 // The registry is keyed by URL, so a batch that repeats one
@@ -54,16 +98,18 @@ fn check_batch(
                 if !batch_urls.insert(worker.url()) {
                     return Err(step_failed(format!(
                         "Worker {} appears twice in the same registration",
-                        worker.url()
+                        worker.redacted_url()
                     )));
                 }
             }
             Ok(())
         }
-        // One ID replaces one worker. `PUT` is refused up front when the
-        // router runs data-parallel, which is the only expansion that turns
-        // one spec into several workers; the check keeps a future caller from
-        // writing a partial batch.
+        // One ID replaces one worker. `PUT` is refused up front for a rank
+        // worker. A plain worker whose engine reports several ranks by now
+        // is the one other spec that turns into several workers: the
+        // creation step refuses its `PUT` first, since the ranks would
+        // stand beside the plain worker, and this check stands behind it,
+        // before any of them is written.
         WorkerRegistrationMode::ReplaceById { worker_id, .. } if workers.len() != 1 => {
             Err(step_failed(format!(
                 "Replacing worker {worker_id} needs exactly one worker, got {}",
@@ -83,40 +129,34 @@ fn register_worker(
         WorkerRegistrationMode::CreateOnly => registry
             .register(worker.clone())
             .ok_or_else(|| step_failed(format!("Worker {} already exists", worker.redacted_url()))),
-        WorkerRegistrationMode::Upsert => Ok(registry.register_or_replace(worker)),
+        // A registration of the URL: over a worker its removal drains the
+        // new worker starts without that mark, and is admitted as any new
+        // worker is.
+        WorkerRegistrationMode::Upsert => Ok(registry.register_or_replace_clearing_drain(worker)),
         WorkerRegistrationMode::ReplaceById {
             worker_id,
             expected_revision,
         } => {
             let worker_id = WorkerId::from_string(worker_id.clone());
-            let url = worker.url().to_string();
+            let address = worker.redacted_url().to_string();
             // Fails when the ID is gone or the worker moved on, which covers
-            // the concurrent DELETE, DELETE + POST, and second-PUT cases.
-            if registry.replace_claiming_local(&worker_id, worker, *expected_revision) {
+            // the concurrent DELETE, DELETE + POST, and second-PUT cases, and
+            // when a removal is draining the worker.
+            if registry.replace_claiming_local_unless_draining(
+                &worker_id,
+                worker,
+                *expected_revision,
+            ) {
                 Ok(worker_id)
             } else {
                 Err(step_failed(format!(
-                    "Worker {} at {url} is no longer at revision {expected_revision}, \
-                     so the replacement was dropped",
+                    "Worker {} at {address} is no longer at revision {expected_revision} or \
+                     is being removed, so the replacement was dropped",
                     worker_id.as_str()
                 )))
             }
         }
     }
-}
-
-/// The pool-size groups a registration of `workers` touches: each new
-/// worker's own group, and the group of the worker it replaces at the same
-/// URL, when there is one and it differs (a replacement that changes the
-/// model, worker type or connection mode empties the old group).
-fn pool_groups_touched(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -> PoolGroups {
-    let mut groups: PoolGroups = workers.iter().map(|w| pool_group(w.as_ref())).collect();
-    for worker in workers {
-        if let Some(replaced) = registry.get_by_url(worker.url()) {
-            groups.insert(pool_group(replaced.as_ref()));
-        }
-    }
-    groups
 }
 
 /// The models a registration of `workers` may move workers off: every model
@@ -132,106 +172,114 @@ fn models_left(registry: &WorkerRegistry, workers: &[Arc<dyn Worker>]) -> HashSe
         .collect()
 }
 
+/// Write a batch to the registry, whole or not at all, and do what follows
+/// the write ([`after_write`]).
+fn write_batch(
+    app_context: &AppContext,
+    workers: &[Arc<dyn Worker>],
+    registration_mode: &WorkerRegistrationMode,
+    symphony_table: Option<&'static str>,
+) -> WorkflowResult<()> {
+    let registry = &app_context.worker_registry;
+    check_batch(registry, workers, registration_mode)?;
+
+    let mut worker_ids = Vec::with_capacity(workers.len());
+    for worker in workers {
+        let worker_id = register_worker(registry, Arc::clone(worker), registration_mode)?;
+        debug!(
+            "Registered worker {} (model: {}) with ID {:?}",
+            worker.redacted_url(),
+            worker.model_id(),
+            worker_id
+        );
+        // A decode worker's running window is the PD admission bound; one
+        // that reports none leaves the gate off for it, which is said here
+        // rather than inferred later from absent series.
+        pd_admission::announce_decode_window(worker.as_ref());
+        worker_ids.push(worker_id);
+    }
+
+    after_write(workers, symphony_table);
+
+    // WorkerMonitor subscribes to registry events directly (see
+    // `smg_worker::load::monitor::WorkerMonitor::start_event_loop`), so this
+    // step no longer has to push group-add notifications. The
+    // monitor's event loop reconciles the impacted groups as soon as the
+    // registry emits `WorkerEvent::Registered` or `WorkerEvent::Replaced`.
+
+    // Note: worker_ids are stored for potential future use but not persisted
+    // as they are internal registry identifiers
+    debug!(
+        "Registered {} workers with IDs: {:?}",
+        worker_ids.len(),
+        worker_ids
+    );
+    Ok(())
+}
+
+/// What a registration does beside the registry's write, once every worker
+/// of the batch stands in the registry: the parser series of
+/// `symphony_table` and the port probe. The registry's own write moved the
+/// pool sizes and settled the retry settings of each model.
+fn after_write(workers: &[Arc<dyn Worker>], symphony_table: Option<&'static str>) {
+    // Under Symphony the failure classes of the table that reads these
+    // workers' model exist at zero from here, once every worker of the
+    // batch is in the registry: a registration refused before leaves no
+    // series behind. The table was resolved where the model card and the
+    // names are (none for an HTTP worker, the legacy parsers or a model
+    // no table reads).
+    if let Some(table) = symphony_table {
+        telemetry::init_table_series(table);
+    }
+
+    // The rendezvous port a disaggregated worker advertises is probed once
+    // the worker is in the registry (DP ranks share the port), off the
+    // registration path: a registration refused before, or a workflow
+    // that failed before this step, is never reported as a registered
+    // worker with a dead port.
+    if let Some(worker) = workers.first() {
+        bootstrap_probe::spawn_bootstrap_port_probe(worker.as_ref());
+    }
+}
+
+/// A test's hold on the registry step, between the engine's cancel read for
+/// the step and the step's registry write: the window a `DELETE`'s cancel
+/// lands in while the step runs, whose worker the job's end then reads from
+/// the registry. Placed by URL for its next registration, taken once.
+#[cfg(test)]
+#[path = "../../../../tests/unit/workflow/steps/shared/register/registration_hold.rs"]
+pub(crate) mod registration_hold;
+
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorkersStep {
     async fn execute(&self, context: &mut WorkflowContext<D>) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .get_app_context()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.get_app_context())?.clone();
 
         let workers = context
             .data
             .get_actual_workers()
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
 
-        let mut worker_ids = Vec::with_capacity(workers.len());
+        // A test's hold on this step's window (`registration_hold`).
+        #[cfg(test)]
+        {
+            if let Some(worker) = workers.first() {
+                registration_hold::honour(worker.url()).await;
+            }
+        }
+
         let registration_mode = context.data.registration_mode();
 
-        check_batch(&app_context.worker_registry, workers, &registration_mode)?;
-
-        // Taken before the registry is written: a replacement that changes a
-        // worker's group must refresh the group it leaves as well as the one
-        // it joins, and only the registry as it is now knows the former.
-        let touched_groups = pool_groups_touched(&app_context.worker_registry, workers);
+        // Read before the registry is written: only the registry as it is
+        // now knows the workers this registration replaces.
         let left_models = models_left(&app_context.worker_registry, workers);
 
-        for worker in workers {
-            // The handle this URL had before the write: a registration that
-            // replaces it tells the policy registry, as a removal would, so
-            // the engine's rows of the retired handle do not outlive it (the
-            // policies' URL-keyed state carries over to the replacement).
-            let previous = app_context.worker_registry.get_by_url(worker.url());
-            let worker_id = register_worker(
-                &app_context.worker_registry,
-                Arc::clone(worker),
-                &registration_mode,
-            )?;
-            if let Some(previous) = previous.filter(|previous| !Arc::ptr_eq(previous, worker)) {
-                app_context
-                    .policy_registry
-                    .on_worker_replaced(previous.as_ref(), worker.as_ref());
-            }
-            debug!(
-                "Registered worker {} (model: {}) with ID {:?}",
-                worker.redacted_url(),
-                worker.model_id(),
-                worker_id
-            );
-            // A decode worker's running window is the PD admission bound; one
-            // that reports none leaves the gate off for it, which is said here
-            // rather than inferred later from absent series.
-            pd_admission::announce_decode_window(worker.as_ref());
-            worker_ids.push(worker_id);
-        }
-
-        // Under Symphony the failure classes of the table that reads these
-        // workers' model exist at zero from here, once every worker of the
-        // batch is in the registry: a registration refused above leaves no
-        // series behind. The table was resolved where the model card and the
-        // names are (none for an HTTP worker, the legacy parsers or a model
-        // no table reads).
-        if let Some(table) = context.data.symphony_table() {
-            telemetry::init_table_series(table);
-        }
-
-        // The rendezvous port a disaggregated worker advertises is probed once
-        // the worker is in the registry (DP ranks share the port), off the
-        // registration path: a registration refused above, or a workflow
-        // that failed before this step, is never reported as a registered
-        // worker with a dead port.
-        if let Some(worker) = workers.first() {
-            bootstrap_probe::spawn_bootstrap_port_probe(worker.as_ref());
-        }
-
-        // Update per-model retry config (last write wins).
-        // Only update if the worker has non-empty retry overrides in its spec.
-        for worker in workers {
-            let resilience_spec = &worker.metadata().spec.resilience;
-            let has_retry_overrides = resilience_spec.max_retries.is_some()
-                || resilience_spec.initial_backoff_ms.is_some()
-                || resilience_spec.max_backoff_ms.is_some()
-                || resilience_spec.backoff_multiplier.is_some()
-                || resilience_spec.jitter_factor.is_some()
-                || resilience_spec.disable_retry.is_some();
-
-            if has_retry_overrides {
-                let resolved = worker.resilience();
-                let retry_config = resolved.retry.clone();
-                for model_id in WorkerRegistry::worker_model_ids(worker) {
-                    app_context.worker_registry.set_model_retry_config(
-                        &model_id,
-                        retry_config.clone(),
-                        resolved.retry_enabled,
-                    );
-                }
-            }
-        }
-
-        // Update Layer 3 worker pool size metrics per unique
-        // `(worker_type, connection_mode, model_id)` the registration touched.
-        refresh_worker_pool_sizes(&app_context.worker_registry, &touched_groups);
+        write_batch(
+            &app_context,
+            workers,
+            &registration_mode,
+            context.data.symphony_table(),
+        )?;
 
         // A replacement that moved a worker to another model, or that lists
         // a model fewer, takes the policy of each model no worker of this
@@ -242,20 +290,6 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             }
         }
 
-        // WorkerMonitor subscribes to registry events directly (see
-        // `worker::monitor::WorkerMonitor::start_event_loop`), so this
-        // step no longer has to push group-add notifications. The
-        // monitor's event loop reconciles the impacted groups as soon as the
-        // registry emits `WorkerEvent::Registered` or `WorkerEvent::Replaced`.
-
-        // Note: worker_ids are stored for potential future use but not persisted
-        // as they are internal registry identifiers
-        debug!(
-            "Registered {} workers with IDs: {:?}",
-            worker_ids.len(),
-            worker_ids
-        );
-
         Ok(StepResult::Success)
     }
 
@@ -265,221 +299,5 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
 }
 
 #[cfg(test)]
-mod tests {
-    use openai_protocol::model_card::ModelCard;
-
-    use super::*;
-    use crate::worker::BasicWorkerBuilder;
-
-    fn worker_at(url: &str, model_id: &str) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .model(ModelCard::new(model_id))
-                .build(),
-        )
-    }
-
-    fn worker(model_id: &str) -> Arc<dyn Worker> {
-        worker_at("http://worker:8080", model_id)
-    }
-
-    fn replace_by_id(worker_id: &WorkerId, expected_revision: u64) -> WorkerRegistrationMode {
-        WorkerRegistrationMode::ReplaceById {
-            worker_id: worker_id.as_str().to_string(),
-            expected_revision,
-        }
-    }
-
-    #[test]
-    fn a_replacement_that_changes_the_model_touches_the_group_it_leaves_too() {
-        let registry = WorkerRegistry::new();
-        registry.register(worker("original-model")).unwrap();
-
-        // The same URL comes back under another model: both groups' pool
-        // sizes move, the old one to zero.
-        let touched = pool_groups_touched(&registry, &[worker("replacement-model")]);
-        let models: HashSet<&str> = touched.iter().map(|(_, _, m)| m.as_str()).collect();
-        assert_eq!(
-            models,
-            HashSet::from(["original-model", "replacement-model"])
-        );
-
-        // A URL the registry has not seen touches its own group only.
-        let fresh = pool_groups_touched(&registry, &[worker_at("http://fresh:8080", "new-model")]);
-        assert_eq!(fresh.len(), 1);
-        assert!(fresh.iter().all(|(_, _, m)| m == "new-model"));
-    }
-
-    #[test]
-    fn create_only_rejects_duplicate_url_and_keeps_existing_worker() {
-        let registry = WorkerRegistry::new();
-        let original_id = registry.register(worker("original-model")).unwrap();
-
-        let result = register_worker(
-            &registry,
-            worker("replacement-model"),
-            &WorkerRegistrationMode::CreateOnly,
-        );
-
-        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
-        assert_eq!(
-            registry.get_id_by_url("http://worker:8080"),
-            Some(original_id)
-        );
-        assert_eq!(registry.get_by_model("original-model").len(), 1);
-        assert!(registry.get_by_model("replacement-model").is_empty());
-    }
-
-    #[test]
-    fn upsert_replaces_the_worker_at_the_same_url() {
-        let registry = WorkerRegistry::new();
-        let original_id = registry.register(worker("original-model")).unwrap();
-
-        let new_id = register_worker(
-            &registry,
-            worker("replacement-model"),
-            &WorkerRegistrationMode::Upsert,
-        )
-        .unwrap();
-
-        // Replacing at the same URL keeps the worker ID stable, so callers
-        // holding the ID from the original registration stay valid.
-        assert_eq!(new_id, original_id);
-        assert_eq!(registry.get_id_by_url("http://worker:8080"), Some(new_id));
-        assert_eq!(registry.get_by_model("replacement-model").len(), 1);
-        assert!(registry.get_by_model("original-model").is_empty());
-    }
-
-    #[test]
-    fn create_only_rejects_the_batch_before_registering_any_worker() {
-        let registry = WorkerRegistry::new();
-        registry
-            .register(worker_at("http://rank1:8080", "taken"))
-            .unwrap();
-
-        // A data-parallel spec expands to several workers. Rank 0 is free and
-        // rank 1 is taken, so the whole batch must be refused untouched.
-        let batch = vec![
-            worker_at("http://rank0:8080", "new-model"),
-            worker_at("http://rank1:8080", "new-model"),
-        ];
-        let result = check_batch(&registry, &batch, &WorkerRegistrationMode::CreateOnly);
-
-        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
-        assert!(registry.get_by_url("http://rank0:8080").is_none());
-        assert_eq!(registry.get_by_model("taken").len(), 1);
-        assert!(registry.get_by_model("new-model").is_empty());
-    }
-
-    #[test]
-    fn replace_by_id_refuses_a_multi_worker_batch() {
-        let registry = WorkerRegistry::new();
-        let original_id = registry.register(worker("original-model")).unwrap();
-
-        let batch = vec![
-            worker_at("http://worker:8080", "new-model"),
-            worker_at("http://worker:8081", "new-model"),
-        ];
-        let result = check_batch(&registry, &batch, &replace_by_id(&original_id, 0));
-
-        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
-    }
-
-    #[test]
-    fn replace_by_id_applies_the_new_spec() {
-        let registry = WorkerRegistry::new();
-        let original_id = registry.register(worker("original-model")).unwrap();
-
-        let new_id = register_worker(
-            &registry,
-            worker("replacement-model"),
-            &replace_by_id(&original_id, 0),
-        )
-        .unwrap();
-
-        assert_eq!(new_id, original_id);
-        assert_eq!(registry.get_by_model("replacement-model").len(), 1);
-        assert!(registry.get_by_model("original-model").is_empty());
-    }
-
-    #[test]
-    fn replace_by_id_does_not_restore_an_older_spec_over_a_newer_one() {
-        let registry = WorkerRegistry::new();
-        let original_id = registry.register(worker("original-model")).unwrap();
-
-        // Two PUTs are accepted while the worker sits at revision 0, and the
-        // newer one finishes first. Replacing bumps the revision.
-        register_worker(
-            &registry,
-            worker("newer-model"),
-            &replace_by_id(&original_id, 0),
-        )
-        .unwrap();
-
-        let result = register_worker(
-            &registry,
-            worker("older-model"),
-            &replace_by_id(&original_id, 0),
-        );
-
-        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
-        assert_eq!(registry.get_by_model("newer-model").len(), 1);
-        assert!(registry.get_by_model("older-model").is_empty());
-    }
-
-    #[test]
-    fn create_only_rejects_a_batch_that_repeats_a_url() {
-        let registry = WorkerRegistry::new();
-
-        let batch = vec![
-            worker_at("http://rank0:8080", "new-model"),
-            worker_at("http://rank0:8080", "new-model"),
-        ];
-        let result = check_batch(&registry, &batch, &WorkerRegistrationMode::CreateOnly);
-
-        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
-        assert!(registry.get_by_url("http://rank0:8080").is_none());
-    }
-
-    #[test]
-    fn replace_by_id_does_not_resurrect_a_removed_worker() {
-        let registry = WorkerRegistry::new();
-        let original_id = registry.register(worker("original-model")).unwrap();
-        // Stands in for a DELETE that lands while the replacement workflow runs.
-        assert!(registry.remove(&original_id).is_some());
-
-        let result = register_worker(
-            &registry,
-            worker("replacement-model"),
-            &replace_by_id(&original_id, 0),
-        );
-
-        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
-        assert!(registry.get_by_url("http://worker:8080").is_none());
-    }
-
-    #[test]
-    fn replace_by_id_does_not_overwrite_a_recreated_worker() {
-        let registry = WorkerRegistry::new();
-        let original_id = registry.register(worker("original-model")).unwrap();
-        // Stands in for DELETE + POST on the same URL while the replacement
-        // workflow runs: same URL, different worker, new ID.
-        assert!(registry.remove(&original_id).is_some());
-        let recreated_id = registry.register(worker("recreated-model")).unwrap();
-        assert_ne!(recreated_id, original_id);
-
-        let result = register_worker(
-            &registry,
-            worker("replacement-model"),
-            &replace_by_id(&original_id, 0),
-        );
-
-        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
-        assert_eq!(
-            registry.get_id_by_url("http://worker:8080"),
-            Some(recreated_id)
-        );
-        assert_eq!(registry.get_by_model("recreated-model").len(), 1);
-        assert!(registry.get_by_model("replacement-model").is_empty());
-    }
-}
+#[path = "../../../../tests/unit/workflow/steps/shared/register/tests.rs"]
+mod tests;

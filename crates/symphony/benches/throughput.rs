@@ -466,7 +466,39 @@ fn setup(c: &mut Criterion) {
             b.iter(|| black_box(engine(subject.table, subject.prompt, &tools)));
         });
     }
+    // Inkling 2's template writes no opener, so no subject's short tail stands for its prompt:
+    // a first turn, whose text before the last message's close the setup must not read.
+    for kilobytes in [8_usize, 32, 128] {
+        let mut prompt = String::from("<|message_user|>");
+        while prompt.len() < kilobytes << 10 {
+            prompt.push_str(&prose());
+        }
+        prompt.push_str("<|end_message|>");
+        let name = format!("inkling2_first_turn_{kilobytes}k");
+        group.bench_with_input(BenchmarkId::new("engine", name), &prompt, |b, prompt| {
+            b.iter(|| black_box(engine(Table::Inkling2, prompt, &tools)));
+        });
+    }
     group.bench_function("declared", |b| b.iter(|| black_box(declared())));
+    // The anchors of DeepSeek V3.2 stand at the end of a generation prompt, and before the open
+    // message of a continued one: the setup must not read the turns before them.
+    let open = format!("<｜Assistant｜></think>{}", &prose()[..256]);
+    for kilobytes in [8_usize, 32, 128] {
+        let mut turns = String::from("<｜begin▁of▁sentence｜><｜User｜>");
+        while turns.len() < kilobytes << 10 {
+            turns.push_str(&prose());
+        }
+        for (shape, end) in [
+            ("first_turn", "<｜Assistant｜><think>"),
+            ("continued", open.as_str()),
+        ] {
+            let prompt = format!("{turns}{end}");
+            let name = format!("deepseek_v3.2_{shape}_{kilobytes}k");
+            group.bench_with_input(BenchmarkId::new("engine", name), &prompt, |b, prompt| {
+                b.iter(|| black_box(engine(Table::DeepSeekV3_2, prompt, &tools)));
+            });
+        }
+    }
     group.finish();
 }
 

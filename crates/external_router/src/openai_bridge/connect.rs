@@ -10,7 +10,7 @@
 //! `lookup_tool_format` debug log added in 283f27f1 fingerprints the bug
 //! at runtime, but a wrapper makes the mistake structurally impossible.
 
-use smg_mcp::{McpOrchestrator, McpResult, McpServerConfig};
+use smg_mcp::{ConnectedServer, McpOrchestrator, McpResult, McpServerConfig};
 
 use super::FormatRegistry;
 
@@ -24,13 +24,14 @@ pub async fn connect_static_server(
     Ok(())
 }
 
-/// Returns the assigned server key.
+/// Returns the assigned server key and the outcome of the server's tool
+/// listing.
 pub async fn connect_dynamic_server(
     orchestrator: &McpOrchestrator,
     registry: &FormatRegistry,
     config: McpServerConfig,
-) -> McpResult<String> {
-    let server_key = orchestrator.connect_dynamic_server(config.clone()).await?;
+) -> McpResult<ConnectedServer> {
+    let connected = orchestrator.connect_dynamic_server(config.clone()).await?;
     registry.populate_from_server_config(&config);
-    Ok(server_key)
+    Ok(connected)
 }

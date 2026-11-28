@@ -2,10 +2,11 @@
 
 use openai_protocol::{
     common::{
-        to_value_exact, ContextManagementType, Detail, PromptCacheRetention,
+        to_value_exact, ContextManagementType, Detail, GenerationRequest, PromptCacheRetention,
         ToolChoice as ChatToolChoice, ToolChoiceValue as ChatToolChoiceValue, ToolReference,
     },
     responses::*,
+    validated::Normalizable,
 };
 use serde_json::json;
 use validator::Validate;
@@ -73,7 +74,7 @@ fn tool_continuation_keeps_other_input_and_cross_field_validation() {
     assert!(request.validate().is_err());
     assert!(serde_json::from_value::<ResponsesRequest>(json!({
         "model": "test-model", "previous_response_id": "resp_previous",
-        "input": [{"type": "function_call_output", "output": "sunny"}]
+        "input": [{"type": "function_call_output", "call_id": "call_weather"}]
     }))
     .is_err());
 }
@@ -115,7 +116,10 @@ fn text_only_function_output_projection_preserves_order_and_rejects_media() {
     let value = json!([{"type":"input_image", "image_url":"data:image/png;base64,AA=="}]);
     let output: StringOrContentParts = serde_json::from_value(value.clone()).unwrap();
     assert_eq!(serde_json::to_value(&output).unwrap(), value);
-    assert!(output.to_text_only().is_err());
+    assert!(output
+        .to_text_only()
+        .unwrap_err()
+        .contains("\"input_image\""));
 }
 
 #[test]
@@ -243,6 +247,93 @@ fn reasoning_items_preserve_empty_summary_arrays() {
     assert_eq!(serialized, input_payload);
 }
 
+/// A Response's `conversation` is the public API's object, `{"id": ...}`: a
+/// Response carrying it parses and writes it back, and one carrying the bare
+/// id the crate wrote before still parses and writes the object.
+#[test]
+fn a_response_reads_its_conversation_as_an_object_or_a_bare_id() {
+    for conversation in [json!({"id": "conv_1"}), json!("conv_1")] {
+        let response: ResponsesResponse = serde_json::from_value(json!({
+            "id": "resp_conv",
+            "object": "response",
+            "created_at": 1,
+            "status": "completed",
+            "error": null,
+            "incomplete_details": null,
+            "instructions": null,
+            "max_output_tokens": null,
+            "model": "gpt-5.4",
+            "output": [],
+            "parallel_tool_calls": true,
+            "previous_response_id": null,
+            "reasoning": null,
+            "store": true,
+            "temperature": 1.0,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": 1.0,
+            "truncation": "disabled",
+            "usage": null,
+            "user": null,
+            "metadata": {},
+            "conversation": conversation
+        }))
+        .unwrap_or_else(|e| panic!("conversation {conversation}: {e}"));
+        assert_eq!(response.conversation.as_deref(), Some("conv_1"));
+        let written = serde_json::to_value(&response).expect("serialize the response");
+        assert_eq!(written["conversation"], json!({"id": "conv_1"}));
+    }
+}
+
+/// The public API writes a reasoning item as `{id, type, summary,
+/// encrypted_content}`, often with no `content`, which it does not require:
+/// such an item parses with no content, alone and in a Response's output, and
+/// is written back with an empty `content`, as the gateway writes its own.
+#[test]
+fn a_reasoning_output_item_without_content_parses() {
+    let hosted = json!({
+        "type": "reasoning",
+        "id": "rs_hosted",
+        "summary": [{"type": "summary_text", "text": "Weighing the options."}],
+        "encrypted_content": "gAAAAB-opaque"
+    });
+    let item: ResponseOutputItem =
+        serde_json::from_value(hosted.clone()).expect("a reasoning item without content parses");
+    let written = serde_json::to_value(&item).expect("serialize the reasoning item");
+    assert_eq!(written["content"], json!([]), "{written}");
+    assert_eq!(written["summary"], hosted["summary"], "{written}");
+    assert_eq!(written["encrypted_content"], hosted["encrypted_content"]);
+
+    let response: ResponsesResponse = serde_json::from_value(json!({
+        "id": "resp_reasoning",
+        "object": "response",
+        "created_at": 1,
+        "status": "completed",
+        "error": null,
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": "gpt-5.4",
+        "output": [hosted],
+        "parallel_tool_calls": true,
+        "previous_response_id": null,
+        "reasoning": null,
+        "store": true,
+        "temperature": 1.0,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": 1.0,
+        "truncation": "disabled",
+        "usage": null,
+        "user": null,
+        "metadata": {}
+    }))
+    .expect("a Response carrying a reasoning item without content parses");
+    assert_eq!(response.output.len(), 1);
+}
+
 #[test]
 fn legacy_vec_string_summary_fails_to_deserialize() {
     let legacy = r#"{"type":"reasoning","id":"r_x","summary":["text"]}"#;
@@ -251,6 +342,29 @@ fn legacy_vec_string_summary_fails_to_deserialize() {
         result.is_err(),
         "legacy Vec<String> summary must no longer deserialize"
     );
+}
+
+/// The public API's reasoning config takes `mode`, `context` and the
+/// deprecated `generate_summary` beside `effort` and `summary`: a request
+/// carrying them writes them back for the upstream as sent, a mode the spec
+/// does not list included, since its `mode` is an open string.
+#[test]
+fn a_responses_reasoning_config_keeps_its_mode_context_and_generate_summary() {
+    for mode in ["pro", "a-mode-the-spec-does-not-list"] {
+        let reasoning = json!({
+            "effort": "high",
+            "summary": "auto",
+            "mode": mode,
+            "context": "all_turns",
+            "generate_summary": "concise"
+        });
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.6", "input": "think it through", "reasoning": reasoning.clone()
+        }))
+        .unwrap_or_else(|e| panic!("mode {mode}: {e}"));
+        let written = serde_json::to_value(&request).expect("serialize the request");
+        assert_eq!(written["reasoning"], reasoning, "mode {mode}");
+    }
 }
 
 #[test]
@@ -292,6 +406,51 @@ fn test_responses_request_explicit_top_p_preserved() {
     .expect("request should deserialize");
 
     assert_eq!(request.top_p, Some(0.9));
+}
+
+/// The public API's function tool takes `async`, `defer_loading`,
+/// `output_schema` and `allowed_callers` beside the function object's own
+/// keys: a request declaring them parses and writes them back for the upstream
+/// as sent, the chat template's copy leaves them out, and a key outside the
+/// spec is still refused. A custom tool takes `async` and `allowed_callers`
+/// too.
+#[test]
+fn a_function_tool_keeps_the_public_apis_tool_keys() {
+    let tool = json!({
+        "type": "function",
+        "name": "lookup",
+        "parameters": {"type": "object", "properties": {}},
+        "strict": true,
+        "async": true,
+        "defer_loading": true,
+        "output_schema": {"type": "object"},
+        "allowed_callers": ["direct", "programmatic"]
+    });
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.6", "input": "hi", "tools": [tool.clone()]
+    }))
+    .expect("a function tool with the spec's tool keys parses");
+    assert_eq!(serde_json::to_value(&request).unwrap()["tools"][0], tool);
+    let Some(ResponseTool::Function(function_tool)) =
+        request.tools.as_deref().and_then(<[_]>::first)
+    else {
+        panic!("a function tool: {:?}", request.tools);
+    };
+    assert!(function_tool.chat_function().extra.is_empty());
+
+    let refused = serde_json::from_value::<ResponsesRequest>(json!({
+        "model": "gpt-5.6", "input": "hi",
+        "tools": [{"type": "function", "name": "lookup", "parameters": null, "not_a_tool_key": 1}]
+    }));
+    assert!(refused.is_err(), "a key outside the spec is refused");
+
+    let custom =
+        json!({"type": "custom", "name": "shell", "async": false, "allowed_callers": ["direct"]});
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.6", "input": "hi", "tools": [custom.clone()]
+    }))
+    .expect("a custom tool with async and allowed_callers parses");
+    assert_eq!(serde_json::to_value(&request).unwrap()["tools"][0], custom);
 }
 
 #[test]
@@ -439,6 +598,36 @@ fn test_file_search_tool_round_trip_hybrid_weights_omitted() {
     assert_eq!(serialized, payload);
 }
 
+/// The preview web search tool as the public API declares it: the dated
+/// `web_search_preview_2025_03_11` type reads as the preview tool and is
+/// written under the canonical `web_search_preview`, and the tool's
+/// `search_content_types` is kept.
+#[test]
+fn the_web_search_preview_tool_takes_its_dated_type_and_content_types() {
+    for tool_type in ["web_search_preview", "web_search_preview_2025_03_11"] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-4o",
+            "input": "news today",
+            "tools": [{
+                "type": tool_type,
+                "search_context_size": "low",
+                "search_content_types": ["text", "image"]
+            }]
+        }))
+        .unwrap_or_else(|e| panic!("{tool_type}: {e}"));
+        let written = serde_json::to_value(&request).expect("serialize the request");
+        assert_eq!(
+            written["tools"][0],
+            json!({
+                "type": "web_search_preview",
+                "search_context_size": "low",
+                "search_content_types": ["text", "image"]
+            }),
+            "{tool_type}"
+        );
+    }
+}
+
 // ------------------------------------------------------------------
 // T3: non-preview web_search tool + WebSearchCall.results
 // ------------------------------------------------------------------
@@ -522,6 +711,44 @@ fn test_web_search_response_tool_echo_accepts_return_token_budget() {
         serialized["tools"][0]["return_token_budget"],
         json!("default")
     );
+}
+
+/// A web search call as the public API writes it: a `find_in_page` action,
+/// an `open_page` action without a URL or with a null one, and the
+/// `incomplete` status parse and are written back as the public API writes
+/// them. The `find` action this crate wrote before still reads, and is
+/// written as `find_in_page`.
+#[test]
+fn a_web_search_call_reads_the_public_apis_actions_and_statuses() {
+    let find = json!({"type": "find_in_page", "url": "https://example.com", "pattern": "price"});
+    let opened = json!({"type": "open_page", "url": "https://example.com"});
+    for (status, action, written_action) in [
+        ("completed", find.clone(), find.clone()),
+        (
+            "completed",
+            json!({"type": "find", "url": "https://example.com", "pattern": "price"}),
+            find.clone(),
+        ),
+        ("completed", opened.clone(), opened.clone()),
+        (
+            "incomplete",
+            json!({"type": "open_page"}),
+            json!({"type": "open_page"}),
+        ),
+        (
+            "completed",
+            json!({"type": "open_page", "url": null}),
+            json!({"type": "open_page"}),
+        ),
+    ] {
+        let raw =
+            json!({"type": "web_search_call", "id": "ws_1", "status": status, "action": action});
+        let item: ResponseOutputItem =
+            serde_json::from_value(raw.clone()).unwrap_or_else(|e| panic!("{raw}: {e}"));
+        let written = serde_json::to_value(&item).expect("serialize the web search call");
+        assert_eq!(written["action"], written_action, "{raw}");
+        assert_eq!(written["status"], status, "{raw}");
+    }
 }
 
 /// Acceptance: `web_search_call` output item carries an optional typed
@@ -653,24 +880,30 @@ fn test_responses_request_new_top_level_fields_round_trip() {
     );
 }
 
-/// `prompt_cache_retention` accepts the other spec value and serializes
-/// back with the hyphenated rename.
+/// `prompt_cache_retention` reads the public API's `in_memory`, and the
+/// hyphenated `in-memory` this crate wrote before, and writes `in_memory`.
 #[test]
 fn test_prompt_cache_retention_in_memory_round_trip() {
-    let request: ResponsesRequest = serde_json::from_value(json!({
-        "model": "gpt-5.4",
-        "input": "hello",
-        "prompt_cache_retention": "in-memory"
-    }))
-    .expect("should deserialize");
+    for spelling in ["in_memory", "in-memory"] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "gpt-5.4",
+            "input": "hello",
+            "prompt_cache_retention": spelling
+        }))
+        .expect(spelling);
 
-    assert_eq!(
-        request.prompt_cache_retention,
-        Some(PromptCacheRetention::InMemory)
-    );
+        assert_eq!(
+            request.prompt_cache_retention,
+            Some(PromptCacheRetention::InMemory),
+            "{spelling}"
+        );
 
-    let reserialized = serde_json::to_value(&request).expect("should serialize");
-    assert_eq!(reserialized["prompt_cache_retention"], "in-memory");
+        let reserialized = serde_json::to_value(&request).expect("should serialize");
+        assert_eq!(
+            reserialized["prompt_cache_retention"], "in_memory",
+            "{spelling}"
+        );
+    }
 }
 
 /// Absent fields must stay absent on the wire (no `"prompt": null` etc.),
@@ -763,6 +996,50 @@ fn content_part_input_file_roundtrip() {
     }
     let roundtripped = serde_json::to_value(&part).unwrap();
     assert_eq!(roundtripped, raw);
+}
+
+/// `auto` is the public API's default file detail (`FileInputDetail`): an
+/// input file part carrying it parses and writes it back, and so does a
+/// request whose message holds such a part.
+#[test]
+fn an_input_file_with_detail_auto_round_trips() {
+    let raw = json!({"type": "input_file", "detail": "auto", "file_id": "file_1"});
+    let part: ResponseContentPart =
+        serde_json::from_value(raw.clone()).expect("an input_file with detail auto parses");
+    assert!(
+        matches!(
+            &part,
+            ResponseContentPart::InputFile {
+                detail: Some(FileDetail::Auto),
+                ..
+            }
+        ),
+        "{part:?}"
+    );
+    assert_eq!(serde_json::to_value(&part).unwrap(), raw);
+
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.4",
+        "input": [{"type": "message", "role": "user", "content": [raw.clone()]}]
+    }))
+    .expect("a request with an auto-detail file part parses");
+    let written = serde_json::to_value(&request).unwrap();
+    assert_eq!(written["input"][0]["content"][0], raw);
+}
+
+/// A prompt's file variable keeps its detail level when the request is
+/// written back for an upstream, as an input file part does.
+#[test]
+fn a_prompt_file_variable_keeps_its_detail() {
+    let variable = json!({"type": "input_file", "file_id": "file_1", "detail": "high"});
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "gpt-5.4",
+        "input": "summarize the document",
+        "prompt": {"id": "pmpt_1", "variables": {"doc": variable.clone()}}
+    }))
+    .expect("a request with a file prompt variable parses");
+    let written = serde_json::to_value(&request).unwrap();
+    assert_eq!(written["prompt"]["variables"]["doc"], variable);
 }
 
 #[test]
@@ -1059,9 +1336,14 @@ fn responses_tool_choice_types_round_trip() {
             json!({"type": "image_generation"}),
             BuiltInToolChoiceType::ImageGeneration,
         ),
+        (json!({"type": "computer"}), BuiltInToolChoiceType::Computer),
         (
             json!({"type": "computer_use_preview"}),
             BuiltInToolChoiceType::ComputerUsePreview,
+        ),
+        (
+            json!({"type": "computer_use"}),
+            BuiltInToolChoiceType::ComputerUse,
         ),
         (
             json!({"type": "code_interpreter"}),
@@ -1528,7 +1810,7 @@ fn image_generation_call_input_item_round_trips_spec_shape() {
             status,
             ..
         } => {
-            assert_eq!(id, "ig_2");
+            assert_eq!(id.as_deref(), Some("ig_2"));
             assert_eq!(result.as_deref(), Some("d29ybGQ="));
             assert!(revised_prompt.is_none());
             assert_eq!(*status, Some(ImageGenerationCallStatus::Completed));
@@ -1560,7 +1842,7 @@ fn image_generation_call_input_item_accepts_id_only_reference() {
             status,
             ..
         } => {
-            assert_eq!(id, "ig_3");
+            assert_eq!(id.as_deref(), Some("ig_3"));
             assert!(result.is_none());
             assert!(revised_prompt.is_none());
             assert!(status.is_none());
@@ -1595,7 +1877,7 @@ fn image_generation_call_input_item_round_trips_with_revised_prompt() {
             status,
             ..
         } => {
-            assert_eq!(id, "ig_2");
+            assert_eq!(id.as_deref(), Some("ig_2"));
             assert_eq!(result.as_deref(), Some("d29ybGQ="));
             assert_eq!(
                 revised_prompt.as_deref(),
@@ -1736,8 +2018,9 @@ fn image_generation_call_input_item_round_trips_with_full_metadata() {
             revised_prompt,
             size,
             status,
+            ..
         } => {
-            assert_eq!(id, "ig_prod_2");
+            assert_eq!(id.as_deref(), Some("ig_prod_2"));
             assert_eq!(action.as_deref(), Some("edit"));
             assert_eq!(background.as_deref(), Some("transparent"));
             assert_eq!(output_format.as_deref(), Some("webp"));
@@ -1777,8 +2060,9 @@ fn image_generation_call_input_item_round_trips_minimal_without_metadata() {
             revised_prompt,
             size,
             status,
+            ..
         } => {
-            assert_eq!(id, "ig_min_2");
+            assert_eq!(id.as_deref(), Some("ig_min_2"));
             assert!(action.is_none());
             assert!(background.is_none());
             assert!(output_format.is_none());
@@ -2268,6 +2552,50 @@ fn computer_call_output_input_item_round_trips_spec_shape() {
     assert_eq!(serde_json::to_value(&item).expect("serialize"), payload);
 }
 
+/// A replayed `computer_call_output` may carry `acknowledged_safety_checks:
+/// null`, which the public API's input item allows: it parses as none
+/// acknowledged and is written back without the key, as an item without it
+/// is.
+#[test]
+fn a_computer_call_output_with_null_safety_checks_parses() {
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model": "computer-use-preview",
+        "input": [{
+            "type": "computer_call_output",
+            "call_id": "call_1",
+            "output": {"type": "computer_screenshot", "file_id": "file_1"},
+            "acknowledged_safety_checks": null
+        }]
+    }))
+    .expect("a computer_call_output with null safety checks parses");
+    let written = serde_json::to_value(&request).expect("serialize the request");
+    assert_eq!(
+        written["input"][0],
+        json!({
+            "type": "computer_call_output",
+            "call_id": "call_1",
+            "output": {"type": "computer_screenshot", "file_id": "file_1"}
+        })
+    );
+}
+
+/// A populated `acknowledged_safety_checks` reaches its value through the
+/// null-tolerant reader: the item round-trips unchanged.
+#[test]
+fn a_computer_call_output_keeps_its_acknowledged_safety_checks() {
+    let payload = json!({
+        "type": "computer_call_output",
+        "call_id": "call_1",
+        "output": {"type": "computer_screenshot", "file_id": "file_1"},
+        "acknowledged_safety_checks": [
+            {"id": "sc_1", "code": "malicious_instructions", "message": "m"}
+        ]
+    });
+    let item: ResponseInputOutputItem =
+        serde_json::from_value(payload.clone()).expect("deserialize");
+    assert_eq!(serde_json::to_value(&item).expect("serialize"), payload);
+}
+
 #[test]
 fn computer_call_output_item_round_trips_spec_shape() {
     let payload = json!({
@@ -2364,6 +2692,7 @@ fn test_custom_tool_call_input_item_round_trip() {
             name,
             id,
             namespace,
+            ..
         } => {
             assert_eq!(call_id, "call_abc123");
             assert_eq!(input, "SELECT count(*) FROM events");
@@ -2398,6 +2727,7 @@ fn test_custom_tool_call_output_string_round_trip() {
             call_id,
             output,
             id,
+            ..
         } => {
             assert_eq!(call_id, "call_abc123");
             assert_eq!(id.as_deref(), Some("ctco_01"));
@@ -2762,6 +3092,7 @@ fn shell_call_input_item_round_trips_spec_shape() {
             environment,
             status,
             created_by,
+            ..
         } => {
             assert_eq!(call_id, "call_shell_1");
             assert_eq!(id.as_deref(), Some("sc_01"));
@@ -2822,6 +3153,7 @@ fn shell_call_minimal_shape_round_trips() {
             environment,
             status,
             created_by,
+            ..
         } => {
             assert_eq!(call_id, "call_shell_2");
             assert!(id.is_none());
@@ -2896,6 +3228,7 @@ fn shell_call_output_input_item_round_trips_spec_shape() {
             max_output_length,
             status,
             created_by,
+            ..
         } => {
             assert_eq!(call_id, "call_shell_1");
             assert_eq!(id.as_deref(), Some("sco_01"));
@@ -3000,8 +3333,8 @@ fn local_shell_call_input_item_round_trips_spec_shape() {
             action,
             status,
         } => {
-            assert_eq!(id, "ls_1");
-            assert_eq!(call_id, "call_ls_1");
+            assert_eq!(id.as_deref(), Some("ls_1"));
+            assert_eq!(call_id.as_deref(), Some("call_ls_1"));
             assert_eq!(*status, LocalShellCallStatus::InProgress);
             match action {
                 LocalShellExec::Exec {
@@ -3392,7 +3725,7 @@ fn test_apply_patch_tool_round_trip() {
 
     let tool: ResponseTool =
         serde_json::from_value(payload.clone()).expect("apply_patch tool should deserialize");
-    assert!(matches!(tool, ResponseTool::ApplyPatch));
+    assert!(matches!(tool, ResponseTool::ApplyPatch(_)));
 
     let serialized = serde_json::to_value(&tool).expect("apply_patch tool should serialize");
     assert_eq!(serialized, payload);
@@ -3524,6 +3857,7 @@ fn test_apply_patch_call_input_item_round_trip() {
             operation,
             status,
             id,
+            ..
         } => {
             assert_eq!(call_id, "call_patch_001");
             assert_eq!(*status, ApplyPatchCallStatus::Completed);
@@ -3563,6 +3897,7 @@ fn test_apply_patch_call_input_item_in_progress_status_and_omitted_id() {
             operation,
             status,
             id,
+            ..
         } => {
             assert_eq!(call_id, "call_patch_002");
             assert_eq!(*status, ApplyPatchCallStatus::InProgress);
@@ -3601,6 +3936,7 @@ fn test_apply_patch_call_output_input_item_completed_round_trip() {
             status,
             id,
             output,
+            ..
         } => {
             assert_eq!(call_id, "call_patch_001");
             assert_eq!(*status, ApplyPatchCallOutputStatus::Completed);
@@ -3632,6 +3968,7 @@ fn test_apply_patch_call_output_input_item_failed_without_output() {
             status,
             id,
             output,
+            ..
         } => {
             assert_eq!(call_id, "call_patch_003");
             assert_eq!(*status, ApplyPatchCallOutputStatus::Failed);
@@ -4658,6 +4995,57 @@ fn metadata_limits_are_enforced() {
     );
 }
 
+/// A Response reads as the public API writes one: its `metadata` may be
+/// `null`, which reads as the empty map, and `incomplete_details.reason` may be
+/// any of the four reasons the public API lists.
+#[test]
+fn a_response_with_null_metadata_or_any_listed_incomplete_reason_parses() {
+    let mut response = json!({
+        "id": "resp_incomplete",
+        "object": "response",
+        "created_at": 1,
+        "status": "incomplete",
+        "error": null,
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "model": "gpt-5.6",
+        "output": [],
+        "parallel_tool_calls": true,
+        "previous_response_id": null,
+        "reasoning": null,
+        "store": true,
+        "temperature": 1.0,
+        "text": {"format": {"type": "text"}},
+        "tool_choice": "auto",
+        "tools": [],
+        "top_p": 1.0,
+        "truncation": "disabled",
+        "usage": null,
+        "user": null,
+        "metadata": null
+    });
+    for reason in [
+        "max_output_tokens",
+        "max_messages",
+        "content_filter",
+        "steered",
+    ] {
+        response["incomplete_details"] = json!({"reason": reason});
+        let parsed: ResponsesResponse = serde_json::from_value(response.clone())
+            .unwrap_or_else(|e| panic!("a Response incomplete for {reason}: {e}"));
+        assert!(parsed.metadata.is_empty());
+        let written = serde_json::to_value(&parsed).unwrap();
+        assert_eq!(written["incomplete_details"], json!({"reason": reason}));
+        assert_eq!(written["metadata"], json!({}));
+    }
+
+    // A populated map still reads as sent.
+    response["metadata"] = json!({"k": "v"});
+    let parsed: ResponsesResponse = serde_json::from_value(response).unwrap();
+    assert_eq!(parsed.metadata.get("k"), Some(&json!("v")));
+}
+
 #[test]
 fn function_tool_parameters_must_be_an_object() {
     let request = plain_request(json!({
@@ -4669,6 +5057,233 @@ fn function_tool_parameters_must_be_an_object() {
     assert!(
         code.contains("invalid_type") && code.contains("tools[0].parameters"),
         "{code}"
+    );
+}
+
+/// The public API's function-tool keys are checked for shape as the custom
+/// tool's typed fields are: `async` and `defer_loading` a boolean,
+/// `allowed_callers` an array of strings, `output_schema` an object, each also
+/// `null`, on a function tool alone or in a namespace.
+#[test]
+fn function_tool_keys_must_have_the_spec_shapes() {
+    use serde_json::Value;
+    let tool = |key: &str, value: &Value| {
+        let mut tool = json!({"type": "function", "name": "f", "parameters": {}});
+        tool[key] = value.clone();
+        tool
+    };
+    for (key, value, expected) in [
+        (
+            "async",
+            json!("yes"),
+            "expected a boolean, but got a string",
+        ),
+        (
+            "defer_loading",
+            json!(1),
+            "expected a boolean, but got a number",
+        ),
+        (
+            "allowed_callers",
+            json!("direct"),
+            "expected an array of strings, but got a string",
+        ),
+        (
+            "allowed_callers",
+            json!(["direct", 1]),
+            "expected an array of strings, but got a number",
+        ),
+        (
+            "output_schema",
+            json!("object"),
+            "expected an object, but got a string",
+        ),
+    ] {
+        let request = plain_request(json!({
+            "model": "m", "input": "hi", "tools": [tool(key, &value)]
+        }))
+        .unwrap();
+        let code = validation_code(&request);
+        assert!(
+            code.contains("invalid_type")
+                && code.contains(&format!("tools[0].{key}"))
+                && code.contains(expected),
+            "{key}={value}: {code}"
+        );
+
+        let namespaced = plain_request(json!({
+            "model": "m", "input": "hi",
+            "tools": [{"type": "namespace", "name": "ns", "description": "d",
+                       "tools": [tool(key, &value)]}]
+        }))
+        .unwrap();
+        let code = validation_code(&namespaced);
+        assert!(
+            code.contains(&format!("tools[0].tools[0].{key}")),
+            "{key}={value}: {code}"
+        );
+    }
+    for (key, value) in [
+        ("async", json!(false)),
+        ("defer_loading", Value::Null),
+        ("allowed_callers", json!(["programmatic"])),
+        ("allowed_callers", Value::Null),
+        ("output_schema", json!({"type": "object"})),
+        ("output_schema", Value::Null),
+    ] {
+        let request = plain_request(json!({
+            "model": "m", "input": "hi", "tools": [tool(key, &value)]
+        }))
+        .unwrap();
+        assert!(request.validate().is_ok(), "{key}={value}");
+    }
+}
+
+fn function_tool(name: &str) -> serde_json::Value {
+    json!({"type": "function", "name": name, "parameters": {"type": "object"}})
+}
+
+/// The refusal of the tool named nothing at `field`, read in the validator's
+/// verdict.
+fn names_the_unnamed_tool(code: &str, field: &str) -> bool {
+    code.contains("empty_string")
+        && code.contains(&format!(
+            "Invalid '{field}': empty string. Expected a string with minimum length 1"
+        ))
+}
+
+/// A function declared with an empty name is refused with its place in
+/// `tools`: no client can dispatch a call that names nothing. The place counts
+/// every tool, a built-in one ahead of the function too. A named function
+/// passes.
+#[test]
+fn a_function_tool_has_a_name() {
+    for ahead in [function_tool("f"), json!({"type": "web_search_preview"})] {
+        let request = plain_request(json!({
+            "model": "m", "input": "hi", "tools": [ahead, function_tool("")]
+        }))
+        .unwrap();
+        let code = validation_code(&request);
+        assert!(names_the_unnamed_tool(&code, "tools[1].name"), "{code}");
+    }
+
+    let request = plain_request(json!({
+        "model": "m", "input": "hi", "tools": [function_tool("f")]
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok(), "a named function passes");
+}
+
+/// A custom tool, a namespace and a namespace's members are called by name as
+/// a function is: an empty name is refused at its place, a member's inside its
+/// namespace, the two places told apart. Named ones pass.
+#[test]
+fn a_custom_tool_a_namespace_and_its_members_have_names() {
+    let custom = |name: &str| json!({"type": "custom", "name": name});
+    let namespace = |name: &str, tools: serde_json::Value| json!({"type": "namespace", "name": name, "description": "d", "tools": tools});
+    for (tools, field) in [
+        (json!([function_tool("f"), custom("")]), "tools[1].name"),
+        (
+            json!([namespace("", json!([function_tool("f")]))]),
+            "tools[0].name",
+        ),
+        (
+            json!([
+                function_tool("f"),
+                namespace("ns", json!([function_tool("")]))
+            ]),
+            "tools[1].tools[0].name",
+        ),
+        (
+            json!([namespace("ns", json!([function_tool("g"), custom("")]))]),
+            "tools[0].tools[1].name",
+        ),
+    ] {
+        let request = plain_request(json!({"model": "m", "input": "hi", "tools": tools})).unwrap();
+        let code = validation_code(&request);
+        assert!(names_the_unnamed_tool(&code, field), "{field}: {code}");
+    }
+
+    let named = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [custom("c"), namespace("ns", json!([function_tool("g"), custom("h")]))]
+    }))
+    .unwrap();
+    assert!(named.validate().is_ok(), "named tools pass");
+}
+
+/// A namespace's function member is handed to the model as a function of its
+/// own, so its `parameters` are held to the rule a top-level function's are: a
+/// JSON Schema object, refused at the member's place inside its namespace. The
+/// name's rule stands ahead, as it does for a top-level function. A member
+/// with an object, with `null` or with no `parameters` passes, and so does a
+/// custom member, which has none.
+#[test]
+fn a_namespace_members_parameters_must_be_an_object() {
+    let namespace = |name: &str, tools: serde_json::Value| json!({"type": "namespace", "name": name, "description": "d", "tools": tools});
+    let member = |name: &str, parameters: serde_json::Value| json!({"type": "function", "name": name, "parameters": parameters});
+    for (parameters, got) in [
+        (json!("not-an-object"), "a string"),
+        (json!([1]), "an array"),
+        (json!(7), "a number"),
+        (json!(true), "a boolean"),
+    ] {
+        let request = plain_request(json!({
+            "model": "m", "input": "hi",
+            "tools": [
+                function_tool("f"),
+                namespace("ns", json!([function_tool("g"), member("h", parameters.clone())]))
+            ]
+        }))
+        .unwrap();
+        let code = validation_code(&request);
+        assert!(
+            code.contains("invalid_type")
+                && code.contains(&format!(
+                    "Invalid type for 'tools[1].tools[1].parameters': expected an object, but got {got} instead."
+                )),
+            "{parameters}: {code}"
+        );
+    }
+
+    // The first member of a second namespace: the namespace's place, then the member's.
+    let request = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [
+            namespace("a", json!([function_tool("g")])),
+            namespace("b", json!([member("h", json!("x")), function_tool("i")]))
+        ]
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(code.contains("'tools[1].tools[0].parameters'"), "{code}");
+
+    // An unnamed member with such parameters is refused for its name.
+    let request = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [namespace("ns", json!([member("", json!("x"))]))]
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(
+        names_the_unnamed_tool(&code, "tools[0].tools[0].name") && !code.contains("invalid_type"),
+        "{code}"
+    );
+
+    let accepted = plain_request(json!({
+        "model": "m", "input": "hi",
+        "tools": [namespace("ns", json!([
+            member("object", json!({"type": "object"})),
+            member("null", serde_json::Value::Null),
+            {"type": "function", "name": "absent"},
+            {"type": "custom", "name": "custom"}
+        ]))]
+    }))
+    .unwrap();
+    assert!(
+        accepted.validate().is_ok(),
+        "{}",
+        validation_code(&accepted)
     );
 }
 
@@ -4714,6 +5329,67 @@ fn strict_function_schema_passes_through_for_self_hosted_models() {
     let request = plain_request(json!({
         "model": SELF_HOSTED_MODEL, "input": "hi",
         "tools": [{"type": "function", "name": "f", "strict": true, "parameters": loose}]
+    }))
+    .unwrap();
+    assert!(
+        request.validate().is_ok(),
+        "the engine's grammar compiler decides a self-hosted model's strict schema"
+    );
+}
+
+/// A strict function that is a namespace's member is held to the pin a
+/// top-level strict function is held to, for OpenAI's own models: the refusal
+/// names the member whose schema lacks it. A pinned member and a member that
+/// is not strict pass, and a self-hosted model's strict member is passed
+/// through as its top-level function is.
+#[test]
+fn strict_namespace_member_schema_needs_additional_properties_false_for_openai_models() {
+    let loose = json!({"type": "object", "properties": {"x": {"type": "string"}}});
+    let pinned = json!({
+        "type": "object", "properties": {"x": {"type": "string"}}, "additionalProperties": false
+    });
+    let namespace = |tools: serde_json::Value| json!({"type": "namespace", "name": "ns", "description": "d", "tools": tools});
+    let strict = |name: &str, parameters: &serde_json::Value| json!({"type": "function", "name": name, "strict": true, "parameters": parameters});
+
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "hi",
+        "tools": [namespace(json!([
+            strict("f", &pinned),
+            {"type": "custom", "name": "c"},
+            strict("g", &loose)
+        ]))]
+    }))
+    .unwrap();
+    let code = validation_code(&request);
+    assert!(
+        code.contains("invalid_function_parameters")
+            && code.contains(
+                "Invalid schema for function 'g': In context=(), 'additionalProperties' is required to be supplied and to be false."
+            ),
+        "{code}"
+    );
+
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "hi",
+        "tools": [namespace(json!([strict("f", &pinned)]))]
+    }))
+    .unwrap();
+    assert!(request.validate().is_ok(), "a pinned member passes");
+
+    // Not strict: the pin is not required.
+    let request = plain_request(json!({
+        "model": OPENAI_MODEL, "input": "hi",
+        "tools": [namespace(json!([{"type": "function", "name": "f", "parameters": loose}]))]
+    }))
+    .unwrap();
+    assert!(
+        request.validate().is_ok(),
+        "a member that is not strict passes"
+    );
+
+    let request = plain_request(json!({
+        "model": SELF_HOSTED_MODEL, "input": "hi",
+        "tools": [namespace(json!([strict("g", &loose)]))]
     }))
     .unwrap();
     assert!(
@@ -4873,4 +5549,381 @@ fn function_tool_round_trips_a_missing_schema_as_null() {
         serde_json::to_value(tool).unwrap(),
         json!({"type":"function", "name":"absent", "parameters":null})
     );
+}
+
+#[test]
+fn codex_additional_tools_and_agent_message_round_trip_and_validate() {
+    let body = json!({
+        "model": "test-model",
+        "stream": true,
+        "tool_choice": "auto",
+        "parallel_tool_calls": false,
+        "store": false,
+        "input": [
+            {
+                "type": "additional_tools",
+                "id": "at_123",
+                "role": "developer",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "functions",
+                        "description": "",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "exec_command",
+                                "description": "Run a shell command",
+                                "parameters": {"type": "object", "properties": {}},
+                                "strict": false
+                            },
+                            {
+                                "type": "custom",
+                                "name": "apply_patch",
+                                "description": "Apply a patch",
+                                "format": {"type": "text"}
+                            }
+                        ]
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "clock",
+                        "description": "Tools in the clock namespace.",
+                        "defer_loading": true,
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "now",
+                                "description": "Current time",
+                                "parameters": {"type": "object", "properties": {}}
+                            }
+                        ]
+                    },
+                    {
+                        "type": "namespace",
+                        "name": "collaboration",
+                        "description": "Tools in the collaboration namespace.",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "send_message",
+                                "description": "Message another agent",
+                                "parameters": {"type": "object", "properties": {}}
+                            }
+                        ]
+                    },
+                    {
+                        "type": "tool_search",
+                        "execution": "client",
+                        "description": "Load deferred tools",
+                        "parameters": {"type": "object", "properties": {}}
+                    },
+                    {
+                        "type": "web_search",
+                        "external_web_access": true,
+                        "indexed_web_access": false,
+                        "search_content_types": ["text", "image"]
+                    }
+                ]
+            },
+            {
+                "type": "message",
+                "id": "msg_1",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": "Base instructions"}]
+            },
+            {
+                "type": "agent_message",
+                "id": "am_1",
+                "author": "/root",
+                "recipient": "/root/worker_1",
+                "content": [{"type": "input_text", "text": "Reply with OK-SUBAGENT."}]
+            }
+        ]
+    });
+
+    let request: ResponsesRequest =
+        serde_json::from_value(body.clone()).expect("Codex subagent request should parse");
+    request
+        .validate()
+        .expect("Codex subagent request should validate");
+    assert_eq!(
+        request.extract_text_for_routing(),
+        "Base instructions Reply with OK-SUBAGENT."
+    );
+
+    let wire = to_value_exact(&request).expect("serialize request");
+    assert_eq!(wire["input"], body["input"]);
+}
+
+#[test]
+fn additional_tools_normalizes_tool_choice_and_reports_input_item_error_path() {
+    let input = json!([
+        {
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions",
+                    "description": "",
+                    "tools": [{
+                        "type": "function",
+                        "name": "exec_command",
+                        "parameters": {"type": "object"}
+                    }]
+                },
+                {
+                    "type": "namespace",
+                    "name": "collaboration",
+                    "description": "Collab",
+                    "tools": [{
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "parameters": {"type": "object"}
+                    }]
+                }
+            ]
+        },
+        {"role": "user", "content": "hi"}
+    ]);
+
+    // Empty top-level `tools: []` with inline `additional_tools` defaults to
+    // `"auto"`, while an explicit `"none"` is preserved.
+    let mut implicit_choice: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "tools": [],
+        "input": input
+    }))
+    .unwrap();
+    implicit_choice.normalize();
+    assert!(matches!(
+        implicit_choice.tool_choice,
+        Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto))
+    ));
+    implicit_choice.validate().unwrap();
+
+    let mut explicit_none: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "tools": [],
+        "tool_choice": "none",
+        "input": input
+    }))
+    .unwrap();
+    explicit_none.normalize();
+    assert!(matches!(
+        explicit_none.tool_choice,
+        Some(ResponsesToolChoice::Options(ToolChoiceOptions::None))
+    ));
+
+    for choice in [
+        json!("required"),
+        json!({"type": "function", "name": "exec_command"}),
+        json!({"type": "function", "name": "spawn_agent", "namespace": "collaboration"}),
+        json!({"type": "function", "name": "exec_command", "namespace": "functions"}),
+        json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "exec_command"}]}),
+    ] {
+        let req: ResponsesRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "input": input,
+            "tool_choice": choice
+        }))
+        .unwrap();
+        req.validate()
+            .unwrap_or_else(|e| panic!("choice {choice} should validate: {e}"));
+    }
+
+    // Validation errors inside inline additional_tools point at `input[i].tools[j]`.
+    let bad_inline_tool: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "input": [
+            {"role": "developer", "content": "instructions"},
+            {
+                "type": "additional_tools",
+                "role": "developer",
+                "tools": [{
+                    "type": "function",
+                    "name": "bad_schema",
+                    "parameters": "not-an-object"
+                }]
+            }
+        ]
+    }))
+    .unwrap();
+    let err = bad_inline_tool.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("input[1].tools[0].parameters"),
+        "expected input-scoped error path, got: {err}"
+    );
+}
+
+#[test]
+fn empty_agent_message_is_rejected_at_validation() {
+    let req: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "input": [{"type":"agent_message","author":"/root","recipient":"/root/worker","content":[]}]
+    }))
+    .unwrap();
+    assert!(req
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("Agent message content cannot be empty"));
+}
+
+#[test]
+fn agent_message_rejects_unknown_content_part() {
+    let err = serde_json::from_value::<ResponsesRequest>(json!({
+        "model": "test-model",
+        "input": [{
+            "type": "agent_message",
+            "author": "/root",
+            "recipient": "/root/worker",
+            "content": [{"type": "mystery_part", "payload": "x"}]
+        }]
+    }))
+    .expect_err("unknown agent_message content part must fail deserialization");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("content[0].type") && msg.contains("mystery_part"),
+        "expected part-scoped refusal, got: {msg}"
+    );
+}
+
+#[test]
+fn reasoning_input_accepts_null_content_and_optional_id() {
+    // Matches cross-model continuation history (reasoning with explicit
+    // `content: null`, omitted `content`, empty `[]`, and non-empty content)
+    // and Codex tool-output follow-ups where `reasoning.id` is omitted or null.
+    let req: ResponsesRequest = serde_json::from_value(json!({
+        "model": "test-model",
+        "input": [
+            {
+                "type": "reasoning",
+                "id": "rs_omitted_content",
+                "summary": [{"type": "summary_text", "text": "s0"}]
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_empty_content",
+                "summary": [],
+                "content": []
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_null_content",
+                "summary": [{"type": "summary_text", "text": "s1"}],
+                "content": null,
+                "encrypted_content": "gAAAAB-opaque"
+            },
+            {
+                "type": "reasoning",
+                "id": "rs_with_content",
+                "summary": [],
+                "content": [{"type": "reasoning_text", "text": "step 1"}]
+            },
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "no id"}]
+            },
+            {
+                "type": "reasoning",
+                "id": null,
+                "summary": [],
+                "content": null
+            }
+        ]
+    }))
+    .expect("reasoning items with null content and optional id should deserialize");
+
+    req.validate().expect("reasoning items should validate");
+
+    let wire = serde_json::to_value(&req).unwrap();
+    let items = wire["input"].as_array().unwrap();
+    assert_eq!(items[0]["id"], "rs_omitted_content");
+    assert!(items[0].get("content").is_none());
+    assert_eq!(items[1]["id"], "rs_empty_content");
+    assert!(items[1].get("content").is_none());
+    assert_eq!(items[2]["id"], "rs_null_content");
+    assert!(items[2].get("content").is_none());
+    assert_eq!(items[2]["summary"][0]["text"], "s1");
+    assert_eq!(items[2]["encrypted_content"], "gAAAAB-opaque");
+    assert_eq!(items[3]["content"][0]["text"], "step 1");
+    assert!(items[4].get("id").is_none());
+    assert!(items[5].get("id").is_none());
+    assert!(items[5].get("content").is_none());
+}
+
+#[test]
+fn function_call_output_accepts_optional_call_id_name_namespace_and_caller() {
+    // Real Codex payload: function_call_output without call_id, identified by
+    // namespace + name, alongside programmatic-tool-calling caller metadata.
+    let payload = json!({
+        "model": "test-model",
+        "input": [
+            {
+                "type": "function_call_output",
+                "name": "codex_apps_open_page",
+                "namespace": "agent",
+                "output": "{\"page_id\":null}"
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_ptc",
+                "caller": {"type": "program", "caller_id": "prog_1"},
+                "name": "query_db",
+                "arguments": "{}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_ptc",
+                "caller": {"type": "direct"},
+                "output": "[]"
+            }
+        ]
+    });
+
+    let req: ResponsesRequest = serde_json::from_value(payload.clone())
+        .expect("call_id-less and caller-tagged items should deserialize");
+    req.validate().expect("items should validate");
+
+    let wire = serde_json::to_value(&req).unwrap();
+    assert_eq!(wire["input"], payload["input"]);
+}
+
+#[test]
+fn responses_schema_passthrough_for_ptc_tool_search_web_search_and_optional_ids() {
+    let payload = json!({
+        "model": "test-model",
+        "prompt_cache_options": {"retention": "24h"},
+        "tools": [
+            {"type": "programmatic_tool_calling"},
+            {"type": "apply_patch", "allowed_callers": ["direct", "programmatic"]},
+            {"type": "shell", "allowed_callers": ["programmatic"]},
+            {"type": "mcp", "server_label": "docs", "server_url": "https://example.com/mcp", "allowed_callers": ["direct"], "tunnel_id": "tun_1"}
+        ],
+        "tool_choice": {"type": "programmatic_tool_calling"},
+        "input": [
+            {"type": "tool_search_call", "call_id": "ts_1", "arguments": {"query": "weather"}, "execution": "client"},
+            {"type": "tool_search_output", "call_id": "ts_1", "execution": "client", "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object"}}]},
+            {"type": "web_search_call", "id": "ws_1", "status": "completed", "action": {"type": "search", "query": "rust"}, "results": [{"url": "https://rust-lang.org/", "title": "Rust"}]},
+            {"type": "program", "id": "prg_1", "call_id": "call_p1", "code": "return 1;", "fingerprint": "fp_1"},
+            {"type": "program_output", "id": "prgo_1", "call_id": "call_p1", "result": "1", "status": "completed"},
+            {"type": "local_shell_call", "action": {"type": "exec", "command": ["ls"], "env": {}}, "status": "completed"},
+            {"type": "image_generation_call", "status": "failed", "error": {"code": "moderation_blocked"}}
+        ]
+    });
+
+    let req: ResponsesRequest = serde_json::from_value(payload.clone())
+        .expect("PTC, tool_search, web_search_call, and optional-id items should deserialize");
+    req.validate().expect("request should validate");
+
+    let wire = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        wire["prompt_cache_options"],
+        payload["prompt_cache_options"]
+    );
+    assert_eq!(wire["tools"], payload["tools"]);
+    assert_eq!(wire["tool_choice"], payload["tool_choice"]);
+    assert_eq!(wire["input"], payload["input"]);
 }

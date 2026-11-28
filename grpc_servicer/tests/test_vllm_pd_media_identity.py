@@ -325,7 +325,7 @@ async def test_router_processed_encoder_returns_a_pixel_less_identity(monkeypatc
     ],
 )
 async def test_cpu_consumer_rejects_missing_or_invalid_hash_handles(monkeypatch, handles, kv):
-    """A grid-only ECCPU leg must never fall back to encoding missing pixels."""
+    """A grid-only ECCPU request must never fall back to encoding missing pixels."""
     import grpc
 
     servicer = _servicer(monkeypatch, _Processor())

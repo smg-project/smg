@@ -1,0 +1,1537 @@
+{
+  "recorded_from": "436f0c8c5725b0a408b990003d76eaddc72c4be4",
+  "policy": "overload",
+  "rows": [
+    {
+      "name": "the-queue-vetoes-at-its-count-and-above-summed-over-two-ranks",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.8
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 3,
+              "usage": 0.125
+            },
+            {
+              "waiting": 4,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 4,
+              "usage": 0.125
+            },
+            {
+              "waiting": 4,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 9,
+              "usage": 0.125
+            },
+            {
+              "waiting": 0,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.125
+            },
+            {
+              "waiting": 7,
+              "usage": 0.125
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          true,
+          true,
+          false
+        ]
+      }
+    },
+    {
+      "name": "the-usage-vetoes-at-its-mean-and-above-over-two-ranks",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.5
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.25
+            },
+            {
+              "waiting": 0,
+              "usage": 0.5
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.25
+            },
+            {
+              "waiting": 0,
+              "usage": 0.75
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.5
+            },
+            {
+              "waiting": 0,
+              "usage": 0.5
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 1.0
+            },
+            {
+              "waiting": 0,
+              "usage": 0.0
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.375
+            },
+            {
+              "waiting": 0,
+              "usage": 0.5
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          true,
+          true,
+          true,
+          false
+        ]
+      }
+    },
+    {
+      "name": "either-signal-alone-vetoes",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.5
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 1,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 8,
+              "usage": 0.0
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 7,
+              "usage": 0.25
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.5
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.0
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          true,
+          false,
+          true,
+          false
+        ]
+      }
+    },
+    {
+      "name": "a-count-of-one-vetoes-any-queue-and-a-usage-of-one-only-a-full-rank",
+      "gateway": {
+        "waiting_requests": 1,
+        "token_usage": 1.0
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 1,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.75
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 1,
+              "usage": 0.0
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 1.0
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.0
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          true,
+          true,
+          false
+        ]
+      }
+    },
+    {
+      "name": "two-ranks-that-trade-their-queues-in-one-answer-move-no-verdict",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.8
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 6,
+              "usage": 0.125
+            },
+            {
+              "waiting": 1,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 1,
+              "usage": 0.125
+            },
+            {
+              "waiting": 6,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 6,
+              "usage": 0.125
+            },
+            {
+              "waiting": 1,
+              "usage": 0.125
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          false,
+          false
+        ]
+      }
+    },
+    {
+      "name": "two-ranks-that-trade-their-usage-in-one-answer-move-no-verdict",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.5
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.75
+            },
+            {
+              "waiting": 0,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.125
+            },
+            {
+              "waiting": 0,
+              "usage": 0.75
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.75
+            },
+            {
+              "waiting": 0,
+              "usage": 0.125
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          false,
+          false
+        ]
+      }
+    },
+    {
+      "name": "a-poll-that-brought-no-report-clears-the-veto",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.8
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 1,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 9,
+              "usage": 0.125
+            }
+          ]
+        },
+        "no_report",
+        "no_report",
+        {
+          "poll": [
+            {
+              "waiting": 9,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 1,
+              "usage": 0.125
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          true,
+          false,
+          false,
+          true,
+          false
+        ]
+      }
+    },
+    {
+      "name": "a-record-after-a-poll-that-brought-no-report-is-judged-again",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.8
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 1,
+      "steps": [
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 9,
+              "usage": 0.125
+            }
+          }
+        },
+        "no_report",
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 9,
+              "usage": 0.125
+            }
+          }
+        },
+        "no_report",
+        {
+          "poll": [
+            {
+              "waiting": 9,
+              "usage": 0.125
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          true,
+          false,
+          true,
+          false,
+          true
+        ]
+      }
+    },
+    {
+      "name": "an-answer-that-names-no-rank-reads-as-no-report",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.8
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 9,
+              "usage": 0.125
+            },
+            {
+              "waiting": 0,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "poll": [
+            null,
+            null
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 9,
+              "usage": 0.125
+            },
+            {
+              "waiting": 0,
+              "usage": 0.125
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          true,
+          false,
+          true
+        ]
+      }
+    },
+    {
+      "name": "both-signals-off-writes-no-verdict",
+      "gateway": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 1000,
+              "usage": 1.0
+            },
+            {
+              "waiting": 1000,
+              "usage": 1.0
+            }
+          ]
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 1000,
+              "usage": 1.0
+            }
+          }
+        },
+        "no_report"
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          false,
+          false
+        ]
+      }
+    },
+    {
+      "name": "a-worker-s-own-count-stands-over-the-gateway-s-and-the-usage-stays-the-gateway-s",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.5
+      },
+      "worker": {
+        "waiting_requests": 3,
+        "token_usage": null
+      },
+      "ranks": 1,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 2,
+              "usage": 0.0
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 3,
+              "usage": 0.0
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.25
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.5
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          true,
+          false,
+          true
+        ]
+      }
+    },
+    {
+      "name": "a-worker-s-own-values-veto-under-a-gateway-with-both-signals-off",
+      "gateway": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "worker": {
+        "waiting_requests": 3,
+        "token_usage": 0.5
+      },
+      "ranks": 1,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 2,
+              "usage": 0.25
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 3,
+              "usage": 0.0
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.5
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.0
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          true,
+          true,
+          false
+        ]
+      }
+    },
+    {
+      "name": "a-worker-that-names-its-count-alone-under-a-gateway-with-both-signals-off-reads-no-usage",
+      "gateway": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "worker": {
+        "waiting_requests": 3,
+        "token_usage": null
+      },
+      "ranks": 1,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 2,
+              "usage": 1.0
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 3,
+              "usage": 0.0
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 1.0
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          true,
+          false
+        ]
+      }
+    },
+    {
+      "name": "a-worker-that-names-its-usage-alone-under-a-gateway-with-both-signals-off-reads-no-queue",
+      "gateway": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": 0.5
+      },
+      "ranks": 1,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 1000,
+              "usage": 0.25
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.5
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 1000,
+              "usage": 0.0
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          true,
+          false
+        ]
+      }
+    },
+    {
+      "name": "the-usage-is-the-running-requests-share-where-a-rank-reports-one",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.5
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 1,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 1.0,
+              "active": 0.25
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.25,
+              "active": 0.75
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.75,
+              "active": 0.5
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          true,
+          true
+        ]
+      }
+    },
+    {
+      "name": "a-pushed-record-moves-the-verdict-by-its-own-rank",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.8
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 1,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 1,
+            "figures": {
+              "waiting": 0,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 8,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 0,
+              "usage": 0.125
+            }
+          }
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          true,
+          false,
+          true,
+          false
+        ]
+      }
+    },
+    {
+      "name": "a-record-after-a-poll-is-judged-beside-the-poll-s-figures-once-every-rank-has-pushed",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.8
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 1,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 1,
+            "figures": {
+              "waiting": 1,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "poll": [
+            {
+              "waiting": 4,
+              "usage": 0.125
+            },
+            {
+              "waiting": 3,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 1,
+            "figures": {
+              "waiting": 0,
+              "usage": 0.125
+            }
+          }
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          false,
+          false,
+          true,
+          false
+        ]
+      }
+    },
+    {
+      "name": "a-poll-after-a-record-is-judged-by-the-poll-s-own-figures",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.8
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 9,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "poll": [
+            {
+              "waiting": 1,
+              "usage": 0.125
+            },
+            {
+              "waiting": 1,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 4,
+              "usage": 0.125
+            },
+            {
+              "waiting": 4,
+              "usage": 0.125
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          true,
+          false,
+          true
+        ]
+      }
+    },
+    {
+      "name": "the-worker-s-loads-dropped-clears-the-veto",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.8
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 1,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 9,
+              "usage": 0.125
+            }
+          ]
+        },
+        "evict",
+        {
+          "poll": [
+            {
+              "waiting": 9,
+              "usage": 0.125
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          true,
+          false,
+          true
+        ]
+      }
+    },
+    {
+      "name": "a-usage-under-the-threshold-by-less-than-half-a-permille-is-under-it",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.5
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 1,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.4996
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.4994
+            }
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          false
+        ]
+      }
+    },
+    {
+      "name": "a-rank-an-answer-omits-leaves-the-sum-at-once",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.8
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 1,
+              "usage": 0.125
+            },
+            {
+              "waiting": 9,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 1,
+              "usage": 0.125
+            },
+            null
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 1,
+              "usage": 0.125
+            },
+            null
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 1,
+              "usage": 0.125
+            },
+            null
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 1,
+              "usage": 0.125
+            },
+            null
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 1,
+              "usage": 0.125
+            },
+            null
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          true,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      }
+    },
+    {
+      "name": "a-rank-an-answer-omits-leaves-the-mean-at-once",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.5
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.75
+            },
+            {
+              "waiting": 0,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.75
+            },
+            null
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.75
+            },
+            null
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.75
+            },
+            null
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.75
+            },
+            null
+          ]
+        },
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.75
+            },
+            null
+          ]
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      }
+    },
+    {
+      "name": "a-record-after-a-poll-is-judged-over-the-ranks-that-have-pushed",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.8
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 4,
+              "usage": 0.125
+            },
+            {
+              "waiting": 3,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 1,
+            "figures": {
+              "waiting": 0,
+              "usage": 0.125
+            }
+          }
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false
+        ]
+      }
+    },
+    {
+      "name": "a-record-s-usage-is-judged-over-the-ranks-that-have-pushed",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.5
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "poll": [
+            {
+              "waiting": 0,
+              "usage": 0.125
+            },
+            {
+              "waiting": 0,
+              "usage": 0.125
+            }
+          ]
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 0,
+              "usage": 0.75
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 0,
+              "usage": 0.75
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 0,
+              "usage": 0.75
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 0,
+              "usage": 0.75
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 0,
+              "usage": 0.75
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 1,
+            "figures": {
+              "waiting": 0,
+              "usage": 0.75
+            }
+          }
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          true,
+          true,
+          true,
+          true,
+          true,
+          true
+        ]
+      }
+    },
+    {
+      "name": "an-answer-that-names-no-rank-takes-the-ranks-that-pushed-before-it-off-the-report",
+      "gateway": {
+        "waiting_requests": 8,
+        "token_usage": 0.8
+      },
+      "worker": {
+        "waiting_requests": null,
+        "token_usage": null
+      },
+      "ranks": 2,
+      "steps": [
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 1,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "poll": [
+            null,
+            null
+          ]
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 0,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        },
+        {
+          "record": {
+            "rank": 1,
+            "figures": {
+              "waiting": 5,
+              "usage": 0.125
+            }
+          }
+        }
+      ],
+      "outcome": {
+        "verdicts": [
+          false,
+          true,
+          false,
+          false,
+          false,
+          false,
+          false,
+          false,
+          true
+        ]
+      }
+    }
+  ]
+}

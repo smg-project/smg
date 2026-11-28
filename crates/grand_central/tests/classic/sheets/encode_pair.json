@@ -1,0 +1,4834 @@
+{
+  "recorded_from": "4ba2a6431357be5411a2383cdc4916b41471d722",
+  "policy": "encode_pair",
+  "rows": [
+    {
+      "name": "two-runtimes-the-items-go-to-the-encoders-of-the-pushing-pair",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 3
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 1
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 2
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        },
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02",
+            "03"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1
+              ],
+              "keys": [
+                "01",
+                "02",
+                "03"
+              ],
+              "encoders": [
+                1,
+                1,
+                1
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two-runtimes-the-items-go-to-the-encoders-of-the-rendezvous-pair",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 1
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 3
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 2
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            0
+          ]
+        },
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02",
+            "03"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 1,
+              "decode": 1,
+              "offered": [
+                2,
+                3
+              ],
+              "keys": [
+                "01",
+                "02",
+                "03"
+              ],
+              "encoders": [
+                3,
+                3,
+                3
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two-runtimes-a-key-goes-to-an-encoder-of-the-pushing-pair",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "consistent_hashing",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 3
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 1
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 2
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        },
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02",
+            "03"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1
+              ],
+              "keys": [
+                "01",
+                "02",
+                "03"
+              ],
+              "encoders": [
+                1,
+                1,
+                1
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two-runtimes-a-key-goes-to-an-encoder-of-the-rendezvous-pair",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "consistent_hashing",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 1
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 3
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 2
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            0
+          ]
+        },
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02",
+            "03"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 1,
+              "decode": 1,
+              "offered": [
+                2,
+                3
+              ],
+              "keys": [
+                "01",
+                "02",
+                "03"
+              ],
+              "encoders": [
+                2,
+                2,
+                3
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two-runtimes-the-pair-is-picked-where-an-encoder-is-ready-the-rendezvous-encoders-are-not",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 1
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": false,
+          "in_flight": 3
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": false,
+          "in_flight": 2
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            0
+          ]
+        },
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1
+              ],
+              "keys": [
+                "01",
+                "02"
+              ],
+              "encoders": [
+                0,
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two-runtimes-the-pair-is-picked-where-an-encoder-is-ready-the-pushing-encoders-are-not",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": false,
+          "in_flight": 3
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": false,
+          "in_flight": 1
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 2
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        },
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 1,
+              "decode": 1,
+              "offered": [
+                2,
+                3
+              ],
+              "keys": [
+                "01",
+                "02"
+              ],
+              "encoders": [
+                3,
+                3
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two-runtimes-a-request-without-items-is-not-held-to-the-encoders",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 1
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": false,
+          "in_flight": 3
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": false,
+          "in_flight": 2
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            0
+          ]
+        },
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        },
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 1,
+              "decode": 1,
+              "offered": [],
+              "keys": [],
+              "encoders": []
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1
+              ],
+              "keys": [
+                "01"
+              ],
+              "encoders": [
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two-runtimes-references-go-to-the-pushing-runtime",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 1
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 3
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 2
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            0
+          ]
+        },
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02"
+          ],
+          "references": true,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        },
+        {
+          "items": [
+            "01",
+            "02"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1
+              ],
+              "keys": [
+                "01",
+                "02"
+              ],
+              "encoders": [
+                0,
+                0
+              ]
+            }
+          },
+          {
+            "placed": {
+              "prefill": 1,
+              "decode": 1,
+              "offered": [
+                2,
+                3
+              ],
+              "keys": [
+                "01",
+                "02"
+              ],
+              "encoders": [
+                3,
+                3
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two-runtimes-the-items-are-placed-as-one-key-on-the-pushing-pair",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 3
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 1
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 2
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        },
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02",
+            "03"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": false
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1
+              ],
+              "keys": [
+                "eae71d26f6795db0700f45592aaa7b699ed6e936a330d98ff1333f57e8d7037f"
+              ],
+              "encoders": [
+                1
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "two-runtimes-the-items-keep-their-keys-on-the-rendezvous-pair",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 1
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 3
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 2
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            0
+          ]
+        },
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02",
+            "03"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": false
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 1,
+              "decode": 1,
+              "offered": [
+                2,
+                3
+              ],
+              "keys": [
+                "01",
+                "02",
+                "03"
+              ],
+              "encoders": [
+                3,
+                3,
+                3
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-a-producer-and-a-consumer-on-one-connector-pair",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0
+              ],
+              "keys": [
+                "01",
+                "02"
+              ],
+              "encoders": [
+                0,
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-a-prefill-takes-the-encoder-of-its-connector",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 2
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c2",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c2",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 1
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0,
+            1
+          ]
+        },
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c2",
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            0,
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 1
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02",
+            "03"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0
+              ],
+              "keys": [
+                "01",
+                "02",
+                "03"
+              ],
+              "encoders": [
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-a-prefill-takes-the-encoders-of-its-connector-the-one-that-holds-fewer",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 2
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c2",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c2",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 1
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            0,
+            1
+          ]
+        },
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c2",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0,
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 1
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02",
+            "03"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 1,
+              "decode": 0,
+              "offered": [
+                1,
+                2
+              ],
+              "keys": [
+                "01",
+                "02",
+                "03"
+              ],
+              "encoders": [
+                1,
+                1,
+                1
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-a-producer-and-a-consumer-on-two-connectors-are-refused",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c2",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "ec_incompatible"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-an-encoder-without-the-producer-role-is-refused",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": false,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "ec_incompatible"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-a-prefill-without-the-consumer-role-is-refused",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": false,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "ec_incompatible"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-a-worker-in-both-roles-is-a-producer-and-a-consumer",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0
+              ],
+              "keys": [
+                "01",
+                "02"
+              ],
+              "encoders": [
+                0,
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-a-role-without-a-connector-is-no-role",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "ec_incompatible"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-a-role-on-a-connector-without-a-name-is-no-role",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "ec_incompatible"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-a-producer-without-the-transfer-label-is-no-producer",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": false,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "ec_incompatible"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-a-consumer-without-the-transfer-label-is-no-consumer",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": false,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "ec_incompatible"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-an-encoder-without-the-producer-role-is-refused-ready-or-not",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": false,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": false,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "ec_incompatible"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-the-pair-is-picked-on-the-prefill-that-has-a-producer",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c2",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        },
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 1,
+              "decode": 0,
+              "offered": [
+                0
+              ],
+              "keys": [
+                "01"
+              ],
+              "encoders": [
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-the-pair-is-picked-on-the-connector-whose-encoder-is-ready",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": false,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c2",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0,
+            1
+          ]
+        },
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c2",
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            0,
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 1
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 1,
+              "decode": 0,
+              "offered": [
+                1
+              ],
+              "keys": [
+                "01",
+                "02"
+              ],
+              "encoders": [
+                1,
+                1
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-a-ready-encoder-on-one-connector-and-a-ready-prefill-on-the-other-are-refused",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c2",
+          "images": true,
+          "references": true,
+          "open": false,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": false,
+          "in_flight": 0,
+          "partners": [
+            0,
+            1
+          ]
+        },
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c2",
+          "open": true,
+          "in_flight": 4,
+          "partners": [
+            0,
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 1
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "placement",
+              "role": "prefill",
+              "why": "unavailable"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "rendezvous-the-items-are-placed-over-its-encoders",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 2
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 1
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02",
+            "03"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1
+              ],
+              "keys": [
+                "01",
+                "02",
+                "03"
+              ],
+              "encoders": [
+                1,
+                1,
+                1
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "rendezvous-references-are-not-supported",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 2
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 1
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": true,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        },
+        {
+          "items": [
+            "01"
+          ],
+          "references": true,
+          "images": false,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "encode_not_supported"
+            }
+          },
+          {
+            "refused": {
+              "name": "encode_not_supported"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "rendezvous-a-processor-label-does-not-make-an-encoder-take-references",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": true,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        },
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "encode_not_supported"
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0
+              ],
+              "keys": [
+                "01"
+              ],
+              "encoders": [
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-references-go-to-the-encoders-that-process-them",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 3
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02"
+          ],
+          "references": true,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        },
+        {
+          "items": [
+            "01",
+            "02"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                1
+              ],
+              "keys": [
+                "01",
+                "02"
+              ],
+              "encoders": [
+                1,
+                1
+              ]
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1
+              ],
+              "keys": [
+                "01",
+                "02"
+              ],
+              "encoders": [
+                0,
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-references-without-an-encoder-that-processes-them-are-not-supported",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": true,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "encode_not_supported"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "images-go-to-the-encoders-that-take-them",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": false,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 3
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02",
+            "03"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        },
+        {
+          "items": [
+            "01",
+            "02",
+            "03"
+          ],
+          "references": false,
+          "images": false,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                1
+              ],
+              "keys": [
+                "01",
+                "02",
+                "03"
+              ],
+              "encoders": [
+                1,
+                1,
+                1
+              ]
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1
+              ],
+              "keys": [
+                "01",
+                "02",
+                "03"
+              ],
+              "encoders": [
+                0,
+                0,
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "images-without-an-encoder-that-takes-them-are-refused",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": false,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        },
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": false,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "encode_vision_unsupported"
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0
+              ],
+              "keys": [
+                "01"
+              ],
+              "encoders": [
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "decode-images-take-the-decode-that-takes-them",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0,
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": false,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 4
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": true,
+          "fanout": true
+        },
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 1,
+              "offered": [
+                0
+              ],
+              "keys": [
+                "01"
+              ],
+              "encoders": [
+                0
+              ]
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0
+              ],
+              "keys": [
+                "01"
+              ],
+              "encoders": [
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "decode-images-without-a-decode-that-takes-them-are-refused",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": false,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": true,
+          "fanout": true
+        },
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "decode_vision_unsupported"
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0
+              ],
+              "keys": [
+                "01"
+              ],
+              "encoders": [
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "references-with-images-prefer-a-decode-that-takes-images",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0,
+            1
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": false,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 4
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": true,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        },
+        {
+          "items": [
+            "01"
+          ],
+          "references": true,
+          "images": false,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 1,
+              "offered": [
+                0
+              ],
+              "keys": [
+                "01"
+              ],
+              "encoders": [
+                0
+              ]
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0
+              ],
+              "keys": [
+                "01"
+              ],
+              "encoders": [
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "references-with-images-keep-a-decode-without-them-when-no-other-is-registered",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": false,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": true,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0
+              ],
+              "keys": [
+                "01"
+              ],
+              "encoders": [
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "rendezvous-a-decode-is-not-held-to-the-vision-label",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "tokenspeed",
+          "images": false,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": true,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0
+              ],
+              "keys": [
+                "01"
+              ],
+              "encoders": [
+                0
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "no-ready-encoder-beside-a-registered-one-is-unavailable",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": false,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "unavailable"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "a-request-without-items-needs-no-encoder",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": false,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [],
+              "keys": [],
+              "encoders": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "a-request-without-items-is-not-held-to-the-encode-roles",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c2",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [],
+              "keys": [],
+              "encoders": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "no-encoder-registered-is-unavailable",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "unavailable"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "a-ready-encoder-of-another-runtime-does-not-open-the-pair",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": false,
+          "in_flight": 0
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "placement",
+              "role": "prefill",
+              "why": "unavailable"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "the-pair-s-prefill-not-ready-is-the-pair-s-refusal",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": false,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "placement",
+              "role": "prefill",
+              "why": "unavailable"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "an-encoder-whose-runtime-states-no-handoff-serves-no-item",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "sglang",
+          "handoff": null,
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "sglang",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "sglang",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        },
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": false,
+          "decode_images": false,
+          "fanout": true
+        },
+        {
+          "items": [],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "refused": {
+              "name": "encode_not_supported"
+            }
+          },
+          {
+            "refused": {
+              "name": "unavailable"
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [],
+              "keys": [],
+              "encoders": []
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ring-one-item-goes-to-its-key-s-owner",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "consistent_hashing",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1,
+                2
+              ],
+              "keys": [
+                "01"
+              ],
+              "encoders": [
+                1
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ring-three-items-of-three-owners-go-to-three-encoders",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "consistent_hashing",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "04",
+            "06"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        },
+        {
+          "items": [
+            "01",
+            "04",
+            "06"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1,
+                2
+              ],
+              "keys": [
+                "01",
+                "04",
+                "06"
+              ],
+              "encoders": [
+                1,
+                0,
+                2
+              ]
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1,
+                2
+              ],
+              "keys": [
+                "01",
+                "04",
+                "06"
+              ],
+              "encoders": [
+                1,
+                0,
+                2
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ring-equal-keys-go-to-one-encoder",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "consistent_hashing",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "04",
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1,
+                2
+              ],
+              "keys": [
+                "01",
+                "04",
+                "01"
+              ],
+              "encoders": [
+                1,
+                0,
+                1
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ring-the-items-of-a-request-without-image-fan-out-are-placed-as-one-key",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "consistent_hashing",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "04",
+            "06"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": false
+        },
+        {
+          "items": [
+            "01",
+            "04"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": false
+        },
+        {
+          "items": [
+            "01"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": false
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1,
+                2
+              ],
+              "keys": [
+                "436f074467be2787fab8cac1155fdec89ce47ded7cb57693546e056bc8720e1a"
+              ],
+              "encoders": [
+                0
+              ]
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1,
+                2
+              ],
+              "keys": [
+                "f0c96b6b57026458bbbd65ae95b37522353fa1748f95772dc9982004859247f3"
+              ],
+              "encoders": [
+                1
+              ]
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1,
+                2
+              ],
+              "keys": [
+                "fa1fd2786e8860a7aa94276683579b3ed999ebdc2257a924811c4bcdbe5ee9f4"
+              ],
+              "encoders": [
+                2
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ring-a-key-whose-owner-is-not-ready-goes-to-another-encoder",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "consistent_hashing",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": false,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "04",
+            "06"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                2
+              ],
+              "keys": [
+                "01",
+                "04",
+                "06"
+              ],
+              "encoders": [
+                2,
+                0,
+                2
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ring-forty-eight-keys-over-three-encoders",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "consistent_hashing",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02",
+            "03",
+            "04",
+            "05",
+            "06",
+            "07",
+            "08",
+            "09",
+            "0a",
+            "0b",
+            "0c",
+            "0d",
+            "0e",
+            "0f",
+            "10",
+            "11",
+            "12",
+            "13",
+            "14",
+            "15",
+            "16",
+            "17",
+            "18",
+            "19",
+            "1a",
+            "1b",
+            "1c",
+            "1d",
+            "1e",
+            "1f",
+            "20",
+            "21",
+            "22",
+            "23",
+            "24",
+            "25",
+            "26",
+            "27",
+            "28",
+            "29",
+            "2a",
+            "2b",
+            "2c",
+            "2d",
+            "2e",
+            "2f",
+            "30"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1,
+                2
+              ],
+              "keys": [
+                "01",
+                "02",
+                "03",
+                "04",
+                "05",
+                "06",
+                "07",
+                "08",
+                "09",
+                "0a",
+                "0b",
+                "0c",
+                "0d",
+                "0e",
+                "0f",
+                "10",
+                "11",
+                "12",
+                "13",
+                "14",
+                "15",
+                "16",
+                "17",
+                "18",
+                "19",
+                "1a",
+                "1b",
+                "1c",
+                "1d",
+                "1e",
+                "1f",
+                "20",
+                "21",
+                "22",
+                "23",
+                "24",
+                "25",
+                "26",
+                "27",
+                "28",
+                "29",
+                "2a",
+                "2b",
+                "2c",
+                "2d",
+                "2e",
+                "2f",
+                "30"
+              ],
+              "encoders": [
+                1,
+                1,
+                1,
+                0,
+                1,
+                2,
+                0,
+                0,
+                1,
+                1,
+                2,
+                2,
+                0,
+                0,
+                2,
+                1,
+                1,
+                0,
+                2,
+                2,
+                0,
+                1,
+                2,
+                2,
+                1,
+                1,
+                2,
+                2,
+                1,
+                0,
+                1,
+                2,
+                1,
+                0,
+                1,
+                1,
+                1,
+                0,
+                2,
+                1,
+                2,
+                1,
+                2,
+                0,
+                0,
+                0,
+                2,
+                1
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "ring-a-rendezvous-never-places-the-items-as-one-key",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "consistent_hashing",
+      "encoders": [
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 0
+        },
+        {
+          "runtime": "tokenspeed",
+          "handoff": "rendezvous",
+          "ec_producer": false,
+          "connector": null,
+          "images": true,
+          "references": false,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "tokenspeed",
+          "ec_consumer": false,
+          "connector": null,
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "tokenspeed",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "04",
+            "06"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": false
+        },
+        {
+          "items": [
+            "01",
+            "04",
+            "06"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1,
+                2
+              ],
+              "keys": [
+                "01",
+                "04",
+                "06"
+              ],
+              "encoders": [
+                1,
+                0,
+                2
+              ]
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1,
+                2
+              ],
+              "keys": [
+                "01",
+                "04",
+                "06"
+              ],
+              "encoders": [
+                1,
+                0,
+                2
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "push-the-items-of-a-request-without-image-fan-out-take-one-encoder",
+      "prefill_policy": "power_of_two:least_requests",
+      "decode_policy": "power_of_two:least_requests",
+      "encode_policy": "power_of_two:least_requests",
+      "encoders": [
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 1
+        },
+        {
+          "runtime": "vllm",
+          "handoff": "push",
+          "ec_producer": true,
+          "connector": "c1",
+          "images": true,
+          "references": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "prefills": [
+        {
+          "runtime": "vllm",
+          "ec_consumer": true,
+          "connector": "c1",
+          "open": true,
+          "in_flight": 0,
+          "partners": [
+            0
+          ]
+        }
+      ],
+      "decodes": [
+        {
+          "runtime": "vllm",
+          "images": true,
+          "open": true,
+          "in_flight": 0
+        }
+      ],
+      "requests": [
+        {
+          "items": [
+            "01",
+            "02",
+            "03"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": false
+        },
+        {
+          "items": [
+            "01",
+            "02",
+            "03"
+          ],
+          "references": false,
+          "images": true,
+          "decode_images": false,
+          "fanout": true
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1
+              ],
+              "keys": [
+                "eae71d26f6795db0700f45592aaa7b699ed6e936a330d98ff1333f57e8d7037f"
+              ],
+              "encoders": [
+                1
+              ]
+            }
+          },
+          {
+            "placed": {
+              "prefill": 0,
+              "decode": 0,
+              "offered": [
+                0,
+                1
+              ],
+              "keys": [
+                "01",
+                "02",
+                "03"
+              ],
+              "encoders": [
+                1,
+                1,
+                1
+              ]
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

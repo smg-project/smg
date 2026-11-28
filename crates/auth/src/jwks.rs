@@ -12,15 +12,22 @@
 //! - Rate-limited refresh on an unknown `kid`
 
 use std::{
+    collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
-use jsonwebtoken::jwk::{Jwk, JwkSet};
+use jsonwebtoken::{
+    jwk::{AlgorithmParameters, Jwk, JwkSet},
+    Algorithm, DecodingKey,
+};
 use parking_lot::{Mutex, RwLock};
 use rustls::crypto::{ring, CryptoProvider};
 use tracing::{debug, info, warn};
 use url::Url;
+
+use crate::jwt::JwtValidatorError;
 
 /// Maximum allowed JWKS response size (1 MB)
 const MAX_JWKS_RESPONSE_SIZE: u64 = 1024 * 1024;
@@ -208,16 +215,121 @@ struct OidcDiscovery {
     issuer: String,
 }
 
-/// Cached JWKS with expiration tracking.
+/// The cached key set with expiration tracking: its keys by `kid`, each with
+/// its parsed form, built once here so a token's check borrows its key instead
+/// of copying the set, the key and the key's parsed form per token.
 struct CachedJwks {
-    jwks: JwkSet,
+    keys: HashMap<String, Arc<SigningKey>>,
     fetched_at: Instant,
     ttl: Duration,
 }
 
 impl CachedJwks {
+    fn new(jwks: JwkSet, ttl: Duration) -> Self {
+        let mut keys = HashMap::with_capacity(jwks.keys.len());
+        for jwk in jwks.keys {
+            let Some(kid) = jwk.common.key_id.clone() else {
+                continue;
+            };
+            // The first key of a `kid` is the one a lookup finds, as before.
+            keys.entry(kid)
+                .or_insert_with(|| Arc::new(SigningKey::new(jwk)));
+        }
+        Self {
+            keys,
+            fetched_at: Instant::now(),
+            ttl,
+        }
+    }
+
     fn is_expired(&self) -> bool {
         self.fetched_at.elapsed() > self.ttl
+    }
+}
+
+/// A key of the cached set as a token's check reads it: the JWK as fetched
+/// and, for a key the validator can use, its parsed form, built once when the
+/// set is fetched and dropped with it, so no token parses the key again.
+#[derive(Debug)]
+pub(crate) struct SigningKey {
+    pub(crate) jwk: Jwk,
+    pub(crate) parsed: Option<ParsedKey>,
+}
+
+/// The parsed form of a JWK: the algorithm its tokens must carry and the
+/// decoding key built from its components.
+#[derive(Debug)]
+pub(crate) struct ParsedKey {
+    pub(crate) algorithm: Algorithm,
+    pub(crate) decoding_key: DecodingKey,
+}
+
+impl SigningKey {
+    fn new(jwk: Jwk) -> Self {
+        let parsed = match (key_algorithm(&jwk), decoding_key(&jwk)) {
+            (Ok(algorithm), Ok(decoding_key)) => Some(ParsedKey {
+                algorithm,
+                decoding_key,
+            }),
+            // A key this validator cannot use: a token's check reports why.
+            _ => None,
+        };
+        Self { jwk, parsed }
+    }
+}
+
+/// The algorithm a JWK's tokens must carry.
+pub(crate) fn key_algorithm(jwk: &Jwk) -> Result<Algorithm, JwtValidatorError> {
+    // First check if algorithm is explicitly specified
+    if let Some(alg) = &jwk.common.key_algorithm {
+        return Ok(match alg {
+            jsonwebtoken::jwk::KeyAlgorithm::RS256 => Algorithm::RS256,
+            jsonwebtoken::jwk::KeyAlgorithm::RS384 => Algorithm::RS384,
+            jsonwebtoken::jwk::KeyAlgorithm::RS512 => Algorithm::RS512,
+            jsonwebtoken::jwk::KeyAlgorithm::ES256 => Algorithm::ES256,
+            jsonwebtoken::jwk::KeyAlgorithm::ES384 => Algorithm::ES384,
+            other => {
+                return Err(JwtValidatorError::ValidationFailed(format!(
+                    "Unsupported key algorithm: {other:?}"
+                )))
+            }
+        });
+    }
+
+    // Infer from key type
+    match &jwk.algorithm {
+        AlgorithmParameters::RSA(_) => Ok(Algorithm::RS256), // Default RSA to RS256
+        AlgorithmParameters::EllipticCurve(ec) => {
+            use jsonwebtoken::jwk::EllipticCurve;
+            match ec.curve {
+                EllipticCurve::P256 => Ok(Algorithm::ES256),
+                EllipticCurve::P384 => Ok(Algorithm::ES384),
+                // Other curves not supported for ECDSA
+                _ => Err(JwtValidatorError::ValidationFailed(format!(
+                    "Unsupported EC curve: {:?}",
+                    ec.curve
+                ))),
+            }
+        }
+        _ => Err(JwtValidatorError::ValidationFailed(
+            "Cannot determine algorithm from key".to_string(),
+        )),
+    }
+}
+
+/// The decoding key built from a JWK's components.
+pub(crate) fn decoding_key(jwk: &Jwk) -> Result<DecodingKey, JwtValidatorError> {
+    match &jwk.algorithm {
+        AlgorithmParameters::RSA(rsa) => Ok(DecodingKey::from_rsa_components(&rsa.n, &rsa.e)?),
+        AlgorithmParameters::EllipticCurve(ec) => {
+            Ok(DecodingKey::from_ec_components(&ec.x, &ec.y)?)
+        }
+        AlgorithmParameters::OctetKey(_) => {
+            Err(JwtValidatorError::UnsupportedAlgorithm(Algorithm::HS256))
+        }
+        AlgorithmParameters::OctetKeyPair(_) => {
+            Err(JwtValidatorError::UnsupportedAlgorithm(Algorithm::EdDSA))
+        }
     }
 }
 
@@ -249,7 +361,8 @@ fn install_crypto_provider() {
     }
 }
 
-/// The provider's HTTP client: a 10 s timeout and no redirects (SSRF).
+/// The provider's HTTP client: a 10 s timeout, no redirects (SSRF) and the
+/// provider's request headers.
 #[expect(
     clippy::disallowed_methods,
     reason = "the crate's one direct client construction; the process TLS crypto provider is installed first"
@@ -259,8 +372,23 @@ fn http_client() -> Result<reqwest::Client, JwksError> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .redirect(reqwest::redirect::Policy::none()) // Prevent SSRF via redirects
+        .default_headers(default_request_headers())
         .build()
         .map_err(|e| JwksError::HttpClientError(e.to_string()))
+}
+
+/// The headers the provider's client sends with every request: it names
+/// `identity` as the one content coding it accepts. The client is built
+/// without decoders, so a coded discovery document or key set would fail to
+/// parse; a server that honours the header never sends one (RFC 9110,
+/// section 12.5.3).
+fn default_request_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
+    headers
 }
 
 /// The response body, bounded by [`MAX_JWKS_RESPONSE_SIZE`] as it is read: a
@@ -406,39 +534,40 @@ impl JwksProvider {
 
     /// Fetch the key set and make it the cached one: the step behind an expiry
     /// refresh and an unknown-`kid` refresh alike.
-    async fn refresh(&self) -> Result<JwkSet, JwksError> {
+    async fn refresh(&self) -> Result<(), JwksError> {
         let jwks = self.fetch_jwks().await?;
-        *self.cache.write() = Some(CachedJwks {
-            jwks: jwks.clone(),
-            fetched_at: Instant::now(),
-            ttl: self.ttl,
-        });
-        Ok(jwks)
+        *self.cache.write() = Some(CachedJwks::new(jwks, self.ttl));
+        Ok(())
     }
 
-    /// Get the cached JWKS, refreshing if expired or not present.
-    pub async fn get_jwks(&self) -> Result<JwkSet, JwksError> {
-        // Check cache first
+    /// Fetch the key set when none is cached or the cached one has expired.
+    async fn ensure_fresh(&self) -> Result<(), JwksError> {
+        if self
+            .cache
+            .read()
+            .as_ref()
+            .is_some_and(|cached| !cached.is_expired())
         {
-            let cache = self.cache.read();
-            if let Some(cached) = cache.as_ref() {
-                if !cached.is_expired() {
-                    return Ok(cached.jwks.clone());
-                }
-            }
+            return Ok(());
         }
-
-        // Cache miss or expired.
         self.refresh().await
     }
 
-    /// Get a specific key by kid (key ID).
-    pub async fn get_key(&self, kid: &str) -> Result<Jwk, JwksError> {
-        let jwks = self.get_jwks().await?;
+    /// The cached set's key of this `kid`: a shared entry, nothing copied.
+    fn cached_key(&self, kid: &str) -> Option<Arc<SigningKey>> {
+        self.cache
+            .read()
+            .as_ref()
+            .and_then(|cached| cached.keys.get(kid))
+            .cloned()
+    }
 
-        // First try to find by kid
-        if let Some(key) = jwks.find(kid) {
-            return Ok(key.clone());
+    /// Get a specific key by kid (key ID): the cached set's entry, with the
+    /// key's parsed form, shared with every other check of a token it signed.
+    pub async fn get_key(&self, kid: &str) -> Result<Arc<SigningKey>, JwksError> {
+        self.ensure_fresh().await?;
+        if let Some(key) = self.cached_key(kid) {
+            return Ok(key);
         }
 
         // Key not found - try refreshing the cache in case keys were rotated,
@@ -451,9 +580,8 @@ impl JwksProvider {
             return Err(JwksError::KeyNotFound(kid.to_string()));
         }
         warn!("Key {} not found in cached JWKS, refreshing...", kid);
-        let jwks = self.refresh().await?;
-        jwks.find(kid)
-            .cloned()
+        self.refresh().await?;
+        self.cached_key(kid)
             .ok_or_else(|| JwksError::KeyNotFound(kid.to_string()))
     }
 
@@ -473,475 +601,9 @@ impl JwksProvider {
 /// A loopback OIDC discovery endpoint for the tests of the provider and of
 /// the validator built on it.
 #[cfg(test)]
-pub(crate) mod test_support {
-    use axum::{routing::get, Json, Router};
-    use serde_json::json;
-    use tokio::net::TcpListener;
-
-    /// An OIDC discovery endpoint over loopback. Returns the server's origin,
-    /// the issuer a document served there is requested for; the document names
-    /// `document_issuer(origin)` as its issuer and the origin's `/jwks.json` as
-    /// its key set.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the server lives exactly as long as the test"
-    )]
-    pub(crate) async fn discovery_server(document_issuer: impl FnOnce(&str) -> String) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        let document = json!({
-            "issuer": document_issuer(&origin),
-            "jwks_uri": format!("{origin}/jwks.json"),
-        });
-        let app = Router::new().route(
-            "/.well-known/openid-configuration",
-            get(move || {
-                let document = document.clone();
-                async move { Json(document) }
-            }),
-        );
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        origin
-    }
-}
+#[path = "../tests/unit/jwks/test_support.rs"]
+pub(crate) mod test_support;
 
 #[cfg(test)]
-mod tests {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
-
-    use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
-    use serde_json::{json, Value};
-    use tokio::net::TcpListener;
-
-    use super::{test_support::discovery_server, *};
-
-    #[test]
-    fn test_cached_jwks_expiration() {
-        let jwks = JwkSet { keys: vec![] };
-        let cached = CachedJwks {
-            jwks,
-            fetched_at: Instant::now() - Duration::from_secs(100),
-            ttl: Duration::from_secs(60),
-        };
-        assert!(cached.is_expired());
-
-        let jwks = JwkSet { keys: vec![] };
-        let cached = CachedJwks {
-            jwks,
-            fetched_at: Instant::now(),
-            ttl: Duration::from_secs(60),
-        };
-        assert!(!cached.is_expired());
-    }
-
-    #[test]
-    fn test_validate_url_https_required() {
-        // Valid HTTPS URL
-        assert!(validate_url("https://example.com/.well-known/jwks.json").is_ok());
-
-        // HTTP not allowed for non-localhost
-        assert!(validate_url("http://example.com/.well-known/jwks.json").is_err());
-
-        // HTTP allowed for localhost (testing)
-        assert!(validate_url("http://localhost:8080/jwks").is_ok());
-        assert!(validate_url("http://127.0.0.1:8080/jwks").is_ok());
-
-        // Invalid schemes
-        assert!(validate_url("ftp://example.com/jwks").is_err());
-        assert!(validate_url("file:///etc/passwd").is_err());
-    }
-
-    #[test]
-    fn test_validate_url_blocks_private_ips() {
-        // Private IPv4 ranges
-        assert!(validate_url("https://10.0.0.1/jwks").is_err());
-        assert!(validate_url("https://172.16.0.1/jwks").is_err());
-        assert!(validate_url("https://192.168.1.1/jwks").is_err());
-
-        // Loopback
-        assert!(validate_url("https://127.0.0.1/jwks").is_err());
-
-        // Link-local
-        assert!(validate_url("https://169.254.1.1/jwks").is_err());
-
-        // Cloud metadata endpoint
-        assert!(validate_url("https://169.254.169.254/jwks").is_err());
-
-        // CGNAT
-        assert!(validate_url("https://100.64.0.1/jwks").is_err());
-    }
-
-    #[test]
-    fn ipv4_mapped_ipv6_jwks_urls_obey_ipv4_address_policy() {
-        for (host, blocked) in [
-            ("::ffff:127.0.0.1", true),
-            ("::ffff:7f00:1", true),
-            ("::ffff:10.0.0.1", true),
-            ("::ffff:172.16.0.1", true),
-            ("::ffff:192.168.1.1", true),
-            ("::ffff:169.254.169.254", true),
-            ("::ffff:169.254.1.1", true),
-            ("::ffff:100.64.0.1", true),
-            ("::ffff:192.0.2.1", true),
-            ("::ffff:198.51.100.1", true),
-            ("::ffff:203.0.113.1", true),
-            ("::ffff:0.0.0.0", true),
-            ("::ffff:255.255.255.255", true),
-            ("::ffff:8.8.8.8", false),
-            ("::ffff:1.1.1.1", false),
-            ("::1", true),
-            ("::", true),
-            ("fc00::1", true),
-            ("fe80::1", true),
-            ("2001:4860:4860::8888", false),
-        ] {
-            let result = validate_url(&format!("https://[{host}]/jwks"));
-            if blocked {
-                assert!(
-                    matches!(result, Err(JwksError::SsrfBlocked(_))),
-                    "private address {host} must be blocked, got {result:?}"
-                );
-            } else {
-                assert!(result.is_ok(), "public address {host} must remain allowed");
-            }
-        }
-    }
-
-    #[test]
-    fn test_validate_url_blocks_internal_hostnames() {
-        assert!(validate_url("https://metadata/jwks").is_err());
-        assert!(validate_url("https://metadata.google.internal/jwks").is_err());
-        assert!(validate_url("https://internal.example.internal/jwks").is_err());
-        assert!(validate_url("https://printer.local/jwks").is_err());
-    }
-
-    #[test]
-    fn test_is_private_ip() {
-        use std::net::Ipv4Addr;
-
-        // Private ranges
-        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
-        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
-        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
-
-        // Loopback
-        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-
-        // Cloud metadata
-        assert!(is_private_ip(&IpAddr::V4(Ipv4Addr::new(
-            169, 254, 169, 254
-        ))));
-
-        // Public IPs should not be blocked
-        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
-        assert!(!is_private_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
-    }
-
-    /// A JWKS endpoint over loopback that counts its hits and serves whatever
-    /// key set (or failure) it currently holds.
-    #[derive(Clone)]
-    struct JwksServer {
-        url: String,
-        hits: Arc<AtomicUsize>,
-        keys: Arc<RwLock<Vec<&'static str>>>,
-        failing: Arc<RwLock<bool>>,
-    }
-
-    impl JwksServer {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the server lives exactly as long as the test"
-        )]
-        async fn start(kids: &[&'static str]) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let server = Self {
-                url: format!(
-                    "http://127.0.0.1:{}/jwks.json",
-                    listener.local_addr().unwrap().port()
-                ),
-                hits: Arc::default(),
-                keys: Arc::new(RwLock::new(kids.to_vec())),
-                failing: Arc::default(),
-            };
-            let app = Router::new()
-                .route(
-                    "/jwks.json",
-                    get(|State(server): State<Self>| async move { server.respond() }),
-                )
-                .with_state(server.clone());
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            server
-        }
-
-        fn respond(&self) -> (StatusCode, Json<Value>) {
-            self.hits.fetch_add(1, Ordering::SeqCst);
-            if *self.failing.read() {
-                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
-            }
-            let keys: Vec<Value> = self
-                .keys
-                .read()
-                .iter()
-                .map(|kid| {
-                    json!({ "kty": "RSA", "use": "sig", "alg": "RS256", "kid": kid,
-                            "n": "sXchDaQebHnPiGvyDOAT4saGEUetSyo9MKLOoWFsueri23bOdgWp4Dy1Wl", "e": "AQAB" })
-                })
-                .collect();
-            (StatusCode::OK, Json(json!({ "keys": keys })))
-        }
-
-        fn hits(&self) -> usize {
-            self.hits.load(Ordering::SeqCst)
-        }
-
-        fn provider(&self) -> JwksProvider {
-            JwksProvider::new(self.url.clone(), Duration::from_secs(3600)).unwrap()
-        }
-    }
-
-    #[tokio::test]
-    async fn an_unknown_kid_does_not_refetch_a_recently_fetched_key_set() {
-        let server = JwksServer::start(&["k1"]).await;
-        let provider = server.provider();
-
-        assert_eq!(
-            provider
-                .get_key("k1")
-                .await
-                .unwrap()
-                .common
-                .key_id
-                .as_deref(),
-            Some("k1")
-        );
-        assert_eq!(server.hits(), 1);
-
-        for kid in ["unknown-1", "unknown-2", "unknown-1"] {
-            let err = provider.get_key(kid).await.unwrap_err();
-            assert!(
-                matches!(&err, JwksError::KeyNotFound(k) if k == kid),
-                "{err:?}"
-            );
-        }
-        assert_eq!(
-            server.hits(),
-            1,
-            "misses inside the interval must not fetch"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_rotated_key_is_fetched_once_the_interval_has_passed() {
-        let server = JwksServer::start(&["k1"]).await;
-        let provider = server.provider();
-        provider.get_key("k1").await.unwrap();
-        *server.keys.write() = vec!["k2"];
-
-        // Inside the interval the new key is still unknown ...
-        assert!(matches!(
-            provider.get_key("k2").await,
-            Err(JwksError::KeyNotFound(_))
-        ));
-        assert_eq!(server.hits(), 1);
-
-        // ... and once the interval has passed, one refetch picks it up.
-        *provider.last_fetch_attempt.lock() = Some(Instant::now() - UNKNOWN_KID_REFRESH_INTERVAL);
-        assert_eq!(
-            provider
-                .get_key("k2")
-                .await
-                .unwrap()
-                .common
-                .key_id
-                .as_deref(),
-            Some("k2")
-        );
-        assert_eq!(server.hits(), 2);
-
-        // That refetch opened a new interval: the next miss does not fetch.
-        assert!(matches!(
-            provider.get_key("k3").await,
-            Err(JwksError::KeyNotFound(_))
-        ));
-        assert_eq!(server.hits(), 2);
-    }
-
-    #[tokio::test]
-    async fn a_failed_refetch_counts_against_the_interval() {
-        let server = JwksServer::start(&["k1"]).await;
-        let provider = server.provider();
-        provider.get_key("k1").await.unwrap();
-        *server.failing.write() = true;
-        *provider.last_fetch_attempt.lock() = Some(Instant::now() - UNKNOWN_KID_REFRESH_INTERVAL);
-
-        assert!(matches!(
-            provider.get_key("k2").await,
-            Err(JwksError::JwksFetch(_))
-        ));
-        assert_eq!(server.hits(), 2);
-
-        // The issuer is failing: further misses do not retry it until the interval has passed.
-        assert!(matches!(
-            provider.get_key("k2").await,
-            Err(JwksError::KeyNotFound(_))
-        ));
-        assert_eq!(server.hits(), 2);
-    }
-
-    /// The expiry refresh and the unknown-`kid` refresh are one step: each
-    /// fetches once and leaves the fetched set cached, fresh.
-    #[tokio::test]
-    async fn an_expiry_refresh_and_an_unknown_kid_refresh_cache_the_fetched_set_alike() {
-        let server = JwksServer::start(&["k1"]).await;
-        let provider = server.provider();
-        let cached_kids = |provider: &JwksProvider| -> Vec<String> {
-            let cache = provider.cache.read();
-            let cached = cache.as_ref().unwrap();
-            assert!(!cached.is_expired());
-            cached
-                .jwks
-                .keys
-                .iter()
-                .filter_map(|key| key.common.key_id.clone())
-                .collect()
-        };
-        provider.get_key("k1").await.unwrap();
-        assert_eq!(cached_kids(&provider), ["k1"]);
-
-        // The unknown-kid refresh, once the interval has passed.
-        *server.keys.write() = vec!["k2"];
-        *provider.last_fetch_attempt.lock() = Some(Instant::now() - UNKNOWN_KID_REFRESH_INTERVAL);
-        provider.get_key("k2").await.unwrap();
-        assert_eq!(cached_kids(&provider), ["k2"]);
-        assert_eq!(server.hits(), 2);
-
-        // The expiry refresh.
-        *server.keys.write() = vec!["k3"];
-        provider.cache.write().as_mut().unwrap().fetched_at =
-            Instant::now() - TTL - Duration::from_secs(1);
-        assert_eq!(provider.get_jwks().await.unwrap().keys.len(), 1);
-        assert_eq!(cached_kids(&provider), ["k3"]);
-        assert_eq!(server.hits(), 3);
-    }
-
-    const TTL: Duration = Duration::from_secs(3600);
-
-    /// A loopback HTTP/1.1 server that answers one request with a chunked
-    /// body (no declared length) of `chunks` times 64 KiB of JSON-looking
-    /// text, then hangs up. Returns its origin. A refusal that comes within
-    /// one chunk past the limit shows the body was stopped as it was read; a
-    /// read-then-check would report the whole body.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the server lives exactly as long as the test"
-    )]
-    async fn chunked_server(chunks: usize) -> String {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-        tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut head = vec![0u8; 4096];
-            let _ = socket.read(&mut head).await;
-            let _ = socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
-                )
-                .await;
-            let chunk = vec![b'['; 64 * 1024];
-            for _ in 0..chunks {
-                // The client may hang up once it has refused the body: a write
-                // error ends the server, as it should.
-                if socket
-                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
-                    .await
-                    .is_err()
-                    || socket.write_all(&chunk).await.is_err()
-                    || socket.write_all(b"\r\n").await.is_err()
-                {
-                    return;
-                }
-            }
-            let _ = socket.write_all(b"0\r\n\r\n").await;
-        });
-        origin
-    }
-
-    #[tokio::test]
-    async fn a_chunked_key_set_past_the_limit_is_refused_as_it_is_read() {
-        let origin = chunked_server(20).await; // 1.25 MiB over a 1 MiB limit
-        let provider = JwksProvider::new(format!("{origin}/jwks.json"), TTL).unwrap();
-        let err = provider.get_jwks().await.unwrap_err();
-        assert!(
-            matches!(err, JwksError::ResponseTooLarge(read, max) if read > max && read <= max + 64 * 1024 && max == MAX_JWKS_RESPONSE_SIZE),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_chunked_discovery_document_past_the_limit_is_refused_as_it_is_read() {
-        let origin = chunked_server(20).await;
-        let Err(err) = JwksProvider::from_issuer(&origin, TTL).await else {
-            panic!("a chunked discovery document past the limit must be refused");
-        };
-        assert!(
-            matches!(err, JwksError::ResponseTooLarge(read, max) if read > max && read <= max + 64 * 1024 && max == MAX_JWKS_RESPONSE_SIZE),
-            "{err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_discovery_document_for_another_issuer_is_refused() {
-        let origin = discovery_server(|origin| format!("{origin}/another-tenant")).await;
-        let other = format!("{origin}/another-tenant");
-
-        let Err(err) = JwksProvider::from_issuer(&origin, TTL).await else {
-            panic!("a discovery document for another issuer must be refused");
-        };
-
-        assert!(
-            matches!(
-                &err,
-                JwksError::IssuerMismatch { configured, discovered }
-                    if configured == &origin && discovered == &other
-            ),
-            "{err:?}"
-        );
-        // The error names both issuers.
-        let message = err.to_string();
-        assert!(
-            message.contains(&format!("{other:?}")) && message.contains(&format!("{origin:?}")),
-            "{message}"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_discovery_document_for_the_configured_issuer_is_accepted() {
-        let origin = discovery_server(str::to_string).await;
-
-        let provider = JwksProvider::from_issuer(&origin, TTL).await.unwrap();
-
-        assert_eq!(provider.jwks_uri, format!("{origin}/jwks.json"));
-    }
-
-    #[tokio::test]
-    async fn an_issuer_with_a_terminating_slash_is_compared_as_configured() {
-        // The discovery URL carries one slash before the well-known path, and the
-        // document must name the issuer with its slash, as the tokens' `iss` does.
-        let origin = discovery_server(|origin| format!("{origin}/")).await;
-
-        let provider = JwksProvider::from_issuer(&format!("{origin}/"), TTL)
-            .await
-            .unwrap();
-        assert_eq!(provider.jwks_uri, format!("{origin}/jwks.json"));
-
-        // The same document is not for the issuer without the slash.
-        let Err(err) = JwksProvider::from_issuer(&origin, TTL).await else {
-            panic!("a document naming the issuer with a slash is not for the issuer without it");
-        };
-        assert!(matches!(err, JwksError::IssuerMismatch { .. }), "{err:?}");
-    }
-}
+#[path = "../tests/unit/jwks/tests.rs"]
+mod tests;

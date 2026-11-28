@@ -12,9 +12,14 @@ pending-prefill allowance) apply only to workers that push one. A stream
 without the record leaves its worker polled, judged by the transport's
 keepalive alone.
 
-This module mirrors the Rust servicer's relay (``crates/engine_servicer``,
-``kv_events.rs``) field for field and tick for tick, so a gateway sees the
-Python and the Rust servicer of one engine alike:
+This module follows the Rust servicer's relay (``crates/engine_servicer``,
+``kv_events.rs``) in the record and its pacing, and parts from it in ways a
+gateway can see. While the engine is idle this recorder repeats the record
+of one rank, the rank whose batch went out last, where the Rust relay keeps
+every rank on its own clock. It sends nothing before the stream's first
+batch, where the Rust relay sends records numbered 0 to a subscriber that
+asks (``load_records_before_first_batch``). An engine with several
+data-parallel ranks wants the Rust servicer. What is mirrored:
 
 - :func:`engine_load_from` converts an engine's ``SchedulerLoad`` message
   (any of the three protos) to the record, as ``crates/grpc_client``'s

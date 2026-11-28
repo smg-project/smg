@@ -54,9 +54,10 @@ import importlib
 import json
 import logging
 import multiprocessing
+import os
 import signal
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 from smg_grpc_servicer.constrained_decoding import (
@@ -87,6 +88,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     ServicerConfigError,
     apply_kv_events_default,
     ensure_spawn_start_method,
+    kv_events_left_off,
     on_fault_signal,
     resolve_tokenizer_dir,
     servicer_switch,
@@ -107,7 +109,10 @@ from smg_grpc_servicer.tokenspeed.loads import running_window
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 from smg_grpc_servicer.tokenspeed.warmup import (
     DEFAULT_BUDGET_SECS,
+    DEFAULT_REMAINDERS,
+    REMAINDERS_ENV,
     WARMUP_ENV,
+    parse_remainders,
     warmup_inputs,
     warmup_wire,
 )
@@ -117,6 +122,8 @@ logger = logging.getLogger(__name__)
 SERVICER_IMPL_ENV = "SMG_TOKENSPEED_SERVICER_IMPL"
 HANDSHAKE_PORT_ENV = "SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_TOKENSPEED_SERVICER_DRAIN_SECS"
+# How long the engine stays up after the drain's last stream (default 1 s).
+DRAIN_LINGER_SECS_ENV = "SMG_TOKENSPEED_SERVICER_DRAIN_LINGER_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS"
 STARTUP_CEILING_SECS_ENV = "SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS"
 SILENCE_TIMEOUT_SECS_ENV = "SMG_TOKENSPEED_SERVICER_SILENCE_TIMEOUT_SECS"
@@ -124,6 +131,21 @@ PREFILL_TOKENS_PER_SEC_ENV = "SMG_TOKENSPEED_SERVICER_PREFILL_TOKENS_PER_SEC"
 # Set to 0/false/no/off to keep TokenSpeed's KV event publisher off when the
 # launcher was given no --kv-events-config (see `default_kv_events_config`).
 KV_EVENTS_ENV = "SMG_TOKENSPEED_SERVICER_KV_EVENTS"
+
+
+def read_remainders_setting(environ: Mapping[str, str] | None = None) -> str:
+    """The chunk-remainders knob's setting from ``environ[REMAINDERS_ENV]``
+    (:func:`~smg_grpc_servicer.tokenspeed.warmup.parse_remainders`; the
+    process environment by default). A value the knob does not take is a
+    :class:`ServicerConfigError` naming the variable: both launchers read it
+    before any engine work (the Rust launcher with its other knobs, the
+    Python servicer beside its KV-events default), so a typo refuses the
+    start whatever the warm-up level and the engine's role."""
+    source = os.environ if environ is None else environ
+    try:
+        return parse_remainders(source.get(REMAINDERS_ENV))
+    except ValueError as error:
+        raise ServicerConfigError(str(error)) from None
 
 
 def default_kv_events_json(endpoint: str) -> str:
@@ -383,6 +405,17 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     # servicer refuses a constraint that backend cannot enforce before the
     # scheduler, and judges nothing when the backend is not known.
     grammar_backend = tokenspeed_grammar_backend(server_args)
+    if not grammar_backend and callable(getattr(server_args, "resolve_model_defaults", None)):
+        # An unset flag on a checkpoint the engine had not read when it parsed
+        # its arguments (a hub id its cache did not hold). The launcher's model
+        # config step has fetched the checkpoint's config since, so the engine's
+        # own method finds it in the cache now. Ask it on a deep copy: the
+        # launch still finds its arguments unread and settles them itself, and
+        # raises again whatever the method refuses here.
+        with contextlib.suppress(Exception):
+            settled = copy.deepcopy(server_args)
+            settled.resolve_model_defaults()
+            grammar_backend = tokenspeed_grammar_backend(settled)
     grammar_backend_entry(args_dict, grammar_backend)
     # The vocabulary of structural-tag nodes that backend takes, when the
     # xgrammar installed beside the engine predates the current one: the
@@ -493,7 +526,10 @@ def kv_events_unpublishable(server_args: Any, model_config: Any = None) -> str |
 
 
 def default_kv_events_config(
-    server_args: Any, environ: Mapping[str, str] | None = None, model_config: Any = None
+    server_args: Any,
+    environ: Mapping[str, str] | None = None,
+    model_config: Any = None,
+    unless: Callable[[], str | None] | None = None,
 ) -> str | None:
     """Turn TokenSpeed's KV event publisher on when the launcher was given no
     ``--kv-events-config``; returns the configuration applied, or None: the
@@ -504,14 +540,15 @@ def default_kv_events_config(
     from them, unless the engine cannot serve the publisher for this model
     (:func:`kv_events_unpublishable`, on ``model_config`` when the caller has
     TokenSpeed's ``ModelConfig`` already): then the publisher stays off and
-    the reason is logged once."""
+    the reason is logged once. ``unless`` is that question as the caller asks
+    it (the launcher keeps the answer for its facts)."""
     return apply_kv_events_default(
         server_args,
         default_kv_events_json,
         env_name=KV_EVENTS_ENV,
         environ=environ,
         ranks=EngineConfigView(server_args).server_args.attention_dp_size or 1,
-        unless=lambda: kv_events_unpublishable(server_args, model_config),
+        unless=unless or (lambda: kv_events_unpublishable(server_args, model_config)),
     )
 
 
@@ -819,6 +856,7 @@ class TokenSpeedLauncher(RustLauncher):
     ipc_prefix = "tokenspeed-servicer"
     handshake_port_env = HANDSHAKE_PORT_ENV
     drain_secs_env = DRAIN_SECS_ENV
+    drain_linger_secs_env = DRAIN_LINGER_SECS_ENV
     startup_timeout_secs_env = STARTUP_TIMEOUT_SECS_ENV
     startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
     silence_timeout_secs_env = SILENCE_TIMEOUT_SECS_ENV
@@ -839,6 +877,18 @@ class TokenSpeedLauncher(RustLauncher):
     # for the other roles and on an engine whose headless launcher hosts its
     # own.
     _bootstrap_server: Any = None
+    # The line the KV-events default logged when the engine's own word kept
+    # the publisher off; the facts hand it to the servicer.
+    _kv_events_left_off: str | None = None
+    # The chunk-remainders knob's setting (:func:`read_remainders_setting`),
+    # read in ``prepare`` with the launcher's other knobs.
+    _remainders: str = DEFAULT_REMAINDERS
+
+    def prepare(self, args: Any) -> None:
+        # Read before any engine work, whether or not the warm-up runs and
+        # whatever the role: a bad value is the same named exit as a bad
+        # warm-up level, not a start that ignores it.
+        self._remainders = read_remainders_setting()
 
     def metrics_bind_address(
         self, args: Any, environ: Mapping[str, str] | None = None
@@ -857,16 +907,28 @@ class TokenSpeedLauncher(RustLauncher):
     def kv_events_default(self, args: Any) -> str | None:
         # An encode worker runs the vision tower only, with no KV cache to
         # publish from: its server args are left as given (the Python server's
-        # rule). Otherwise the config is built here rather than in the facts:
-        # the facts need it a hook later in any case, so an explicit
-        # configuration or the opt-out, which do not read it, cost nothing
-        # extra.
+        # rule). The engine's word is asked on the model config the facts read
+        # a hook later, and a reason is kept for them.
         if EngineConfigView(args).server_args.disaggregation_mode == "encode":
             return None
-        return default_kv_events_config(args, model_config=self.model_config(args))
+
+        def unpublishable() -> str | None:
+            reason = kv_events_unpublishable(args, self.model_config(args))
+            self._kv_events_left_off = kv_events_left_off(reason) if reason else None
+            return reason
+
+        return default_kv_events_config(args, unless=unpublishable)
 
     def facts(self, args: Any) -> dict[str, Any]:
-        return {**model_facts(args, self.model_config(args)), **server_facts(args)}
+        facts = {**model_facts(args, self.model_config(args)), **server_facts(args)}
+        if self._kv_events_left_off:
+            # One more launcher-derived entry of the server args: the Rust
+            # servicer refuses SubscribeKvEvents with it in place of its
+            # standing text, which names the flag and no reason.
+            server_args = json.loads(facts["server_args_json"])
+            server_args["kv_events_left_off"] = self._kv_events_left_off
+            facts["server_args_json"] = json.dumps(server_args, sort_keys=True)
+        return facts
 
     def tokenizer_dir(self, args: Any) -> str | None:
         return tokenizer_dir_for(args)
@@ -897,7 +959,7 @@ class TokenSpeedLauncher(RustLauncher):
             self._bootstrap_server = None
 
     def warmup_inputs(self, args: Any, facts: Mapping[str, Any]) -> Any:
-        return warmup_inputs(args, facts)
+        return warmup_inputs(args, facts, remainders=self._remainders)
 
     def warmup_wire(self, target: str) -> Any:
         return warmup_wire(target)

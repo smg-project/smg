@@ -14,8 +14,9 @@ No version concerns locally — editable installs always use the latest source.
 ## Proto stubs for local tests
 
 The tests import ``smg_grpc_proto``, whose stubs the released package builds at
-install time from ``crates/grpc_client/proto``. While a proto change is in
-flight, generate stubs from the checkout instead of installing the release:
+install time from ``crates/grpc_client/proto`` and ``crates/worker/proto``. While
+a proto change is in flight, generate stubs from the checkout instead of
+installing the release:
 
 ```bash
 pip install 'grpcio-tools>=1.81.1,<1.82'

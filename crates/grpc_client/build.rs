@@ -1,6 +1,14 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The shared messages' file is the worker crate's. Its build script names
+    // the directory, and cargo hands the name to this one.
+    let wire = std::env::var("DEP_SMG_WORKER_PROTO_DIR").map_err(|e| {
+        format!("DEP_SMG_WORKER_PROTO_DIR, the worker crate's proto directory: {e}")
+    })?;
+
     // Rebuild triggers
-    println!("cargo:rerun-if-changed=proto/common.proto");
+    println!("cargo:rerun-if-changed=proto/sglang_epd.proto");
+    println!("cargo:rerun-if-changed=proto/sglang_encoder.proto");
+    println!("cargo:rerun-if-changed={wire}/common.proto");
     println!("cargo:rerun-if-changed=proto/sglang_scheduler.proto");
     println!("cargo:rerun-if-changed=proto/tokenspeed_scheduler.proto");
     println!("cargo:rerun-if-changed=proto/tokenspeed_encoder.proto");
@@ -8,18 +16,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/trtllm_service.proto");
     println!("cargo:rerun-if-changed=proto/mlx_engine.proto");
 
-    // Pass 1: compile shared message types (no gRPC service generation)
-    tonic_prost_build::configure()
-        .build_server(false)
-        .build_client(false)
-        .protoc_arg("--experimental_allow_proto3_optional")
-        .compile_protos(&["proto/common.proto"], &["proto"])?;
+    // The shared message types are not generated here: the worker crate
+    // generates them and `lib.rs` re-exports its module as `common_proto`.
+    // Both passes below map the shared package to that path.
 
-    // Pass 2: the EPD encoder proto reuses tokenspeed scheduler message types
+    // Pass 1: the EPD encoder proto reuses tokenspeed scheduler message types
     // (MultimodalInputs/TensorData). Compile it with the scheduler package
     // mapped to its already-defined module so the encoder references those
     // types via the crate path instead of a (nonexistent) sibling module. Run
-    // this BEFORE the scheduler pass so the full scheduler output (Pass 3) wins
+    // this BEFORE the scheduler pass so the full scheduler output (Pass 2) wins
     // over the extern stub this pass emits for the imported package.
     tonic_prost_build::configure()
         .build_server(true)
@@ -28,13 +33,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ".tokenspeed.grpc.scheduler",
             "crate::tokenspeed_scheduler::tokenspeed_proto",
         )
+        // The scheduler file imports the shared file: without this path the
+        // pass would write a copy of the shared messages.
+        .extern_path(".smg.grpc.common", "crate::common_proto")
         // The encoder's Encode RPC carries the same pixel tensor as the
         // scheduler's Generate: the same sized codec (see `crate::codec`).
         .codec_path("crate::codec::SizedProstCodec")
+        .type_attribute(
+            ".smg.sglang.managed.v1.Capabilities",
+            "#[derive(serde::Serialize, serde::Deserialize)] #[serde(default)]",
+        )
         .protoc_arg("--experimental_allow_proto3_optional")
-        .compile_protos(&["proto/tokenspeed_encoder.proto"], &["proto"])?;
+        .compile_protos(
+            &[
+                "proto/tokenspeed_encoder.proto",
+                "proto/sglang_encoder.proto",
+                "proto/sglang_epd.proto",
+            ],
+            &["proto", wire.as_str()],
+        )?;
 
-    // Pass 3: compile engine protos, referencing common types via extern_path
+    // Pass 2: compile engine protos, referencing common types via extern_path
     tonic_prost_build::configure()
         .build_server(true)
         .build_client(true)
@@ -59,6 +78,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // once.
         .boxed(".sglang.grpc.scheduler.GenerateRequest.mm_inputs")
         .boxed(".sglang.grpc.scheduler.GenerateRequest.media_identity")
+        // Boxed, the cache partition is 8 bytes of the request. Its two
+        // strings would be 48, and most requests leave it unset.
+        .boxed(".sglang.grpc.scheduler.GenerateRequest.cache_partition")
         // Each message is encoded into a buffer reserved to its length once
         // (see `crate::codec`), not into one that doubles under a tensor.
         .codec_path("crate::codec::SizedProstCodec")
@@ -86,7 +108,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "proto/mlx_engine.proto",
                 "proto/tokenspeed_scheduler.proto",
             ],
-            &["proto"],
+            &["proto", wire.as_str()],
         )?;
 
     Ok(())

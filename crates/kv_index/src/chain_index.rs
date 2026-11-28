@@ -95,9 +95,12 @@ use dashmap::{mapref::entry::Entry, DashMap};
 use parking_lot::{Mutex, MutexGuard};
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
-use crate::block::{
-    chain_prefix_hash, ApplyError, ContentHash, OverlapScores, SequenceHash, StoredBlock,
-    WorkerIdExhausted,
+use crate::{
+    block::{
+        chain_prefix_hash, ApplyError, ContentHash, OverlapScores, SequenceHash, StoredBlock,
+        WorkerIdExhausted,
+    },
+    prefetch::prefetch_read,
 };
 
 mod arena;
@@ -168,14 +171,7 @@ enum Hop {
     Gone,
 }
 
-/// Where one of a worker's blocks lives: the run and the offset of the block within it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct BlockRef {
-    pub run: u32,
-    pub offset: u32,
-}
-
-pub use crate::lane_map::ChainBlockMap;
+pub use crate::lane_map::{BlockRef, ChainBlockMap};
 
 /// Memory and shape counters, as the replay harness reports them and the gateway exports them.
 #[derive(Debug, Clone, Copy, Default)]
@@ -196,7 +192,8 @@ pub struct ChainIndexStats {
     /// Bytes the word arena holds from the process allocator: whole chunks (8 MiB each), the
     /// first taken by the first array or table and each kept once taken.
     pub arena_chunk_bytes: usize,
-    /// Bytes of run headers, coverage words included (all allocated runs).
+    /// Bytes of the headers of all allocated runs, the first coverage word of each included.
+    /// The words a chunk made past the first are counted in `slab_bytes`.
     pub header_bytes: usize,
     /// Bytes the run slab holds from the process allocator: whole chunks of headers and coverage
     /// words, used or not.
@@ -265,6 +262,9 @@ pub struct ChainIndex {
     max_workers: usize,
     worker_to_id: DashMap<Arc<str>, u32, FxBuildHasher>,
     registry: Mutex<WorkerRegistry>,
+    /// Ids handed out a second time ([`Self::ids_reused`]): written where a freed id is
+    /// interned for the next name, under the registry's lock.
+    ids_reused: AtomicU64,
     /// Blocks held per worker, one cache line each: the lanes write these on every event.
     worker_blocks: Box<[CachePadded<AtomicUsize>]>,
     /// Per-worker signed contributions to the distinct-block count, summed on demand.
@@ -276,10 +276,6 @@ pub struct ChainIndex {
     /// Stores whose blocks carried the engine hashes the index holds for other content.
     landing_mismatches: AtomicUsize,
     /// Blocks a store moved to another place for their worker (the old membership released).
-    /// Coverage words a lookup has to read: enough for the highest worker id interned so far
-    /// (ids are handed out densely and reused), at most `words`. An index sized for a thousand
-    /// workers that serves eight reads one word per run instead of sixteen.
-    live_words: AtomicUsize,
     moved_hashes: AtomicUsize,
     /// Splits by cause and runs unlinked, always counted (one relaxed increment per split or
     /// death): the fragmentation figures a churn harness and the gateway's gauges read.
@@ -399,8 +395,11 @@ impl ChainIndex {
         self.arena.cap_words = words;
     }
 
-    /// An index for up to `max_workers` interned workers (at most 1024); coverage costs one bit
-    /// per worker per run, rounded up to 64.
+    /// An index for up to `max_workers` interned workers (at most 1024). A chunk of runs made
+    /// before the index has had more than 64 workers interned at once lays one word per run, and
+    /// the rest of the ceiling once a worker of a later word holds a whole run there; a chunk
+    /// made after that lays the whole ceiling, also once the pool has shrunk: the bound only
+    /// rises.
     pub fn with_max_workers(max_workers: usize) -> Self {
         let max_workers = max_workers.clamp(1, MAX_WORDS * 64);
         let words = max_workers.div_ceil(64);
@@ -427,6 +426,7 @@ impl ChainIndex {
             max_workers,
             worker_to_id: DashMap::with_hasher(FxBuildHasher),
             registry: Mutex::new(WorkerRegistry::default()),
+            ids_reused: AtomicU64::new(0),
             worker_blocks: (0..max_workers)
                 .map(|_| CachePadded::new(AtomicUsize::new(0)))
                 .collect(),
@@ -436,7 +436,6 @@ impl ChainIndex {
             engine_conflicts: AtomicUsize::new(0),
             cap_refusals: AtomicUsize::new(0),
             landing_mismatches: AtomicUsize::new(0),
-            live_words: AtomicUsize::new(0),
             moved_hashes: AtomicUsize::new(0),
             splits_branch: AtomicUsize::new(0),
             splits_hole: AtomicUsize::new(0),
@@ -482,13 +481,19 @@ impl ChainIndex {
             Entry::Vacant(entry) => {
                 let mut registry = self.registry.lock();
                 let id = match registry.free.pop() {
-                    Some(id) => id,
+                    Some(id) => {
+                        // Counted before the id can hold anything of its new name, as
+                        // `live_words` below is published.
+                        self.ids_reused.fetch_add(1, Ordering::Release);
+                        id
+                    }
                     None if registry.names.len() < self.max_workers => {
                         registry.names.push(None);
                         let id = (registry.names.len() - 1) as u32;
                         // Published before the id can hold anything: the worker's first store
                         // comes after this returns.
-                        self.live_words
+                        self.slab
+                            .live_words
                             .fetch_max(id as usize / 64 + 1, Ordering::Release);
                         id
                     }
@@ -523,6 +528,14 @@ impl ChainIndex {
         self.worker_to_id.get(worker).map(|entry| *entry.value())
     }
 
+    /// How many times an id a removed worker freed was interned for the next name. A removal
+    /// alone does not move it. It does not say which id changed hands: a caller that keeps ids
+    /// across calls reads this before it reads them, and again behind a lookup it maps by
+    /// them, and once it moved any id it kept may name another worker.
+    pub fn ids_reused(&self) -> u64 {
+        self.ids_reused.load(Ordering::Acquire)
+    }
+
     /// Whether no worker holds any block: the root has no live child, read under the root's
     /// version. O(1), for a caller that asks before every lookup (`current_size` reads a line
     /// per worker slot).
@@ -555,19 +568,27 @@ impl ChainIndex {
         total.max(0) as usize
     }
 
+    /// How many blocks the index holds under `worker`. The load is ordered behind the
+    /// credit it reads, and an id's first credit comes behind the count of ids handed out
+    /// again ([`Self::ids_reused`]): a caller that reads here what an id's next worker
+    /// stored reads that count moved behind it.
     pub fn worker_block_count(&self, worker: u32) -> usize {
         self.worker_blocks
             .get(worker as usize)
-            .map_or(0, |count| count.load(Ordering::Relaxed))
+            .map_or(0, |count| count.load(Ordering::Acquire))
     }
 
+    /// Published to [`Self::worker_block_count`]: a load that reads this add is ordered
+    /// behind it, and so behind the hand-out of `worker`'s id.
     fn credit(&self, worker: u32, blocks: usize) {
         if blocks == 0 {
             return;
         }
-        self.worker_blocks[worker as usize].fetch_add(blocks, Ordering::Relaxed);
+        self.worker_blocks[worker as usize].fetch_add(blocks, Ordering::Release);
     }
 
+    /// `Relaxed` is enough: every write of the count is an add or a take, so a load that reads
+    /// a take made behind a credit is ordered behind that credit as well.
     fn debit(&self, worker: u32, blocks: usize) {
         if blocks == 0 {
             return;
@@ -927,11 +948,18 @@ impl ChainIndex {
         }
     }
 
+    /// Coverage words that can carry a holder: see the slab's `live_words`. An id is published
+    /// there before its first store, so a walk of a whole coverage reads these and no further.
+    #[inline]
+    fn coverage_words(&self) -> usize {
+        self.slab.live_words.load(Ordering::Acquire).min(self.words)
+    }
+
     /// Blocks of a run held by at least one worker: all of them while anybody holds the whole
     /// run, otherwise the longest partial prefix.
     fn held_len(&self, run_id: u32) -> usize {
         let run = self.slab.run(run_id);
-        if coverage_is_empty(self.slab.coverage(run_id)) {
+        if coverage_is_empty(self.slab.coverage(run_id), self.coverage_words()) {
             self.arena.partial_max(run.partials.load(Ordering::Relaxed))
         } else {
             run.len()
@@ -939,7 +967,7 @@ impl ChainIndex {
     }
 
     fn has_holders(&self, run_id: u32) -> bool {
-        !coverage_is_empty(self.slab.coverage(run_id))
+        !coverage_is_empty(self.slab.coverage(run_id), self.coverage_words())
             || self
                 .arena
                 .table_live(self.slab.run(run_id).partials.load(Ordering::Relaxed))
@@ -1091,7 +1119,8 @@ impl ChainIndex {
             .filter(|(_, cutoff)| *cutoff as usize > at)
             .map(|&(worker, cutoff)| (worker, cutoff - at as u32))
             .collect();
-        let suffix_held = !coverage_is_empty(coverage) || !beyond.is_empty();
+        let words = self.coverage_words();
+        let suffix_held = !coverage_is_empty(coverage, words) || !beyond.is_empty();
         // Children hang off any offset of the run: those past `at` move to the suffix, keyed by
         // their offset within it; the rest stay. Decided under the version step, after
         // the inserts in flight have landed, so none is missed.
@@ -1137,9 +1166,7 @@ impl ChainIndex {
                 },
             );
             let suffix = self.slab.run(suffix_id);
-            for (slot, word) in self.slab.coverage(suffix_id).iter().zip(coverage) {
-                slot.store(word.load(Ordering::Relaxed), Ordering::Relaxed);
-            }
+            coverage.copy_into(self.slab.coverage(suffix_id), words);
             for &(_, child, _) in &moved {
                 self.slab
                     .run(child)
@@ -1635,7 +1662,7 @@ impl ChainIndex {
             Some((child, generation)) => {
                 // The child's header is the next line the walk reads: ask for it while the
                 // version is confirmed.
-                crate::prefetch::prefetch_read(std::ptr::from_ref(self.slab.run(child)));
+                prefetch_read(std::ptr::from_ref(self.slab.run(child)));
                 Plan::Descend(child, generation)
             }
             None if window.children != NONE => Plan::InsertAt(offset),
@@ -1754,7 +1781,7 @@ impl ChainIndex {
             && run_id != ROOT
             && children == NONE
             && run.forwards.load(Ordering::Relaxed) == NONE
-            && covered_only_by(coverage, worker);
+            && covered_only_by(coverage, worker, self.coverage_words());
         let (target, first) = if own_leaf {
             self.append(run, &contents, &engines)?;
             (run_id, len)
@@ -1833,13 +1860,17 @@ impl ChainIndex {
                 )
                 .is_ok();
         if claimed {
+            // Release stores: this thread did not take the array, and a reader may still hold it
+            // from the life before. One that reads a word stored here and then passes its
+            // acquire fence reads, in its check of its run's version, the step that ended that
+            // life.
             let slots = self.arena.words(block + end as u32, contents.len());
             for (slot, &hash) in slots.iter().zip(contents) {
-                slot.store(hash, Ordering::Relaxed);
+                slot.store(hash, Ordering::Release);
             }
             let slots = self.arena.words(engine + end as u32, engines.len());
             for (slot, &hash) in slots.iter().zip(engines) {
-                slot.store(hash, Ordering::Relaxed);
+                slot.store(hash, Ordering::Release);
             }
             run.len
                 .store((len + contents.len()) as u32, Ordering::Release);
@@ -1893,7 +1924,7 @@ impl ChainIndex {
         // so their misses overlap instead of serialising one run after another.
         for removal in &work {
             if removal.run != GONE {
-                crate::prefetch::prefetch_read(std::ptr::from_ref(self.slab.run(removal.run)));
+                prefetch_read(std::ptr::from_ref(self.slab.run(removal.run)));
             }
         }
         let mut freed = Vec::new();
@@ -2113,18 +2144,8 @@ impl ChainIndex {
                 .collect();
             if let [only] = children[..] {
                 let (child_window, _) = self.slab.run(only).snapshot();
-                let parent_words: Vec<u64> = self
-                    .slab
-                    .coverage(run_id)
-                    .iter()
-                    .map(|w| w.load(Ordering::Relaxed))
-                    .collect();
-                let child_words: Vec<u64> = self
-                    .slab
-                    .coverage(only)
-                    .iter()
-                    .map(|w| w.load(Ordering::Relaxed))
-                    .collect();
+                let parent_words = self.slab.coverage(run_id).to_words();
+                let child_words = self.slab.coverage(only).to_words();
                 let same_coverage = parent_words == child_words;
                 let subset = parent_words
                     .iter()
@@ -2156,7 +2177,7 @@ impl ChainIndex {
             arena_bytes: self.arena.used() as usize * size_of::<AtomicU64>(),
             arena_free_bytes: self.arena.free_words() * size_of::<AtomicU64>(),
             arena_chunk_bytes: self.arena.chunk_bytes(),
-            header_bytes: allocated * (size_of::<Run>() + self.words * size_of::<AtomicU64>()),
+            header_bytes: allocated * (size_of::<Run>() + size_of::<AtomicU64>()),
             slab_bytes: self.slab.chunk_bytes(),
             engine_conflicts: self.engine_conflicts.load(Ordering::Relaxed),
             cap_refusals: self.cap_refusals.load(Ordering::Relaxed),

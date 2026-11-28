@@ -19,12 +19,10 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::response::Response;
 use tracing::warn;
 use uuid::Uuid;
 
-use super::PipelineStage;
 pub(crate) use crate::routers::common::rate_limit_cell::{RateLimitCell, RateLimitOutcome};
 use crate::{
     middleware::TenantRequestMeta,
@@ -57,11 +55,11 @@ impl RateLimitReserveStage {
     pub fn new(manager: Option<Arc<RateLimitManager>>) -> Self {
         Self { manager }
     }
-}
 
-#[async_trait]
-impl PipelineStage for RateLimitReserveStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+    /// Called by the pipeline on the stage's own type, as the worker
+    /// selection's `execute` is: a `PipelineStage` impl would box the future
+    /// of every call, an allocation per request.
+    pub(crate) async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         let Some(manager) = &self.manager else {
             return Ok(());
         };
@@ -100,30 +98,8 @@ impl PipelineStage for RateLimitReserveStage {
             }
         }
     }
-
-    fn name(&self) -> &'static str {
-        "RateLimitReserve"
-    }
 }
 
 #[cfg(test)]
-mod iteration_charge_tests {
-    use super::*;
-    use crate::tenant::TenantKey;
-
-    /// Two iterations of one request reserve as the request's tenant under
-    /// charge ids of their own, distinct from each other and from the
-    /// request's.
-    #[test]
-    fn each_iteration_reserves_under_its_own_charge_id() {
-        let request = TenantRequestMeta::new(TenantKey::new("auth:tenant"));
-        let first = iteration_charge(&request);
-        let second = iteration_charge(&request);
-
-        assert_eq!(first.tenant_key, request.tenant_key);
-        assert_eq!(second.tenant_key, request.tenant_key);
-        assert_ne!(first.request_charge_id, request.request_charge_id);
-        assert_ne!(second.request_charge_id, request.request_charge_id);
-        assert_ne!(first.request_charge_id, second.request_charge_id);
-    }
-}
+#[path = "../../../../../tests/unit/routers/grpc/common/stages/rate_limit/iteration_charge_tests.rs"]
+mod iteration_charge_tests;

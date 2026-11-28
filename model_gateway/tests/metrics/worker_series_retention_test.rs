@@ -14,11 +14,15 @@
 use std::sync::Arc;
 
 use smg::{
-    observability::{metrics::Metrics, metrics_server::start_metrics_server},
-    worker::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
+    observability::metrics_server::start_metrics_server,
+    routers::{common::snapshot::WorkerRegistry, grpc::backend_client::BasicWorkerBuilder},
+};
+use smg_worker::{
+    identity::basic::{Worker, WorkerType},
+    metrics::writers::{Metrics, WorkerHandles},
 };
 
-use crate::common::test_app::scrape;
+use crate::{common::test_app::scrape, metrics::recorder};
 
 const URL: &str = "grpc://[fd00::1]:50051";
 
@@ -42,8 +46,8 @@ fn worker() -> Arc<dyn Worker> {
 
 #[tokio::test]
 async fn removed_worker_series_leave_the_scrape() {
-    let handle = crate::metrics::recorder();
-    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
+    let handle = recorder();
+    let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0, None)
         .await
         .expect("metrics server binds an ephemeral port");
     let registry = WorkerRegistry::new();
@@ -84,7 +88,7 @@ async fn removed_worker_series_leave_the_scrape() {
     // worker, as every path that can write for an address does; the store
     // keeps the address retired while any of them can.
     Metrics::set_worker_health(URL, true);
-    Metrics::record_worker_cb_outcome(URL, "failure");
+    Metrics::record_worker_cb_outcome(&WorkerHandles::new(URL), "failure");
     let body = scrape(addr).await;
     assert!(
         worker_lines(&body).is_empty(),
@@ -104,9 +108,8 @@ async fn removed_worker_series_leave_the_scrape() {
         "series missing after re-registration:\n{body}"
     );
     // The removed registration's count (closed -> open, 1) never returns.
-    // The fresh breaker publishes its transition counters at zero while it is
-    // built: once the removed instance is gone from every handle, the store
-    // has forgotten the address and those zeros stand, as for any new worker.
+    // The registration publishes the fresh breaker's transition counters at
+    // zero, as for any new worker.
     assert!(
         lines
             .iter()

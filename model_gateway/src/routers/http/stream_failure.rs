@@ -19,6 +19,8 @@ use std::{error::Error as _, sync::Arc};
 use axum::{http::StatusCode, response::Response};
 use bytes::Bytes;
 use serde_json::json;
+use smg_external_router::retry::{is_request_timeout, REQUEST_TIMEOUT_CODE};
+use smg_worker::identity::basic::Worker;
 use tracing::warn;
 
 use crate::{
@@ -27,27 +29,29 @@ use crate::{
         error_type_from_status, route_to_endpoint,
         stream_failure::{MESSAGES_API_ERROR_TYPE, STREAM_ERROR_TYPE},
     },
-    worker::Worker,
 };
 
 /// The route whose streams end with the Messages API's own error event.
 const MESSAGES_ROUTE: &str = "/v1/messages";
 
-/// Response extension: the successful head of a streamed response was
-/// recorded on the worker's circuit breaker before the relay task was
-/// spawned, so the caller does not record it again (a second success sample
-/// would count twice toward closing a half-open breaker).
+/// Response extension: the worker's circuit breaker takes its sample of a
+/// streamed response with a successful head from the relay (the head's
+/// success before the relay task is spawned where the breaker is not closed,
+/// the stream's one sample at its end where it is), so the caller does not
+/// record the head (a second success sample would count twice toward closing
+/// a half-open breaker, and a closed breaker's would erase the failures a
+/// cut counts into).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct HeadSuccessRecorded;
 
-/// Mark `response` as a streamed response whose successful head was recorded
-/// before its relay was spawned (see [`HeadSuccessRecorded`]).
+/// Mark `response` as a streamed response whose successful head its relay
+/// samples (see [`HeadSuccessRecorded`]).
 pub(crate) fn mark_head_success_recorded(response: &mut Response) {
     response.extensions_mut().insert(HeadSuccessRecorded);
 }
 
-/// Whether the successful head of `response` was recorded before its relay
-/// was spawned, so its caller must not record it again.
+/// Whether the successful head of `response` is its relay's to sample, so
+/// its caller must not record it.
 pub(crate) fn head_success_recorded(response: &Response) -> bool {
     response.extensions().get::<HeadSuccessRecorded>().is_some()
 }
@@ -60,6 +64,10 @@ pub(crate) fn head_success_recorded(response: &Response) -> bool {
 pub(crate) struct UpstreamCut {
     status: StatusCode,
     cause: String,
+    /// The code the event that ends an OpenAI-style stream names the cut
+    /// with, when the cut has one of its own: the request timeout's, the
+    /// code of the 504 the same request gets unary.
+    code: Option<&'static str>,
 }
 
 impl UpstreamCut {
@@ -73,7 +81,13 @@ impl UpstreamCut {
         Self {
             status,
             cause: cause(error),
+            code: is_request_timeout(error).then_some(REQUEST_TIMEOUT_CODE),
         }
+    }
+
+    /// The status the cut is accounted and answered under.
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
     }
 }
 
@@ -172,11 +186,13 @@ impl RelaySource {
     ///
     /// The breaker sample sits outside the request's attempt ledger on
     /// purpose: the relay task outlives the attempt that produced the head.
-    /// The shared relay (`routers::http::stream_relay`) records a
-    /// successful head before it spawns its task, for the regular router and
-    /// the PD router's decode side alike, so the cut is sampled after the
-    /// head's success and never erased by it. A request retried onto the same worker
-    /// after a failed head is charged for that head and for the cut.
+    /// The shared relay (`routers::http::stream_relay`) samples a closed
+    /// breaker once a stream, so the cut is that stream's one sample; on a
+    /// breaker that is not closed it records a successful head before it
+    /// spawns its task. Both hold for the regular router and the PD router's
+    /// decode side alike, so the cut is never erased by the head's success.
+    /// A request retried onto the same worker after a failed head is charged
+    /// for that head and for the cut.
     pub(crate) fn account(&self, cut: &UpstreamCut, bytes_relayed: u64) {
         let error_type = error_type_from_status(cut.status);
         let reason = error_reason_from_status(cut.status);
@@ -211,8 +227,9 @@ impl RelaySource {
     /// The SSE event that ends a response `cut` by the worker, in the shape
     /// of the route's API. An OpenAI-style stream (Chat Completions,
     /// Completions, generate, Responses) gets the error event the gRPC path
-    /// writes for a stream the worker failed, typed `stream_error`, then
-    /// `[DONE]`; a Messages stream gets the API's own `error` event, typed
+    /// writes for a stream the worker failed, typed `stream_error`, under the
+    /// request timeout's code when that is what cut the body, then `[DONE]`;
+    /// a Messages stream gets the API's own `error` event, typed
     /// `api_error` as the gRPC path types a worker's failure there, and no
     /// `[DONE]`, which the protocol does not have.
     pub(crate) fn error_event(&self, cut: &UpstreamCut) -> Bytes {
@@ -226,7 +243,11 @@ impl RelaySource {
             });
             Bytes::from(format!("event: error\ndata: {event}\n\n"))
         } else {
-            let event = json!({"error": {"message": message, "type": STREAM_ERROR_TYPE}});
+            let mut error = json!({"message": message, "type": STREAM_ERROR_TYPE});
+            if let Some(code) = cut.code {
+                error["code"] = json!(code);
+            }
+            let event = json!({"error": error});
             Bytes::from(format!("data: {event}\n\ndata: [DONE]\n\n"))
         }
     }
@@ -289,308 +310,5 @@ pub(crate) fn note_sent(tail: &mut SentTail, bytes: &[u8]) {
 }
 
 #[cfg(test)]
-mod tests {
-    use metrics_exporter_prometheus::PrometheusBuilder;
-    use openai_protocol::messages::MessageStreamEvent;
-    use serde_json::Value;
-
-    use super::*;
-    use crate::worker::{
-        circuit_breaker::CircuitBreakerConfig,
-        test_support::{no_health_check, RefusedAddress},
-        BasicWorkerBuilder,
-    };
-
-    const CAUSE: &str = "error decoding response body: error reading a body from connection: \
-                         connection reset";
-
-    /// A worker whose breaker opens on the first failure.
-    fn worker() -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new("http://engine-under-test:8000")
-                .circuit_breaker_config(CircuitBreakerConfig {
-                    failure_threshold: 1,
-                    ..Default::default()
-                })
-                .health_config(no_health_check())
-                .build(),
-        )
-    }
-
-    fn cut(status: StatusCode) -> UpstreamCut {
-        UpstreamCut {
-            status,
-            cause: CAUSE.to_string(),
-        }
-    }
-
-    /// The source of a response to `route`, read from a fresh worker.
-    fn source(route: &'static str) -> (RelaySource, Arc<dyn Worker>) {
-        let worker = worker();
-        (
-            RelaySource::new("relay-test", route, Arc::clone(&worker)),
-            worker,
-        )
-    }
-
-    /// `cut` ends a chat stream read from a fresh worker: the worker, and the
-    /// metrics as rendered.
-    fn account(cut: &UpstreamCut) -> (Arc<dyn Worker>, String) {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let (source, worker) = source("/v1/chat/completions");
-        metrics::with_local_recorder(&recorder, || source.account(cut, 839));
-        (worker, handle.render())
-    }
-
-    /// A call to a worker nobody listens at: the connect is refused, and the
-    /// error carries the worker's URL as reqwest attaches it.
-    async fn refused_call() -> (std::net::SocketAddr, reqwest::Error) {
-        let refused = RefusedAddress::reserve();
-        let addr = refused.addr();
-        let error = crate::server::http_client_builder()
-            .build()
-            .unwrap()
-            .get(format!("http://{addr}/v1/chat/completions"))
-            .send()
-            .await
-            .unwrap_err();
-        assert_eq!(error.url().map(|url| url.port()), Some(Some(addr.port())));
-        (addr, error)
-    }
-
-    /// The cause a client is told is the transport's reason and its chain, and
-    /// never the worker's address reqwest puts in the outer error: the same
-    /// words head a side's 502 and the error event that ends a cut stream.
-    #[tokio::test]
-    async fn the_cause_of_a_failed_call_names_the_reason_and_not_the_worker() {
-        let (addr, error) = refused_call().await;
-
-        let text = cause(&error);
-        assert!(text.starts_with("error sending request: "), "{text}");
-        assert!(!text.contains(&addr.to_string()), "{text}");
-        assert!(!text.contains("for url"), "{text}");
-        assert!(text.contains("onnect"), "the reason stays: {text}");
-
-        let (source, _worker) = source("/v1/chat/completions");
-        let event = source.error_event(&UpstreamCut::of(&error));
-        let event = std::str::from_utf8(&event).unwrap();
-        assert!(event.contains(&text), "{event}");
-        assert!(!event.contains(&addr.to_string()), "{event}");
-    }
-
-    /// The rendered sample line of `family` with all of `labels`, if any.
-    fn sample<'a>(rendered: &'a str, family: &str, labels: &[&str]) -> Option<&'a str> {
-        rendered.lines().find(|line| {
-            line.starts_with(&format!("{family}{{"))
-                && labels.iter().all(|label| line.contains(label))
-        })
-    }
-
-    #[test]
-    fn a_cut_after_a_successful_head_is_charged_to_the_worker_as_a_backend_error() {
-        let (worker, rendered) = account(&cut(StatusCode::BAD_GATEWAY));
-
-        assert!(
-            !worker.circuit_breaker_can_execute(),
-            "the worker's threshold-1 breaker samples the cut"
-        );
-        let worker_errors = sample(
-            &rendered,
-            "smg_worker_errors_total",
-            &[
-                "worker_type=\"regular\"",
-                "connection_mode=\"http\"",
-                "error_type=\"backend_error\"",
-            ],
-        )
-        .unwrap_or_else(|| panic!("a worker error is counted:\n{rendered}"));
-        assert!(worker_errors.ends_with(" 1"), "{worker_errors}");
-        let router_errors = sample(
-            &rendered,
-            "smg_router_request_errors_total",
-            &[
-                "router_type=\"http\"",
-                "backend_type=\"regular\"",
-                "connection_mode=\"http\"",
-                "model=\"relay-test\"",
-                "endpoint=\"chat\"",
-                "error_type=\"backend_error\"",
-                "reason=\"transport_disconnect\"",
-            ],
-        )
-        .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
-        assert!(router_errors.ends_with(" 1"), "{router_errors}");
-    }
-
-    #[test]
-    fn a_timeout_mid_body_counts_as_a_timeout() {
-        let (worker, rendered) = account(&cut(StatusCode::GATEWAY_TIMEOUT));
-
-        assert!(!worker.circuit_breaker_can_execute());
-        assert!(
-            sample(
-                &rendered,
-                "smg_worker_errors_total",
-                &["connection_mode=\"http\"", "error_type=\"timeout\""]
-            )
-            .is_some(),
-            "{rendered}"
-        );
-        assert!(
-            sample(
-                &rendered,
-                "smg_router_request_errors_total",
-                &[
-                    "router_type=\"http\"",
-                    "error_type=\"timeout\"",
-                    "reason=\"deadline\""
-                ]
-            )
-            .is_some(),
-            "{rendered}"
-        );
-    }
-
-    /// The decode side of a disaggregated pair is charged as the decode
-    /// worker's failure, under the disaggregated router's labels.
-    #[test]
-    fn a_cut_on_the_decode_side_is_counted_under_the_disaggregated_router_s_labels() {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let worker = worker();
-        let source =
-            RelaySource::decode_side("relay-test", "/v1/chat/completions", Arc::clone(&worker));
-
-        metrics::with_local_recorder(&recorder, || {
-            source.account(&cut(StatusCode::BAD_GATEWAY), 839);
-        });
-
-        let rendered = handle.render();
-        assert!(
-            !worker.circuit_breaker_can_execute(),
-            "the decode worker's threshold-1 breaker samples the cut"
-        );
-        let worker_errors = sample(
-            &rendered,
-            "smg_worker_errors_total",
-            &[
-                "worker_type=\"decode\"",
-                "connection_mode=\"http\"",
-                "error_type=\"backend_error\"",
-            ],
-        )
-        .unwrap_or_else(|| panic!("a decode worker error is counted:\n{rendered}"));
-        assert!(worker_errors.ends_with(" 1"), "{worker_errors}");
-        let router_errors = sample(
-            &rendered,
-            "smg_router_request_errors_total",
-            &[
-                "router_type=\"http\"",
-                "backend_type=\"pd\"",
-                "connection_mode=\"http\"",
-                "model=\"relay-test\"",
-                "endpoint=\"chat\"",
-                "error_type=\"backend_error\"",
-            ],
-        )
-        .unwrap_or_else(|| panic!("a disaggregated router error is counted:\n{rendered}"));
-        assert!(router_errors.ends_with(" 1"), "{router_errors}");
-        assert!(
-            sample(
-                &rendered,
-                "smg_worker_errors_total",
-                &["worker_type=\"regular\""]
-            )
-            .is_none(),
-            "nothing is charged to a regular worker:\n{rendered}"
-        );
-    }
-
-    #[test]
-    fn the_event_of_an_openai_style_stream_is_a_stream_error_followed_by_done() {
-        let (source, _worker) = source("/v1/chat/completions");
-
-        let event = source.error_event(&cut(StatusCode::BAD_GATEWAY));
-
-        let text = std::str::from_utf8(&event).unwrap();
-        let (error, done) = text.split_once("\n\n").unwrap();
-        let error: Value = serde_json::from_str(error.strip_prefix("data: ").unwrap()).unwrap();
-        assert_eq!(error["error"]["type"], STREAM_ERROR_TYPE);
-        assert_eq!(error["error"]["message"], format!("Stream error: {CAUSE}"));
-        assert_eq!(done, "data: [DONE]\n\n");
-    }
-
-    #[test]
-    fn the_event_of_a_messages_stream_is_the_api_s_error_event_without_done() {
-        let (source, _worker) = source("/v1/messages");
-
-        let event = source.error_event(&cut(StatusCode::BAD_GATEWAY));
-
-        let text = std::str::from_utf8(&event).unwrap();
-        let data = text
-            .strip_prefix("event: error\ndata: ")
-            .and_then(|rest| rest.strip_suffix("\n\n"))
-            .unwrap_or_else(|| panic!("one error event: {text:?}"));
-        match serde_json::from_str::<MessageStreamEvent>(data).unwrap() {
-            MessageStreamEvent::Error { error } => {
-                assert_eq!(error.error_type, MESSAGES_API_ERROR_TYPE);
-                assert_eq!(error.message, format!("Stream error: {CAUSE}"));
-            }
-            other => panic!("the protocol's error event, got {other:?}"),
-        }
-        assert!(!text.contains("[DONE]"), "{text:?}");
-    }
-
-    /// After a partial line the event opens a frame of its own; on a
-    /// boundary it is written as it is.
-    #[test]
-    fn the_event_that_ends_a_cut_opens_a_frame_after_a_partial_line() {
-        let (source, _worker) = source("/v1/chat/completions");
-        let cut = cut(StatusCode::BAD_GATEWAY);
-        let on_boundary = source.error_event_on_its_own_frame(&cut, b"}\n\n");
-        assert_eq!(on_boundary, source.error_event(&cut));
-        let after_partial = source.error_event_on_its_own_frame(&cut, b"\"con");
-        assert!(
-            after_partial.starts_with(b"\n\ndata: "),
-            "{after_partial:?}"
-        );
-        assert_eq!(&after_partial[2..], &source.error_event(&cut)[..]);
-    }
-
-    /// The boundary is read from the last bytes sent, across chunks.
-    #[test]
-    fn the_frame_boundary_is_read_from_the_last_bytes_sent() {
-        let mut tail = SentTail::default();
-        assert!(on_frame_boundary(tail.as_slice()), "nothing sent yet");
-        note_sent(&mut tail, b"data: {\"choices\":[]}\n\n");
-        assert!(on_frame_boundary(tail.as_slice()));
-        note_sent(&mut tail, b"data: {\"cho");
-        assert!(!on_frame_boundary(tail.as_slice()), "a frame cut mid-line");
-        note_sent(&mut tail, b"ices\":[]}\n");
-        assert!(
-            !on_frame_boundary(tail.as_slice()),
-            "one newline is not a blank line"
-        );
-        note_sent(&mut tail, b"\n");
-        assert!(
-            on_frame_boundary(tail.as_slice()),
-            "the blank line split across two chunks"
-        );
-        note_sent(&mut tail, b"event: x\r\ndata: 1\r\n\r\n");
-        assert!(on_frame_boundary(tail.as_slice()));
-        assert_eq!(
-            tail.as_slice(),
-            b"\r\n\r\n",
-            "the last four bytes, oldest first"
-        );
-        note_sent(&mut tail, b"ab");
-        assert_eq!(
-            tail.as_slice(),
-            b"\r\nab",
-            "two new bytes keep two old ones"
-        );
-        note_sent(&mut tail, b"");
-        assert_eq!(tail.as_slice(), b"\r\nab", "an empty chunk changes nothing");
-    }
-}
+#[path = "../../../tests/unit/routers/http/stream_failure/tests.rs"]
+mod tests;

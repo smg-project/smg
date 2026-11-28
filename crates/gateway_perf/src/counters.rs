@@ -34,9 +34,13 @@ fn clk_tck() -> f64 {
     })
 }
 
-/// utime + stime of the whole process (every thread), in seconds.
-pub fn proc_cpu_seconds(pid: u32) -> Result<f64> {
-    let text = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+/// Where the kernel publishes a process's times and memory; a test reads a directory of
+/// its own in its place.
+const PROC: &str = "/proc";
+
+/// utime + stime of the whole process (every thread), in seconds, from `<proc>/<pid>/stat`.
+fn proc_cpu_seconds(proc: &Path, pid: u32) -> Result<f64> {
+    let text = fs::read_to_string(proc.join(pid.to_string()).join("stat"))?;
     cpu_seconds_of_stat(&text, clk_tck())
 }
 
@@ -59,9 +63,9 @@ fn cpu_seconds_of_stat(text: &str, tck: f64) -> Result<f64> {
     Ok((utime + stime) / tck)
 }
 
-/// VmRSS, VmHWM, RssAnon, RssFile and Threads of `/proc/<pid>/status` (kB, a count).
-pub fn proc_status(pid: u32) -> Result<BTreeMap<String, u64>> {
-    let text = fs::read_to_string(format!("/proc/{pid}/status"))?;
+/// VmRSS, VmHWM, RssAnon, RssFile and Threads of `<proc>/<pid>/status` (kB, a count).
+fn proc_status(proc: &Path, pid: u32) -> Result<BTreeMap<String, u64>> {
+    let text = fs::read_to_string(proc.join(pid.to_string()).join("status"))?;
     Ok(status_fields(&text))
 }
 
@@ -112,15 +116,40 @@ pub struct Snapshot {
     pub loadavg: f64,
 }
 
+/// How long a settled snapshot waits between its scrape and its memory read. The scrape
+/// is the gateway's first allocating work after an idle second, and the allocator's purge
+/// pass it starts steps the anonymous set down for up to half a second. Read four times a
+/// second beside the prefill-decode chat cell, the set stepped down within half a second
+/// of the scrape in every run and stayed level from there to the process's end.
+pub const STATUS_SETTLE: Duration = Duration::from_secs(1);
+
+/// The gateway's state now: the scrape, then the clock, the CPU time and the memory.
 pub fn snapshot(bed: &Bed) -> Result<Snapshot> {
+    snapshot_with(Path::new(PROC), bed, || ())
+}
+
+/// A [`snapshot`] for the read after a window: the memory is read [`STATUS_SETTLE`]
+/// after the scrape, once the purge the scrape started has ended. The clock and the CPU
+/// time are taken before the wait, where [`snapshot`] takes them, so the wait is in
+/// neither.
+pub fn settled_snapshot(bed: &Bed) -> Result<Snapshot> {
+    snapshot_with(Path::new(PROC), bed, || thread::sleep(STATUS_SETTLE))
+}
+
+/// The order every snapshot keeps: the scrape, the clock and the CPU time, `settle`, the
+/// memory.
+fn snapshot_with(proc: &Path, bed: &Bed, settle: impl FnOnce()) -> Result<Snapshot> {
     let pid = bed.pid()?;
     let gauges = http::get(bed.metrics_url()?, Duration::from_secs(10))
         .map(|text| metrics_gauges(&text))
         .unwrap_or_default();
+    let t = now_seconds();
+    let cpu_s = proc_cpu_seconds(proc, pid)?;
+    settle();
     Ok(Snapshot {
-        t: now_seconds(),
-        cpu_s: proc_cpu_seconds(pid)?,
-        status: proc_status(pid)?,
+        t,
+        cpu_s,
+        status: proc_status(proc, pid)?,
         gauges,
         loadavg: loadavg(),
     })
@@ -299,62 +328,5 @@ pub fn parse_jemalloc(log: &str) -> Value {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn perf_csv_skips_unsupported_and_comments() {
-        let text = "# started\n123,,instructions:u,1000,100.00,,\n<not supported>,,cycles,0,100.00,,\n4.5,msec,task-clock,1,100.00,,\n";
-        let parsed = parse_perf_csv(text);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed["instructions:u"], 123.0);
-        assert_eq!(parsed["task-clock"], 4.5);
-    }
-
-    const JEMALLOC_LOG: &str = concat!(
-        "gateway lines\n",
-        r#"{"jemalloc": {"stats": {"allocated": 10, "resident": 20},"#,
-        r#" "arenas": {"bin": [{"size": 8}, {"size": 16}], "lextent": [{"size": 16384}]},"#,
-        r#" "stats.arenas": {"merged": {"small": {"nrequests": 30, "nmalloc": 20}, "large": {"nrequests": 2, "nmalloc": 2},"#,
-        r#" "bins": [{"nrequests": 10}, {"nrequests": 20}], "lextents": [{"nrequests": 2}]}}}}"#,
-        "\ntrailer\n"
-    );
-
-    #[test]
-    fn jemalloc_exit_statistics_count_requests_and_bytes_by_size_class() {
-        let je = parse_jemalloc(JEMALLOC_LOG);
-        assert_eq!(je["nrequests"], 32);
-        assert_eq!(je["small_nrequests"], 30);
-        assert_eq!(je["large_nrequests"], 2);
-        assert_eq!(je["bytes_requested"], 10 * 8 + 20 * 16 + 2 * 16384);
-        assert_eq!(je["nmalloc"], 22);
-        assert_eq!(je["allocated"], 10);
-        assert!(parse_jemalloc("no statistics here").get("error").is_some());
-        assert!(parse_jemalloc(r#"{"jemalloc": {broken"#)
-            .get("error")
-            .is_some());
-    }
-
-    #[test]
-    fn proc_stat_and_status_lines_are_read() {
-        let stat = "123 (smg worker) S 1 2 3 4 5 6 7 8 9 10 250 50 0 0 20 0 9 0 100 1 2 3\n";
-        assert_eq!(cpu_seconds_of_stat(stat, 100.0).unwrap(), 3.0);
-        let status =
-            "Name:\tsmg\nVmRSS:\t   61440 kB\nVmHWM:\t   70000 kB\nThreads:\t9\nOther:\t1\n";
-        let fields = status_fields(status);
-        assert_eq!(fields["VmRSS"], 61440);
-        assert_eq!(fields["VmHWM"], 70000);
-        assert_eq!(fields["Threads"], 9);
-        assert!(!fields.contains_key("Other"));
-        assert!(clk_tck() > 0.0);
-    }
-
-    #[test]
-    fn gauges_are_read_with_or_without_labels() {
-        let text = "# HELP x\nsmg_allocator_allocated_bytes 19100000\nsmg_allocator_resident_bytes{a=\"b\"} 2e7\nother 1\n";
-        let gauges = metrics_gauges(text);
-        assert_eq!(gauges["smg_allocator_allocated_bytes"], 19_100_000.0);
-        assert_eq!(gauges["smg_allocator_resident_bytes"], 2e7);
-        assert_eq!(gauges.len(), 2);
-    }
-}
+#[path = "../tests/unit/counters/tests.rs"]
+mod tests;

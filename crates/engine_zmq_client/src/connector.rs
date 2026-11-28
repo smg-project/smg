@@ -517,7 +517,7 @@ struct InputFrame {
     payload: Bytes,
     aux_frames: Vec<Bytes>,
     /// Where the caller waits for the write's result; `None` for a frame no
-    /// caller waits on (the dispatcher's aborts and wakes).
+    /// caller waits on (owned requests, dispatcher aborts and wakes).
     done: Option<oneshot::Sender<Result<()>>>,
     /// The payload bytes the queue bound counts while the frame waits:
     /// `Some` for an add-request, `None` for a control frame.
@@ -536,7 +536,7 @@ impl RetainedInput {
     /// Reserve atomically, rejecting both budget exhaustion and integer overflow.
     fn reserve(total: &Arc<AtomicUsize>, bytes: usize, limit: usize) -> Result<Self> {
         total
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 used.checked_add(bytes).filter(|next| *next <= limit)
             })
             .map_err(|retained_bytes| Error::EngineInputBytesFull {
@@ -650,9 +650,9 @@ struct ClientInner<P: EngineProtocol> {
     /// frame, for one log line when it does.
     refused: AtomicUsize,
     engines: Vec<ConnectedEngine>,
-    /// What `P` read off the engines' handshakes ([`connection_layout`]):
-    /// handed to every request it frames and every output it decodes.
-    layout: P::Layout,
+    /// What `P` read off each engine's handshake, in the order of `engines`:
+    /// an add-request is framed with the layout of the engine it goes to.
+    engine_layouts: Vec<P::Layout>,
     registry: Mutex<RequestRegistry<P::Output>>,
     routing: Mutex<RoutingState>,
     /// Rotates the selection scan start so all-zero ties (cold start, fresh
@@ -722,14 +722,16 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// [`Self::release`]. (vLLM additionally bumps its report cache because
     /// multiple client processes share its engines; this connector is the
     /// sole client of its group, so the in-flight floor already covers it.)
-    fn select_engine(&self, data_parallel_rank: Option<u32>, request_id: &str) -> Result<EngineId> {
+    ///
+    /// Returns the engine's position in `engines`, which is also its place in
+    /// `engine_layouts`.
+    fn select_engine(&self, data_parallel_rank: Option<u32>, request_id: &str) -> Result<usize> {
         match data_parallel_rank {
             Some(rank) => {
-                let engine_id = self
+                let position = self
                     .engines
                     .iter()
-                    .find(|engine| engine.engine_id.engine_index() == Some(rank))
-                    .map(|engine| engine.engine_id.clone())
+                    .position(|engine| engine.engine_id.engine_index() == Some(rank))
                     .ok_or(Error::InvalidDataParallelRank {
                         rank,
                         num_engines: self.engines.len() as u32,
@@ -740,7 +742,7 @@ impl<P: EngineProtocol> ClientInner<P> {
                     .entry(rank)
                     .or_default()
                     .insert(request_id.to_string());
-                Ok(engine_id)
+                Ok(position)
             }
             None => {
                 if self.engines.is_empty() {
@@ -779,7 +781,7 @@ impl<P: EngineProtocol> ClientInner<P> {
                         .or_default()
                         .insert(request_id.to_string());
                 }
-                Ok(engine.engine_id.clone())
+                Ok(position)
             }
         }
     }
@@ -820,6 +822,8 @@ impl<P: EngineProtocol> ClientInner<P> {
             if let Some(load) = routing.load.get_mut(&engine_index) {
                 load.num_running = 0;
                 load.num_waiting = 0;
+                load.num_resident_tokens = load.num_resident_tokens.map(|_| 0);
+                load.num_waiting_uncached_tokens = load.num_waiting_uncached_tokens.map(|_| 0);
             }
         }
     }
@@ -876,18 +880,29 @@ impl<P: EngineProtocol> ClientInner<P> {
             .await
     }
 
-    /// [`Self::send_to_engine`] for an add-request: admitted against the
-    /// queue bound first (see [`Self::admit_add`]) and counted while it waits.
+    /// Admit an Add and transfer the frame to the writer. A managed owner can
+    /// take the output stream as soon as the frame is queued.
     async fn send_add_to_engine(
         &self,
         engine_id: &EngineId,
         payload: Vec<u8>,
         aux_frames: Vec<Bytes>,
+        owned_queue: bool,
     ) -> Result<()> {
         let bytes = aux_frames.iter().fold(payload.len(), |total, frame| {
             total.saturating_add(frame.len())
         });
         self.admit_add(bytes)?;
+        if owned_queue {
+            return self.queue_frame(
+                engine_id,
+                P::add_frame(),
+                payload,
+                aux_frames,
+                None,
+                Some(bytes),
+            );
+        }
         self.send_frame(engine_id, P::add_frame(), payload, aux_frames, Some(bytes))
             .await
     }
@@ -1054,28 +1069,37 @@ impl<P: EngineProtocol> ClientInner<P> {
                 done,
                 counted,
             })
-            .map_err(|_writer_gone| Error::ClientClosed {
-                message: "the engine input writer ended".to_string(),
+            .map_err(|_writer_gone| {
+                // A failed enqueue was never popped by the writer. Return its
+                // waiting charge here; RetainedInput returns payload bytes.
+                if let Some(bytes) = counted {
+                    self.waiting_adds.fetch_sub(1, Ordering::AcqRel);
+                    self.waiting_add_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                }
+                Error::ClientClosed {
+                    message: "the engine input writer ended".to_string(),
+                }
             })
     }
 
-    /// Tell every rank to start `wave`. Does nothing for a protocol without a
-    /// wave protocol.
+    /// Queue a START_DP_WAVE for `wave` to every rank, returning where each
+    /// write's result arrives. Does nothing for a protocol without a wave
+    /// protocol.
     ///
     /// No rank is excluded, not even the one already holding the request: a
     /// rank that skips an update keeps a lower `current_wave` than its peers,
     /// and the group's wave numbers must stay identical for
     /// [`Self::wake_group`]'s ordering argument to hold.
-    async fn broadcast_start_wave(&self, wave: u64) -> Result<()> {
+    ///
+    /// Every rank's frame is queued before any is waited for: a window that
+    /// runs out (a frame is blocked ahead in the queue) then never leaves the
+    /// group half woken; the wake reaches every rank when the engine reads
+    /// again.
+    fn queue_start_wave_writes(&self, wave: u64) -> Result<Vec<oneshot::Receiver<Result<()>>>> {
         let Some((frame, payload)) = P::encode_start_wave(wave)? else {
-            return Ok(());
+            return Ok(Vec::new());
         };
-        // Every rank's frame is queued before any is waited for: a window that
-        // runs out (a frame is blocked ahead in the queue) then never leaves
-        // the group half woken; the wake reaches every rank when the engine
-        // reads again.
-        let pending = self
-            .engines
+        self.engines
             .iter()
             .map(|engine| {
                 self.queue_write(
@@ -1086,13 +1110,12 @@ impl<P: EngineProtocol> ClientInner<P> {
                     None,
                 )
             })
-            .collect::<Result<Vec<_>>>()?;
-        self.await_writes(pending).await
+            .collect()
     }
 
-    /// [`Self::broadcast_start_wave`] without waiting for the engines to
-    /// accept the frames: the dispatcher's wake, which must keep routing the
-    /// output of every rank while a frame ahead in the queue is blocked.
+    /// [`Self::queue_start_wave_writes`] without a result to wait for: the
+    /// dispatcher's wake, which must keep routing the output of every rank
+    /// while a frame ahead in the queue is blocked.
     fn queue_start_wave(&self, wave: u64) -> Result<()> {
         let Some((frame, payload)) = P::encode_start_wave(wave)? else {
             return Ok(());
@@ -1120,9 +1143,10 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// The wake is UNCONDITIONAL for a lockstep group. Gating it on the
     /// tracked `running` flag raced the drain: between the ranks agreeing to
     /// park and this client processing their `wave_complete`, a submit would
-    /// see a stale "running" state, skip the wake, and — without a
-    /// coordinator, a parked engine does not self-wake on ADD — strand the
-    /// request until the silence watchdog killed the group.
+    /// see a stale "running" state and skip the wake. Without a coordinator
+    /// nothing else wakes the holder's peers: the holder steps on its own
+    /// request and blocks alone in the all-reduce, stranding the request
+    /// until the silence watchdog killed the group.
     ///
     /// The wave number is a logical clock this client owns, bumped on every
     /// wake, and an engine only obeys a wave at or above its own. Bumping is
@@ -1134,19 +1158,36 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// engine. Bumping keeps us ahead: every rank sits at the last number we
     /// broadcast plus at most one self-increment (a second needs another wave,
     /// which needs another wake), so `last + 1` is never stale.
+    ///
+    /// Bumping alone does not cover a wake that lands on SOME ranks before the
+    /// park and on others after it: the early readers adopt it while still
+    /// running and then park past it, the late readers start the wave without
+    /// them. [`Self::observe_wave`] closes that hole by re-waking when the
+    /// group reports a park while a prompt it was handed is still unanswered
+    /// ([`RequestRegistry::take_rewake`]).
+    ///
+    /// The wake is numbered and queued under the clock's lock
+    /// ([`Self::queue_next_wave`]), so every rank reads the wakes in
+    /// numbering order: a re-wake numbered after this one can never overtake
+    /// it in a rank's input. Only the wait for the engines to accept the
+    /// frames happens outside it.
     async fn wake_group(&self) -> Result<()> {
-        let Some(wave) = self.next_wave() else {
+        let Some(pending) = self.queue_next_wave(|wave| self.queue_start_wave_writes(wave)) else {
             return Ok(());
         };
-        self.broadcast_start_wave(wave).await
+        self.await_writes(pending?).await
     }
 
-    /// Bump the group's wave clock for a wake; `None` for independent ranks.
-    fn next_wave(&self) -> Option<u64> {
+    /// Bump the group's wave clock for a wake and hand the new number to
+    /// `queue`, which queues the wake, all under the clock's lock: wakes
+    /// reach the input queue in the order they are numbered. `queue` only
+    /// queues frames (no lock of its own, no wait). `None` for independent
+    /// ranks.
+    fn queue_next_wave<T>(&self, queue: impl FnOnce(u64) -> Result<T>) -> Option<Result<T>> {
         let state = self.wave.as_ref()?;
         let mut current = state.lock();
         *current = current.saturating_add(1);
-        Some(*current)
+        Some(queue(*current))
     }
 
     /// Fold a wave notification from an engine into the group's clock. Never
@@ -1215,10 +1256,9 @@ impl<P: EngineProtocol> ClientInner<P> {
     /// keeps flowing), and the wake reaches the whole group when the engine
     /// reads again. `wave` and `why` name the notification it answers.
     fn queue_wake(&self, wave: u64, why: &str) {
-        let queued = match self.next_wave() {
-            Some(next) => self.queue_start_wave(next),
-            None => Ok(()),
-        };
+        let queued = self
+            .queue_next_wave(|next| self.queue_start_wave(next))
+            .unwrap_or(Ok(()));
         if let Err(error) = queued {
             warn!(%error, wave, "failed to queue the wake for {why}");
         }
@@ -1240,29 +1280,14 @@ impl<P: EngineProtocol> ClientInner<P> {
     }
 }
 
-/// The layout of a connection: what its engines declared for the optional
-/// output columns `P` knows and for its request decoder. The ranks of one
-/// connection run one engine build and declare one layout; a group that
-/// disagrees is read at the default layout (none of the optional columns,
-/// every tensor inline) rather than a column at the wrong position on some
-/// rank, and says so once. Every rank's declaration is logged with its id at
-/// the handshake: on a running connection that is the one place that tells
-/// which form the wire takes, and which rank fell behind when they disagree.
-fn connection_layout<P: EngineProtocol>(engines: &[ConnectedEngine]) -> P::Layout {
-    // Every rank is read, and logged, before the decision: the ranks behind a
-    // disagreeing one are the ones that tell which rank fell behind.
-    let layouts: Vec<P::Layout> = engines
-        .iter()
-        .map(|engine| {
-            let layout = P::read_layout(&engine.ready_response);
-            info!(
-                engine_id = ?engine.engine_id,
-                ?layout,
-                "engine's wire layout declared at the handshake"
-            );
-            layout
-        })
-        .collect();
+/// The layout a connection's outputs are decoded with, of the `layouts` its
+/// engines declared: what they declared for the optional output columns `P`
+/// knows. The ranks of one connection run one engine build and declare one
+/// layout; a group that disagrees is read at the default layout (none of the
+/// optional columns) rather than a column at the wrong position on some
+/// rank, and says so once. Its requests need no such agreement: each is
+/// framed with the layout of the engine it goes to.
+fn connection_layout<P: EngineProtocol>(layouts: &[P::Layout]) -> P::Layout {
     let Some(first) = layouts.first() else {
         return P::Layout::default();
     };
@@ -1270,8 +1295,8 @@ fn connection_layout<P: EngineProtocol>(engines: &[ConnectedEngine]) -> P::Layou
         first.clone()
     } else {
         warn!(
-            "the engines of this connection declare different layouts; the optional output \
-             columns are not read and every tensor is sent inline"
+            "the engines of this connection declare different layouts: each is sent its \
+             requests in the form it declared, and the optional output columns are not read"
         );
         P::Layout::default()
     }
@@ -1307,7 +1332,22 @@ impl<P: EngineProtocol> Client<P> {
         let lockstep = engines
             .iter()
             .any(|engine| engine.ready_response.data_parallel_size > 1);
-        let layout = connection_layout::<P>(&engines);
+        // Every rank's declaration is logged with its id at the handshake: on
+        // a running connection that is the one place that tells which form
+        // the wire takes, and which rank fell behind when they disagree.
+        let engine_layouts: Vec<P::Layout> = engines
+            .iter()
+            .map(|engine| {
+                let layout = P::read_layout(&engine.ready_response);
+                info!(
+                    engine_id = ?engine.engine_id,
+                    ?layout,
+                    "engine's wire layout declared at the handshake"
+                );
+                layout
+            })
+            .collect();
+        let layout = connection_layout::<P>(&engine_layouts);
 
         let (abort_tx, abort_rx) = mpsc::unbounded_channel();
         let (input_tx, input_rx) = mpsc::unbounded_channel();
@@ -1327,7 +1367,7 @@ impl<P: EngineProtocol> Client<P> {
             writing_since: Mutex::new(None),
             refused: AtomicUsize::new(0),
             engines,
-            layout,
+            engine_layouts,
             registry: Mutex::new(RequestRegistry::default()),
             routing: Mutex::new(RoutingState::default()),
             scan_start: AtomicUsize::new(0),
@@ -1455,11 +1495,7 @@ impl<P: EngineProtocol> Client<P> {
             clippy::disallowed_methods,
             reason = "background tasks are aborted on client drop"
         )]
-        let output_task = tokio::spawn(run_output_loop::<P>(
-            output_socket,
-            out_tx,
-            inner.layout.clone(),
-        ));
+        let output_task = tokio::spawn(run_output_loop::<P>(output_socket, out_tx, layout));
         #[expect(
             clippy::disallowed_methods,
             reason = "background tasks are aborted on client drop"
@@ -1689,6 +1725,19 @@ impl<P: EngineProtocol> Client<P> {
         request: P::Request,
         extra_aux_frames: Vec<Bytes>,
     ) -> Result<RequestStream<P>> {
+        self.submit_inner(request, extra_aux_frames, false).await
+    }
+
+    /// Ordinary submission waits for socket admission. A managed owner instead
+    /// takes the queued frame and its output registration together, without an
+    /// await between enqueue and handoff: a send window cannot roll back native
+    /// D work before P has finished transferring KV.
+    async fn submit_inner(
+        &self,
+        request: P::Request,
+        extra_aux_frames: Vec<Bytes>,
+        owned_queue: bool,
+    ) -> Result<RequestStream<P>> {
         P::validate(&request)?;
         let request_id = P::request_id(&request).to_string();
         // Register before selecting: registration is the admission gate (it
@@ -1714,11 +1763,11 @@ impl<P: EngineProtocol> Client<P> {
 
         // Selection reserves the engine's in-flight slot; every failure path
         // from here to a successful hand-off must release it.
-        let engine_id = match self
+        let position = match self
             .inner
             .select_engine(P::data_parallel_rank(&request), &request_id)
         {
-            Ok(engine_id) => engine_id,
+            Ok(position) => position,
             Err(error) => {
                 self.inner.registry.lock().remove_all([request_id.as_str()]);
                 return Err(error);
@@ -1731,11 +1780,15 @@ impl<P: EngineProtocol> Client<P> {
         // while the frame waits for the engine.
         let mut guard = SubmitGuard {
             inner: &self.inner,
-            engine_id,
+            engine_id: self.inner.engines[position].engine_id.clone(),
             request_id,
             armed: true,
         };
-        let (payload, mut aux_frames) = match P::encode_add(&request, &self.inner.layout) {
+        // The ranks of a group that declare different layouts are each sent
+        // the form their own handshake declared: one sent its peer's may not
+        // decode it.
+        let layout = &self.inner.engine_layouts[position];
+        let (payload, mut aux_frames) = match P::encode_add(&request, layout) {
             Ok(encoded) => encoded,
             Err(error) => {
                 guard.take_back(false);
@@ -1745,7 +1798,7 @@ impl<P: EngineProtocol> Client<P> {
         aux_frames.extend(extra_aux_frames);
         if let Err(error) = self
             .inner
-            .send_add_to_engine(&guard.engine_id, payload, aux_frames)
+            .send_add_to_engine(&guard.engine_id, payload, aux_frames, owned_queue)
             .await
         {
             // A frame the engine has not accepted is still queued for it: the
@@ -1753,22 +1806,21 @@ impl<P: EngineProtocol> Client<P> {
             // arrival instead of serving it for nobody. A frame refused at the
             // queue's bound, or by the socket, never reached the engine, so
             // nothing is there to abort.
-            guard.take_back(matches!(error, Error::EngineInputBlocked { .. }));
+            guard.take_back(!owned_queue && matches!(error, Error::EngineInputBlocked { .. }));
             return Err(error);
         }
-        // The engine has the prompt: its prefill is work in hand from here,
-        // whatever becomes of the submit (a request taken back from the engine
-        // keeps its allowance like any withdrawn prompt).
+        // Charge an accepted or owned queued prompt to the silence allowance.
         self.inner.registry.lock().handed(&guard.request_id);
 
-        // The rank now holds the request; its peers must be awake for it to
-        // step. Waking after the send keeps the group parked (and so unable to
-        // report another drained wave) for the whole window.
-        if let Err(error) = self.inner.wake_group().await {
-            // The request can never make progress with its peers asleep, so
-            // take it back rather than leaving it stranded on the engine.
-            guard.take_back(true);
-            return Err(error);
+        // SGLang has independent ranks. Ordinary submits still wake peers only
+        // after the engine accepts the frame.
+        if !owned_queue {
+            if let Err(error) = self.inner.wake_group().await {
+                // The request can never make progress with its peers asleep, so
+                // take it back rather than leaving it stranded on the engine.
+                guard.take_back(true);
+                return Err(error);
+            }
         }
 
         let (engine_id, request_id) = guard.complete();
@@ -1828,6 +1880,26 @@ impl<P: EngineProtocol> Client<P> {
         self.inner
             .send_frame(engine_id, request_type, payload, aux_frames, Some(bytes))
             .await
+    }
+}
+
+impl Client<SglangProtocol> {
+    /// Transfer a queued Add and its output registration to a native resource
+    /// owner. Writer failure reaches that stream; it never manufactures native
+    /// completion. Only callers that retain it until safe termination may use
+    /// this path. Legacy submit keeps its original send-window rollback.
+    pub async fn submit_owned(
+        &self,
+        request: <SglangProtocol as EngineProtocol>::Request,
+    ) -> Result<RequestStream<SglangProtocol>> {
+        self.submit_inner(request, Vec::new(), true).await
+    }
+
+    /// Queue cancellation behind Add without retiring its terminal observer.
+    /// Controls bypass Add admission but retain the transport's FIFO and memory
+    /// budget. A successful enqueue is not a native release acknowledgement.
+    pub fn abort_retaining_output(&self, engine_id: &EngineId, request_id: &str) -> Result<()> {
+        self.inner.queue_abort(engine_id, request_id)
     }
 }
 
@@ -2330,7 +2402,7 @@ async fn run_input_writer<P: EngineProtocol>(
             }
             None => {
                 if let Err(error) = result {
-                    warn!(%error, "failed to write a queued abort or wake");
+                    warn!(%error, "failed to write an owned request or queued control");
                     if matches!(error, Error::EngineCoreDead | Error::Transport(_)) {
                         // The socket to the engine is gone, and with it the way
                         // to stop the requests it holds: fail what is in flight,

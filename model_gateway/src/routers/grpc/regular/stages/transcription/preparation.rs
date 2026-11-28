@@ -11,7 +11,7 @@ use openai_protocol::{
     common::{ContentPart, InputAudio},
     transcription::{AudioFile, TranscriptionRequest},
 };
-use tracing::error;
+use tracing::warn;
 
 use super::{audio_format, parse_response_format, resolve_family, supported_families};
 use crate::routers::{
@@ -20,6 +20,7 @@ use crate::routers::{
         common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext},
         regular::stages::chat::prepare_chat_like,
+        utils,
     },
 };
 
@@ -123,7 +124,7 @@ fn build_chat_request(
     messages.push(ChatMessage::User {
         content: MessageContent::Parts(vec![ContentPart::InputAudio {
             input_audio: InputAudio {
-                data: BASE64_STANDARD.encode(&audio.bytes),
+                data: BASE64_STANDARD.encode(&audio.bytes).into(),
                 format: audio_format(audio),
             },
         }]),
@@ -134,11 +135,11 @@ fn build_chat_request(
     let prefill = family
         .assistant_prefill(body.language.as_deref())
         .map_err(|unsupported| {
-            error!(function = "TranscriptionPreparation", language = %unsupported.0, "unsupported transcription language");
-            error::bad_request(
+            warn!(function = "TranscriptionPreparation", language = %unsupported.0, "unsupported transcription language");
+            utils::reported(error::bad_request(
                 "unsupported_transcription_language",
                 format!("{} does not support language '{}'", family.name(), unsupported.0),
-            )
+            ))
         })?;
     let continue_final_message = prefill.is_some();
     if let Some(prefill) = prefill {
@@ -169,106 +170,5 @@ fn build_chat_request(
 }
 
 #[cfg(test)]
-mod tests {
-    use axum::http::StatusCode;
-    use bytes::Bytes;
-    use llm_multimodal::registry::{
-        qwen3_asr::transcription::MAX_PROMPT_BYTES, transcription::FAMILIES,
-    };
-
-    use super::*;
-
-    fn transcription_request() -> TranscriptionRequest {
-        TranscriptionRequest {
-            model: "Qwen/Qwen3-ASR-1.7B".to_string(),
-            ..Default::default()
-        }
-    }
-
-    fn wav_file() -> AudioFile {
-        AudioFile {
-            bytes: Bytes::from_static(b"RIFFtest"),
-            file_name: "sample.wav".to_string(),
-            content_type: Some("audio/wav".to_string()),
-        }
-    }
-
-    fn family() -> &'static dyn TranscriptionFamily {
-        FAMILIES[0]
-    }
-
-    #[test]
-    fn builds_audio_chat_request_with_language_continuation() {
-        let mut body = transcription_request();
-        body.prompt = Some("domain vocabulary".to_string());
-        body.temperature = Some(0.2);
-        body.language = Some("en".to_string());
-
-        let chat = build_chat_request(&body, &wav_file(), family()).unwrap();
-
-        assert_eq!(chat.model, body.model);
-        assert_eq!(chat.temperature, Some(0.2));
-        assert!(chat.continue_final_message);
-        assert_eq!(chat.messages.len(), 3);
-        match &chat.messages[0] {
-            ChatMessage::System {
-                content: MessageContent::Text(text),
-                ..
-            } => assert_eq!(text, "domain vocabulary"),
-            other => panic!("expected system prompt, got {other:?}"),
-        }
-        match &chat.messages[1] {
-            ChatMessage::User {
-                content: MessageContent::Parts(parts),
-                ..
-            } => match &parts[0] {
-                ContentPart::InputAudio { input_audio } => {
-                    assert_eq!(input_audio.data, "UklGRnRlc3Q=");
-                    assert_eq!(input_audio.format, "wav");
-                }
-                other => panic!("expected audio content part, got {other:?}"),
-            },
-            other => panic!("expected user message, got {other:?}"),
-        }
-        match &chat.messages[2] {
-            ChatMessage::Assistant {
-                content: Some(MessageContent::Text(content)),
-                ..
-            } => assert_eq!(content, "language English<asr_text>"),
-            other => panic!("expected assistant continuation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn transcription_chat_defaults_to_greedy_whole_file_decoding() {
-        let chat = build_chat_request(&transcription_request(), &wav_file(), family()).unwrap();
-
-        assert_eq!(chat.temperature, Some(0.0));
-        assert!(!chat.continue_final_message);
-        assert!(!chat.stream);
-        assert_eq!(chat.n, Some(1));
-        // No prompt and no language: just the audio user turn.
-        assert_eq!(chat.messages.len(), 1);
-    }
-
-    #[test]
-    fn maps_family_validation_errors_to_gateway_codes() {
-        let mut body = transcription_request();
-        body.prompt = Some("a".repeat(MAX_PROMPT_BYTES + 1));
-        let response = build_chat_request(&body, &wav_file(), family()).unwrap_err();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            error::extract_error_code_from_response(&response),
-            "asr_prompt_too_long"
-        );
-
-        let mut body = transcription_request();
-        body.language = Some("klingon".to_string());
-        let response = build_chat_request(&body, &wav_file(), family()).unwrap_err();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            error::extract_error_code_from_response(&response),
-            "unsupported_transcription_language"
-        );
-    }
-}
+#[path = "../../../../../../tests/unit/routers/grpc/regular/stages/transcription/preparation/tests.rs"]
+mod tests;

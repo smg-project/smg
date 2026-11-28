@@ -15,9 +15,10 @@ wrapper state the calls sit in, and the thought's close the row from the reasoni
 where the thought opened; the request's tools give each call its name and schema. What the syntax
 inside the markers constrains comes from the call syntax: a JSON object around each tool's schema
 for the JSON family; the engines' `glm_xml` style of a schema for keyed arguments in the compact
-spelling, and the table's own tags written one pair per property for Ling's newlines and Hy4's
-suffixed tags (the `keyed` module); `<function=` and `<parameter=` tags, one per property, for Qwen
-3.5's and Seed-OSS's tagged syntax (the `tagged` module); a tag grammar per parameter for DSML; for
+spelling, its values free of the markers that end a call as the other keyed values are, and the
+table's own tags written one pair per property for Ling's newlines and Hy4's suffixed tags (the
+`keyed` module); `<function=` and `<parameter=` tags, one per property, for Qwen 3.5's and
+Seed-OSS's tagged syntax (the `tagged` module); a tag grammar per parameter for DSML; for
 Kimi K3's XTML, one argument tag per property of the schema (the `xtml` module); `<invoke name="…">`
 blocks of `<parameter name="…">` tags for MiniMax M2 (the `attributed` module); Python calls, one
 per line or as a list, each value in the template's spelling, for Olmo 3 and LFM2.5 (the `pythonic`
@@ -54,7 +55,13 @@ its generation prompt adds no opener), the tag admits first what the model would
 or the bare close the turn's start also has a row for, which the model writes for an empty
 thought; or nothing. Then the calls. A forced call is written at once, so without this the tag
 would take the thought away, and the model, held to the call from its first token, answers worse
-than it reasons.
+than it reasons. Where the generation prompt itself ends with that close (a request with thinking
+switched off: the template closed the thought in the model's place, `Format::thought_closed`), a
+forced call starts at once: its tag holds no thought and no second close. The `auto` tag still
+admits them. A JSON answer's grammar takes no closed reading (`Format::answer_grammar_for`): asked
+as on a prompt with no marker it admits them too. A caller that read the prompt closed asks the
+answer as after the thought (`reasoning_open` with `GrammarStart::AfterReasoning`) and gets the
+schema alone, as the gateway does.
 
 Inkling's named JSON takes the tag the gateway's old Inkling parser writes, the call marker its
 trigger inside whatever message the model is writing. Mistral's named arguments take a tag per tool
@@ -100,6 +107,16 @@ and the call's end carries the terminal that ends the turn wherever the model st
 table has one (Kimi K3's message close), since nothing may follow; a turn a stop token ends has
 nothing after the call.
 
+Where a call is required and several are allowed, free text after a call would be read as content
+beside the calls. A table whose layout says what its template writes between two calls
+(`Layout::between_calls`) therefore gets a tag of one or more calls and no free text. In the tag
+built from the table's markers that text may follow each call, once or twice (between two calls
+and before the turn ends), nothing else may, and the terminal that ends the turn comes last where
+the table has one; in the tag written from the layout that text stands between two calls and the
+layout's `after_calls` follows the last. A table that says no such text keeps the tag that opens
+in free text. In a block syntax the text between two calls is written inside the block, and none
+stands between two blocks.
+
 `Format::answer_grammar` is the tag for an answer that is JSON a schema accepts, the
 `response_format` of a request, from the same table: the rows into the state the answer is written
 in, the schema, and the answer's close with the end of the turn. Where the output starts in
@@ -121,9 +138,9 @@ loosely, as before, though the gateway no longer asks for one). A table may boun
 its tokens (`Format::bounds_answer_whitespace`, written as xgrammar's `max_whitespace_cnt` on the
 answer's schema node; an xgrammar before 0.2.7 ignores the key): a model held to its answer's JSON
 after a long thought, by an engine that starts the grammar at the first token, may drift into tabs
-and newlines the schema's grammar otherwise admits without end. LFM2.5's table bounds them to
-thirty-two, which leaves four-space indentation seven levels deep; the calls' values are never
-bounded.
+and newlines the schema's grammar otherwise admits without end. LFM2.5's table and MiniMax M3's
+bound them to thirty-two, which leaves four-space indentation seven levels deep; the calls'
+values are never bounded.
 
 Where the thought is a message of its own before an answer that is another (Inkling's: the
 thought's close ends every message alike, and the next message's opener says what it is), and the
@@ -177,7 +194,8 @@ second time; the gateway reads it from the rendered prompt as it reads `reasonin
 (`Format::thought_closed`, `Options::thought_closed`), and a thought the model writes anyway carries
 its own. GLM 4.6's thinking-off prompt ends with the bare `<think></think>`, so its newline stays the
 tag's to write. An answer's tag keeps the schema alone after the close, the engine's own constraint,
-which the registry's tables leave to it.
+which the registry's tables leave to it unless they bound the answer's whitespace: such a table
+sends the schema alone as the tag of its node, where the bound is written.
 
 A marker that is one token of the model's vocabulary (`Format::marker_tokens`: a terminal, a
 structural token, one of the syntax's own tags (`CallSyntax::tag_texts`), or a token inside one) is
@@ -197,3 +215,43 @@ the last thing before its tag's end leaves out the excludes that end makes redun
 matcher cannot build the text otherwise). On the newer xgrammar the spelling compiles to the same
 token masks at every step; an engine whose grammar compiler predates the nodes no longer refuses the
 request at compile time. The gateway spells the tags it sends so where a worker's engine needs it.
+
+A grammar becomes the text a request carries in one place, `Grammar::spelled`, by the grammar
+backend the worker's engine runs (`GrammarBackend`): for xgrammar the structural tag above, byte
+for byte, in the vocabulary the compiler reads; a backend with no spelling of the tree refuses the
+grammar by name there (`Unspelled`), before the request leaves, rather than sending a text the
+engine's compiler would reject with its own words after the prompt ran. What the gateway does
+with that refusal follows what the request asked and whose table reads the output: the response
+template's table, which alone can write its forced call or answer, refuses by the backend's name, as
+does the whole turn; under `auto` the grammar counts as a tag the table does not have, whatever the
+table, and so does a registry table's forced call or answer, which the older registry decides as it
+did before the table constrained it.
+
+The llguidance backend takes the same tree as one Lark text (`Grammar::to_lark`), spelled for the
+worker's vocabulary (`AddedTokens`: its added tokens by text, and its end-of-sequence token). That
+backend reads every added token as a special token, which no byte literal and no text lexeme
+matches, so the spelling names them: a fixed word the vocabulary has as a token is the token beside
+its bytes, `(<tool_call> | "<tool_call>")`; free text is a text lexeme interleaved with the added
+tokens it may hold (every added token except one equal to, holding or standing inside a word the
+text may not hold), and a token that begins or ends such a word spelled across several tokens gets
+one transition in every state of the text, after a text that may not end with the word's leading
+bytes (nor, in the state of the token the word begins with, be the bytes between the two tokens) and
+into a text that may not start with its remaining bytes (a later token of the word read as its
+bytes); a token the text leaves out is read as bytes wherever a word holds it; the words a text may
+not hold are the `& ~` operators of its lexeme's regex. A fixed word that follows free text is
+folded into the text's head, since the lexer takes the longest match and a greedy lexeme would run
+past the word: the text ends at the word's bytes through a lazy lexeme or at the word's leading
+token by itself; a token node that follows the text is reached by the token alone, never by its
+bytes, so a vocabulary without the token refuses the grammar. A JSON schema is `%json {...}`, its
+whitespace bound the backend's `whitespace_pattern`; a
+schema in an XML style, a schema that accepts nothing, an embedded EBNF grammar and a token the
+vocabulary lacks have no Lark spelling and refuse the grammar by name (`Inexpressible`). The one
+loosening is named in the text's notes (`Lark::notes`): a schema's excluded words are not held out
+of its strings, which the backend's JSON cannot do.
+
+The outlines backend builds a regular expression from one JSON schema and nothing wider, so its one
+spelling is a JSON schema alone (`Spelling::JsonSchema`, `Grammar::json_schema_alone`): an answer
+the engine starts at the schema, in the plain JSON style and with no excluded words, written as the
+schema's text; its whitespace bound is not written, as an older xgrammar ignores it. A tag, a schema
+the template's text leads or follows, a schema in an XML style or one with excluded words has no
+outlines spelling and is refused by the backend's name (`Unspelled`).

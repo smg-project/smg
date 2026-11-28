@@ -26,7 +26,7 @@ use super::{CompletionChunkFrame, StreamingProcessor};
 use crate::{
     observability::metrics::{metrics_labels, LocalStopAbort, Metrics},
     routers::{
-        common::sse::SseSender,
+        common::{prefill_admission::PrefillLoadGuard, sse::SseSender},
         grpc::{
             common::response_formatting::{known_spec_drafted, CompletionTokenTracker},
             context,
@@ -37,7 +37,6 @@ use crate::{
             utils,
         },
     },
-    worker::PrefillLoadGuard,
 };
 
 /// One backend stream of a `/v1/completions` request. Batched requests fan
@@ -232,6 +231,7 @@ impl<'a> CompletionStream<'a> {
             &dispatch.model,
             dispatch.created,
             dispatch.weight_version.as_deref(),
+            spec.include_usage,
         );
         // Where every choice's logprobs offsets start: after the echoed
         // prompt, counted only for a request that asked for logprobs.
@@ -720,7 +720,7 @@ impl<'a> CompletionStream<'a> {
             endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
             tail_tokens: self.tail_tokens,
         });
-        drop(grpc_stream);
+        grpc_stream.abort_past_stop();
     }
 
     /// The unit's totals for the coordinator. The closed choices are the

@@ -139,6 +139,14 @@ fn hy4() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Hy4.format(), keyed_tools()))
 }
 
+fn hy_v3() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::HyV3.format(), keyed_tools()))
+}
+
+fn longcat() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::LongCat.format(), keyed_tools()))
+}
+
 fn ling() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Ling.format(), keyed_tools()))
 }
@@ -325,6 +333,10 @@ fn kimi_k2() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::KimiK2.format(), Declared::default()))
 }
 
+fn kimi() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Kimi.format(), Declared::default()))
+}
+
 fn mistral() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Mistral.format(), Declared::default()))
 }
@@ -338,6 +350,10 @@ fn llama_nemotron() -> Box<dyn Parser> {
         Table::LlamaNemotron.format(),
         Declared::default(),
     ))
+}
+
+fn command() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Command.format(), Declared::default()))
 }
 
 fn function_gemma() -> Box<dyn Parser> {
@@ -436,6 +452,10 @@ fn minimax_m2() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::MinimaxM2.format(), recorded_tools()))
 }
 
+fn steptml() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Steptml.format(), recorded_tools()))
+}
+
 fn minicpm5() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::MiniCpm5.format(), recorded_tools()))
 }
@@ -460,12 +480,25 @@ fn inkling() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Inkling.format(), Declared::default()))
 }
 
+/// Inkling 2 reads the same messages after the opener: the contract feeds every subject an empty
+/// prompt, which no table reads as an unopened turn, so the outputs are the shapes after
+/// `<|message_model|>`; the turn the model opens itself is the table's own tests' and the corpus's.
+fn inkling2() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Inkling2.format(), Declared::default()))
+}
+
 /// Inkling as a request without tools reads it: the message header content, its markers dropped.
 fn inkling_without_calls() -> Box<dyn Parser> {
     Box::new(Engine::new(
         Table::Inkling.format().without_calls(),
         Declared::default(),
     ))
+}
+
+/// Inkling as a JSON answer reads it (`Engine::reads_json_answer`): a marker's spelling inside a
+/// string of the answer is the answer's text, a frame outside the strings a call.
+fn inkling_json_answer() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Inkling.format(), Declared::default()).reads_json_answer())
 }
 
 /// `\w` as these outputs need it: the ASCII letters, digits and `_` their names are written in.
@@ -550,6 +583,11 @@ fn gpt_oss_template() -> Box<dyn Parser> {
             .stop_tokens(["<|return|>", "<|endoftext|>", "<|call|>"]),
         Declared::default(),
     ))
+}
+
+/// The crate's own gpt-oss table, which no registry row lists yet.
+fn gpt_oss_table() -> Box<dyn Parser> {
+    Box::new(Engine::new(formats::gpt_oss(), Declared::default()))
 }
 
 fn space() -> Class {
@@ -838,6 +876,18 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::Hy4),
     },
     Subject {
+        name: "hy_v3",
+        new: hy_v3,
+        outputs: HY_V3_OUTPUTS,
+        table: Some(Table::HyV3),
+    },
+    Subject {
+        name: "longcat",
+        new: longcat,
+        outputs: LONGCAT_OUTPUTS,
+        table: Some(Table::LongCat),
+    },
+    Subject {
         name: "ling",
         new: ling,
         outputs: LING_OUTPUTS,
@@ -934,6 +984,12 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::KimiK2),
     },
     Subject {
+        name: "kimi",
+        new: kimi,
+        outputs: KIMI_OUTPUTS,
+        table: Some(Table::Kimi),
+    },
+    Subject {
         name: "plain",
         new: plain,
         outputs: PLAIN_OUTPUTS,
@@ -982,6 +1038,12 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::MinimaxM2),
     },
     Subject {
+        name: "steptml",
+        new: steptml,
+        outputs: STEPTML_OUTPUTS,
+        table: Some(Table::Steptml),
+    },
+    Subject {
         name: "minicpm5",
         new: minicpm5,
         outputs: MINICPM5_OUTPUTS,
@@ -1018,9 +1080,21 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::Inkling),
     },
     Subject {
+        name: "inkling2",
+        new: inkling2,
+        outputs: INKLING_OUTPUTS,
+        table: Some(Table::Inkling2),
+    },
+    Subject {
         name: "inkling, no tools",
         new: inkling_without_calls,
         outputs: INKLING_NO_TOOLS_OUTPUTS,
+        table: None,
+    },
+    Subject {
+        name: "inkling, json answer",
+        new: inkling_json_answer,
+        outputs: INKLING_JSON_ANSWER_OUTPUTS,
         table: None,
     },
     Subject {
@@ -1042,6 +1116,12 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::LlamaNemotron),
     },
     Subject {
+        name: "command",
+        new: command,
+        outputs: COMMAND_OUTPUTS,
+        table: Some(Table::Command),
+    },
+    Subject {
         name: "function gemma",
         new: function_gemma,
         outputs: FUNCTION_GEMMA_OUTPUTS,
@@ -1057,6 +1137,12 @@ const FORMATS: &[Subject] = &[
         name: "gpt-oss test template, its calls as a shape",
         new: gpt_oss_template,
         outputs: GPT_OSS_OUTPUTS,
+        table: None,
+    },
+    Subject {
+        name: "gpt-oss table, not listed yet",
+        new: gpt_oss_table,
+        outputs: GPT_OSS_TABLE_OUTPUTS,
         table: None,
     },
     Subject {
@@ -1168,6 +1254,29 @@ const GPT_OSS_OUTPUTS: &[&str] = &[
     "<|channel|>commentary to=functions.get_weather<|message|>{\"city\": \"Paris\", \"days\": ,}",
 ];
 
+/// The gpt-oss table: a call under either order of its header and on the analysis channel, a
+/// preamble, the model's own tools under either order, a recipient that is no function, a header
+/// with no channel, a marker that names no tool, a header the end leaves unfinished, a call a
+/// start marker ends, and nothing.
+const GPT_OSS_TABLE_OUTPUTS: &[&str] = &[
+    "<|channel|>analysis<|message|>User asks for the weather.<|end|><|start|>assistant\
+     <|channel|>commentary to=functions.get_weather <|constrain|>json<|message|>\
+     {\"city\": \"Paris\", \"days\": 3}",
+    " to=functions.get_weather<|channel|>commentary json<|message|>{\"city\": \"Par",
+    "<|channel|>analysis to=functions.get-weather.v2 <|constrain|>json<|message|>{}",
+    "<|channel|>commentary<|message|>Looking it up.<|end|><|start|>assistant<|channel|>final\
+     <|message|>Done.",
+    " to=python<|channel|>analysis<|message|>print(1)<|end|><|start|>assistant<|channel|>final\
+     <|message|>Done.",
+    "<|channel|>analysis to=browser.search code<|message|>{\"query\": \"x\"}",
+    "<|channel|>commentary to=repo_browser.print_tree <|constrain|>json<|message|>{\"path\": \".\"}",
+    "<|message|>Plain.<|end|> after",
+    "<|channel|>commentary to=functions.<|channel|>final<|message|>Hi",
+    "<|channel|>commentary to=functions.get_weather json",
+    "<|channel|>commentary to=functions.get_weather json<|message|><|start|>assistant",
+    "",
+];
+
 /// Calls on abstract tags: a call its trailer closes, terminals whose header does not match (in
 /// the content, in a thought, twice in a row), a close the trailer does not end at, a call cut
 /// short, a value the reader refuses before the trailer closes the call, a call the stop closes
@@ -1264,6 +1373,17 @@ const MUSE_SPARK_OUTPUTS: &[&str] = &[
     "<atem:invoke id=\"1\">text</atem:invoke> to=user<|message|>Hi",
     " to=self<|message|>A thought cut<|eom|><|start|>assistant to=us",
     "unframed text",
+];
+
+/// The Kimi table: a thought between the older pair and the answer, a call behind such a
+/// thought, the answer alone, a thought cut, text before a thought, and the line's own pair.
+const KIMI_OUTPUTS: &[&str] = &[
+    "◁think▷The user greets me.◁/think▷Hello!",
+    "◁think▷Need the weather.◁/think▷<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_calls_section_end|>",
+    "Hello!",
+    "◁think▷The user gre",
+    "First. ◁think▷Then a thought.◁/think▷Then the rest.",
+    "<think>a plan</think>Sure.",
 ];
 
 /// The Kimi K2 table: a thought and a call; two calls; content and a call with no arguments; a
@@ -1547,6 +1667,18 @@ const MISTRAL_OUTPUTS: &[&str] = &[
     "[TOOL_CALLS]get_weather[ARGS]{\"city\": ,}[TOOL_CALLS]get_stock_price[ARGS]{}",
 ];
 
+/// Command's turn: the thought, the list of calls and the answer, each between its own markers;
+/// an answer with no marker, the list cut, and prose where the list should be.
+const COMMAND_OUTPUTS: &[&str] = &[
+    "<|START_THINKING|>The user asks about Paris.<|END_THINKING|><|START_ACTION|>[\n    \
+     {\"tool_call_id\": \"0\", \"tool_name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}},\n    \
+     {\"tool_call_id\": \"1\", \"tool_name\": \"get_stock_price\", \"parameters\": {}}\n]<|END_ACTION|>",
+    "<|START_THINKING|>No tool is needed.<|END_THINKING|><|START_RESPONSE|>Hello!<|END_RESPONSE|>",
+    "Hello!",
+    "<|START_ACTION|>[\n    {\"tool_call_id\": \"0\", \"tool_name\": \"get_weather\", \"parameters\": {\"city\": \"Par",
+    "<|START_ACTION|>not a list<|END_ACTION|>",
+];
+
 /// Llama Nemotron's calls: one JSON list between `<TOOLCALL>` and `</TOOLCALL>`, content before
 /// it, the thought between `<think>` and `</think>`; the list cut, empty, or not a list.
 const LLAMA_NEMOTRON_OUTPUTS: &[&str] = &[
@@ -1671,6 +1803,29 @@ const HY4_OUTPUTS: &[&str] = &[
     "</think:opensource><tool_calls:opensource><tool_call:opensource>get_weather\
      <arg_key:opensource>city</arg_key:opensource><arg_value:opensource>a <</tool_call:opensource>\
      </tool_calls:opensource>",
+];
+
+/// Keyed arguments in Hy V3's spelling: the recorded shapes with `<tool_sep>` after the name and
+/// K2-Horizon's newlines, a cut stream, a call without arguments, prose where a call should be,
+/// a name without its separator, text after the separator.
+const HY_V3_OUTPUTS: &[&str] = &[
+    "The user asks.</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>city</arg_key>\n\
+     <arg_value>Paris</arg_value>\n<arg_key>days</arg_key>\n<arg_value>3</arg_value>\n</tool_call>\n\
+     <tool_call>get_weather<tool_sep>\n</tool_call>\n</tool_calls>",
+    "</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>city</arg_key>\n<arg_value>Par",
+    "</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>city</arg_key>\n<arg_value>Par\
+     </tool_call>\n</tool_calls>",
+    "</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>note</arg_key>\n\
+     <arg_value>null</arg_value>\n<arg_key>extra</arg_key>\n<arg_value>[1, 2]</arg_value>\n\
+     </tool_call>\n</tool_calls>",
+    "</think><tool_calls>\nprose<tool_call>get_weather<tool_sep>\n</tool_call>\n</tool_calls>",
+    "</think>Hello!",
+    "</think><tool_calls>\n<tool_call>get_weather<tool_sep>\n<arg_key>city</arg_key>\n<arg_value>a <\
+     </tool_call>\n</tool_calls>",
+    "<tool_calls>\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n\
+     </tool_call>\n</tool_calls>",
+    "<tool_calls>\n<tool_call>get_weather<tool_sep>prose<arg_key>city</arg_key>\n\
+     <arg_value>Paris</arg_value>\n</tool_call>\n</tool_calls>",
 ];
 
 /// Keyed arguments in Ling's spelling, with its newlines.
@@ -1862,6 +2017,27 @@ const DSML_OUTPUTS: &[&str] = &[
      </｜DSML｜ calls>",
     "</think>Sure. \n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n</｜DSML｜ invoke>\n\
      </｜DSML｜ calls>",
+    // An invoke whose arguments are one JSON object in place of the parameter tags, as one
+    // serving engine's parser reads it: whole, with a parameter's closing tag inside a string, cut
+    // short, with a fault inside it and after it, and with the invoke's close, the next invoke's
+    // opening or the block's close inside a string, which ends the call there.
+    "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n{\"city\": \"Paris\", \
+     \"days\": 3}\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": \"x </｜DSML｜ parameter> <｜DSML｜\"}\
+     </｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n{\"a\": \"par",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n{\"a\": 1}\n</｜DSML｜ parame",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": 1}</｜D",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n{\"a\": 1,} more\n</｜DSML｜ invoke>\n\
+     </｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n{\"a\": 1} more\n</｜DSML｜ invoke>\n\
+     </｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": \"x </｜DSML｜ invoke> y\", \"b\": 3}\
+     </｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": \"x <｜DSML｜ invoke name=\"g\">\
+     {\"b\": 3}</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">{\"a\": \"x </｜DSML｜ calls> y\"}\
+     </｜DSML｜ invoke>\n</｜DSML｜ calls>",
 ];
 
 /// Outputs in the tagged syntax: the recorded shapes, and the cuts and faults the assembler
@@ -1992,6 +2168,13 @@ const DEEPSEEK_V4_OUTPUTS: &[&str] = &[
     "Hello!",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
     "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par</｜DSML｜tool_calls>",
+    // An invoke whose arguments are one JSON object, whole, cut short, with a fault after it, and
+    // with the invoke's close inside a string, which ends the call there.
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n{\"location\": \"Paris\"}\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Par",
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Paris\"}</｜DSML｜par",
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Paris\"} more</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+    "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"x </｜DSML｜invoke> y\"}</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
 ];
 
 /// DeepSeek V3.2's DSML as its reference encoder renders it (the thought the prompt opens written
@@ -2016,6 +2199,12 @@ const DEEPSEEK_V3_2_OUTPUTS: &[&str] = &[
     "<think>still thinking",
     "Hello!",
     "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n<｜DSML｜parameter name=\"location\" string=\"true\">Par",
+    // An invoke whose arguments are one JSON object, whole, cut short, with a fault after it, and
+    // with the invoke's close inside a string, which ends the call there.
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">\n{\"location\": \"Paris\"}\n</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Par",
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"Paris\"} more</｜DSML｜invoke>\n</｜DSML｜function_calls>",
+    "<｜DSML｜function_calls>\n<｜DSML｜invoke name=\"get_weather\">{\"location\": \"x </｜DSML｜invoke> y\"}</｜DSML｜invoke>\n</｜DSML｜function_calls>",
 ];
 
 /// DeepSeek V3.1's calls as its chat template renders them (the thought the prompt opens written
@@ -2090,6 +2279,15 @@ const MINIMAX_M2_OUTPUTS: &[&str] = &[
     "<think>\nplan\n</think>\n<minimax:tool_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">Par</minimax:tool_call>",
 ];
 
+/// Step 3's turn as its template spells it (the thought the prompt opens written here): two
+/// calls in the block, the answer alone, a call in the older parser's spelling, and one cut short.
+const STEPTML_OUTPUTS: &[&str] = &[
+    "<think>\nThe user asks about Paris.\n</think>\n<｜tool_calls_begin｜>\n<｜tool_call_begin｜>\nfunction<｜tool_sep｜><steptml:invoke name=\"get_weather\"><steptml:parameter name=\"city\">Paris</steptml:parameter><steptml:parameter name=\"unit\">celsius</steptml:parameter></steptml:invoke><｜tool_call_end｜>\n<｜tool_call_begin｜>\nfunction<｜tool_sep｜><steptml:invoke name=\"get_stock_price\"><steptml:parameter name=\"ticker\">AAPL</steptml:parameter></steptml:invoke><｜tool_call_end｜>\n<｜tool_calls_end｜>",
+    "<think>\nNo tool is needed.\n</think>\nHello!",
+    "<think>\nShort.\n</think>\nLet me check.\n<｜tool_calls_begin｜>\n<｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name=\"get_weather\">\n<steptml:parameter name=\"city\">Paris</steptml:parameter>\n</steptml:invoke><｜tool_call_end｜>\n<｜tool_calls_end｜>",
+    "<think>\nShort.\n</think>\n<｜tool_calls_begin｜>\n<｜tool_call_begin｜>\nfunction<｜tool_sep｜><steptml:invoke name=\"get_weather\"><steptml:parameter name=\"city\">Par",
+];
+
 /// The outputs bellwether's common set records for MiniCPM5, and one cut short.
 const MINICPM5_OUTPUTS: &[&str] = &[
     "<think>\nThe user asks about Paris.\n</think>\n\n<function name=\"get_weather\"><param name=\"city\">Paris</param></function>",
@@ -2122,6 +2320,32 @@ const DOTS3_OUTPUTS: &[&str] = &[
     // output ending there (the table's row out of the thought on the opener reads it).
     "<think>\nThe user asks about Paris.\n</think>\n\n<dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nParis\n</parameter>\n</invoke>\n</dots_function_call>",
     "<think>\nThe user asks about Paris: <dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nParis\n</parameter>\n</invoke>\n</dots_function_call>",
+];
+
+/// Keyed arguments in LongCat's spelling: the recorded shapes with GLM 4.6's newlines under the
+/// prefixed tags and the template's newline after each close, a cut stream, a call without
+/// arguments, a null and a list, prose where a tag should be, the plain syntax quoted in content.
+const LONGCAT_OUTPUTS: &[&str] = &[
+    "The user asks.</longcat_think>Let me check.<longcat_tool_call>get_weather\n\
+     <longcat_arg_key>city</longcat_arg_key>\n<longcat_arg_value>Paris</longcat_arg_value>\n\
+     <longcat_arg_key>days</longcat_arg_key>\n<longcat_arg_value>3</longcat_arg_value>\n\
+     </longcat_tool_call>\n",
+    "<longcat_tool_call>get_weather\n<longcat_arg_key>city</longcat_arg_key>\n\
+     <longcat_arg_value>Paris</longcat_arg_value>\n</longcat_tool_call>\n\
+     <longcat_tool_call>get_weather\n<longcat_arg_key>city</longcat_arg_key>\n\
+     <longcat_arg_value>Rome</longcat_arg_value>\n</longcat_tool_call>\n",
+    "<longcat_tool_call>get_weather\n</longcat_tool_call>\n",
+    "Hello!",
+    "<longcat_tool_call>get_weather\n<longcat_arg_key>city</longcat_arg_key>\n<longcat_arg_value>Par",
+    "<longcat_tool_call>get_weather\n<longcat_arg_key>city</longcat_arg_key>\n<longcat_arg_value>Par\
+     </longcat_tool_call>\n",
+    "<longcat_tool_call>get_weather\n<longcat_arg_key>note</longcat_arg_key>\n\
+     <longcat_arg_value>null</longcat_arg_value>\n<longcat_arg_key>extra</longcat_arg_key>\n\
+     <longcat_arg_value>[1, 2]</longcat_arg_value>\n</longcat_tool_call>\n",
+    "<longcat_tool_call>get_weather\nprose<longcat_arg_key>city</longcat_arg_key>\n\
+     <longcat_arg_value>Paris</longcat_arg_value>\n</longcat_tool_call>\n",
+    "The syntax is:\n\n```\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\
+     \n</tool_call>\n```\n\nThat is all.",
 ];
 
 /// The outputs bellwether's common set records for GLM 4.6, and one cut short.
@@ -2208,6 +2432,22 @@ const INKLING_NO_TOOLS_OUTPUTS: &[&str] = &[
     "<|content_thinking|>The user asks: \"Give the facts about Tokyo.\" The system instruction says: \"Answer with a JSON object with the keys city, country and population.\"\n\nSo I need to provide facts about Tokyo, but specifically format the answer as a JSON object with keys: city, country, population.\n\nI should include the relevant values:\n- city: Tokyo\n- country: Japan\n- population: Approximately 13.9 million (for Tokyo proper) or 37 million (for Greater Tokyo Area). Usually \"Tokyo\" as a city refers to the prefecture/capital, but the city proper is about 14 million. I should provide a clear figure. Let's use ~13.96 million (as of recent estimates) or just \"13.9 million\". To be safe and accurate, I can specify the metropolitan area, but the key is just population. Let's provide \"13.9 million\" for the city proper, or mention both? The instruction is strict: JSON object with those keys. So just those three.\n\nLet's construct:\n{\n  \"city\": \"Tokyo\",\n  \"country\": \"Japan\",\n  \"population\": \"13.9 million\"\n}\n\nThis satisfies. I will not add extra text outside JSON? The instruction says \"Answer with a JSON object...\". Usually that means the response should be just the JSON. I will provide just the JSON.<|end_message|><|message_model|><|content_text|><|content_text|>{\"city\": \"Tokyo\", \"country\": \"Japan\", \"population\": \"13.9 million\"}<|end_message|>",
     "<|content_thinking|>The user asks about Paris.<|end_message|><|message_model|><|content_text|><|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>",
     "<|content_thinking|>Short.<|end_message|><|message_model|><|content_text|>The answer is cut he",
+];
+
+/// JSON answers under the engine's JSON-answer option, the family's parsers' own cases: a marker's
+/// spelling in a value and in a key, every spelling as a key and in a value with escapes after a
+/// thought that holds an unmatched quote, a list and a bare string of spellings, a whole call frame
+/// quoted in a value beside a real call, and strings the stream's end leaves open.
+const INKLING_JSON_ANSWER_OUTPUTS: &[&str] = &[
+    "<|content_text|>{\"literal\":\"<|content_thinking|>quoted<|end_message|>\"}<|end_message|>",
+    "<|content_thinking|>unmatched quote: \"<|end_message|><|message_model|><|content_text|>{\"<|message_model|>\":\"\u{3b1}\\\"<|content_text|>\\\\\u{7d42}\",\"<|end_message|>\":\"<|content_thinking|><|content_model_end_sampling|>\"}<|end_message|><|content_model_end_sampling|>",
+    "<|content_text|>[\"<|message_model|>\",\"<|end_message|>\"]<|end_message|>",
+    "<|content_text|>\"<|content_thinking|>\"<|end_message|>",
+    "<|content_text|>{\"note\":\"get_weather<|content_invoke_tool_json|>{\\\"name\\\":\\\"get_weather\\\",\\\"args\\\":{}}<|end_message|>\"}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>",
+    "<|content_text|>{\"value\":\"<|content_thinking|>unfinished<|end_mes",
+    "<|content_text|>{\"value\":\"escaped quote: \\\"<|end_message|>",
+    "<|content_text|>{\"note\":\"<|end_message|>\"}<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>\
+     {\"name\":\"get_weather\",\"args\":{\"city\":\"\\\"<|end_message|>\"}}<|end_message|>",
 ];
 
 /// Every subject with each of its outputs.
@@ -2444,7 +2684,7 @@ fn check_well_formed(subject: &Subject, text: &str, cuts: &[usize], events: &[Ev
                     }
                 }
             }
-            Event::ToolCallEnd { index, source } => {
+            Event::ToolCallEnd { index, source, .. } => {
                 assert!(
                     started.contains(index),
                     "{}: before the call's start",
@@ -2751,6 +2991,11 @@ const CALLS_WITHOUT_ARGUMENTS: &[(&str, &str)] = &[
         "<tool_calls:opensource><tool_call:opensource>get_weather</tool_call:opensource>\
          </tool_calls:opensource>",
     ),
+    (
+        "hy_v3",
+        "<tool_calls>\n<tool_call>get_weather<tool_sep>\n</tool_call>\n</tool_calls>",
+    ),
+    ("longcat", "<longcat_tool_call>get_weather\n</longcat_tool_call>"),
     ("ling", "<tool_call>get_weather\n</tool_call>"),
     ("glm", "<tool_call>get_weather</tool_call>"),
     ("glm4", "<tool_call>get_weather\n</tool_call>"),

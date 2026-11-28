@@ -10,7 +10,7 @@ without a red lane (#2458). This module asserts that every registered worker,
 including prefill and decode workers, actually reports.
 
 Usage:
-    E2E_RUNTIME=sglang pytest e2e_test/router/test_loads.py -v
+    E2E_RUNTIME=sglang E2E_ENGINE=sglang pytest e2e_test/router/test_loads.py -v
 """
 
 from __future__ import annotations

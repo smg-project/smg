@@ -126,9 +126,9 @@ pub(super) async fn server_info(state: &State) -> vllm::GetServerInfoResponse {
 
 fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
     let ready = state.shared.ready();
-    // The ranks this servicer serves (the gateway expands the worker into
-    // that many under `--dp-aware`): the connected engines, as `GetLoads`
-    // counts them, not the handshake's figure.
+    // The ranks this servicer serves (the gateway registers the worker as
+    // that many rank workers): the connected engines, as `GetLoads` counts
+    // them, not the handshake's figure.
     let data_parallel_size =
         i32::try_from(state.shared.rank_count(state.model.data_parallel_size)).unwrap_or(i32::MAX);
     let model = &state.model;
@@ -174,6 +174,8 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         constrained_decoding_start: model.constrained_decoding_start.clone(),
         constrained_decoding: model.constrained_decoding.clone(),
         structural_tag_vocabulary: model.structural_tag_vocabulary.clone(),
+        // The cache partition fields the adapter's translation reads.
+        cache_partition_fields: "cache_salt".to_string(),
         ..Default::default()
     }
 }
@@ -207,6 +209,8 @@ fn reported_entry(
         gen_throughput: estimate.gen_throughput,
         prefill_throughput: estimate.prefill_throughput,
         cache_hit_rate: estimate.cache_hit_rate,
+        // The engine's own report states no named value.
+        values: Vec::new(),
     }
 }
 

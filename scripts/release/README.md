@@ -56,7 +56,12 @@ pushed, the read-only commands (`check`, `status`, `publish-plan`, `notes`) read
   comparison tag's version with changes since it; a version another line published, above or
   below it, that `release-bump-main` moved to `main` or that a cut found there), and a
   proposed version a release tag carries steps to the next free patch (crates.io and PyPI take
-  a version once). A version a tag carries with this very code needs nothing. A version
+  a version once). A version a tag carries with this very code needs nothing. A crate whose
+  wire files differ from the tag that carries its version (`crates/worker/proto/` for
+  `smg-worker`: a dependent builds the messages they declare) steps past its own caret
+  whatever its commits ask. A bump by hand that stays inside the caret of a version any
+  release line published with other wire files is an issue: a dependent's published copy
+  would resolve to it and build messages that gained a field. A version
   published without a release tag is not seen by the tags: `make release-check` reads crates.io
   and PyPI for every crate and package at the branch head and fails on a version they hold
   already with changes after it (the commits since the registry's own publish time of that

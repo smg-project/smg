@@ -66,6 +66,8 @@ logger = logging.getLogger(__name__)
 
 HANDSHAKE_PORT_ENV = "SMG_TRTLLM_SERVICER_HANDSHAKE_PORT"
 DRAIN_SECS_ENV = "SMG_TRTLLM_SERVICER_DRAIN_SECS"
+# How long the engine stays up after the drain's last stream (default 1 s).
+DRAIN_LINGER_SECS_ENV = "SMG_TRTLLM_SERVICER_DRAIN_LINGER_SECS"
 STARTUP_TIMEOUT_SECS_ENV = "SMG_TRTLLM_SERVICER_STARTUP_TIMEOUT_SECS"
 STARTUP_CEILING_SECS_ENV = "SMG_TRTLLM_SERVICER_STARTUP_CEILING_SECS"
 SILENCE_TIMEOUT_SECS_ENV = "SMG_TRTLLM_SERVICER_SILENCE_TIMEOUT_SECS"
@@ -369,6 +371,7 @@ class TrtllmLauncher(RustLauncher):
     ipc_prefix = "trtllm-servicer"
     handshake_port_env = HANDSHAKE_PORT_ENV
     drain_secs_env = DRAIN_SECS_ENV
+    drain_linger_secs_env = DRAIN_LINGER_SECS_ENV
     startup_timeout_secs_env = STARTUP_TIMEOUT_SECS_ENV
     startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
     silence_timeout_secs_env = SILENCE_TIMEOUT_SECS_ENV

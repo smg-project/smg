@@ -146,6 +146,8 @@ pub enum StepStatus {
     Failed,
     Retrying,
     Skipped,
+    /// The workflow was cancelled before the step's next attempt began.
+    Cancelled,
 }
 
 /// State of a workflow step

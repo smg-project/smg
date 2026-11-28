@@ -205,11 +205,19 @@ fn a_json_answer_past_the_retained_size_is_exact_and_leaves_the_thread_warm() {
     let (_, bytes) = body_of(json_response(&large)).expect("a body built from bytes");
     assert_eq!(bytes, expected, "the same bytes as serde_json writes");
 
-    // The thread's buffer went with the large body; the next short answer
-    // grows a new one once, and the one after that is back to one allocation.
+    // The thread's buffer went with the large body (the retention cap): the
+    // next short answer grows a new one, more than the one allocation of a
+    // warm thread, and the one after that is back to one. Without the cap
+    // the large buffer would stay and the first count would be the warm one.
     let short = completion(9);
-    drop(json_response(&short));
     let parts = parts_allocations();
+    let (response, regrown) = allocations_during(|| json_response(&short));
+    drop(response);
+    assert!(
+        regrown > parts + 1,
+        "the buffer grows again after the cap dropped it: {regrown} calls, the response parts alone {parts}"
+    );
+    eprintln!("allocation calls for the first short answer after the cap: {regrown} (the response parts alone: {parts})");
     let (response, calls) = allocations_during(|| json_response(&short));
     drop(response);
     assert_eq!(

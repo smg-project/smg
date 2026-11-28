@@ -2,12 +2,13 @@
 //!
 //! `ToolEntry` stores its JSON Schema as `Arc<serde_json::Map>`. Downstream
 //! protocol types require an owned `serde_json::Map` inside `Value::Object`,
-//! so every builder deep-clones the schema once per tool per call. Schema
-//! maps are typically small; if this ever profiles hot, cache the
-//! materialised `Value::Object` alongside the `Arc<Map>` on `ToolEntry`.
+//! so every builder copies the schema once per tool per call: the copy the
+//! payload owns, built key by key where `json!` (which copies its operands)
+//! or a typed item serialised to JSON would copy it a second time.
 
 use openai_protocol::{
     common::{Function, Tool},
+    event_types::ItemType,
     responses::{
         generate_id, FunctionTool, McpAllowedTools, McpToolInfo, RequireApproval,
         RequireApprovalMode, ResponseOutputItem, ResponseTool,
@@ -59,12 +60,15 @@ fn exposed_tool_fields<'a>(
 pub fn function_tools_json(session: &McpToolSession<'_>) -> Vec<Value> {
     exposed_tool_fields(session)
         .map(|(name, description, parameters)| {
-            json!({
-                "type": "function",
-                "name": name,
-                "description": description,
-                "parameters": schema_to_value(parameters)
-            })
+            let mut tool = serde_json::Map::with_capacity(4);
+            tool.insert("type".to_string(), Value::String("function".to_string()));
+            tool.insert("name".to_string(), Value::String(name.to_string()));
+            tool.insert(
+                "description".to_string(),
+                description.map_or(Value::Null, |text| Value::String(text.to_string())),
+            );
+            tool.insert("parameters".to_string(), schema_to_value(parameters));
+            Value::Object(tool)
         })
         .collect()
 }
@@ -115,21 +119,49 @@ pub fn response_tools(session: &McpToolSession<'_>) -> Vec<ResponseTool> {
 pub fn build_mcp_tool_infos(entries: &[smg_mcp::ToolEntry]) -> Vec<McpToolInfo> {
     entries
         .iter()
-        .map(|entry| {
-            let read_only = entry
-                .tool
-                .annotations
-                .as_ref()
-                .and_then(|a| a.read_only_hint)
-                .unwrap_or(false);
-            McpToolInfo {
-                name: entry.tool_name().to_string(),
-                description: entry.tool.description.as_ref().map(|d| d.to_string()),
-                input_schema: schema_to_value(&entry.tool.input_schema),
-                annotations: Some(json!({ "read_only": read_only })),
-            }
+        .map(|entry| McpToolInfo {
+            name: entry.tool_name().to_string(),
+            description: entry.tool.description.as_ref().map(|d| d.to_string()),
+            input_schema: schema_to_value(&entry.tool.input_schema),
+            annotations: Some(json!({ "read_only": read_only_hint(entry) })),
         })
         .collect()
+}
+
+/// The rmcp `read_only_hint` of a tool, false when the server did not annotate it.
+fn read_only_hint(entry: &smg_mcp::ToolEntry) -> bool {
+    entry
+        .tool
+        .annotations
+        .as_ref()
+        .and_then(|a| a.read_only_hint)
+        .unwrap_or(false)
+}
+
+/// `McpToolInfo` as JSON for one tool, the schema copied once: the typed
+/// record above serialised (`the_json_tool_info_is_the_typed_one` pins the
+/// two) without the second copy its serialisation makes.
+fn mcp_tool_info_json(entry: &smg_mcp::ToolEntry) -> Value {
+    let mut info = serde_json::Map::with_capacity(4);
+    info.insert(
+        "name".to_string(),
+        Value::String(entry.tool_name().to_string()),
+    );
+    if let Some(description) = entry.tool.description.as_deref() {
+        info.insert(
+            "description".to_string(),
+            Value::String(description.to_string()),
+        );
+    }
+    info.insert(
+        "input_schema".to_string(),
+        schema_to_value(&entry.tool.input_schema),
+    );
+    info.insert(
+        "annotations".to_string(),
+        json!({ "read_only": read_only_hint(entry) }),
+    );
+    Value::Object(info)
 }
 
 /// Typed `mcp_list_tools` output item for one server's exposed tools.
@@ -138,25 +170,43 @@ pub fn mcp_list_tools_item(
     server_label: &str,
     server_key: &str,
 ) -> ResponseOutputItem {
-    let tools = session.list_tools_for_server(server_key);
+    let tools = session.list_tools_for_label(server_label, server_key);
     ResponseOutputItem::McpListTools {
         id: generate_id("mcpl"),
         server_label: server_label.to_string(),
         tools: build_mcp_tool_infos(&tools),
-        error: None,
+        error: session.list_error_for_binding(server_label, server_key),
     }
 }
 
-/// JSON form of `mcp_list_tools_item`. Falls back to a minimal stub if the
-/// typed item fails to serialise (should be infallible for well-formed input).
+/// JSON form of `mcp_list_tools_item`, built in place: the typed item's shape
+/// (`the_json_list_tools_item_is_the_typed_one` pins the two) with each
+/// tool's schema copied once, where the typed item serialised to JSON
+/// copied every schema twice.
 pub fn mcp_list_tools_json(
     session: &McpToolSession<'_>,
     server_label: &str,
     server_key: &str,
 ) -> Value {
-    serde_json::to_value(mcp_list_tools_item(session, server_label, server_key)).unwrap_or_else(
-        |_| json!({ "type": "mcp_list_tools", "server_label": server_label, "tools": [] }),
-    )
+    let tools = session.list_tools_for_label(server_label, server_key);
+    let mut item = serde_json::Map::with_capacity(4);
+    item.insert(
+        "type".to_string(),
+        Value::String(ItemType::MCP_LIST_TOOLS.to_string()),
+    );
+    item.insert("id".to_string(), Value::String(generate_id("mcpl")));
+    item.insert(
+        "server_label".to_string(),
+        Value::String(server_label.to_string()),
+    );
+    item.insert(
+        "tools".to_string(),
+        Value::Array(tools.iter().map(mcp_tool_info_json).collect()),
+    );
+    if let Some(error) = session.list_error_for_binding(server_label, server_key) {
+        item.insert("error".to_string(), Value::String(error));
+    }
+    Value::Object(item)
 }
 
 /// Inject only client-visible MCP metadata and call items into a response output array.
@@ -205,6 +255,12 @@ pub fn inject_client_visible_mcp_output_items(
 /// Parses `ResponseTool::Mcp::require_approval`/`allowed_tools` and forwards
 /// the resolved approval mode + scoping to `session.set_approval_mode`.
 ///
+/// An approval is asked where `require_approval` is the string `always` or
+/// the object form with an `always` filter: a filter of `tool_names` alone
+/// asks it of the named tools, one that reads `read_only` or names nothing
+/// asks it of every tool the entry allows (over-gate, as below). A `never`
+/// filter asks none, and a tool named under both is asked for.
+///
 /// `McpAllowedTools` projection (T11):
 /// - `None` or `Filter { None, None }` → no name constraint (every binding
 ///   on the server inherits the explicit approval mode).
@@ -220,21 +276,31 @@ pub fn configure_response_tools_approval(session: &mut McpToolSession<'_>, tools
             continue;
         };
 
-        let approval_mode = match mcp_tool.require_approval.as_ref() {
-            Some(RequireApproval::Mode(RequireApprovalMode::Always)) => ApprovalMode::Interactive,
-            _ => ApprovalMode::PolicyOnly,
+        // The names an `always` filter narrows the approval to; `None` asks
+        // it of every tool the entry allows.
+        let always_names: Option<&[String]> = match mcp_tool.require_approval.as_ref() {
+            Some(RequireApproval::Mode(RequireApprovalMode::Always)) => None,
+            Some(RequireApproval::Rules(rules)) => match rules.always.as_ref() {
+                Some(always) => always
+                    .tool_names
+                    .as_deref()
+                    .filter(|_| always.read_only.is_none()),
+                None => continue,
+            },
+            _ => continue,
         };
 
-        if approval_mode == ApprovalMode::PolicyOnly {
-            continue;
-        }
-
-        let allowed_tool_names: Option<&[String]> =
+        let allowed_tool_names: Option<&[String]> = always_names.or_else(|| {
             mcp_tool.allowed_tools.as_ref().and_then(|at| match at {
                 McpAllowedTools::List(names) => Some(names.as_slice()),
                 McpAllowedTools::Filter(filter) => filter.tool_names.as_deref(),
-            });
-        session.set_approval_mode(&mcp_tool.server_label, allowed_tool_names, approval_mode);
+            })
+        });
+        session.set_approval_mode(
+            &mcp_tool.server_label,
+            allowed_tool_names,
+            ApprovalMode::Interactive,
+        );
     }
 }
 
@@ -357,51 +423,5 @@ fn is_client_visible_output_item(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{borrow::Cow, sync::Arc};
-
-    use rmcp::model::{Tool, ToolAnnotations as RmcpToolAnnotations};
-    use smg_mcp::ToolEntry;
-
-    use super::*;
-
-    // `Tool` and `ToolAnnotations` are `#[non_exhaustive]` in rmcp 1.7, so build
-    // them via the constructor/setters rather than struct literals.
-    fn entry_with_rmcp_annotations(annotations: Option<RmcpToolAnnotations>) -> ToolEntry {
-        let mut tool = Tool::new(
-            Cow::Owned("widget".to_string()),
-            Cow::Owned("widget description".to_string()),
-            Arc::new(serde_json::Map::new()),
-        );
-        tool.annotations = annotations;
-        ToolEntry::from_server_tool("srv", tool)
-    }
-
-    fn read_only_hint(value: bool) -> RmcpToolAnnotations {
-        RmcpToolAnnotations::new().read_only(value)
-    }
-
-    #[test]
-    fn build_mcp_tool_infos_surfaces_rmcp_read_only_hint() {
-        let entries = vec![entry_with_rmcp_annotations(Some(read_only_hint(true)))];
-        let infos = build_mcp_tool_infos(&entries);
-        let serialized = serde_json::to_value(&infos[0])
-            .expect("McpToolInfo must serialize")
-            .get("annotations")
-            .cloned()
-            .expect("annotations must serialize");
-        assert_eq!(serialized, json!({ "read_only": true }));
-    }
-
-    #[test]
-    fn build_mcp_tool_infos_defaults_to_false_when_hint_absent() {
-        let entries = vec![entry_with_rmcp_annotations(None)];
-        let infos = build_mcp_tool_infos(&entries);
-        let serialized = serde_json::to_value(&infos[0])
-            .expect("McpToolInfo must serialize")
-            .get("annotations")
-            .cloned()
-            .expect("annotations must serialize");
-        assert_eq!(serialized, json!({ "read_only": false }));
-    }
-}
+#[path = "../../tests/unit/openai_bridge/tool_descriptors/tests.rs"]
+mod tests;

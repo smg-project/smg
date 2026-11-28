@@ -153,7 +153,7 @@ message GenerateRequest {
   // Input embeddings (alternative to text/tokens)
   repeated float input_embeds = 14;
 
-  // LoRA adapter ID (if pre-loaded)
+  // Preloaded LoRA adapter ID or name (resolved to an ID by the worker).
   string lora_id = 15;
 
   // Data parallel routing: the rank the request is pinned to, when it is
@@ -175,8 +175,26 @@ message GenerateRequest {
   // Additional modality batches, matching vLLM's mm_inputs + extra_mm_inputs.
   // Each batch owns its tensors, token ID and placeholders.
   repeated MultimodalInputs extra_mm_inputs = 21;
+
+  // SMG prepared-input v1 metadata only. P exports the final native layout;
+  // D requires that layout and never falls back to preprocessing references.
+  bytes prepared_control = 22;
+  bytes prepared_input = 23;
+
+  // The request's partition of the engine's prefix cache. Unset is the
+  // partition that requests without a value share.
+  CachePartition cache_partition = 24;
 }
 
+// The engine keeps the two values as two separate fields. An empty string is
+// unset. A value can be a secret: do not log it.
+message CachePartition {
+  optional string cache_salt = 1;
+  optional string extra_key = 2;
+}
+
+// The gateway codec writes this message by hand around its field numbers and
+// GenerateRequest.tokenized = 2: change them together with crates/grpc_client/src/codec.rs.
 message TokenizedInput {
   string original_text = 1;  // For reference
   repeated uint32 input_ids = 2;
@@ -244,6 +262,7 @@ message GenerateResponse {
   // Control-only first item (response unset), never a generated token.
   // An empty identity explicitly declines reuse.
   MediaIdentity media_identity = 5;
+  bytes prepared_input = 6;
 
   oneof response {
     GenerateStreamChunk chunk = 2;
@@ -649,6 +668,12 @@ message SchedulerLoad {
   // measurement; absent if unknown or stale. Numbered 18 (the next free
   // number) so the existing field numbers stay stable.
   optional double prefill_throughput = 18;
+  // Values the engine reports by name, as a pushed record carries them
+  // (smg.grpc.common.EngineLoad.values, under the same field number). An
+  // answer's list is that answer's alone: a name it leaves out says nothing
+  // about that value. A value's age_ms is its sample's age as the answer is
+  // made. An old worker's answer has no list and states no value.
+  repeated smg.grpc.common.NamedValue values = 24;
 }
 
 message MemoryMetrics {

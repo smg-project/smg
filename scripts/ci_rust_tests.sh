@@ -37,7 +37,7 @@ shopt -s inherit_errexit
 
 GATEWAY_SHARDS=3
 
-# shard | path filter | extra setup (comma-separated: golden, ffmpeg, turbojpeg, postgres, wasm-fixtures) | test step timeout (minutes)
+# shard | path filter | extra setup (comma-separated: golden, ffmpeg, turbojpeg, postgres, wasm-fixtures, policy-guest, policy-import) | test step timeout (minutes)
 SHARDS='
 gateway-unit rust-gateway    ffmpeg                 20
 gateway-1    rust-gateway    -                      20
@@ -50,7 +50,7 @@ symphony     rust-symphony   -                      20
 agentic      rust-agentic    postgres,wasm-fixtures 20
 protocols    rust-protocols  -                      20
 engine       rust-engine     -                      20
-kv           rust-kv         -                      20
+kv           rust-kv         policy-guest,policy-import 20
 radix-fuzz   rust-radix      -                      15
 '
 
@@ -76,9 +76,9 @@ packages_of() {
         multimodal) echo llm-multimodal ;;
         symphony)   echo smg-symphony tool-parser reasoning-parser smg-response-template ;;
         agentic)    echo data-connector smg-mcp smg-wasm wfaas ;;
-        protocols)  echo openai-protocol smg-external-router smg-auth smg-rl smg-client openapi-gen ;;
+        protocols)  echo openai-protocol smg-worker smg-external-router smg-service-discovery smg-auth smg-rl smg-client openapi-gen ;;
         engine)     echo smg-grpc-client engine-zmq-client engine-zmq-adapter engine-servicer mock-worker gateway-perf ;;
-        kv)         echo kv-index smg-mesh smg-mm-rdma smg-policy-controller smg-radix-tree ;;
+        kv)         echo kv-index smg-mesh smg-mm-rdma smg-grand-central grand-central-example smg-radix-tree ;;
         radix-fuzz) echo smg-radix-tree ;;
         *) shard_row "$1" >/dev/null ;;
     esac
@@ -145,12 +145,12 @@ commands_of() {
     local shard=$1
     case "$shard" in
         gateway-unit)
-            # The lib's unit tests and the smg binary's. The alias binary amg is the same
-            # source (its manifest entry says test = false); an explicit --bins would build
-            # and run its harness anyway, so the binary is named.
+            # The lib's unit tests. The command line's cases run with the library, and
+            # neither executable builds a test harness (their manifest entries say
+            # test = false).
             # One invocation for both packages: on its own, the harness's `-p` would unify the gateway
             # down to the harness's feature set and build the gateway lib a second time.
-            echo "-p smg -p smg-test-harness --lib --bin smg"
+            echo "-p smg -p smg-test-harness --lib"
             echo "-p smg --doc" ;;
         gateway-[0-9]*)
             local index=${shard#gateway-} selectors
@@ -173,12 +173,31 @@ commands_of() {
             # Opt-in (#[ignore]) cases against the database the workflow creates for the job.
             echo "-p data-connector --test postgres_integration --test conformance :: --ignored --test-threads=1" ;;
         protocols)
-            echo "-p openai-protocol -p smg-external-router -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini" ;;
+            echo "-p openai-protocol -p smg-worker -p smg-external-router -p smg-service-discovery -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-worker/runtime,smg-worker/workflow,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini,smg-service-discovery/consul,smg-service-discovery/file,smg-service-discovery/kubernetes,smg-service-discovery/slurm"
+            # The discovery crate with no provider built: its shared cases, and the refusal of
+            # each provider's settings.
+            echo "-p smg-service-discovery" ;;
         engine)
-            echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine" ;;
+            # `engine-port` is on for the cases of the client crate's engine port: no package of the shard
+            # asks for it, so nothing else would turn it on.
+            echo "-p smg-grpc-client -p engine-zmq-client -p engine-zmq-adapter -p engine-servicer -p mock-worker -p gateway-perf --features engine-zmq-client/mock-engine,smg-grpc-client/engine-port" ;;
         kv)
             local selectors
-            echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-policy-controller"
+            # The example controller rides the Grand Central crate's invocation: it asks for the crate's
+            # `controller` feature, which this line turns on already, so nothing is built twice.
+            # `worker-host` is on for the cases of the crate's worker objects and for the test targets that
+            # run the stock binary, which require it.
+            echo "-p kv-index -p smg-mesh -p smg-mm-rdma -p smg-grand-central -p grand-central-example --features smg-grand-central/client,smg-grand-central/kubernetes,smg-grand-central/worker-host"
+            # The Grand Central crate's library once more, under `discovery`: no package of the shard asks for
+            # that feature, so nothing else would run the cases behind it. The line above stays as it
+            # is: it runs the case of a build without the feature.
+            echo "-p smg-grand-central --lib --features smg-grand-central/discovery"
+            # The Grand Central crate's case for a host that builds the `operator` feature alone. The shard's
+            # first line turns the controller on, so that case would never run as such a host builds it.
+            echo "-p smg-grand-central --no-default-features --features operator --test operator_door"
+            # The Grand Central crate's library as a host in process builds it: `worker-host` without the
+            # controller. The shard's first line turns the controller on, so that build would never be made.
+            echo "-p smg-grand-central --lib --no-default-features --features worker-host"
             # The radix tree without its fuzz binary (the radix-fuzz shard); --doc cannot share an invocation with --test.
             selectors=$(test_selectors_except smg-radix-tree fuzz_differential)
             echo "-p smg-radix-tree --lib$selectors"
@@ -221,6 +240,22 @@ run_commands() {
     return "$status"
 }
 
+# Every set of the discovery crate's four provider features but the empty one, a comma list
+# a line, and each set that does not hold the file provider once more with the directory
+# watch (`file` names `fs-watch`): the 23 distinct builds a host can name.
+discovery_feature_sets() {
+    local mask features
+    for mask in $(seq 0 15); do
+        features=""
+        [ $((mask & 1)) -eq 0 ] || features="consul"
+        [ $((mask & 2)) -eq 0 ] || features="${features:+$features,}file"
+        [ $((mask & 4)) -eq 0 ] || features="${features:+$features,}kubernetes"
+        [ $((mask & 8)) -eq 0 ] || features="${features:+$features,}slurm"
+        [ -z "$features" ] || echo "$features"
+        [ $((mask & 2)) -ne 0 ] || echo "${features:+$features,}fs-watch"
+    done
+}
+
 lint() {
     case "$1" in
         all-features)
@@ -239,6 +274,16 @@ lint() {
             (set -x; cargo check -p llm-multimodal)
             # Standalone consumers that resolve model files themselves build without `hf-hub`.
             (set -x; cargo check -p llm-multimodal --no-default-features --all-targets)
+            # The discovery crate builds each provider under a feature of its own, and a host
+            # names the ones it runs: with none, under every set of them, and with the test
+            # helpers alone, nothing is left unused and no lint reads one set apart.
+            (set -x; cargo clippy -p smg-service-discovery --all-targets -- -D warnings)
+            for features in $(discovery_feature_sets) test-util; do
+                (set -x; cargo clippy -p smg-service-discovery --features "$features" --all-targets -- -D warnings)
+            done
+            # The Grand Central crate's `operator` feature is what a host calls in its own process. It
+            # builds with no controller behind it, and nothing of it is left unused there.
+            (set -x; cargo clippy -p smg-grand-central --no-default-features --features operator --all-targets -- -D warnings)
             (set -x; cargo check --manifest-path bindings/python/Cargo.toml)
             (set -x; cargo check --manifest-path bindings/golang/Cargo.toml) ;;
         *) echo "ci_rust_tests.sh: unknown lint leg '$1' (all-features, self-hosted, anthropic-only, default-build)" >&2; exit 2 ;;

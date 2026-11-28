@@ -3,23 +3,23 @@
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
-use openai_protocol::worker::{WorkerModels, WorkerSpec, WorkerStatus};
-use tracing::{debug, info};
+use openai_protocol::worker::{GrammarStart, WorkerModels, WorkerSpec, WorkerStatus};
+use smg_service_discovery::DISCOVERY_PROVIDER_LABEL;
+use smg_worker::{
+    identity::basic::{merge_labels, BasicWorker, RuntimeType, Worker},
+    workflow::{
+        kv_transfer_value, model_card_for_labels, report_for_rank, unnamed_grammar_start_warning,
+        validate_constrained_decoding_label, DP_WIDTH_LABELS,
+    },
+};
+use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
-#[cfg(test)]
-use super::create_worker::labels_for_rank;
-use super::create_worker::{
-    model_card_for_labels, report_for_rank, validate_parser_overrides,
-    warn_on_conflicting_parser_overrides, DP_WIDTH_LABELS,
-};
+use super::check_local_worker::{validate_parser_overrides, warn_on_conflicting_parser_overrides};
 use crate::{
-    service_discovery::DISCOVERY_PROVIDER_LABEL,
-    worker::{
-        basic::merge_labels, overload::OverloadThresholds, service::MAX_WORKER_LABELS, BasicWorker,
-        BasicWorkerBuilder, RuntimeType, Worker,
-    },
-    workflow::data::WorkerUpdateWorkflowData,
+    admin::worker_service::MAX_WORKER_LABELS,
+    routers::grpc::backend_client::BasicWorkerBuilder,
+    workflow::data::{require_app_context, WorkerUpdateWorkflowData},
 };
 
 /// Step to update worker properties.
@@ -43,9 +43,8 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
         // merges the request's labels into the existing ones.
         let refresh = context.data.refresh_discovered_labels;
         // The engine's KV transfer metadata travels in its report under label
-        // names and is never a label (registration takes it out the same way,
-        // `create_worker::take_kv_transfer_metadata`): out of the report before
-        // any merge, applied to the worker's dedicated fields below.
+        // names. Take it out before merging labels and apply it to the same
+        // dedicated fields as registration.
         let (fresh_engine_labels, fresh_kv) = match context.data.fresh_engine_labels.clone() {
             Some(mut fresh) => {
                 let kv = EngineKvMetadata::take(&mut fresh);
@@ -59,12 +58,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             context.data.updated_workers = Some(Vec::new());
             return Ok(StepResult::Skip);
         }
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?
-            .clone();
+        let app_context = require_app_context(context.data.app_context.as_ref())?.clone();
         let workers_to_update = context
             .data
             .workers_to_update
@@ -104,7 +98,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     // An engine that reports a `constrained_decoding` naming no
                     // policy is refused as at registration: the job fails with
                     // the reason and the worker keeps the labels it had.
-                    super::create_worker::validate_constrained_decoding_label(
+                    validate_constrained_decoding_label(
                         &labels,
                         worker.url(),
                         "update_worker_properties",
@@ -112,7 +106,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     labels
                 } else {
                     // A window set here is the worker's only window, as at
-                    // registration (see `create_worker::merge_labels`).
+                    // registration (see `merge_labels`).
                     let updated_labels = match request.labels {
                         Some(ref new_labels) => {
                             // The admin check refused labels for a discovered
@@ -127,7 +121,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                                         "worker {} is owned by the '{provider}' discovery provider \
                                          since this update was accepted; its labels come from its \
                                          discovery source",
-                                        worker.url()
+                                        worker.redacted_url()
                                     ),
                                 });
                             }
@@ -138,7 +132,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                     // A `constrained_decoding` label sent in the update must name a
                     // policy, as at registration (`create_worker`): a typo would
                     // otherwise read as `requested` from here on.
-                    super::create_worker::validate_constrained_decoding_label(
+                    validate_constrained_decoding_label(
                         &updated_labels,
                         worker.url(),
                         "update_worker_properties",
@@ -151,7 +145,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                             message: format!(
                                 "{} labels on worker {} after this update ({} now, {} new); at most {MAX_WORKER_LABELS} are accepted",
                                 updated_labels.len(),
-                                worker.url(),
+                                worker.redacted_url(),
                                 existing.len(),
                                 updated_labels.len() - existing.len()
                             ),
@@ -206,14 +200,18 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 && !fresh_kv.fills_a_field_of(&worker.metadata().spec)
             {
                 debug!(
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     "Engine labels unchanged; the worker is kept as it is"
                 );
                 continue;
             }
+            let lost_start = fresh_engine_labels
+                .as_ref()
+                .filter(|_| refresh)
+                .and_then(|fresh| refresh_left_no_grammar_start(worker, &updated_labels, fresh));
             if !card_fields.is_empty() {
                 info!(
-                    worker_url = %worker.url(),
+                    worker_url = %worker.redacted_url(),
                     fields = ?card_fields,
                     "The worker's model card follows its labels"
                 );
@@ -289,9 +287,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 .cost(updated_cost)
                 // The effective overload thresholds re-resolve against the
                 // same gateway defaults registration used.
-                .overload_defaults(OverloadThresholds::from_gateway_config(
-                    &app_context.router_config,
-                ))
+                .overload_defaults(app_context.router_config.worker_overload_thresholds())
                 .status(next_status);
             if refresh {
                 // A connector or role the operator configured none of follows
@@ -345,7 +341,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 }
                 _ if refresh => {
                     debug!(
-                        worker_url = %worker.url(),
+                        worker_url = %worker.redacted_url(),
                         "Worker changed or left during the label refresh; not rebuilt"
                     );
                     continue;
@@ -356,27 +352,36 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                         message: format!(
                             "worker {} was replaced or removed since this update found it, so \
                              the update was dropped",
-                            worker.url()
+                            worker.redacted_url()
                         ),
                     });
                 }
             };
 
-            // The rebuilt handle stands at the old one's URL: tell the policy
-            // registry, as a removal would, so the engine's rows of the
-            // retired handle do not outlive it.
-            app_context
-                .policy_registry
-                .on_worker_replaced(worker.as_ref(), new_worker.as_ref());
+            // Said only of a refresh the registry took: one dropped above
+            // leaves the worker as a newer registration holds it.
+            if let Some(warning) = lost_start {
+                warn!("{warning}");
+            }
 
             // Same-URL replace preserves the existing shared runtime. If the
             // update disables health checks, force the lifecycle to Ready so
             // the worker does not stay stuck in a non-routable pre-update
-            // status while the manager correctly skips future probes.
+            // status while the manager correctly skips future probes. A
+            // worker its removal is draining stays so, decided under the
+            // worker's lock. The revision is only the call's precondition
+            // and a mesh publication can raise it in place behind the read:
+            // it is read once more.
             if updated_health_config.disable_health_check {
-                let _ = app_context
-                    .worker_registry
-                    .transition_status(&worker_id, WorkerStatus::Ready);
+                let registry = &app_context.worker_registry;
+                let ready_unless_draining = || {
+                    let held = registry.get(&worker_id)?;
+                    registry.apply_if_revision(&worker_id, held.revision(), |held| {
+                        let leaving = held.status() == WorkerStatus::Draining;
+                        ((), (!leaving).then_some(WorkerStatus::Ready))
+                    })
+                };
+                let _ = ready_unless_draining().or_else(ready_unless_draining);
             }
 
             updated_workers.push(new_worker);
@@ -384,7 +389,7 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
 
         // Log result
         if updated_workers.len() == 1 {
-            info!("Updated worker {}", updated_workers[0].url());
+            info!("Updated worker {}", updated_workers[0].redacted_url());
         } else {
             info!("Updated {} workers", updated_workers.len());
         }
@@ -423,7 +428,7 @@ fn models_for_labels(
 
 /// The engine's KV transfer metadata, which its report carries under label
 /// names (`kv_connector`, `kv_role`, `kv_engine_id`) and the worker holds in
-/// dedicated fields, as at registration (`create_worker::take_kv_transfer_metadata`).
+/// dedicated fields, as at registration.
 #[derive(Debug, Default)]
 struct EngineKvMetadata {
     connector: Option<String>,
@@ -432,9 +437,10 @@ struct EngineKvMetadata {
 }
 
 impl EngineKvMetadata {
-    /// Takes the three keys out of the report; an empty value is none.
+    /// Takes the three keys out of the report, an empty value being none
+    /// (`kv_transfer_value`, the registration's reading of the same keys).
     fn take(report: &mut HashMap<String, String>) -> Self {
-        let mut take = |key: &str| report.remove(key).filter(|value| !value.is_empty());
+        let mut take = |key: &str| kv_transfer_value(report.remove(key));
         Self {
             connector: take("kv_connector"),
             role: take("kv_role"),
@@ -471,7 +477,7 @@ impl EngineKvMetadata {
         let previous = worker.kv_engine_id();
         if worker.refresh_kv_engine_id(Some(engine_id.clone())) {
             info!(
-                worker_url = %worker.url(),
+                worker_url = %worker.redacted_url(),
                 ?previous,
                 engine_id,
                 "The worker's KV engine id follows its engine's report"
@@ -501,6 +507,40 @@ fn fresh_in_rank_space(
         }
     }
     report_for_rank(fresh, worker.dp_rank().zip(worker.dp_size()), &width_source)
+}
+
+/// What a label refresh says, once, of a worker it leaves without a grammar
+/// start: the sentence a registration writes of a worker that names none
+/// (`unnamed_grammar_start_warning`, which also says which workers a
+/// gateway-shaped grammar reaches). It is owed at the refresh that takes the
+/// start away (the worker named one before and `labels` name none), and at
+/// the first refresh of a worker registered on a read that found nothing (no
+/// report is on record), of which a registration says nothing. `None` at a
+/// later refresh of the same state: the worker named no start before and its
+/// report is on record, so its operator was told.
+fn refresh_left_no_grammar_start(
+    worker: &Arc<dyn Worker>,
+    labels: &HashMap<String, String>,
+    fresh: &HashMap<String, String>,
+) -> Option<String> {
+    let before = worker.metadata();
+    let start_before = before
+        .spec
+        .labels
+        .get(GrammarStart::LABEL)
+        .map(String::as_str);
+    let named_before = GrammarStart::from_label(start_before) != GrammarStart::Unknown;
+    if !named_before && !before.discovered_labels.is_empty() {
+        return None;
+    }
+    unnamed_grammar_start_warning(
+        worker.url(),
+        before.spec.connection_mode,
+        before.spec.runtime_type,
+        before.spec.worker_type,
+        fresh,
+        labels,
+    )
 }
 
 /// The labels a worker carries once its engine reports `fresh`: every label
@@ -548,4 +588,5 @@ pub(crate) fn refreshed_labels(
 }
 
 #[cfg(test)]
+#[path = "../../../../tests/unit/workflow/steps/local/update_worker_properties/tests/mod.rs"]
 mod tests;

@@ -21,11 +21,14 @@ use super::{
 use crate::{error, mcp_utils::DEFAULT_MAX_ITERATIONS, metrics::Metrics};
 
 /// Execute a non-streaming Messages API request, handling both
-/// plain and MCP tool loop paths.
+/// plain and MCP tool loop paths. The plain path relays the provider's answer
+/// as it wrote it; the MCP loop reads each answer typed to find its tool calls.
 pub(crate) async fn execute(router: &RouterContext, mut req_ctx: RequestContext) -> Response {
     if req_ctx.mcp_servers.is_none() {
-        return match send_one_request(router, &req_ctx).await {
-            Ok(message) => (StatusCode::OK, Json(message)).into_response(),
+        return match send_to_worker(router, &req_ctx).await {
+            Ok((response, start_time)) => {
+                worker::relay_response(response, &req_ctx.model_id, start_time).await
+            }
             Err(response) => response,
         };
     }
@@ -49,9 +52,11 @@ pub(crate) async fn execute(router: &RouterContext, mut req_ctx: RequestContext)
     for _iteration in 0..DEFAULT_MAX_ITERATIONS {
         Metrics::record_mcp_tool_iteration(&req_ctx.model_id);
 
-        let result = mcp::IterationResult::from_message(&message);
+        let result = mcp::IterationResult::take_from(&mut message);
         match mcp::process_iteration(&result, &session, &req_ctx.model_id).await {
             mcp::ToolLoopAction::Done => {
+                // The final answer's blocks go back where the rebuild reads them.
+                message.content = result.content_blocks;
                 let final_message = mcp::rebuild_response_with_mcp_blocks(
                     message,
                     &all_mcp_calls,
@@ -63,8 +68,9 @@ pub(crate) async fn execute(router: &RouterContext, mut req_ctx: RequestContext)
                 return error::bad_gateway("mcp_tool_loop_error", msg);
             }
             mcp::ToolLoopAction::Continue(cont) => {
-                // Collect content blocks from this iteration for the final response
-                prior_content_blocks.extend(message.content.clone());
+                // This iteration's blocks, kept for the final response: moved,
+                // the message is sent no further.
+                prior_content_blocks.extend(result.content_blocks);
                 all_mcp_calls.extend(cont.mcp_calls);
                 req_ctx.request.messages.push(InputMessage {
                     role: Role::Assistant,
@@ -84,8 +90,9 @@ pub(crate) async fn execute(router: &RouterContext, mut req_ctx: RequestContext)
     }
 
     // Max iterations — check if the last response completed naturally
-    let result = mcp::IterationResult::from_message(&message);
+    let result = mcp::IterationResult::take_from(&mut message);
     if result.tool_use_blocks.is_empty() {
+        message.content = result.content_blocks;
         let final_message =
             mcp::rebuild_response_with_mcp_blocks(message, &all_mcp_calls, &prior_content_blocks);
         return (StatusCode::OK, Json(final_message)).into_response();
@@ -106,6 +113,17 @@ async fn send_one_request(
     router: &RouterContext,
     req_ctx: &RequestContext,
 ) -> Result<Message, Response> {
+    let (response, start_time) = send_to_worker(router, req_ctx).await?;
+    worker::parse_response(response, &req_ctx.model_id, start_time).await
+}
+
+/// Send a single non-streaming request to a worker: its successful answer,
+/// unread, with the time the request started; a refusal answered as the
+/// provider's error.
+async fn send_to_worker(
+    router: &RouterContext,
+    req_ctx: &RequestContext,
+) -> Result<(reqwest::Response, Instant), Response> {
     let model_id = &req_ctx.model_id;
     let start_time = Instant::now();
 
@@ -126,5 +144,5 @@ async fn send_one_request(
         return Err(worker::handle_error_response(response, model_id, start_time).await);
     }
 
-    worker::parse_response(response, model_id, start_time).await
+    Ok((response, start_time))
 }

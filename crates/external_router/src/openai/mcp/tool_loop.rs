@@ -16,13 +16,13 @@ use openai_protocol::{
     event_types::{is_function_call_type, ItemType, McpEvent, OutputItemEvent},
     responses::{generate_id, McpToolCallError, ResponseTool, ResponsesRequest},
 };
+use serde::Serialize;
 use serde_json::{json, to_value, Value};
 use smg_mcp::{McpServerBinding, McpToolSession, ToolExecutionInput, ToolExecutionResult};
 use tracing::{debug, info, warn};
 
 use super::tool_handler::FunctionCallInProgress;
 use crate::{
-    error,
     header_utils::ApiProvider,
     mcp_utils::{prepare_hosted_dispatch_args, DEFAULT_MAX_ITERATIONS},
     metrics::{metrics_labels, Metrics},
@@ -32,7 +32,8 @@ use crate::{
         extract_embedded_openai_responses, mcp_response_item_id, FormatRegistry, ResponseFormat,
         ResponseTransformer,
     },
-    sse::SseSender,
+    sse::{SseEncoder, SseSender},
+    upstream_body::error_body_text,
 };
 
 /// State for tracking multi-turn tool calling loop
@@ -47,6 +48,12 @@ pub(crate) struct ToolLoopState {
     pub existing_mcp_list_tools_labels: HashSet<String>,
     /// Transformed output items (mcp_call, web_search_call, etc.) - stored to avoid reconstruction
     pub mcp_call_items: Vec<Value>,
+    /// The `mcp_list_tools` items this loop renders, built at their first use
+    /// and kept (see [`Self::mcp_list_tools_items`]).
+    mcp_list_tools_items: Option<Vec<Value>>,
+    /// How many of `conversation_history`'s items the loop's payload carries
+    /// already; a resume appends the rest.
+    history_in_payload: usize,
 }
 
 impl ToolLoopState {
@@ -61,7 +68,48 @@ impl ToolLoopState {
             conversation_history: Vec::new(),
             existing_mcp_list_tools_labels: known_labels,
             mcp_call_items: Vec::new(),
+            mcp_list_tools_items: None,
+            history_in_payload: 0,
         }
+    }
+
+    /// The `mcp_list_tools` items of the bindings this loop announces: every
+    /// server of the session without an item in the history the request
+    /// continues, the internal servers' left out (the stream announces what
+    /// the final response and the stored record carry). Built once, each
+    /// tool's schema copied into them once: the stream's start and the final
+    /// response render the same items.
+    pub fn mcp_list_tools_items(&mut self, session: &McpToolSession<'_>) -> &[Value] {
+        self.mcp_list_tools_items.get_or_insert_with(|| {
+            mcp_list_tools_bindings_to_emit(
+                &self.existing_mcp_list_tools_labels,
+                session.mcp_servers(),
+            )
+            .iter()
+            .filter(|(server_label, _)| !session.is_internal_non_builtin_server_label(server_label))
+            .map(|(server_label, server_key)| {
+                openai_bridge::mcp_list_tools_json(session, server_label, server_key)
+            })
+            .collect()
+        })
+    }
+
+    /// The kept `mcp_list_tools` items, moved out for a response's last
+    /// render: the stored record on the streaming path; the answered, the
+    /// approval or the tool-call-limit response on the non-streaming path.
+    /// Nothing reads them afterwards, so that render owns them instead of
+    /// copying every schema once more.
+    pub fn take_mcp_list_tools_items(&mut self, session: &McpToolSession<'_>) -> Vec<Value> {
+        self.mcp_list_tools_items(session);
+        self.mcp_list_tools_items.take().unwrap_or_default()
+    }
+
+    /// The calls recorded since the loop's payload last took them, each with
+    /// its output: the next resume payload appends them.
+    pub fn history_to_append(&mut self) -> &[Value] {
+        let from = self.history_in_payload.min(self.conversation_history.len());
+        self.history_in_payload = self.conversation_history.len();
+        &self.conversation_history[from..]
     }
 
     /// Record a tool call in the loop state
@@ -336,9 +384,10 @@ fn streaming_call_item(
 }
 
 /// A streamed call closed on the wire with its item (the format's completed
-/// event, then the item's `response.output_item.done`) and recorded in the
-/// loop's state, as the non-streamed loop records a call. Returns false when
-/// the client left.
+/// event, or `response.mcp_call.failed` for an `mcp_call` that failed, then
+/// the item's `response.output_item.done`) and recorded in the loop's state,
+/// as the non-streamed loop records a call. Returns false when the client
+/// left.
 async fn close_streaming_call(
     call: FunctionCallInProgress,
     mcp_call_item: Value,
@@ -518,23 +567,26 @@ fn remap_tool_choice_for_functions(tool_choice: Option<&Value>, tools: &[Value])
     }
 }
 
-/// Build a resume payload: the payload the loop started from, its input (the
-/// request's own, with the history it continues loaded in front) followed by
-/// every call this loop executed with its output.
-pub(crate) fn build_resume_payload(
-    base_payload: &Value,
-    conversation_history: &[Value],
-    tools_json: &Value,
+/// Turn the payload the loop just sent into the payload of its next turn, in
+/// place: the calls executed since the last turn, each with its output, go
+/// behind its input (the request's own, with the history it continues loaded
+/// in front), the model is left free to answer, and the loop's own `stream`
+/// and `store` are set. One payload serves every turn; its input items and
+/// its tools are never copied.
+pub(crate) fn resume_payload_in_place(
+    payload: &mut Value,
+    new_history: &[Value],
     is_streaming: bool,
-) -> Result<Value, String> {
-    let mut payload = base_payload.clone();
-
+) -> Result<(), String> {
     let obj = payload
         .as_object_mut()
         .ok_or_else(|| "payload not an object".to_string())?;
 
-    let mut input_array = match obj.get("input") {
-        Some(Value::Array(items)) => items.clone(),
+    // The input is taken out in place (a removal would move the last key into
+    // its slot under the crate's ordered maps) and its items are moved into
+    // the resumed list; the insert below fills the slot again.
+    let mut input_array = match obj.get_mut("input").map(Value::take) {
+        Some(Value::Array(items)) => items,
         Some(Value::String(text)) => vec![json!({
             "type": "message",
             "role": "user",
@@ -543,52 +595,55 @@ pub(crate) fn build_resume_payload(
         _ => return Err("payload input is neither a string nor an item list".to_string()),
     };
 
-    input_array.extend_from_slice(conversation_history);
+    input_array.extend_from_slice(new_history);
     obj.insert("input".to_string(), Value::Array(input_array));
 
-    if let Some(tools_arr) = tools_json.as_array() {
-        if !tools_arr.is_empty() {
-            obj.insert("tools".to_string(), tools_json.clone());
-            // The tool call already happened; "auto" lets the model answer
-            // instead of looping a preserved "required" until the call limit.
-            obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
-        }
+    if obj
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+    {
+        // The tool call already happened; "auto" lets the model answer
+        // instead of looping a preserved "required" until the call limit.
+        obj.insert("tool_choice".to_string(), Value::String("auto".to_string()));
     }
 
     obj.insert("stream".to_string(), Value::Bool(is_streaming));
     obj.insert("store".to_string(), Value::Bool(false));
 
-    Ok(payload)
+    Ok(())
 }
 
-/// Send mcp_list_tools events to client at the start of streaming
-/// Returns false if client disconnected
+/// Send the `mcp_list_tools` events of one item to the client at the start of
+/// streaming: the item added empty, the listing in progress and completed
+/// (or failed, when the item carries the listing's `error`), the item done
+/// with its tools. The item is written to the wire where it stands (the loop
+/// keeps it for the final response), not copied into the events. Returns
+/// false if the client disconnected.
 pub(crate) async fn send_mcp_list_tools_events(
     tx: &SseSender,
-    session: &McpToolSession<'_>,
-    server_label: &str,
+    enc: &mut SseEncoder,
+    item: &Value,
     output_index: usize,
     sequence_number: &mut u64,
-    server_key: &str,
 ) -> bool {
-    let tools_item_full = openai_bridge::mcp_list_tools_json(session, server_label, server_key);
-    let item_id = tools_item_full
-        .get("id")
-        .and_then(|v| v.as_str())
+    let item_id = item.get("id").and_then(Value::as_str).unwrap_or("");
+    let server_label = item
+        .get("server_label")
+        .and_then(Value::as_str)
         .unwrap_or("");
-
-    // Create empty tools version for the initial added event
-    let mut tools_item_empty = tools_item_full.clone();
-    if let Some(obj) = tools_item_empty.as_object_mut() {
-        obj.insert("tools".to_string(), json!([]));
-    }
 
     // Event 1: response.output_item.added with empty tools
     let event1_payload = json!({
         "type": OutputItemEvent::ADDED,
         "sequence_number": *sequence_number,
         "output_index": output_index,
-        "item": tools_item_empty
+        "item": {
+            "type": ItemType::MCP_LIST_TOOLS,
+            "id": item_id,
+            "server_label": server_label,
+            "tools": []
+        }
     });
     *sequence_number += 1;
     let event1 = format!(
@@ -617,37 +672,66 @@ pub(crate) async fn send_mcp_list_tools_events(
         return false;
     }
 
-    // Event 3: response.mcp_list_tools.completed
+    // Event 3: response.mcp_list_tools.completed, or .failed when the item
+    // carries the listing's error (the done item below carries it to the
+    // client; the event itself names only the outcome)
+    let event3_type = if item.get("error").is_some_and(|error| !error.is_null()) {
+        McpEvent::LIST_TOOLS_FAILED
+    } else {
+        McpEvent::LIST_TOOLS_COMPLETED
+    };
     let event3_payload = json!({
-        "type": McpEvent::LIST_TOOLS_COMPLETED,
+        "type": event3_type,
         "sequence_number": *sequence_number,
         "output_index": output_index,
         "item_id": item_id
     });
     *sequence_number += 1;
-    let event3 = format!(
-        "event: {}\ndata: {}\n\n",
-        McpEvent::LIST_TOOLS_COMPLETED,
-        event3_payload
-    );
+    let event3 = format!("event: {event3_type}\ndata: {event3_payload}\n\n");
     if tx.send(Ok(Bytes::from(event3))).await.is_err() {
         return false;
     }
 
-    // Event 4: response.output_item.done with full tools list
-    let event4_payload = json!({
-        "type": OutputItemEvent::DONE,
-        "sequence_number": *sequence_number,
-        "output_index": output_index,
-        "item": tools_item_full
-    });
+    // Event 4: response.output_item.done with the full tools list, the item
+    // serialised from where it stands
+    let event4_payload = OutputItemEventPayload {
+        event_type: OutputItemEvent::DONE,
+        sequence_number: *sequence_number,
+        output_index,
+        item,
+    };
     *sequence_number += 1;
-    let event4 = format!(
-        "event: {}\ndata: {}\n\n",
-        OutputItemEvent::DONE,
-        event4_payload
-    );
-    tx.send(Ok(Bytes::from(event4))).await.is_ok()
+    let event4 = match enc.encode_event(OutputItemEvent::DONE, &event4_payload) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(
+                "failed to encode the list-tools done event via SseEncoder, falling back: {error}"
+            );
+            Bytes::from(format!(
+                "event: {}\ndata: {}\n\n",
+                OutputItemEvent::DONE,
+                json!({
+                    "type": OutputItemEvent::DONE,
+                    "sequence_number": event4_payload.sequence_number,
+                    "output_index": output_index,
+                    "item": item
+                })
+            ))
+        }
+    };
+    tx.send(Ok(event4)).await.is_ok()
+}
+
+/// An `output_item` event's payload around a borrowed item: the item is
+/// serialised onto the wire from where it stands, where `json!` would copy
+/// it into the event first.
+#[derive(Serialize)]
+struct OutputItemEventPayload<'a> {
+    #[serde(rename = "type")]
+    event_type: &'static str,
+    sequence_number: u64,
+    output_index: usize,
+    item: &'a Value,
 }
 
 /// Send intermediate event during tool execution (searching/interpreting).
@@ -681,7 +765,10 @@ async fn send_tool_call_intermediate_event(
 
 /// Send tool call completion events after tool execution.
 /// Handles mcp_call, web_search_call, code_interpreter_call, file_search_call,
-/// and image_generation_call items.
+/// and image_generation_call items. An `mcp_call` whose item reads `failed`
+/// closes under `response.mcp_call.failed`, as a call past the allowance
+/// does ([`skip_streaming_tool_calls`]); the hosted formats have no failed
+/// sub-event, so their item's status says it.
 /// Returns false if client disconnected.
 async fn send_tool_call_completion_events(
     tx: &SseSender,
@@ -693,32 +780,39 @@ async fn send_tool_call_completion_events(
     let effective_output_index = call.effective_output_index();
     let item_id = stable_streaming_tool_item_id(call, response_format);
 
-    // Resolve the completion event from the item's `type` (the typed
+    // Resolve the closing event from the item's `type` (the typed
     // `tool_call_item` may have been re-tagged after dispatch); fall back
-    // to the format-derived event for unknown types.
+    // to the format-derived event for unknown types. A failed `mcp_call`
+    // has a sub-event of its own.
     let item_type = tool_call_item
         .get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let completed_event_type: &str = openai_bridge::format_from_type_str(item_type)
-        .map(|f| openai_bridge::descriptor(f).completed_event)
-        .unwrap_or_else(|| openai_bridge::descriptor(response_format).completed_event);
+    let failed_mcp_call = item_type == ItemType::MCP_CALL
+        && tool_call_item.get("status").and_then(|v| v.as_str()) == Some("failed");
+    let close_event_type: &str = if failed_mcp_call {
+        McpEvent::CALL_FAILED
+    } else {
+        openai_bridge::format_from_type_str(item_type)
+            .map(|f| openai_bridge::descriptor(f).completed_event)
+            .unwrap_or_else(|| openai_bridge::descriptor(response_format).completed_event)
+    };
 
-    // Event 1: response.<type>.completed
-    let completed_payload = json!({
-        "type": completed_event_type,
+    // Event 1: response.<type>.completed, or response.mcp_call.failed
+    let close_payload = json!({
+        "type": close_event_type,
         "sequence_number": *sequence_number,
         "output_index": effective_output_index,
         "item_id": item_id
     });
     *sequence_number += 1;
 
-    let completed_event = format!("event: {completed_event_type}\ndata: {completed_payload}\n\n");
-    if tx.send(Ok(Bytes::from(completed_event))).await.is_err() {
+    let close_event = format!("event: {close_event_type}\ndata: {close_payload}\n\n");
+    if tx.send(Ok(Bytes::from(close_event))).await.is_err() {
         return false;
     }
 
-    // Event 2: response.output_item.done (with completed tool call)
+    // Event 2: response.output_item.done (with the call's final item)
     let done_payload = json!({
         "type": OutputItemEvent::DONE,
         "sequence_number": *sequence_number,
@@ -793,66 +887,70 @@ pub(crate) fn mcp_list_tools_bindings_to_emit(
         .collect()
 }
 
-/// Inject MCP metadata into a streaming response
-pub(crate) fn inject_mcp_metadata_streaming(
+/// Inject MCP metadata into a response's last render: the streamed loop's
+/// final response (the wire and the record share it), the answered response
+/// on the non-streaming path. The kept `mcp_list_tools` items move into it;
+/// nothing reads them afterwards.
+pub(crate) fn inject_mcp_metadata_last(
     response: &mut Value,
-    state: &ToolLoopState,
+    state: &mut ToolLoopState,
     session: &McpToolSession<'_>,
 ) {
-    let list_tools_bindings = mcp_list_tools_bindings_to_emit(
-        &state.existing_mcp_list_tools_labels,
-        session.mcp_servers(),
-    );
+    let prefix = mcp_output_prefix_last(state, session, 0);
+    inject_mcp_output_prefix(response, prefix);
+}
 
+fn inject_mcp_output_prefix(response: &mut Value, prefix: Vec<Value>) {
     if let Some(output_array) = response.get_mut("output").and_then(|v| v.as_array_mut()) {
         output_array.retain(|item| {
             item.get("type").and_then(|t| t.as_str()) != Some(ItemType::MCP_LIST_TOOLS)
         });
-
-        let mut prefix = Vec::with_capacity(list_tools_bindings.len() + state.mcp_call_items.len());
-        for (server_label, server_key) in &list_tools_bindings {
-            if !session.is_internal_server_label(server_label) {
-                prefix.push(openai_bridge::mcp_list_tools_json(
-                    session,
-                    server_label,
-                    server_key,
-                ));
-            }
-        }
-        prefix.extend(
-            state
-                .mcp_call_items
-                .iter()
-                .filter(|item| !is_internal_mcp_response_item(item, session))
-                .cloned(),
-        );
         output_array.splice(0..0, prefix);
     } else if let Some(obj) = response.as_object_mut() {
-        let mut output_items = Vec::new();
-        for (server_label, server_key) in &list_tools_bindings {
-            if !session.is_internal_server_label(server_label) {
-                output_items.push(openai_bridge::mcp_list_tools_json(
-                    session,
-                    server_label,
-                    server_key,
-                ));
-            }
-        }
-        // Use stored transformed items (no reconstruction needed)
-        output_items.extend(
-            state
-                .mcp_call_items
-                .iter()
-                .filter(|item| !is_internal_mcp_response_item(item, session))
-                .cloned(),
-        );
-        obj.insert("output".to_string(), Value::Array(output_items));
+        obj.insert("output".to_string(), Value::Array(prefix));
     }
+}
+
+/// The prefix of a response's last render: the kept `mcp_list_tools` items
+/// moved, not copied (the answered, the approval and the tool-call-limit
+/// responses of the non-streaming path, the streamed loop's final response
+/// that the wire and the record share), then the calls the loop executed
+/// (the stored transformed items, no reconstruction), the internal servers'
+/// left out; with room for `extra` items the caller appends. Nothing reads
+/// the moved items afterwards.
+fn mcp_output_prefix_last(
+    state: &mut ToolLoopState,
+    session: &McpToolSession<'_>,
+    extra: usize,
+) -> Vec<Value> {
+    let list_tools_items = state.take_mcp_list_tools_items(session);
+    mcp_output_prefix_with(list_tools_items, state, session, extra)
+}
+
+/// The prefix around the `mcp_list_tools` items the caller took, then the
+/// executed calls.
+fn mcp_output_prefix_with(
+    list_tools_items: Vec<Value>,
+    state: &ToolLoopState,
+    session: &McpToolSession<'_>,
+    extra: usize,
+) -> Vec<Value> {
+    let mut prefix =
+        Vec::with_capacity(list_tools_items.len() + state.mcp_call_items.len() + extra);
+    prefix.extend(list_tools_items);
+    prefix.extend(
+        state
+            .mcp_call_items
+            .iter()
+            .filter(|item| !is_internal_mcp_response_item(item, session))
+            .cloned(),
+    );
+    prefix
 }
 
 fn build_approval_response(
     mut response: Value,
-    state: ToolLoopState,
+    mut state: ToolLoopState,
     session: &McpToolSession<'_>,
     original_body: &ResponsesRequest,
     approval_item: Value,
@@ -862,24 +960,17 @@ fn build_approval_response(
         .ok_or_else(|| "response not an object".to_string())?;
     obj.insert("status".to_string(), Value::String("completed".to_string()));
 
-    let list_tools_bindings = mcp_list_tools_bindings_to_emit(
-        &state.existing_mcp_list_tools_labels,
-        session.mcp_servers(),
-    );
-
     match obj.get_mut("output").and_then(|v| v.as_array_mut()) {
         Some(output_array) => {
             let retained_items = retained_output_items(output_array, original_body);
-            let prefix =
-                approval_prefix_items(&state, session, &list_tools_bindings, approval_item);
+            let prefix = approval_prefix_items(&mut state, session, approval_item);
 
             output_array.clear();
             output_array.extend(prefix);
             output_array.extend(retained_items);
         }
         None => {
-            let output_items =
-                approval_prefix_items(&state, session, &list_tools_bindings, approval_item);
+            let output_items = approval_prefix_items(&mut state, session, approval_item);
             obj.insert("output".to_string(), Value::Array(output_items));
         }
     }
@@ -928,28 +1019,11 @@ pub(crate) fn retained_output_items(
 }
 
 fn approval_prefix_items(
-    state: &ToolLoopState,
+    state: &mut ToolLoopState,
     session: &McpToolSession<'_>,
-    list_tools_bindings: &[(String, String)],
     approval_item: Value,
 ) -> Vec<Value> {
-    let mut prefix = Vec::with_capacity(list_tools_bindings.len() + state.mcp_call_items.len() + 1);
-    for (list_server_label, server_key) in list_tools_bindings {
-        if !session.is_internal_server_label(list_server_label) {
-            prefix.push(openai_bridge::mcp_list_tools_json(
-                session,
-                list_server_label,
-                server_key,
-            ));
-        }
-    }
-    prefix.extend(
-        state
-            .mcp_call_items
-            .iter()
-            .filter(|item| !is_internal_mcp_response_item(item, session))
-            .cloned(),
-    );
+    let mut prefix = mcp_output_prefix_last(state, session, 1);
     if !is_internal_mcp_response_item(&approval_item, session) {
         prefix.push(approval_item);
     }
@@ -981,8 +1055,6 @@ pub(crate) async fn execute_tool_loop(
 
     let mut state = ToolLoopState::new(existing_mcp_list_tools_labels.to_vec());
     let max_tool_calls = original_body.max_tool_calls.map(|n| n as usize);
-    let base_payload = initial_payload.clone();
-    let tools_json = base_payload.get("tools").cloned().unwrap_or(json!([]));
     let mut current_payload = initial_payload;
 
     info!(
@@ -1008,7 +1080,7 @@ pub(crate) async fn execute_tool_loop(
                     state.iteration, state.total_calls
                 );
                 if state.total_calls > 0 {
-                    inject_mcp_metadata_streaming(&mut response_json, &state, session);
+                    inject_mcp_metadata_last(&mut response_json, &mut state, session);
                 }
                 return Ok(response_json);
             }
@@ -1059,12 +1131,7 @@ pub(crate) async fn execute_tool_loop(
             }
         }
 
-        current_payload = build_resume_payload(
-            &base_payload,
-            &state.conversation_history,
-            &tools_json,
-            false,
-        )?;
+        resume_payload_in_place(&mut current_payload, state.history_to_append(), false)?;
     }
 }
 
@@ -1143,19 +1210,18 @@ async fn upstream_round(
     let response = request_builder
         .send()
         .await
-        .map_err(|e| format!("upstream request failed: {e}"))?;
+        .map_err(|e| format!("upstream request failed: {}", e.without_url()))?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        let body = error::sanitize_error_body(&body);
+        let body = error_body_text(response).await;
         return Err(format!("upstream error {status}: {body}"));
     }
 
     let response_json = response
         .json::<Value>()
         .await
-        .map_err(|e| format!("parse response: {e}"))?;
+        .map_err(|e| format!("parse response: {}", e.without_url()))?;
 
     let function_calls = extract_function_calls(&response_json);
     if function_calls.is_empty() {
@@ -1323,7 +1389,7 @@ fn record_tool_metrics(model_id: &str, tool_output: &smg_mcp::ToolExecutionOutpu
 /// Build an incomplete response when limits are exceeded
 fn build_incomplete_response(
     mut response: Value,
-    state: ToolLoopState,
+    mut state: ToolLoopState,
     reason: &str,
     session: &McpToolSession<'_>,
     format_registry: &FormatRegistry,
@@ -1339,11 +1405,6 @@ fn build_incomplete_response(
     obj.insert(
         "incomplete_details".to_string(),
         json!({ "reason": reason }),
-    );
-
-    let list_tools_bindings = mcp_list_tools_bindings_to_emit(
-        &state.existing_mcp_list_tools_labels,
-        session.mcp_servers(),
     );
 
     let user_function_names: HashSet<&str> = original_body
@@ -1425,25 +1486,7 @@ fn build_incomplete_response(
 
         // Add mcp_list_tools and executed mcp_call items at the beginning
         if state.total_calls > 0 || !incomplete_items.is_empty() {
-            let mut prefix = Vec::with_capacity(
-                list_tools_bindings.len() + state.mcp_call_items.len() + incomplete_items.len(),
-            );
-            for (server_label, server_key) in &list_tools_bindings {
-                if !session.is_internal_server_label(server_label) {
-                    prefix.push(openai_bridge::mcp_list_tools_json(
-                        session,
-                        server_label,
-                        server_key,
-                    ));
-                }
-            }
-            prefix.extend(
-                state
-                    .mcp_call_items
-                    .iter()
-                    .filter(|item| !is_internal_mcp_response_item(item, session))
-                    .cloned(),
-            );
+            let mut prefix = mcp_output_prefix_last(&mut state, session, incomplete_items.len());
             prefix.extend(
                 incomplete_items
                     .into_iter()
@@ -1596,997 +1639,5 @@ fn extract_function_calls(resp: &Value) -> Vec<ExtractedFunctionCall> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-
-    use metrics_exporter_prometheus::PrometheusBuilder;
-    use openai_protocol::responses::ResponsesRequest;
-    use serde_json::json;
-    use smg_mcp::{
-        BuiltinToolType, McpConfig, McpOrchestrator, McpServerBinding, McpServerConfig,
-        McpToolSession, McpTransport, Tool, ToolEntry,
-    };
-    use tokio::sync::mpsc;
-
-    use super::{
-        build_transformed_mcp_call_item, extract_openai_response_output_items,
-        is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit,
-        not_executed_tool_call_item, ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
-    };
-    use crate::{
-        openai::mcp::test_support,
-        openai_bridge::{FormatRegistry, ResponseFormat},
-    };
-
-    fn test_tool(name: &str) -> Tool {
-        let mut schema = serde_json::Map::new();
-        schema.insert("type".to_string(), json!("object"));
-        schema.insert("properties".to_string(), json!({}));
-
-        Tool::new(name.to_string(), "internal", schema)
-    }
-
-    /// A call left over the tool-call allowance is rendered in its own
-    /// format: an `mcp_call` that failed with the not-executed error and the
-    /// id an executed call would have had, or the hosted item type the stream
-    /// announces for the tool, `failed`, with that format's id.
-    #[test]
-    fn a_not_executed_call_item_keeps_the_format_the_stream_announced() {
-        let plain = not_executed_tool_call_item(
-            ResponseFormat::Passthrough,
-            "fc_1",
-            "mock",
-            "brave_web_search",
-            "{}",
-        );
-        assert_eq!(plain["type"], "mcp_call");
-        assert_eq!(plain["status"], "failed");
-        assert_eq!(plain["id"], "mcp_1");
-        assert_eq!(plain["server_label"], "mock");
-        assert!(
-            plain["error"]
-                .to_string()
-                .contains(NOT_EXECUTED_AT_TOOL_CALL_LIMIT),
-            "{plain}"
-        );
-
-        let hosted = not_executed_tool_call_item(
-            ResponseFormat::WebSearchCall,
-            "1",
-            "mock",
-            "brave_web_search",
-            r#"{"query":"q"}"#,
-        );
-        assert_eq!(hosted["type"], "web_search_call");
-        assert_eq!(hosted["status"], "failed");
-        assert_eq!(hosted["id"], "ws_1");
-        assert!(hosted.get("server_label").is_none());
-    }
-
-    #[test]
-    fn build_transformed_mcp_call_item_does_not_add_server_label_for_builtin_formats() {
-        let item = build_transformed_mcp_call_item(
-            &json!({
-                "queries": ["private query"],
-                "results": [
-                    { "url": "https://example.com" }
-                ]
-            }),
-            ResponseFormat::WebSearchCall,
-            "call_123",
-            "internal-label",
-            "brave_web_search",
-            r#"{"query":"private query"}"#,
-        );
-
-        assert_eq!(
-            item.get("type").and_then(|value| value.as_str()),
-            Some("web_search_call")
-        );
-        assert!(item.get("server_label").is_none());
-    }
-
-    #[tokio::test]
-    async fn internal_filter_keeps_builtin_passthrough_mcp_call_items() {
-        let orchestrator = test_support::internal_orchestrator_serving(
-            Some((BuiltinToolType::WebSearchPreview, "brave_web_search")),
-            vec![test_tool("brave_web_search")],
-        )
-        .await;
-        let session = test_support::internal_session(&orchestrator);
-
-        let item = json!({
-            "type": "mcp_call",
-            "name": "brave_web_search",
-            "server_label": "internal-label"
-        });
-
-        assert!(!is_internal_mcp_response_item(&item, &session));
-    }
-
-    #[tokio::test]
-    async fn internal_filter_keeps_builtin_passthrough_mcp_call_items_with_mixed_tools() {
-        let orchestrator = test_support::internal_orchestrator_serving(
-            Some((BuiltinToolType::WebSearchPreview, "brave_web_search")),
-            vec![
-                test_tool("brave_web_search"),
-                test_tool("internal_non_builtin_tool"),
-            ],
-        )
-        .await;
-        let session = test_support::internal_session(&orchestrator);
-
-        let builtin_item = json!({
-            "type": "mcp_call",
-            "name": "brave_web_search",
-            "server_label": "internal-label"
-        });
-        let internal_non_builtin_item = json!({
-            "type": "mcp_call",
-            "name": "internal_non_builtin_tool",
-            "server_label": "internal-label"
-        });
-
-        assert!(!is_internal_mcp_response_item(&builtin_item, &session));
-        assert!(is_internal_mcp_response_item(
-            &internal_non_builtin_item,
-            &session
-        ));
-    }
-
-    #[test]
-    fn emits_only_new_binding_when_resume_adds_second_tool_block() {
-        let existing_labels = HashSet::from(["deepwiki_ask".to_string()]);
-        let bindings = vec![
-            McpServerBinding {
-                label: "deepwiki_ask".to_string(),
-                server_key: "server-ask".to_string(),
-                allowed_tools: Some(vec!["ask_question".to_string()]),
-            },
-            McpServerBinding {
-                label: "deepwiki_read".to_string(),
-                server_key: "server-read".to_string(),
-                allowed_tools: Some(vec!["read_wiki_structure".to_string()]),
-            },
-        ];
-
-        let bindings_to_emit = mcp_list_tools_bindings_to_emit(&existing_labels, &bindings);
-
-        assert_eq!(
-            bindings_to_emit,
-            vec![("deepwiki_read".to_string(), "server-read".to_string())]
-        );
-    }
-
-    #[test]
-    fn emits_all_bindings_when_no_prior_mcp_list_tools_exist() {
-        let existing_labels = HashSet::new();
-        let bindings = vec![McpServerBinding {
-            label: "deepwiki_ask".to_string(),
-            server_key: "server-ask".to_string(),
-            allowed_tools: Some(vec!["ask_question".to_string()]),
-        }];
-
-        let bindings_to_emit = mcp_list_tools_bindings_to_emit(&existing_labels, &bindings);
-
-        assert_eq!(
-            bindings_to_emit,
-            vec![("deepwiki_ask".to_string(), "server-ask".to_string())]
-        );
-    }
-
-    #[test]
-    fn extract_openai_response_output_items_from_embedded_text_json() {
-        let output = r#"[{"type":"text","text":"{\"execution_id\":\"abc\",\"openai_response\":{\"content\":{\"type\":\"output_text\",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"Example citation\",\"url\":\"https://example.com/openai-result\",\"start_index\":0,\"end_index\":10}],\"logprobs\":[],\"text\":\"intermediate summary\"}}}"}]"#;
-
-        let extracted = extract_openai_response_output_items(output);
-        assert_eq!(extracted.len(), 1);
-        assert_eq!(extracted[0]["type"], "message");
-        assert_eq!(extracted[0]["role"], "assistant");
-        assert_eq!(extracted[0]["content"][0]["type"], "output_text");
-        assert_eq!(extracted[0]["content"][0]["text"], "intermediate summary");
-        assert_eq!(
-            extracted[0]["content"][0]["annotations"][0]["type"],
-            "url_citation"
-        );
-        assert_eq!(
-            extracted[0]["content"][0]["annotations"][0]["title"],
-            "Example citation"
-        );
-        assert_eq!(
-            extracted[0]["content"][0]["annotations"][0]["url"],
-            "https://example.com/openai-result"
-        );
-        assert_eq!(
-            extracted[0]["content"][0]["annotations"][0]["start_index"],
-            0
-        );
-        assert_eq!(
-            extracted[0]["content"][0]["annotations"][0]["end_index"],
-            10
-        );
-    }
-
-    #[test]
-    fn record_call_appends_openai_response_output_after_tool_item() {
-        let mut state = ToolLoopState::new(Vec::new());
-        let transformed = json!({
-            "type": "web_search_call",
-            "id": "ws_test",
-            "status": "completed",
-            "action": {"type": "search"}
-        });
-        let output = r#"[{"type":"text","text":"{\"openai_response\":{\"content\":{\"type\":\"output_text\",\"annotations\":[{\"type\":\"url_citation\",\"title\":\"Example citation\",\"url\":\"https://example.com/openai-result\",\"start_index\":0,\"end_index\":10}],\"logprobs\":[],\"text\":\"intermediate\"}}}"}]"#;
-
-        state.record_call(
-            true,
-            "call_123".to_string(),
-            "search_web".to_string(),
-            "{\"query\":\"x\"}".to_string(),
-            output.to_string(),
-            transformed,
-        );
-
-        assert_eq!(state.mcp_call_items.len(), 2);
-        assert_eq!(state.mcp_call_items[0]["type"], "web_search_call");
-        assert_eq!(state.mcp_call_items[1]["type"], "message");
-        assert_eq!(
-            state.mcp_call_items[1]["content"][0]["text"],
-            "intermediate"
-        );
-        assert_eq!(
-            state.mcp_call_items[1]["content"][0]["annotations"][0]["type"],
-            "url_citation"
-        );
-        assert_eq!(
-            state.mcp_call_items[1]["content"][0]["annotations"][0]["title"],
-            "Example citation"
-        );
-        assert_eq!(
-            state.mcp_call_items[1]["content"][0]["annotations"][0]["url"],
-            "https://example.com/openai-result"
-        );
-        assert_eq!(
-            state.mcp_call_items[1]["content"][0]["annotations"][0]["start_index"],
-            0
-        );
-        assert_eq!(
-            state.mcp_call_items[1]["content"][0]["annotations"][0]["end_index"],
-            10
-        );
-    }
-
-    #[test]
-    fn record_call_does_not_append_openai_response_output_for_non_builtin_tools() {
-        let mut state = ToolLoopState::new(Vec::new());
-        let transformed = json!({
-            "type": "web_search_call",
-            "id": "ws_test",
-            "status": "completed",
-            "action": {"type": "search"}
-        });
-        let output = r#"[{"type":"text","text":"{\"openai_response\":{\"content\":{\"type\":\"output_text\",\"annotations\":[],\"logprobs\":[],\"text\":\"intermediate\"}}}"}]"#;
-
-        state.record_call(
-            false,
-            "call_123".to_string(),
-            "internal_search_web".to_string(),
-            "{\"query\":\"x\"}".to_string(),
-            output.to_string(),
-            transformed,
-        );
-
-        assert_eq!(state.mcp_call_items.len(), 1);
-        assert_eq!(state.mcp_call_items[0]["type"], "web_search_call");
-    }
-
-    #[test]
-    fn extract_openai_response_output_items_ignores_null_openai_response() {
-        let output = r#"[{"type":"text","text":"{\"openai_response\":null}"}]"#;
-        let extracted = extract_openai_response_output_items(output);
-        assert!(extracted.is_empty());
-    }
-
-    // ========================================================================
-    // Streaming emission ordering invariant.
-    //
-    // `send_tool_call_completion_events` MUST emit
-    // `response.<tool>.completed` BEFORE `response.output_item.done` so the
-    // umbrella event terminates the item's sub-events per spec (see
-    // `.claude/_audit/openai-responses-api-spec.md` §streaming, events
-    // L1054-L1072).
-    // ========================================================================
-
-    fn drain_channel(rx: &mut mpsc::Receiver<Result<bytes::Bytes, std::io::Error>>) -> Vec<String> {
-        let mut events = Vec::new();
-        while let Ok(chunk) = rx.try_recv() {
-            let bytes = chunk.expect("no io errors in unit-test channel");
-            events.push(String::from_utf8(bytes.to_vec()).expect("utf-8 sse block"));
-        }
-        events
-    }
-
-    fn event_type_from_sse_block(block: &str) -> String {
-        // SSE block shape: `event: <name>\ndata: {...}\n\n`. We parse only
-        // the leading `event: …` line to get the wire type without pulling
-        // serde_json into this tiny assertion helper.
-        for line in block.lines() {
-            if let Some(rest) = line.strip_prefix("event: ") {
-                return rest.trim().to_string();
-            }
-        }
-        block.to_string()
-    }
-
-    #[tokio::test]
-    async fn image_generation_completion_events_fire_before_output_item_done() {
-        // Gap B lock test: after the tool executes, the completion
-        // emitter must push `response.image_generation_call.completed`
-        // onto the wire BEFORE `response.output_item.done`. If a future
-        // refactor reverses the order this asserts and fails loudly.
-        let call = super::FunctionCallInProgress {
-            call_id: "call_img".to_string(),
-            name: "image_generation".to_string(),
-            arguments_buffer: "{}".to_string(),
-            item_id: Some("fc_img".to_string()),
-            output_index: 0,
-            last_obfuscation: None,
-            assigned_output_index: Some(0),
-        };
-
-        let tool_call_item = json!({
-            "type": "image_generation_call",
-            "id": "ig_img",
-            "status": "completed",
-            "result": "BASE64",
-        });
-
-        let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
-        let mut sequence_number: u64 = 0;
-
-        let ok = super::send_tool_call_completion_events(
-            &tx,
-            &call,
-            &tool_call_item,
-            ResponseFormat::ImageGenerationCall,
-            &mut sequence_number,
-        )
-        .await;
-        assert!(ok, "send_tool_call_completion_events should not disconnect");
-        drop(tx);
-
-        let events = drain_channel(&mut rx);
-        let types: Vec<String> = events
-            .iter()
-            .map(|b| event_type_from_sse_block(b))
-            .collect();
-
-        let completed_idx = types
-            .iter()
-            .position(|t| t == "response.image_generation_call.completed")
-            .expect("response.image_generation_call.completed must be emitted");
-        let done_idx = types
-            .iter()
-            .position(|t| t == "response.output_item.done")
-            .expect("response.output_item.done must be emitted");
-
-        assert!(
-            completed_idx < done_idx,
-            "`response.image_generation_call.completed` (index {completed_idx}) must come \
-             before `response.output_item.done` (index {done_idx}); full sequence: {types:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn web_search_completion_events_fire_before_output_item_done() {
-        // Same ordering contract for the pre-existing web_search_call path,
-        // so the invariant applies uniformly across every hosted-tool
-        // ResponseFormat we emit.
-        let call = super::FunctionCallInProgress {
-            call_id: "call_ws".to_string(),
-            name: "web_search".to_string(),
-            arguments_buffer: "{}".to_string(),
-            item_id: Some("fc_ws".to_string()),
-            output_index: 0,
-            last_obfuscation: None,
-            assigned_output_index: Some(0),
-        };
-
-        let tool_call_item = json!({
-            "type": "web_search_call",
-            "id": "ws_ws",
-            "status": "completed",
-            "action": {"type": "search"}
-        });
-
-        let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
-        let mut sequence_number: u64 = 0;
-
-        let ok = super::send_tool_call_completion_events(
-            &tx,
-            &call,
-            &tool_call_item,
-            ResponseFormat::WebSearchCall,
-            &mut sequence_number,
-        )
-        .await;
-        assert!(ok);
-        drop(tx);
-
-        let events = drain_channel(&mut rx);
-        let types: Vec<String> = events
-            .iter()
-            .map(|b| event_type_from_sse_block(b))
-            .collect();
-
-        let completed_idx = types
-            .iter()
-            .position(|t| t == "response.web_search_call.completed")
-            .expect("web_search_call.completed must be emitted");
-        let done_idx = types
-            .iter()
-            .position(|t| t == "response.output_item.done")
-            .expect("output_item.done must be emitted");
-        assert!(completed_idx < done_idx);
-    }
-
-    #[tokio::test]
-    async fn code_interpreter_completion_events_fire_before_output_item_done() {
-        // The suppression gate in `tool_handler.rs` drops the upstream
-        // umbrella `output_item.done` for every tool-call item type. This
-        // test locks the downstream half of the contract for
-        // `code_interpreter_call` — the tool loop's completion emitter
-        // must push `response.code_interpreter_call.completed` BEFORE
-        // `response.output_item.done` so the gate's suppression lines up
-        // with a correctly-ordered wire sequence.
-        let call = super::FunctionCallInProgress {
-            call_id: "call_ci".to_string(),
-            name: "code_interpreter".to_string(),
-            arguments_buffer: "{}".to_string(),
-            item_id: Some("fc_ci".to_string()),
-            output_index: 0,
-            last_obfuscation: None,
-            assigned_output_index: Some(0),
-        };
-
-        let tool_call_item = json!({
-            "type": "code_interpreter_call",
-            "id": "ci_ci",
-            "status": "completed",
-            "code": "print('hi')",
-        });
-
-        let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
-        let mut sequence_number: u64 = 0;
-
-        let ok = super::send_tool_call_completion_events(
-            &tx,
-            &call,
-            &tool_call_item,
-            ResponseFormat::CodeInterpreterCall,
-            &mut sequence_number,
-        )
-        .await;
-        assert!(ok);
-        drop(tx);
-
-        let events = drain_channel(&mut rx);
-        let types: Vec<String> = events
-            .iter()
-            .map(|b| event_type_from_sse_block(b))
-            .collect();
-
-        let completed_idx = types
-            .iter()
-            .position(|t| t == "response.code_interpreter_call.completed")
-            .expect("code_interpreter_call.completed must be emitted");
-        let done_idx = types
-            .iter()
-            .position(|t| t == "response.output_item.done")
-            .expect("output_item.done must be emitted");
-        assert!(
-            completed_idx < done_idx,
-            "`response.code_interpreter_call.completed` (index {completed_idx}) must come \
-             before `response.output_item.done` (index {done_idx}); full sequence: {types:?}"
-        );
-
-        // No duplicate `output_item.done` — the tool loop emits exactly
-        // one umbrella (the upstream copy is dropped by the suppression
-        // gate in `tool_handler.rs`).
-        let done_count = types
-            .iter()
-            .filter(|t| *t == "response.output_item.done")
-            .count();
-        assert_eq!(
-            done_count, 1,
-            "exactly one `output_item.done` expected, got {done_count}: {types:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn file_search_completion_events_fire_before_output_item_done() {
-        // Lock the ordering contract for the hosted `file_search_call`
-        // format so the gate's suppression covers every tool-call item
-        // type listed in `TOOL_CALL_ITEM_TYPES`.
-        let call = super::FunctionCallInProgress {
-            call_id: "call_fs".to_string(),
-            name: "file_search".to_string(),
-            arguments_buffer: "{}".to_string(),
-            item_id: Some("fc_fs".to_string()),
-            output_index: 0,
-            last_obfuscation: None,
-            assigned_output_index: Some(0),
-        };
-
-        let tool_call_item = json!({
-            "type": "file_search_call",
-            "id": "fs_fs",
-            "status": "completed",
-            "queries": ["needle"],
-        });
-
-        let (tx, mut rx) = mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
-        let mut sequence_number: u64 = 0;
-
-        let ok = super::send_tool_call_completion_events(
-            &tx,
-            &call,
-            &tool_call_item,
-            ResponseFormat::FileSearchCall,
-            &mut sequence_number,
-        )
-        .await;
-        assert!(ok);
-        drop(tx);
-
-        let events = drain_channel(&mut rx);
-        let types: Vec<String> = events
-            .iter()
-            .map(|b| event_type_from_sse_block(b))
-            .collect();
-
-        let completed_idx = types
-            .iter()
-            .position(|t| t == "response.file_search_call.completed")
-            .expect("file_search_call.completed must be emitted");
-        let done_idx = types
-            .iter()
-            .position(|t| t == "response.output_item.done")
-            .expect("output_item.done must be emitted");
-        assert!(
-            completed_idx < done_idx,
-            "`response.file_search_call.completed` (index {completed_idx}) must come \
-             before `response.output_item.done` (index {done_idx}); full sequence: {types:?}"
-        );
-
-        // No duplicate `output_item.done` — the tool loop emits exactly
-        // one umbrella (the upstream copy is dropped by the suppression
-        // gate in `tool_handler.rs`).
-        let done_count = types
-            .iter()
-            .filter(|t| *t == "response.output_item.done")
-            .count();
-        assert_eq!(
-            done_count, 1,
-            "exactly one `output_item.done` expected, got {done_count}: {types:?}"
-        );
-    }
-
-    #[test]
-    fn approval_request_item_id_source_uses_single_underscore() {
-        // Regression: `normalize_tool_item_id_with_prefix` appends `_`
-        // internally, so the prefix argument must be the bare token. A
-        // prior version passed `"mcpr_"` here and emitted `mcpr__...` ids,
-        // breaking the approval wire format.
-        assert_eq!(super::approval_request_item_id_source("fc_abc"), "mcpr_abc");
-        assert_eq!(
-            super::approval_request_item_id_source("call_xyz"),
-            "mcpr_xyz"
-        );
-        assert_eq!(
-            super::approval_request_item_id_source("mcpr_already"),
-            "mcpr_already"
-        );
-        assert_eq!(
-            super::approval_request_item_id_source("raw_id"),
-            "mcpr_raw_id"
-        );
-    }
-
-    async fn function_tool_session() -> (McpOrchestrator, Vec<McpServerBinding>) {
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "wiki-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: false,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "wiki-server",
-                test_tool("ask_wiki"),
-            ));
-        let bindings = vec![McpServerBinding {
-            label: "wiki".to_string(),
-            server_key: "wiki-server".to_string(),
-            allowed_tools: None,
-        }];
-        (orchestrator, bindings)
-    }
-
-    #[tokio::test]
-    async fn prepare_preserves_explicit_tool_choice() {
-        let (orchestrator, bindings) = function_tool_session().await;
-        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
-
-        let mut payload = json!({
-            "model": "m",
-            "input": "q",
-            "tools": [{"type": "mcp", "server_label": "wiki"}],
-            "tool_choice": "required"
-        });
-        super::prepare_mcp_tools_as_functions(&mut payload, &session);
-
-        assert_eq!(payload["tool_choice"], json!("required"));
-        assert_eq!(payload["tools"][0]["type"], json!("function"));
-    }
-
-    #[tokio::test]
-    async fn prepare_remaps_hosted_tool_choice_to_function() {
-        let (orchestrator, bindings) = function_tool_session().await;
-        orchestrator
-            .tool_inventory()
-            .insert_entry(ToolEntry::from_server_tool(
-                "wiki-server",
-                test_tool("image_generation"),
-            ));
-        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
-
-        let mut payload = json!({
-            "model": "m",
-            "input": "q",
-            "tools": [{"type": "image_generation"}],
-            "tool_choice": {"type": "image_generation"}
-        });
-        super::prepare_mcp_tools_as_functions(&mut payload, &session);
-
-        assert_eq!(
-            payload["tool_choice"],
-            json!({"type": "function", "name": "image_generation"})
-        );
-    }
-
-    #[tokio::test]
-    async fn prepare_downgrades_unmappable_tool_choice_to_auto() {
-        let (orchestrator, bindings) = function_tool_session().await;
-        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
-
-        let mut payload = json!({
-            "model": "m",
-            "input": "q",
-            "tools": [{"type": "mcp", "server_label": "wiki"}],
-            "tool_choice": {"type": "web_search_preview"}
-        });
-        super::prepare_mcp_tools_as_functions(&mut payload, &session);
-
-        assert_eq!(payload["tool_choice"], json!("auto"));
-    }
-
-    #[tokio::test]
-    async fn prepare_defaults_missing_tool_choice_to_auto() {
-        let (orchestrator, bindings) = function_tool_session().await;
-        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
-
-        let mut payload = json!({
-            "model": "m",
-            "input": "q",
-            "tools": [{"type": "mcp", "server_label": "wiki"}]
-        });
-        super::prepare_mcp_tools_as_functions(&mut payload, &session);
-
-        assert_eq!(payload["tool_choice"], json!("auto"));
-    }
-
-    #[test]
-    fn resume_payload_forces_auto_tool_choice() {
-        let base = json!({
-            "model": "m",
-            "input": "q",
-            "tools": [{"type": "function", "name": "ask_wiki"}],
-            "tool_choice": "required"
-        });
-        let resumed = super::build_resume_payload(
-            &base,
-            &[],
-            &json!([{"type": "function", "name": "ask_wiki"}]),
-            false,
-        )
-        .expect("resume payload");
-
-        assert_eq!(resumed["tool_choice"], json!("auto"));
-        assert_eq!(
-            resumed["input"],
-            json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q"}]}])
-        );
-    }
-
-    /// The payload the loop started from carries the history the request
-    /// continues (a stored turn's function call and the client's answer to
-    /// it); the resume payload keeps it in front of the calls this loop ran.
-    #[test]
-    fn resume_payload_keeps_the_loaded_history_in_front_of_the_loops_calls() {
-        let loaded_input = json!([
-            {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "What is 6*7?"}]},
-            {"type": "function_call", "id": "fc_1", "call_id": "call_A", "name": "calc", "arguments": "{}"},
-            {"type": "function_call_output", "call_id": "call_A", "output": "42"}
-        ]);
-        let base = json!({
-            "model": "m",
-            "input": loaded_input,
-            "tools": [{"type": "function", "name": "search"}]
-        });
-        let executed = [
-            json!({"type": "function_call", "call_id": "call_B", "name": "search", "arguments": "{}"}),
-            json!({"type": "function_call_output", "call_id": "call_B", "output": "found"}),
-        ];
-
-        let resumed = super::build_resume_payload(
-            &base,
-            &executed,
-            &json!([{"type": "function", "name": "search"}]),
-            false,
-        )
-        .expect("resume payload");
-
-        let kinds: Vec<(&str, &str)> = resumed["input"]
-            .as_array()
-            .expect("an item list")
-            .iter()
-            .map(|item| {
-                (
-                    item["type"].as_str().unwrap_or("?"),
-                    item["call_id"].as_str().unwrap_or(""),
-                )
-            })
-            .collect();
-        assert_eq!(
-            kinds,
-            [
-                ("message", ""),
-                ("function_call", "call_A"),
-                ("function_call_output", "call_A"),
-                ("function_call", "call_B"),
-                ("function_call_output", "call_B"),
-            ]
-        );
-        assert_eq!(resumed["store"], json!(false));
-    }
-
-    /// The argument preparation both loops share: a payload that is not an
-    /// object becomes `{}` before the hosted-tool merge, the request's `user`
-    /// is forwarded for a hosted format and left out for a plain MCP tool,
-    /// and an object payload under a plain MCP tool goes through untouched.
-    #[test]
-    fn prepared_arguments_coerce_merge_and_forward_the_user() {
-        let hosted =
-            super::prepared_arguments("42", ResponseFormat::WebSearchCall, &[], Some("u-1"))
-                .expect("a scalar payload parses");
-        assert_eq!(hosted, json!({ "user": "u-1" }));
-        let plain = super::prepared_arguments("42", ResponseFormat::Passthrough, &[], Some("u-1"))
-            .expect("a scalar payload parses");
-        assert_eq!(plain, json!({}));
-        let object = super::prepared_arguments(
-            r#"{"query": "weather", "user": null}"#,
-            ResponseFormat::Passthrough,
-            &[],
-            Some("u-1"),
-        )
-        .expect("an object payload parses");
-        assert_eq!(object, json!({ "query": "weather", "user": null }));
-        let overwritten = super::prepared_arguments(
-            r#"{"query": "weather", "user": null}"#,
-            ResponseFormat::WebSearchCall,
-            &[],
-            Some("u-1"),
-        )
-        .expect("an object payload parses");
-        assert_eq!(overwritten, json!({ "query": "weather", "user": "u-1" }));
-        assert!(
-            super::prepared_arguments("not json", ResponseFormat::Passthrough, &[], None).is_err()
-        );
-    }
-
-    /// The `output` of the one `function_call_output` item a loop recorded
-    /// for the model's next round.
-    fn function_call_output(state: &ToolLoopState) -> String {
-        let item = state
-            .conversation_history
-            .iter()
-            .find(|item| item["type"] == "function_call_output")
-            .expect("a function_call_output item");
-        item["output"]
-            .as_str()
-            .expect("the output is a string")
-            .to_string()
-    }
-
-    /// A call whose arguments are not JSON is counted as an errored call in
-    /// both loops (the streaming one counted nothing before), and both loops
-    /// word the error on the call's item the same way.
-    #[tokio::test]
-    async fn a_call_with_non_json_arguments_is_counted_and_worded_alike_in_both_loops() {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-        let (orchestrator, bindings) = function_tool_session().await;
-        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
-        let registry = FormatRegistry::new();
-
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut state = ToolLoopState::new(Vec::new());
-        let mut sequence_number = 0u64;
-        let mut call = super::FunctionCallInProgress::new("call_1".to_string(), 0);
-        call.name = "wiki_search".to_string();
-        call.arguments_buffer = "not json".to_string();
-        let client_stayed = super::execute_streaming_tool_calls(
-            vec![call],
-            &session,
-            &registry,
-            &tx,
-            &mut state,
-            &mut sequence_number,
-            "m",
-            &[],
-            None,
-        )
-        .await;
-        assert!(client_stayed);
-        let streamed = state.mcp_call_items[0].to_string();
-        assert!(
-            streamed.contains("Invalid tool arguments: "),
-            "the streaming loop's item: {streamed}"
-        );
-        let streamed_output = function_call_output(&state);
-        drop(tx);
-        while rx.recv().await.is_some() {}
-
-        let mut state = ToolLoopState::new(Vec::new());
-        let body: ResponsesRequest =
-            serde_json::from_value(json!({ "model": "m", "input": "q" })).expect("a request");
-        let approval = super::dispatch_call(
-            super::ExtractedFunctionCall {
-                call_id: "call_2".to_string(),
-                item_id: "fc_2".to_string(),
-                name: "wiki_search".to_string(),
-                arguments: "not json".to_string(),
-            },
-            &mut state,
-            &session,
-            &registry,
-            &body,
-        )
-        .await;
-        assert!(approval.is_none());
-        let direct = state.mcp_call_items[0].to_string();
-        assert!(
-            direct.contains("Invalid tool arguments: "),
-            "the non-streaming loop's item: {direct}"
-        );
-        let direct_output = function_call_output(&state);
-        assert!(
-            direct_output.starts_with("{\"error\":\"Invalid tool arguments: ") && direct_output == streamed_output,
-            "the function_call_output the model reads back, both loops: {direct_output} vs {streamed_output}"
-        );
-
-        let series: Vec<String> = handle
-            .render()
-            .lines()
-            .filter(|line| {
-                line.contains("smg_mcp_tool_calls_total") && line.contains("wiki_search")
-            })
-            .map(str::to_owned)
-            .collect();
-        assert_eq!(series.len(), 1, "one errored-call series: {series:?}");
-        assert!(
-            series[0].contains("result=\"error\"") && series[0].ends_with(" 2"),
-            "both loops counted: {}",
-            series[0]
-        );
-    }
-
-    /// A streamed call the session cannot run is closed on the wire the way
-    /// an executed one is: the format's completed event, then the item's
-    /// `response.output_item.done`, in sequence, under the id the stream
-    /// announced for the call; the loop's state records the call with its
-    /// error output and its errored-call metric counts it once.
-    #[tokio::test]
-    async fn a_streamed_call_is_closed_on_the_wire_under_its_announced_id_and_recorded() {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-        let (orchestrator, bindings) = function_tool_session().await;
-        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
-        let registry = FormatRegistry::new();
-
-        let (tx, mut rx) = mpsc::channel(16);
-        let mut state = ToolLoopState::new(Vec::new());
-        let mut sequence_number = 7u64;
-        let mut call = super::FunctionCallInProgress::new("call_9".to_string(), 3);
-        call.name = "not_exposed".to_string();
-        call.arguments_buffer = "{\"q\":1}".to_string();
-        let client_stayed = super::execute_streaming_tool_calls(
-            vec![call],
-            &session,
-            &registry,
-            &tx,
-            &mut state,
-            &mut sequence_number,
-            "m",
-            &[],
-            None,
-        )
-        .await;
-        assert!(client_stayed);
-        drop(tx);
-
-        let events = drain_channel(&mut rx);
-        let types: Vec<String> = events
-            .iter()
-            .map(|e| event_type_from_sse_block(e))
-            .collect();
-        assert_eq!(
-            types,
-            ["response.mcp_call.completed", "response.output_item.done"],
-            "the call's events, in order"
-        );
-        assert_eq!(sequence_number, 9, "one sequence number per event");
-        let done: serde_json::Value = events[1]
-            .lines()
-            .find_map(|line| line.strip_prefix("data: "))
-            .and_then(|data| serde_json::from_str(data).ok())
-            .expect("the done event's data");
-        assert_eq!(done["sequence_number"], 8);
-        assert_eq!(done["output_index"], 3);
-        assert_eq!(done["item"]["id"], "mcp_9", "the id the stream announced");
-        assert_eq!(done["item"]["type"], "mcp_call");
-        assert_eq!(done["item"]["status"], "failed");
-
-        assert_eq!(state.mcp_call_items.len(), 1);
-        assert_eq!(
-            state.mcp_call_items[0], done["item"],
-            "the recorded item is the streamed one"
-        );
-        assert!(
-            function_call_output(&state).contains("is not in this session's exposed tool map"),
-            "the output the model reads back: {}",
-            function_call_output(&state)
-        );
-        let series: Vec<String> = handle
-            .render()
-            .lines()
-            .filter(|line| {
-                line.contains("smg_mcp_tool_calls_total") && line.contains("not_exposed")
-            })
-            .map(str::to_owned)
-            .collect();
-        assert_eq!(series.len(), 1, "one errored-call series: {series:?}");
-        assert!(
-            series[0].contains("result=\"error\"") && series[0].ends_with(" 1"),
-            "counted once: {}",
-            series[0]
-        );
-    }
-}
+#[path = "../../../tests/unit/openai/mcp/tool_loop/tests.rs"]
+mod tests;

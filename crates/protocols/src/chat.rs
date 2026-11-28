@@ -1,4 +1,9 @@
-use std::{borrow::Cow, collections::HashMap, fmt, sync::Arc};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fmt::{self, Write as _},
+    sync::Arc,
+};
 
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
@@ -7,11 +12,11 @@ use validator::Validate;
 use super::{
     common::{
         default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
-        deserialize_null_as_true, invalid, invalid_at, is_false, is_true, json_type_name, on_field,
-        validate_json_schema_shape, validate_logit_bias, validate_stop, CachePartition,
-        ChatLogProbs, ContentPart, Function, FunctionCall, FunctionCallResponse, FunctionChoice,
-        GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool, ToolCall,
-        ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
+        deserialize_null_as_true, empty_tool_name, invalid, invalid_at, is_false, is_true,
+        json_type_name, on_field, validate_json_schema_shape, validate_logit_bias, validate_stop,
+        CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall, FunctionCallResponse,
+        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
+        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -19,6 +24,7 @@ use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
     ext::kimi::{KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
     profile::ProviderProfile,
+    strict_value::StrictValue,
     validated::Normalizable,
 };
 
@@ -26,11 +32,12 @@ use crate::{
 // Chat Messages
 // ============================================================================
 
+crate::kind_read::by_kind! {
 /// One message of a chat conversation, tagged by its `role` (system, user,
 /// assistant, tool, function, developer or root), carrying the content and
 /// fields that role has.
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 #[serde(tag = "role")]
 pub enum ChatMessage {
     #[serde(rename = "system")]
@@ -100,11 +107,26 @@ pub enum ChatMessage {
     /// Hoisted to the front for dispatch (several merge into one), where the
     /// chat template reads it; a template without a root branch gets it as
     /// the leading system message. Rejected by other profiles.
+    ///
+    /// The vendor's chat templates read a date and a location off this
+    /// message beside its content and print one line for each behind the
+    /// text of the slot it fills. Both are plain fields with a default, not
+    /// a flattened struct: a variant with a flattened field is no longer
+    /// read from the array form of a message, which this one is. A date or
+    /// a location that is no string is dropped, as a key the message does
+    /// not know is: the request is not refused for it.
     #[serde(rename = "root")]
     Root {
         content: MessageContent,
         name: Option<String>,
+        /// The text behind `Current date: ` in the rendered prompt.
+        #[serde(default, deserialize_with = "crate::chat::deserialize_text_or_none")]
+        current_date: Option<String>,
+        /// The text behind `Current location: ` in the rendered prompt.
+        #[serde(default, deserialize_with = "crate::chat::deserialize_text_or_none")]
+        current_location: Option<String>,
     },
+}
 }
 
 /// The audio answer of an earlier assistant turn, referred to by its id: the
@@ -203,11 +225,91 @@ impl<'de> Deserialize<'de> for AssistantReasoning {
 
 /// A message's content as the wire carries it: one text string, or a list of
 /// typed parts (text, image, audio, video, refusal).
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, PartialEq, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum MessageContent {
     Text(String),
     Parts(Vec<ContentPart>),
+}
+
+/// A string is the text, a list is the parts. A part's refusal is kept as
+/// the refusal, under the part's place in the list (`content[1]`): a derived
+/// untagged read would replace it with its own generic words, and serde's
+/// path stops at the message a tagged enum buffers. Each part is buffered by
+/// the strict value reader: the plain one keeps the last of a repeated key,
+/// and the typed read after it would never see the repeat.
+impl<'de> Deserialize<'de> for MessageContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ContentVisitor;
+
+        impl<'de> de::Visitor<'de> for ContentVisitor {
+            type Value = MessageContent;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a string or a list of content parts")
+            }
+
+            fn visit_str<E: de::Error>(self, text: &str) -> Result<Self::Value, E> {
+                Ok(MessageContent::Text(text.to_owned()))
+            }
+
+            fn visit_string<E: de::Error>(self, text: String) -> Result<Self::Value, E> {
+                Ok(MessageContent::Text(text))
+            }
+
+            fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut parts = Vec::new();
+                loop {
+                    // Only a repeated key's refusal takes the part's place (any other error is
+                    // the deserializer's own), and as it is: the key is the client's and may
+                    // hold the separator `part_reason_at` splits on.
+                    let next = seq.next_element_seed(StrictValue).map_err(|error| {
+                        let reason = error.to_string();
+                        if reason.starts_with("duplicate field `") {
+                            de::Error::custom(format!("{reason}, in `content[{}]`", parts.len()))
+                        } else {
+                            error
+                        }
+                    })?;
+                    let Some(value) = next else { break };
+                    // The buffer's map is the part's fields: read by kind, not built a second time.
+                    let part = match value {
+                        Value::Object(fields) => ContentPart::from_fields(fields),
+                        other => serde_json::from_value(other),
+                    }
+                    .map_err(|error| {
+                        <A::Error as de::Error>::custom(part_reason_at(parts.len(), &error))
+                    })?;
+                    parts.push(part);
+                }
+                Ok(MessageContent::Parts(parts))
+            }
+        }
+
+        deserializer.deserialize_any(ContentVisitor)
+    }
+}
+
+/// A part's refusal under its place in the list, in serde's own path form,
+/// so the reason keeps its opening words (the public code reads them) and
+/// the field its path: `missing field `image_url.url`` at the second part is
+/// `missing field `content[1].image_url.url``, `..., in `image_url`` is
+/// `..., in `content[1].image_url``, a reason naming no body ends
+/// `, in `content[1]``.
+fn part_reason_at(index: usize, error: &serde_json::Error) -> String {
+    let reason = error.to_string();
+    if let Some(field) = reason.strip_prefix("missing field `") {
+        return format!("missing field `content[{index}].{field}");
+    }
+    // The suffix a known part appends ends in a backtick; serde's own tail (`expected ...`) never
+    // does, so a value the client sent that happens to hold ", in `" cannot move the split.
+    match reason
+        .rsplit_once(", in `")
+        .filter(|(_, body)| body.ends_with('`'))
+    {
+        Some((head, body)) => format!("{head}, in `content[{index}].{body}"),
+        None => format!("{reason}, in `content[{index}]`"),
+    }
 }
 
 impl Default for MessageContent {
@@ -293,6 +395,7 @@ impl MessageContent {
 pub struct ChatCompletionRequest {
     /// A list of messages comprising the conversation so far
     #[validate(custom(function = "validate_messages"))]
+    #[serde(deserialize_with = "crate::kind_read::list")]
     pub messages: Vec<ChatMessage>,
 
     /// ID of the model to use
@@ -313,6 +416,7 @@ pub struct ChatCompletionRequest {
     /// Modify the likelihood of specified tokens appearing in the completion:
     /// token id to a bias in -100..=100, applied by the engine's sampler
     #[validate(custom(function = "validate_logit_bias"))]
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub logit_bias: Option<HashMap<String, f32>>,
 
     /// Whether to return log probabilities of the output tokens
@@ -329,6 +433,7 @@ pub struct ChatCompletionRequest {
     pub max_completion_tokens: Option<u32>,
 
     /// Developer-defined tags and values used for filtering completions in the dashboard
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub metadata: Option<HashMap<String, String>>,
 
     /// Output types that you would like the model to generate for this request
@@ -489,6 +594,7 @@ pub struct ChatCompletionRequest {
     pub lora_path: Option<String>,
 
     /// Session parameters for continual prompting
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub session_params: Option<HashMap<String, Value>>,
 
     /// Separate reasoning content from final answer (O1-style models)
@@ -508,6 +614,7 @@ pub struct ChatCompletionRequest {
     pub stream_reasoning: bool,
 
     /// Chat template kwargs
+    #[serde(serialize_with = "crate::common::serialize_with_sorted_keys")]
     pub chat_template_kwargs: Option<HashMap<String, Value>>,
 
     /// Return model hidden states
@@ -517,6 +624,25 @@ pub struct ChatCompletionRequest {
         skip_serializing_if = "is_false"
     )]
     pub return_hidden_states: bool,
+
+    /// Return the prompt as rendered for the model. With `true` the answer
+    /// carries `prompt_text` ([`ChatCompletionResponse::prompt_text`]; on a
+    /// stream, [`ChatCompletionStreamResponse::prompt_text`]) where the path
+    /// that serves the request returns it (that field says which): the chat
+    /// template's output for this request, with the special tokens and the
+    /// generation prefix the template wrote. Encoding that string anew need
+    /// not give the token ids the model received: where the text of a
+    /// message is encoded as plain text in the prompt, text that spells a
+    /// special token becomes that token when the whole string is encoded
+    /// again.
+    /// This type serializes the key only when `true`; a path that forwards
+    /// the client's own bytes forwards the key as the client wrote it.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_null_as_false",
+        skip_serializing_if = "is_false"
+    )]
+    pub return_prompt_text: bool,
 
     /// Random seed for sampling for deterministic outputs
     pub sampling_seed: Option<u64>,
@@ -602,6 +728,21 @@ impl ChatCompletionRequest {
             .or_else(|| provider.thinking_from_reasoning_effort(self.effective_reasoning_effort()))
     }
 
+    /// The `reasoning_effort` the prompt is rendered with: the effective
+    /// effort as the model's provider profile hands it to the template
+    /// ([`ProviderProfile::template_reasoning_effort`]), given the thinking
+    /// preference the prompt renders with ([`Self::template_thinking_for`]).
+    /// The gateway's kwargs merge adds the template's own switch sent in
+    /// `chat_template_kwargs` where the template reads that key
+    /// ([`ProviderProfile::thinking_from_template_kwargs`] under the detected
+    /// thinking key, which this crate cannot know).
+    pub fn template_reasoning_effort_for(&self, provider: ProviderProfile) -> Option<&str> {
+        provider.template_reasoning_effort(
+            self.effective_reasoning_effort(),
+            self.template_thinking_for(provider),
+        )
+    }
+
     /// Whether `continue_final_message` applies: it is set and the request
     /// ends with an assistant message.
     pub fn continues_final_assistant(&self) -> bool {
@@ -684,6 +825,19 @@ where
             "reasoning_effort must be a string, number, or null",
         )),
     }
+}
+
+/// The date or the location of a root message: the string where the key
+/// holds one, nothing for any other value, so a key of another shape is
+/// dropped as it was before the message read the two keys.
+fn deserialize_text_or_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Value::deserialize(deserializer)? {
+        Value::String(text) => Some(text),
+        _ => None,
+    })
 }
 
 // ============================================================================
@@ -803,12 +957,25 @@ fn validate_chat_cross_parameters(
             .map_err(|error| on_field(error, "response_format"))?;
     }
 
-    // 7. A tool_choice against the tools the model will see
-    if let Some(tool_choice) = &req.tool_choice {
-        validate_tool_choice(req, tool_choice)?;
+    // 7. A function has a name. The rule stands ahead of the choice's, so
+    //    the unnamed tool is the one refused whatever `tool_choice` says
+    for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
+        if tool.function.name.is_empty() {
+            let field = format!("tools[{index}].function.name");
+            return Err(on_field(empty_tool_name(&field), field));
+        }
     }
 
-    // 8. A function's `parameters`, when given, is a JSON Schema object (an
+    // The provider profile, derived once here for the tool-choice rule (8)
+    // and the contract rules (11).
+    let provider = ProviderProfile::for_model(&req.model);
+
+    // 8. A tool_choice against the tools the model will see
+    if let Some(tool_choice) = &req.tool_choice {
+        validate_tool_choice(req, provider, tool_choice)?;
+    }
+
+    // 9. A function's `parameters`, when given, is a JSON Schema object (an
     //    absent or null schema was read as none and passes)
     for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
         let Some(schema) = &tool.function.parameters else {
@@ -827,7 +994,7 @@ fn validate_chat_cross_parameters(
         }
     }
 
-    // 9. A continued final message and the generation header exclude each
+    // 10. A continued final message and the generation header exclude each
     //     other: the pair set together is refused, as the engine that has
     //     the field refuses it; `continue_final_message` alone continues.
     if req.continue_final_message && req.add_generation_prompt == Some(true) {
@@ -838,27 +1005,28 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    // 10. Provider-profile contract rules, selected from the model id. Both
+    // 11. Provider-profile contract rules, selected from the model id. Both
     //     token limits at once are judged there: the request keeps whichever
     //     the client wrote and `output_token_cap` reads `max_completion_tokens`
     //     first, the precedence the serving engines apply themselves; only
     //     OpenAI's own contract refuses the pair.
-    ProviderProfile::for_model(&req.model).validate_chat(req)?;
+    provider.validate_chat(req)?;
 
     Ok(())
 }
 
 /// A `tool_choice` against the tools the model will see: the request's tools
-/// plus the dynamic tools its system and developer messages declare. Only
-/// `none` and `auto` are allowed without tools; a named function must be
-/// declared; an allowed-tools choice names a mode and function tools only,
-/// each declared.
+/// plus the dynamic tools its system and developer messages declare under
+/// `provider`, the request's profile the caller derived. Only `none` and
+/// `auto` are allowed without tools; a named function must be declared; an
+/// allowed-tools choice names a mode and function tools only, each declared.
 fn validate_tool_choice(
     req: &ChatCompletionRequest,
+    provider: ProviderProfile,
     tool_choice: &ToolChoice,
 ) -> Result<(), validator::ValidationError> {
     // Lazy on purpose: most tool traffic only needs the emptiness check.
-    let effective_tools = || req.effective_tools();
+    let effective_tools = || req.effective_tools_for(provider);
     let has_tools = effective_tools().next().is_some();
     let requires_tools = !matches!(
         tool_choice,
@@ -921,7 +1089,14 @@ impl ChatCompletionRequest {
     /// request's provider profile defines them (Kimi K3 dynamic tools on
     /// system and developer messages; see [`ProviderProfile::dynamic_tools`]).
     pub fn dynamic_tools(&self) -> impl Iterator<Item = &Tool> {
-        ProviderProfile::for_model(&self.model).dynamic_tools(self)
+        self.dynamic_tools_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::dynamic_tools`] under `provider`, the model's profile the
+    /// caller derived already (the gateway's preparation derives it once per
+    /// request, and the stages after it read that one).
+    pub fn dynamic_tools_for(&self, provider: ProviderProfile) -> impl Iterator<Item = &Tool> {
+        provider.dynamic_tools(self)
     }
 
     /// Whether the request offers the model any tool: a request-level `tools`
@@ -939,16 +1114,28 @@ impl ChatCompletionRequest {
         self.tools.is_some() || self.dynamic_tools().next().is_some()
     }
 
+    /// [`Self::declares_tools`] under `provider`, the model's profile the
+    /// caller derived already.
+    pub fn declares_tools_for(&self, provider: ProviderProfile) -> bool {
+        self.tools.is_some() || self.dynamic_tools_for(provider).next().is_some()
+    }
+
     /// Every tool the model will see: the request-level `tools` followed by
     /// the dynamic tools. Anything that resolves a tool name in the response,
     /// tool-call parsing first of all, must work from this set rather than
     /// from `tools` alone, or a call to a dynamic tool comes back as text.
     pub fn effective_tools(&self) -> impl Iterator<Item = &Tool> {
+        self.effective_tools_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::effective_tools`] under `provider`, the model's profile the
+    /// caller derived already.
+    pub fn effective_tools_for(&self, provider: ProviderProfile) -> impl Iterator<Item = &Tool> {
         self.tools
             .as_deref()
             .into_iter()
             .flatten()
-            .chain(self.dynamic_tools())
+            .chain(self.dynamic_tools_for(provider))
     }
 
     /// [`Self::effective_tools`] as one list: the request's own `tools`,
@@ -957,7 +1144,13 @@ impl ChatCompletionRequest {
     /// request (the constraint, the response spec, the table that reads the
     /// calls), so where nothing narrows it, nothing copies it.
     pub fn effective_tool_list(&self) -> Cow<'_, [Tool]> {
-        let mut dynamic = self.dynamic_tools().peekable();
+        self.effective_tool_list_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::effective_tool_list`] under `provider`, the model's profile
+    /// the caller derived already.
+    pub fn effective_tool_list_for(&self, provider: ProviderProfile) -> Cow<'_, [Tool]> {
+        let mut dynamic = self.dynamic_tools_for(provider).peekable();
         if dynamic.peek().is_none() {
             return Cow::Borrowed(self.tools.as_deref().unwrap_or(&[]));
         }
@@ -978,7 +1171,13 @@ impl ChatCompletionRequest {
     /// shared, when no message declares a tool; a list that chains both
     /// otherwise; an empty list when the request declares none.
     pub fn shared_tool_list(&self) -> Arc<[Tool]> {
-        let mut dynamic = self.dynamic_tools().peekable();
+        self.shared_tool_list_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::shared_tool_list`] under `provider`, the model's profile the
+    /// caller derived already.
+    pub fn shared_tool_list_for(&self, provider: ProviderProfile) -> Arc<[Tool]> {
+        let mut dynamic = self.dynamic_tools_for(provider).peekable();
         match (&self.tools, dynamic.peek()) {
             (Some(tools), None) => Arc::clone(tools),
             (None, None) => Arc::default(),
@@ -999,7 +1198,13 @@ impl ChatCompletionRequest {
     /// alone, a forced call could only ever land on a request-level tool. The
     /// list is borrowed from the request where the choice narrows nothing.
     pub fn callable_tools(&self) -> Cow<'_, [Tool]> {
-        let tools = self.effective_tool_list();
+        self.callable_tools_for(ProviderProfile::for_model(&self.model))
+    }
+
+    /// [`Self::callable_tools`] under `provider`, the model's profile the
+    /// caller derived already.
+    pub fn callable_tools_for(&self, provider: ProviderProfile) -> Cow<'_, [Tool]> {
+        let tools = self.effective_tool_list_for(provider);
         match self
             .tool_choice
             .as_ref()
@@ -1092,6 +1297,10 @@ impl GenerationRequest for ChatCompletionRequest {
         self.rid.as_deref()
     }
 
+    fn max_output_tokens(&self) -> Option<u32> {
+        self.output_token_cap()
+    }
+
     fn is_stream(&self) -> bool {
         self.stream
     }
@@ -1111,62 +1320,232 @@ impl GenerationRequest for ChatCompletionRequest {
     }
 
     fn extract_text_for_routing(&self) -> String {
-        // Extract text from messages for routing decisions
-        // Use a single buffer to avoid intermediate Vec<String> allocations
-        let mut buffer = String::new();
-        let mut has_content = false;
+        self.joined_text(|_, _| {})
+    }
 
+    fn routing_text(&self) -> String {
+        let mut markers = 0;
+        self.joined_text(|buffer, part| {
+            if markers < PART_MARKERS_A_REQUEST {
+                markers += 1;
+                push_part_marker(buffer, part);
+            }
+        })
+    }
+}
+
+impl ChatCompletionRequest {
+    /// The request's text in message and part order, each piece that is not
+    /// empty joined to the text before it by one space; `other` is handed
+    /// each part that is no text, at its place.
+    fn joined_text(&self, mut other: impl FnMut(&mut String, &ContentPart)) -> String {
+        fn join(buffer: &mut String, text: &str) {
+            if !text.is_empty() {
+                if !buffer.is_empty() {
+                    buffer.push(' ');
+                }
+                buffer.push_str(text);
+            }
+        }
+        let mut buffer = String::new();
+        let mut join_content = |buffer: &mut String, content: &MessageContent| match content {
+            MessageContent::Text(text) => join(buffer, text),
+            MessageContent::Parts(parts) => {
+                for part in parts {
+                    match part.text() {
+                        Some(text) => join(buffer, text),
+                        None => other(buffer, part),
+                    }
+                }
+            }
+        };
         for msg in &self.messages {
             match msg {
                 ChatMessage::System { content, .. }
                 | ChatMessage::User { content, .. }
                 | ChatMessage::Tool { content, .. }
                 | ChatMessage::Developer { content, .. }
-                | ChatMessage::Root { content, .. } => {
-                    if has_content && content.has_text() {
-                        buffer.push(' ');
-                    }
-                    if content.append_text_to(&mut buffer) {
-                        has_content = true;
-                    }
-                }
+                | ChatMessage::Root { content, .. } => join_content(&mut buffer, content),
                 ChatMessage::Assistant {
                     content, reasoning, ..
                 } => {
-                    // Append main content
-                    if let Some(c) = content {
-                        if has_content && c.has_text() {
-                            buffer.push(' ');
-                        }
-                        if c.append_text_to(&mut buffer) {
-                            has_content = true;
-                        }
+                    if let Some(content) = content {
+                        join_content(&mut buffer, content);
                     }
-                    // Append reasoning content
                     if let Some(text) = &reasoning.text {
-                        if !text.is_empty() {
-                            if has_content {
-                                buffer.push(' ');
-                            }
-                            buffer.push_str(text);
-                            has_content = true;
-                        }
+                        join(&mut buffer, text);
                     }
                 }
                 ChatMessage::Function { content, .. } => {
-                    if let Some(content) = content.as_deref().filter(|c| !c.is_empty()) {
-                        if has_content {
-                            buffer.push(' ');
-                        }
-                        buffer.push_str(content);
-                        has_content = true;
+                    if let Some(content) = content {
+                        join(&mut buffer, content);
                     }
                 }
             }
         }
-
         buffer
     }
+}
+
+/// The width in characters of the marker the routing text carries at the
+/// place of a part that is no text: the part's digest in hex, repeated. A
+/// marker of a few characters would leave two requests that differ in such a
+/// part alone alike under a policy that weighs how much of a key matched.
+const PART_MARKER_WIDTH: usize = 256;
+
+/// The markers the routing text of one request carries at most. A part
+/// behind them is left out of the key, as every part that is no text was:
+/// the key of a conversation stays a prefix of the key of its next turn,
+/// and later parts no longer tell two such conversations apart.
+const PART_MARKERS_A_REQUEST: usize = 32;
+
+/// The bytes a part's digest reads at most, whatever the part's size.
+const PART_DIGEST_BYTES: usize = 1024;
+
+/// The state an FNV-1a digest starts from.
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// Joins the marker of a part that is no text to the routing text. Out of
+/// line: a request of text alone never comes here, and its walk stays the
+/// walk of `extract_text_for_routing`.
+#[cold]
+fn push_part_marker(buffer: &mut String, part: &ContentPart) {
+    if !buffer.is_empty() {
+        buffer.push(' ');
+    }
+    let start = buffer.len();
+    let _ = write!(buffer, "{:016x}", part_digest(part));
+    for _ in 1..PART_MARKER_WIDTH / 16 {
+        buffer.extend_from_within(start..start + 16);
+    }
+}
+
+/// FNV-1a over `bytes`, from `state`: the same in every build and on every
+/// host, which a key that later processes and other gateways meet again
+/// needs, with no dependency of this crate.
+fn fnv1a(state: u64, bytes: &[u8]) -> u64 {
+    bytes.iter().fold(state, |state, &byte| {
+        (state ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// Folds a string of a part into its digest and takes what it read from
+/// `budget`: the length and every byte or, of a string longer than the
+/// budget, windows of 64 bytes spread evenly from its first byte to its
+/// last, as many as the budget holds, or its first bytes where the budget
+/// holds no window. An inline image of megabytes is never read whole and
+/// never copied.
+fn fold_sampled(state: u64, text: &str, budget: &mut usize) -> u64 {
+    let bytes = text.as_bytes();
+    let length = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let state = fnv1a(state, &length.to_le_bytes());
+    if bytes.len() <= *budget {
+        *budget -= bytes.len();
+        return fnv1a(state, bytes);
+    }
+    let windows = *budget / 64;
+    if windows == 0 {
+        let head = bytes.get(..*budget).unwrap_or_default();
+        *budget = 0;
+        return fnv1a(state, head);
+    }
+    *budget -= windows * 64;
+    let (last, steps) = (bytes.len().saturating_sub(64), windows.max(2) - 1);
+    (0..windows).fold(state, |state, window| {
+        let start = last / steps * window + last % steps * window / steps;
+        fnv1a(state, bytes.get(start..start + 64).unwrap_or_default())
+    })
+}
+
+/// Folds a JSON value of a part of an unknown kind into its digest, its
+/// strings by [`fold_sampled`]. Each node the budget reaches folds a byte
+/// of its kind ahead of what it holds, and a list its length too, so two
+/// values that part in the kind or the shape of such a node do not fold
+/// alike; a whole number folds exactly.
+/// A node costs eight bytes of the budget. No further entry of a list is
+/// visited once it is spent; an object's members share what is left
+/// equally, by [`fold_members`].
+fn fold_value(state: u64, value: &Value, budget: &mut usize) -> u64 {
+    if *budget < 8 {
+        return state;
+    }
+    *budget -= 8;
+    match value {
+        Value::Null => fnv1a(state, &[0]),
+        Value::Bool(flag) => fnv1a(state, &[1 + u8::from(*flag)]),
+        Value::Number(number) => {
+            let (kind, bytes) = match (number.as_u64(), number.as_i64()) {
+                (Some(whole), _) => (3, whole.to_le_bytes()),
+                (None, Some(whole)) => (4, whole.to_le_bytes()),
+                (None, None) => (5, number.as_f64().map_or(0, f64::to_bits).to_le_bytes()),
+            };
+            fnv1a(fnv1a(state, &[kind]), &bytes)
+        }
+        Value::String(text) => fold_sampled(fnv1a(state, &[6]), text, budget),
+        Value::Array(items) => {
+            let length = u64::try_from(items.len()).unwrap_or(u64::MAX);
+            let mut state = fnv1a(fnv1a(state, &[7]), &length.to_le_bytes());
+            for item in items {
+                if *budget < 8 {
+                    break;
+                }
+                state = fold_value(state, item, budget);
+            }
+            state
+        }
+        Value::Object(fields) => fold_members(fnv1a(state, &[8]), fields, budget),
+    }
+}
+
+/// Folds the members of an object into the digest whatever their order: a
+/// client that replays a part with its members in another order keeps the
+/// part's marker. Each member reads an equal share of the budget, so what
+/// is read of one member does not depend on the members in front of it, and
+/// the members' digests are folded in their sorted order: no two of them
+/// cancel as they would in a sum. An object of more members than the budget
+/// has shares for folds their count alone.
+fn fold_members(state: u64, fields: &Map<String, Value>, budget: &mut usize) -> u64 {
+    let share = budget.checked_div(fields.len()).unwrap_or(0);
+    let mut members = [0u64; PART_DIGEST_BYTES / 8];
+    let mut read = 0;
+    if share >= 8 {
+        let mut left = 0;
+        for ((name, field), member) in fields.iter().zip(&mut members) {
+            let mut own = share;
+            *member = fold_value(fold_sampled(FNV_OFFSET, name, &mut own), field, &mut own);
+            left += own;
+        }
+        *budget = left;
+        read = fields.len();
+    }
+    let members = members.get_mut(..read).unwrap_or_default();
+    members.sort_unstable();
+    let count = u64::try_from(fields.len()).unwrap_or(u64::MAX);
+    members
+        .iter()
+        .fold(fnv1a(state, &count.to_le_bytes()), |state, member| {
+            fnv1a(state, &member.to_le_bytes())
+        })
+}
+
+/// The digest of a part that is no text, for its marker in the routing text:
+/// the part's kind and what it names (the URL or the inline data as the
+/// request carries it; the members of a part of an unknown kind), reading
+/// [`PART_DIGEST_BYTES`] at most. It reads the reference, never the media:
+/// one image under two URLs has two digests.
+fn part_digest(part: &ContentPart) -> u64 {
+    let mut budget = PART_DIGEST_BYTES;
+    let (kind, reference) = match part {
+        ContentPart::ImageUrl { image_url } => ("image_url", image_url.url.as_str()),
+        ContentPart::AudioUrl { audio_url } => ("audio_url", audio_url.url.as_str()),
+        ContentPart::InputAudio { input_audio } => ("input_audio", input_audio.data.as_str()),
+        ContentPart::VideoUrl { video_url } => ("video_url", video_url.url.as_str()),
+        ContentPart::Text { text } | ContentPart::Refusal { refusal: text } => {
+            ("text", text.as_str())
+        }
+        ContentPart::Unknown(fields) => return fold_members(FNV_OFFSET, fields, &mut budget),
+    };
+    fold_sampled(fnv1a(FNV_OFFSET, kind.as_bytes()), reference, &mut budget)
 }
 
 // ============================================================================
@@ -1189,6 +1568,17 @@ pub struct ChatCompletionResponse {
     /// OpenAI API sends it; the gateway has one tier, `default`.
     #[serde(default = "default_service_tier")]
     pub service_tier: String,
+    /// The prompt as rendered for the model, on the answer of a request that
+    /// set `return_prompt_text`: the chat template's output, with the
+    /// special tokens and the generation prefix the template wrote. The
+    /// gateway's gRPC path returns it for a request that sends the worker no
+    /// media; where media
+    /// travels to the worker with the prompt, and for a model served through
+    /// the Harmony pipeline, the answer carries none. The rule follows what
+    /// was sent: an image that a text-only model's template turned into a
+    /// note in the prompt sent no media, and the answer carries the prompt,
+    /// note included. Absent otherwise.
+    pub prompt_text: Option<String>,
 }
 
 /// The one service tier the gateway serves.
@@ -1260,6 +1650,11 @@ pub struct ChatCompletionStreamResponse {
     pub created: u64,
     pub model: String,
     pub system_fingerprint: Option<String>,
+    /// The prompt as rendered for the model
+    /// ([`ChatCompletionResponse::prompt_text`]). The gateway's gRPC path
+    /// writes it on the first chunk that opens a choice and on no other, so
+    /// a stream of several choices carries it once.
+    pub prompt_text: Option<String>,
     pub choices: Vec<ChatStreamChoice>,
     pub usage: Option<Usage>,
 }
@@ -1370,7 +1765,10 @@ mod tests {
         ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef, GenerationRequest,
         ThinkingParam, ThinkingType,
     };
-    use crate::common::{FunctionCallDelta, ToolCallDelta};
+    use crate::{
+        common::{FunctionCallDelta, FunctionCallResponse, ToolCall, ToolCallDelta},
+        profile::ProviderProfile,
+    };
 
     /// The borrowed stream choice serializes to the bytes of the owned one, shape for shape:
     /// text deltas, a reasoning delta, a tool call's start and arguments, the finishing choice,
@@ -1594,13 +1992,14 @@ mod tests {
         assert!(!back.stream_reasoning);
     }
 
-    /// The MiniMax contract reads `reasoning_effort` by its own rule: `none`
-    /// (the default depth) and `minimal` (`low`) keep thinking on; every
-    /// other profile keeps the OpenAI reading. An explicit `thinking.type:
-    /// disabled` wins over any effort under every profile, as an explicit
-    /// toggle wins over the effort in the engine's own server.
+    /// `none` switches thinking off under every profile (under MiniMax the
+    /// contract's reading: the request answers as `thinking.type: disabled`
+    /// does); `minimal` does under the OpenAI reading and is MiniMax's lowest
+    /// level, thinking on; a level leaves the template's default. An explicit
+    /// `thinking.type` wins over any effort under every profile, as an
+    /// explicit toggle wins over the effort in the engine's own server.
     #[test]
-    fn minimax_profile_keeps_thinking_on_for_every_effort() {
+    fn none_switches_thinking_off_under_every_profile_and_minimal_is_minimax_low() {
         let request = |model: &str, fields: Value| -> ChatCompletionRequest {
             let mut value = json!({"model": model, "messages": []});
             value
@@ -1609,56 +2008,160 @@ mod tests {
                 .extend(fields.as_object().cloned().unwrap_or_default());
             serde_json::from_value(value).unwrap()
         };
-        for effort in ["none", "minimal", "low", "high", "max"] {
+        for model in [
+            "MiniMax-M3",
+            "self-hosted-model",
+            "kimi-k3",
+            "deepseek-v4.1",
+        ] {
             assert_eq!(
-                request("MiniMax-M3", json!({"reasoning_effort": effort})).template_thinking(),
-                None,
-                "MiniMax {effort}: the template's default, thinking on"
+                request(model, json!({"reasoning_effort": "minimal"})).template_thinking(),
+                if model == "MiniMax-M3" {
+                    None
+                } else {
+                    Some(false)
+                },
+                "{model} minimal"
             );
-            assert_eq!(
-                request(
-                    "MiniMax-M3",
-                    json!({"reasoning_effort": effort, "thinking": {"type": "disabled"}})
-                )
-                .template_thinking(),
-                Some(false),
-                "MiniMax {effort}: thinking.disabled wins"
-            );
-        }
-        assert_eq!(
-            request("MiniMax-M3", json!({"thinking": {"type": "disabled"}})).template_thinking(),
-            Some(false),
-            "thinking.disabled alone switches thinking off"
-        );
-        assert_eq!(
-            request(
-                "MiniMax-M3",
-                json!({"reasoning_effort": "none", "thinking": {"type": "enabled"}})
-            )
-            .template_thinking(),
-            Some(true)
-        );
-        for model in ["self-hosted-model", "kimi-k3", "deepseek-v4.1"] {
             assert_eq!(
                 request(model, json!({"reasoning_effort": "none"})).template_thinking(),
                 Some(false),
-                "{model}: the OpenAI reading, none switches thinking off"
+                "{model} none: thinking off"
             );
             assert_eq!(
                 request(
                     model,
-                    json!({"reasoning_effort": "high", "thinking": {"type": "disabled"}})
+                    json!({"reasoning_effort": "none", "thinking": {"type": "enabled"}})
                 )
                 .template_thinking(),
-                Some(false),
-                "{model}: thinking.disabled wins"
+                Some(true),
+                "{model} none: thinking.enabled wins"
             );
+            for effort in ["low", "high", "max"] {
+                assert_eq!(
+                    request(model, json!({"reasoning_effort": effort})).template_thinking(),
+                    None,
+                    "{model} {effort}: the template's default"
+                );
+                assert_eq!(
+                    request(
+                        model,
+                        json!({"reasoning_effort": effort, "thinking": {"type": "disabled"}})
+                    )
+                    .template_thinking(),
+                    Some(false),
+                    "{model} {effort}: thinking.disabled wins"
+                );
+            }
             assert_eq!(
-                request(model, json!({"reasoning_effort": "high"})).template_thinking(),
-                None,
-                "{model}"
+                request(model, json!({"thinking": {"type": "disabled"}})).template_thinking(),
+                Some(false),
+                "{model}: thinking.disabled alone switches thinking off"
             );
         }
+    }
+
+    /// The effort the template renders is the profile's second reading of
+    /// the field: the value as sent under the default profile; under MiniMax
+    /// a level the contract names only (`minimal` as `low`), and none while
+    /// thinking is off (the typed toggle or the effort; the template's own
+    /// switch sent as a kwarg is the gateway's to apply, see
+    /// [`thinking_from_template_kwargs_reads_the_minimax_switch`]).
+    #[test]
+    fn template_reasoning_effort_follows_the_profile() {
+        let request = |fields: Value| -> ChatCompletionRequest {
+            let mut value = json!({"model": "m", "messages": []});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().cloned().unwrap_or_default());
+            serde_json::from_value(value).unwrap()
+        };
+        for (fields, minimax, generic) in [
+            (
+                json!({"reasoning_effort": "high"}),
+                Some("high"),
+                Some("high"),
+            ),
+            (
+                json!({"reasoning_effort": "xhigh"}),
+                Some("xhigh"),
+                Some("xhigh"),
+            ),
+            (
+                json!({"thinking": {"type": "enabled", "effort": "low"}, "reasoning_effort": "max"}),
+                Some("low"),
+                Some("low"),
+            ),
+            (json!({"reasoning_effort": "none"}), None, Some("none")),
+            (
+                json!({"reasoning_effort": "minimal"}),
+                Some("low"),
+                Some("minimal"),
+            ),
+            (
+                json!({"reasoning_effort": "ultra_super_max_xyz"}),
+                None,
+                Some("ultra_super_max_xyz"),
+            ),
+            (
+                json!({"reasoning_effort": "high", "thinking": {"type": "disabled"}}),
+                None,
+                Some("high"),
+            ),
+            (
+                json!({"reasoning_effort": "none", "thinking": {"type": "enabled"}}),
+                None,
+                Some("none"),
+            ),
+            // A kwarg switch is not this method's to read: the gateway applies
+            // it where the template reads that key.
+            (
+                json!({"reasoning_effort": "high", "chat_template_kwargs": {"thinking_mode": "disabled"}}),
+                Some("high"),
+                Some("high"),
+            ),
+            (json!({}), None, None),
+        ] {
+            assert_eq!(
+                request(fields.clone()).template_reasoning_effort_for(ProviderProfile::Minimax),
+                minimax,
+                "MiniMax {fields}"
+            );
+            assert_eq!(
+                request(fields.clone()).template_reasoning_effort_for(ProviderProfile::Generic),
+                generic,
+                "generic {fields}"
+            );
+        }
+    }
+
+    /// The template's own `thinking_mode` switch sent as a kwarg, read by the
+    /// profile that knows its templates' key; the gateway applies it where the
+    /// template reads that key.
+    #[test]
+    fn thinking_from_template_kwargs_reads_the_minimax_switch() {
+        let kwargs = |mode: &str| {
+            std::collections::HashMap::from([("thinking_mode".to_string(), json!(mode))])
+        };
+        let minimax = ProviderProfile::Minimax;
+        assert_eq!(
+            minimax.thinking_from_template_kwargs(Some(&kwargs("enabled"))),
+            Some(true)
+        );
+        assert_eq!(
+            minimax.thinking_from_template_kwargs(Some(&kwargs("disabled"))),
+            Some(false)
+        );
+        assert_eq!(
+            minimax.thinking_from_template_kwargs(Some(&kwargs("adaptive"))),
+            None
+        );
+        assert_eq!(minimax.thinking_from_template_kwargs(None), None);
+        assert_eq!(
+            ProviderProfile::Generic.thinking_from_template_kwargs(Some(&kwargs("disabled"))),
+            None
+        );
     }
 
     #[test]
@@ -1917,10 +2420,10 @@ mod tests {
             content: None,
             refusal: None,
             annotations: Vec::new(),
-            tool_calls: Some(vec![crate::common::ToolCall {
+            tool_calls: Some(vec![ToolCall {
                 id: "call_1".to_string(),
                 tool_type: "function".to_string(),
-                function: crate::common::FunctionCallResponse {
+                function: FunctionCallResponse {
                     name: "get_weather".to_string(),
                     arguments: Some("{}".to_string()),
                 },
@@ -2035,6 +2538,193 @@ mod tests {
             size_of::<ChatMessage>()
         );
     }
+
+    /// The routing text of a chat request carries, at the place of each part
+    /// that is no text, a marker of 256 characters made from the part's
+    /// digest, 32 markers a request at most. The pairs below are parts the
+    /// digest tells apart within the bytes it reads; a part whose members
+    /// come in another order keeps its marker.
+    #[test]
+    fn the_routing_text_carries_a_marker_of_each_part_that_is_no_text() {
+        let routed = |parts: Value| -> String {
+            let chat: ChatCompletionRequest = serde_json::from_value(json!({
+                "model": "m", "messages": [{"role": "user", "content": parts}]
+            }))
+            .unwrap();
+            chat.routing_text()
+        };
+        let text = json!({"type": "text", "text": "what does it show"});
+        let image = |url: &str| json!({"type": "image_url", "image_url": {"url": url}});
+        let around = |part: Value| json!([text, part, text]);
+
+        let first = routed(around(image("https://example.com/a.png")));
+        assert!(first.starts_with("what does it show ") && first.ends_with(" what does it show"));
+        // The marker is the digest's 16 digits sixteen times: 256 characters.
+        assert_eq!(first.len(), 18 + 256 + 18);
+        assert_eq!(first[18..274], first[18..34].repeat(16));
+
+        // An inline image far over the bytes its digest reads: its last
+        // byte still parts two keys.
+        let inline = |last: char| {
+            image(&format!(
+                "data:image/png;base64,{}{last}",
+                "A".repeat(1 << 20)
+            ))
+        };
+        assert_ne!(routed(around(inline('B'))), routed(around(inline('C'))));
+
+        for (one, two) in [
+            (
+                json!({"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}}),
+                json!({"type": "audio_url", "audio_url": {"url": "https://example.com/b.wav"}}),
+            ),
+            (
+                json!({"type": "input_audio", "input_audio": {"data": "QUJD", "format": "wav"}}),
+                json!({"type": "input_audio", "input_audio": {"data": "QUJE", "format": "wav"}}),
+            ),
+            (
+                json!({"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}),
+                json!({"type": "video_url", "video_url": {"url": "https://example.com/b.mp4"}}),
+            ),
+            (
+                json!({"type": "file", "file": {"file_id": "file-1", "filename": "a.pdf"}}),
+                json!({"type": "file", "file": {"file_id": "file-2", "filename": "a.pdf"}}),
+            ),
+            // Two kinds of value, two shapes of a list and two whole numbers
+            // that one float holds are each two parts; so are two members
+            // that change together, a string longer than its share and a
+            // list with an entry more behind what its share reads.
+            (
+                json!({"type": "file", "file": {"file_id": 0}}),
+                json!({"type": "file", "file": {"file_id": ""}}),
+            ),
+            (
+                json!({"type": "file", "file": {"pages": [[1, 2], [3]]}}),
+                json!({"type": "file", "file": {"pages": [[1], [2, 3]]}}),
+            ),
+            (
+                json!({"type": "file", "file": {"file_id": 9_007_199_254_740_993_u64}}),
+                json!({"type": "file", "file": {"file_id": 9_007_199_254_740_992_u64}}),
+            ),
+            (
+                json!({"type": "file", "a": null, "b": null}),
+                json!({"type": "file", "a": false, "b": false}),
+            ),
+            (
+                json!({"type": "file", "file": {
+                    "file_data": "A".repeat(64),
+                    "a": null, "b": null, "c": null, "d": null, "e": null, "f": null, "g": null
+                }}),
+                json!({"type": "file", "file": {
+                    "file_data": format!("B{}", "A".repeat(63)),
+                    "a": null, "b": null, "c": null, "d": null, "e": null, "f": null, "g": null
+                }}),
+            ),
+            (
+                json!({"type": "file", "file": {"pages": ["x".repeat(479)]}}),
+                json!({"type": "file", "file": {"pages": ["x".repeat(479), null]}}),
+            ),
+        ] {
+            let (one, two) = (routed(around(one)), routed(around(two)));
+            assert_eq!(one[..18], two[..18]);
+            assert_ne!(one[18..34], two[18..34], "{one} / {two}");
+        }
+
+        // A part replayed with its members in another order keeps its marker.
+        assert_eq!(
+            routed(around(
+                json!({"type": "file", "file": {"file_id": "file-1", "filename": "a.pdf"}})
+            )),
+            routed(around(
+                json!({"file": {"filename": "a.pdf", "file_id": "file-1"}, "type": "file"})
+            )),
+        );
+        // So does a part whose inline data is longer than its digest reads:
+        // each member reads its own share, whatever stands in front of it.
+        let (data, other) = ("QUJD".repeat(1024), "QUJE".repeat(1024));
+        assert_eq!(
+            routed(around(
+                json!({"type": "file", "file": {"file_data": data, "filename": "a.pdf"}})
+            )),
+            routed(around(
+                json!({"file": {"filename": "a.pdf", "file_data": data}, "type": "file"})
+            )),
+        );
+        assert_ne!(
+            routed(around(
+                json!({"type": "file", "file": {"file_data": data, "filename": "a.pdf"}})
+            )),
+            routed(around(
+                json!({"type": "file", "file": {"file_data": other, "filename": "a.pdf"}})
+            )),
+        );
+
+        // One request carries 32 markers at most: the 32nd image still parts
+        // two keys, the 33rd no longer does, and the key stays a prefix of
+        // the key of the same parts with a turn behind them.
+        let images = |changed: usize| -> Vec<Value> {
+            (0..40)
+                .map(|at| image(&format!("https://example.com/{at}-{}.png", at == changed)))
+                .collect()
+        };
+        assert_ne!(routed(json!(images(31))), routed(json!(images(40))));
+        assert_eq!(routed(json!(images(32))), routed(json!(images(40))));
+        let mut longer = images(40);
+        longer.extend([text.clone(), image("https://example.com/next.png")]);
+        assert!(routed(json!(longer)).starts_with(&routed(json!(images(40)))));
+    }
+
+    /// The text for routing of a mixed request, piece by piece: an empty
+    /// text part joins nothing, a part that is no text gives nothing between
+    /// two texts, an assistant's reasoning follows its content and a function
+    /// message gives its content. The routing text is another text exactly
+    /// where a part of the request is no text.
+    #[test]
+    fn the_text_for_routing_joins_the_texts_of_a_mixed_request() {
+        let chat = |messages: Value| -> ChatCompletionRequest {
+            serde_json::from_value(json!({"model": "m", "messages": messages})).unwrap()
+        };
+        let image = json!({"type": "image_url", "image_url": {"url": "https://example.com/a.png"}});
+        let history = |part: Value| {
+            chat(json!([
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": ""},
+                    {"type": "text", "text": "what does"},
+                    part,
+                    {"type": "text", "text": "it show"},
+                ]},
+                {"role": "assistant", "content": "a cat", "reasoning_content": "four legs"},
+                {"role": "function", "name": "lookup", "content": "tabby"},
+            ]))
+        };
+        let mixed = history(image.clone());
+        assert_eq!(
+            mixed.extract_text_for_routing(),
+            "be brief what does it show a cat four legs tabby"
+        );
+        // A refusal part is text: it joins its text and has no marker.
+        let refused = history(json!({"type": "refusal", "refusal": "no"}));
+        assert_eq!(
+            refused.extract_text_for_routing(),
+            "be brief what does no it show a cat four legs tabby"
+        );
+        let replayed = chat(json!([
+            {"role": "user", "content": "what does it show"},
+            {"role": "assistant", "content": [{"type": "text", "text": "a cat"}, image]},
+        ]));
+        assert_eq!(
+            replayed.extract_text_for_routing(),
+            "what does it show a cat"
+        );
+
+        for (request, marked) in [(mixed, true), (refused, false), (replayed, true)] {
+            assert_eq!(
+                request.routing_text() != request.extract_text_for_routing(),
+                marked
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2141,8 +2831,60 @@ mod request_contract_tests {
             error.contains("invalid_type") && error.contains("tools[0].function.parameters"),
             "{error}"
         );
+        assert!(
+            error.contains("expected an object, but got a string instead"),
+            "{error}"
+        );
         let empty = request(json!({"tools": [{"type": "function", "function": {"name": "f"}}]}));
         assert_eq!(rejection(&empty), None);
+    }
+
+    /// A function declared with an empty name is refused with its place in
+    /// `tools`: the model can be made to call it, and no client can dispatch
+    /// a call that names nothing. The first such tool is the one named, under
+    /// every `tool_choice`: a choice that names the empty function, and the
+    /// choices their own rule refuses (a function not declared, a mode not
+    /// known), which the name's rule stands ahead of.
+    #[test]
+    fn a_function_has_a_name() {
+        use crate::common::FIELD_PARAM;
+
+        let parameters = json!({"type": "object", "properties": {}});
+        let tool = |name: &str| json!({"type": "function", "function": {"name": name, "parameters": parameters}});
+        for (tools, at) in [
+            (json!([tool("")]), 0),
+            (json!([tool("f"), tool(""), tool("")]), 1),
+        ] {
+            for choice in [
+                json!("auto"),
+                json!("required"),
+                json!("none"),
+                json!({"type": "function", "function": {"name": ""}}),
+                json!({"type": "function", "function": {"name": "not declared"}}),
+                json!({"type": "allowed_tools", "mode": "sometimes",
+                       "tools": [{"type": "function", "name": "f"}]}),
+            ] {
+                let unnamed = request(json!({"tools": tools, "tool_choice": choice}));
+                let errors = unnamed.validate().expect_err("an empty name");
+                let error = &errors.field_errors()["__all__"][0];
+                assert_eq!(error.code, "empty_string", "{choice}");
+                let field = format!("tools[{at}].function.name");
+                assert_eq!(error.params[FIELD_PARAM], field.as_str(), "{choice}");
+                assert_eq!(
+                    error.message.as_deref(),
+                    Some(
+                        format!(
+                            "Invalid '{field}': empty string. Expected a string with minimum \
+                             length 1, but got an empty string instead."
+                        )
+                        .as_str()
+                    ),
+                    "{choice}"
+                );
+            }
+        }
+        let named = request(json!({"tools": [tool("f")], "tool_choice": "required"}));
+        assert_eq!(rejection(&named), None);
     }
 
     /// `logit_bias` is keyed by token ids, no two of them spelling one id,
@@ -2203,7 +2945,7 @@ mod request_contract_tests {
 mod tool_choice_tests {
     use serde_json::{json, Value};
 
-    use super::{validate_tool_choice, ChatCompletionRequest};
+    use super::{validate_tool_choice, ChatCompletionRequest, ProviderProfile};
 
     fn request(tools: Value, tool_choice: Value) -> ChatCompletionRequest {
         serde_json::from_value(json!({
@@ -2219,7 +2961,7 @@ mod tool_choice_tests {
     fn verdict(tools: Value, tool_choice: Value) -> Option<String> {
         let req = request(tools, tool_choice);
         let choice = req.tool_choice.as_ref().expect("a tool choice");
-        validate_tool_choice(&req, choice)
+        validate_tool_choice(&req, ProviderProfile::for_model(&req.model), choice)
             .err()
             .map(|e| e.code.into_owned())
     }
@@ -2297,6 +3039,160 @@ mod tool_choice_tests {
                 code.map(str::to_string),
                 "{tool_choice}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod content_tests {
+    use serde_json::json;
+
+    use super::{ChatCompletionRequest, ChatMessage, MessageContent};
+
+    fn content_of(message: ChatMessage) -> MessageContent {
+        match message {
+            ChatMessage::User { content, .. } => content,
+            other => panic!("not a user message: {other:?}"),
+        }
+    }
+
+    /// A string is the text, a list is the parts, an unknown part is kept.
+    #[test]
+    fn message_content_reads_text_and_parts() {
+        let text = serde_json::from_value::<ChatMessage>(json!({"role": "user", "content": "hi"}))
+            .unwrap();
+        assert_eq!(content_of(text), MessageContent::Text("hi".to_string()));
+
+        let parts = serde_json::from_value::<ChatMessage>(json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+                {"type": "vendor_media", "payload": {"items": [1]}}
+            ]
+        }))
+        .unwrap();
+        let MessageContent::Parts(parts) = content_of(parts) else {
+            panic!("not parts");
+        };
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].text(), Some("hi"));
+    }
+
+    /// A part's refusal reaches the message's error as the part's own
+    /// reason, under the part's place, never as the generic words of an
+    /// untagged read; a content that is neither a string nor a list names
+    /// both forms.
+    #[test]
+    fn message_content_keeps_a_parts_refusal_under_its_place() {
+        for (content, reason) in [
+            (
+                json!([{"type": "text", "text": "hi"}, {"type": "refusal", "refusal": null}]),
+                "invalid type: null, expected a string, in `content[1].refusal`",
+            ),
+            (
+                json!([{"type": "image_url", "image_url": {"detail": "high"}}]),
+                "missing field `content[0].image_url.url`",
+            ),
+            (
+                json!([{"type": "text", "text": "hi"}, {"type": "image_url"}]),
+                "missing field `content[1].image_url`",
+            ),
+            (
+                json!([{"type": "image_url", "image_url": {"url": "data:image/png;base64,AA==", "max_long_side_pixel": -1}}]),
+                "invalid value: integer `-1`, expected u32, in `content[0].image_url`",
+            ),
+            (
+                json!([5]),
+                "invalid type: integer `5`, expected a map, in `content[0]`",
+            ),
+            // A value the client sent that holds ", in `" does not move the place.
+            (
+                json!(["see, in `x"]),
+                "invalid type: string \"see, in `x\", expected a map, in `content[0]`",
+            ),
+            (
+                json!(5),
+                "invalid type: integer `5`, expected a string or a list of content parts",
+            ),
+        ] {
+            let error =
+                serde_json::from_value::<ChatMessage>(json!({"role": "user", "content": content}))
+                    .unwrap_err();
+            assert_eq!(error.to_string(), reason, "{content}");
+        }
+    }
+
+    /// A key repeated inside a content part is refused with serde's words
+    /// under the part's place, at any depth of the part and for any kind,
+    /// where a plain value read keeps the last value. A key that holds the
+    /// place's own separator does not move the place.
+    #[test]
+    fn a_content_part_with_a_repeated_key_is_refused() {
+        for (message, reason) in [
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"a","text":"b"}]}"#,
+                "duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"image_url","type":"text","text":"a"}]}"#,
+                "duplicate field `type`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"a"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AA==","url":"data:image/png;base64,AB=="}}]}"#,
+                "duplicate field `url`, in `content[1]`",
+            ),
+            (
+                r#"{"role":"system","content":[{"type":"text","text":"a","text":"b"}]}"#,
+                "duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"tool","tool_call_id":"call_1","content":[{"type":"text","text":"a","text":"b"}]}"#,
+                "duplicate field `text`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"vendor_media","payload":{"a":1,"a":2}}]}"#,
+                "duplicate field `a`, in `content[0]`",
+            ),
+            (
+                r#"{"role":"user","content":[{"type":"text","text":"a","x, in `y":1,"x, in `y":2}]}"#,
+                "duplicate field `x, in `y`, in `content[0]`",
+            ),
+        ] {
+            let error = serde_json::from_str::<ChatMessage>(message).unwrap_err();
+            assert_eq!(error.to_string(), reason, "{message}");
+        }
+    }
+
+    /// A twelve-turn conversation (part turns with an image, text turns, a
+    /// tool call and its result in parts), read two hundred times: the
+    /// content readers' cost on a representative request, for the
+    /// measurement of a change to them. Nothing is asserted beyond the read.
+    #[test]
+    #[ignore = "a read-cost measurement for perf stat, not a check"]
+    fn a_conversation_with_parts_reads_two_hundred_times() {
+        let text = "the previous turn's text, long enough to carry some weight ".repeat(4);
+        let mut messages = Vec::new();
+        for _ in 0..5 {
+            messages.push(json!({"role": "user", "content": [
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "detail": "low"}},
+            ]}));
+            messages.push(json!({"role": "assistant", "content": text}));
+        }
+        messages.push(json!({"role": "assistant", "content": null, "tool_calls": [
+            {"id": "call_1", "type": "function", "function": {"name": "lookup", "arguments": "{\"q\":\"x\"}"}},
+        ]}));
+        messages.push(
+            json!({"role": "tool", "tool_call_id": "call_1", "content": [
+                {"type": "text", "text": text},
+            ]}),
+        );
+        let body = json!({"model": "m", "messages": messages, "max_tokens": 8}).to_string();
+        for _ in 0..200 {
+            let request: ChatCompletionRequest =
+                serde_json::from_str(&body).expect("the body reads");
+            assert_eq!(request.messages.len(), 12);
         }
     }
 }

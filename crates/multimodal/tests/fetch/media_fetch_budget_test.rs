@@ -118,7 +118,7 @@ async fn a_slow_video_completes_within_the_video_budget() {
     });
     let started = Instant::now();
     let clip = connector
-        .fetch_video(MediaSource::Url(url), VideoFetchConfig::default())
+        .fetch_video(MediaSource::Url(url.into()), VideoFetchConfig::default())
         .await
         .expect("a video budget longer than the image budget covers a 2.5 s body");
     assert!(started.elapsed() >= pause, "{:?}", started.elapsed());
@@ -145,7 +145,10 @@ async fn a_stalled_body_fails_at_the_budget_naming_the_url() {
     });
     let started = Instant::now();
     let error = connector
-        .fetch_image(MediaSource::Url(url.clone()), ImageFetchConfig::default())
+        .fetch_image(
+            MediaSource::Url(url.clone().into()),
+            ImageFetchConfig::default(),
+        )
         .await
         .expect_err("the body never completes");
     assert!(
@@ -176,7 +179,10 @@ async fn late_headers_fail_at_the_budget_naming_the_url() {
     });
     let started = Instant::now();
     let error = connector
-        .fetch_image(MediaSource::Url(url.clone()), ImageFetchConfig::default())
+        .fetch_image(
+            MediaSource::Url(url.clone().into()),
+            ImageFetchConfig::default(),
+        )
         .await
         .expect_err("the headers never come");
     assert!(

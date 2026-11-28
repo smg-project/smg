@@ -4,13 +4,13 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     time::Duration,
 };
 
 use axum::{
-    extract::{Extension, Path, Query, RawQuery, Request, State},
+    extract::{Extension, RawQuery, Request, State},
     http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post, Route},
@@ -37,71 +37,91 @@ use openai_protocol::{
     responses::ResponsesRequest,
     systemone::SystemOneRequest,
     tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-    validated::ValidatedJson,
+    validated::{ValidatedJson, ValidatedPath, ValidatedQuery, ValueBody},
     worker::{
         ListWorkersQuery, StartProfileRequest, StopProfileRequest, WorkerListFormat, WorkerSpec,
         WorkerUpdateRequest,
     },
 };
 use serde::Deserialize;
-use serde_json::Value;
+use smg_grand_central::stages::StageRegistry;
 use smg_mesh::{
     ClusterState, MeshServer, MeshServerBuilder, MeshServerConfig, MeshServerHandler,
     PreparedMeshServer,
 };
+use smg_worker::metrics::series as worker_series;
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
 pub mod connection_limit;
 pub mod connection_timeouts;
+pub mod health;
+mod policy_explain;
 pub mod posture;
+mod rate_limit_document;
 pub(crate) mod tls;
 
+use smg_service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig};
 // The HTTP client constructors and the process crypto provider they install
-// first live beside the private-key-file check in `tls`; callers read them as
-// `server::http_client()` and its siblings.
-pub use tls::{blocking_http_client, http_client, http_client_builder, install_crypto_provider};
+// first live in the worker tree, which builds the worker-directed clients
+// with them; callers read them as `server::http_client()` and its siblings.
+pub use smg_worker::connection::client_factory::{
+    blocking_http_client, http_client, http_client_builder, install_crypto_provider,
+};
+use smg_worker::{
+    connection::engine::EngineConnector,
+    health::manager::{WorkerManager, WorkerManagerConfig},
+    identity::{basic::ConnectionMode, endpoint::Endpoint},
+    jobs::WorkerJobs,
+    registry::WorkerId,
+};
 
 use crate::{
-    app_context::AppContext,
-    config::{redacted, ParserChoice, RouterConfig},
-    endpoints::{conversations, models, parse, responses as response_handlers, tokenize},
+    admin::{
+        json::AdminJson,
+        params::{AdminPath, AdminQuery},
+    },
+    app_context::{effective_max_concurrent_requests, AppContext},
+    config::{
+        available_cpus, bind_socket_addr, dp_aware_deprecation_warning,
+        dp_minimum_tokens_scheduler_scope_warning, redacted,
+        runtime_worker_threads_oversubscription, unused_credentials_warnings,
+        validate_mesh_listener_port, ParserChoice, RouterConfig,
+    },
+    endpoints::{
+        conversations, messages::MessagesHeaders, models, parse, responses as response_handlers,
+        tokenize,
+    },
     mesh::{
         discovery::{start_mesh_discovery, MeshDiscoveryConfig},
         MeshAdapters,
     },
     middleware::{self, inert::InertLayer, AdmissionQueue, AuthConfig},
     observability::{
-        heap_profile, history_metrics,
-        inflight_tracker::InFlightRequestTracker,
-        logging::{self, LoggingConfig},
-        metrics::{self, PrometheusConfig},
-        metrics_server, otel_trace, runtime_metrics,
+        heap_profile, history_metrics, inflight_tracker::InFlightRequestTracker, logging,
+        logging::LoggingConfig, metrics, metrics::PrometheusConfig, metrics_server, otel_trace,
+        runtime_metrics,
     },
     routers::{
-        common::{header_utils, realtime::ws::RealtimeQueryParams},
+        common::realtime::ws::RealtimeQueryParams,
         error as route_error,
         gateway::Gateway,
         grpc::{common::responses::spawn_unstored_sweeper, regular::symphony::telemetry},
         http::router::StreamBodyState,
         RouterTrait,
     },
+    secrets::{reload_logged, start_auto_reload, BadFile, KeySets, SecretFiles, SecretReloader},
     server::{
         connection_limit::{BoundedListener, ConnectionLimitAcceptor},
         connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
+        health::{liveness_response, spawn_readiness_maintainer, start_probe_listener, ProbeState},
     },
-    service_discovery::{export_manifest, start_service_discovery, RuntimeDiscoveryConfig},
     tenant,
     wasm::route::{add_wasm_module, list_wasm_modules, remove_wasm_module},
-    worker::{
-        admin_json::AdminJson,
-        endpoint::Endpoint,
-        manager::{WorkerManager, WorkerManagerConfig},
-        ConnectionMode,
-    },
     workflow::{
         job_queue::{JobQueue, JobQueueConfig},
+        worker_events::spawn_worker_event_reactions,
         Job, TokenizerConfigRequest, WorkflowEngines,
     },
 };
@@ -115,26 +135,26 @@ pub struct AppState {
     pub mesh_adapters: Option<Arc<MeshAdapters>>,
     /// Cached O(1) readiness state shared with the optional dedicated
     /// probe listener. Maintained event-driven by
-    /// [`crate::health::spawn_readiness_maintainer`].
-    pub probe_state: Arc<crate::health::ProbeState>,
+    /// [`crate::server::health::spawn_readiness_maintainer`].
+    pub probe_state: Arc<ProbeState>,
     /// Where this start read its secrets (the command line, the environment
     /// or a file), for the configuration view; the values are not here.
     pub secret_sources: posture::SecretSources,
     /// The reload of the keys from their files, when a key came from one;
     /// without it `POST /secrets/reload` answers 409.
-    pub secrets: Option<Arc<crate::secrets::SecretReloader>>,
+    pub secrets: Option<Arc<SecretReloader>>,
 }
 
 async fn parse_function_call(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<ParseFunctionCallRequest>,
+    AdminJson(req): AdminJson<ParseFunctionCallRequest>,
 ) -> Response {
     parse::parse_function_call(&state.context, &req).await
 }
 
 async fn parse_reasoning(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<SeparateReasoningRequest>,
+    AdminJson(req): AdminJson<SeparateReasoningRequest>,
 ) -> Response {
     parse::parse_reasoning(&state.context, &req).await
 }
@@ -170,13 +190,13 @@ async fn unknown_route(status: StatusCode, code: &str, request: Request) -> Resp
 }
 
 async fn liveness() -> Response {
-    crate::health::liveness_response()
+    liveness_response()
 }
 
 /// O(1) readiness: reads the event-maintained snapshot (see
-/// [`crate::health::spawn_readiness_maintainer`]) and the drain flag — no registry
+/// [`crate::server::health::spawn_readiness_maintainer`]) and the drain flag — no registry
 /// scan per probe. The decision logic lives in
-/// [`crate::health::ProbeState::recompute`] and is unchanged from the previous
+/// [`crate::server::health::ProbeState::recompute`] and is unchanged from the previous
 /// inline implementation, plus the drain gate (not-ready while draining).
 async fn readiness(State(state): State<Arc<AppState>>) -> Response {
     state.probe_state.readiness_response()
@@ -207,7 +227,7 @@ async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response
 
 async fn v1_model(
     State(state): State<Arc<AppState>>,
-    Path(model_id): Path<String>,
+    ValidatedPath(model_id): ValidatedPath<String>,
     req: Request,
 ) -> Response {
     let request_id = middleware::request_id_of(&req);
@@ -243,6 +263,9 @@ async fn v1_chat_completions(
     ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
 ) -> Response {
     let model = body.model.clone();
+    // One allocation holds the parsed request from here on: the router
+    // layers below move its pointer, not the 1 KiB request.
+    let body = Arc::new(body);
     cancel
         .guard(
             state
@@ -302,7 +325,7 @@ async fn v1_rerank(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<V1RerankReqInput>,
+    ValidatedJson(body): ValidatedJson<V1RerankReqInput>,
 ) -> Response {
     let rerank_body: RerankRequest = body.into();
     let model = rerank_body.model.clone();
@@ -389,7 +412,7 @@ async fn v1_embeddings(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<EmbeddingRequest>,
+    ValidatedJson(body): ValidatedJson<EmbeddingRequest>,
 ) -> Response {
     let model = body.model.clone();
     cancel
@@ -401,108 +424,25 @@ async fn v1_embeddings(
         .await
 }
 
-/// The public Messages API knows only its dated versions: a request whose
-/// `anthropic-version` is not a calendar date of 2023 or later is refused as
-/// the public API refuses it, before anything is routed. A request without
-/// the header is served as the current version: this gateway's own SDK
-/// clients send none, and the header selects nothing here.
-fn check_anthropic_version(headers: &HeaderMap) -> Result<(), Response> {
-    let Some(value) = headers.get("anthropic-version") else {
-        return Ok(());
-    };
-    let version = value.to_str().unwrap_or_default();
-    if is_anthropic_version(version) {
-        Ok(())
-    } else {
-        Err(route_error::bad_request(
-            "invalid_anthropic_version",
-            format!("anthropic-version: \"{version}\" is not a valid version"),
-        ))
-    }
-}
-
-/// `YYYY-MM-DD`, a real calendar date, 2023 (the first public version) or
-/// later.
-fn is_anthropic_version(version: &str) -> bool {
-    let bytes = version.as_bytes();
-    let shaped = bytes.len() == 10
-        && bytes.iter().enumerate().all(|(i, b)| {
-            if i == 4 || i == 7 {
-                *b == b'-'
-            } else {
-                b.is_ascii_digit()
-            }
-        });
-    if !shaped {
-        return false;
-    }
-    let field = |range: std::ops::Range<usize>| version[range].parse::<u32>().unwrap_or(0);
-    let (year, month, day) = (field(0..4), field(5..7), field(8..10));
-    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
-    let days = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
-        2 => 28,
-        _ => 0,
-    };
-    year >= 2023 && (1..=days).contains(&day)
-}
-
-/// `thinking.budget_tokens` must leave room under `max_tokens` for the
-/// answer, unless the interleaved-thinking beta is on: then the budget covers
-/// every thinking block of the turn and the public API takes a budget at or
-/// above `max_tokens`. The rule reads the `anthropic-beta` header, so it runs
-/// here rather than in the request's own validation.
-fn check_thinking_budget(headers: &HeaderMap, body: &CreateMessageRequest) -> Result<(), Response> {
-    let Some(openai_protocol::messages::ThinkingConfig::Enabled { budget_tokens, .. }) =
-        &body.thinking
-    else {
-        return Ok(());
-    };
-    let interleaved = header_utils::anthropic_beta_named(headers, "interleaved-thinking");
-    if interleaved || *budget_tokens < body.max_tokens {
-        Ok(())
-    } else {
-        Err(route_error::bad_request(
-            "thinking_budget_exceeds_max_tokens",
-            "`max_tokens` must be greater than `thinking.budget_tokens`",
-        ))
-    }
-}
-
-/// A thread turn names the message-threads beta, as the public API requires
-/// (`anthropic-beta: message-threads-2026-08-12`). That header is what tells
-/// the body layer to parse the request before the route, so a `thread` field
-/// without it is refused here with the public API's own 400.
-fn check_thread_beta(headers: &HeaderMap, body: &CreateMessageRequest) -> Result<(), Response> {
-    if body.thread.is_none() || header_utils::anthropic_beta_named(headers, "message-threads") {
-        Ok(())
-    } else {
-        Err(route_error::bad_request(
-            "thread_beta_required",
-            "`thread` requires the `anthropic-beta: message-threads-2026-08-12` header",
-        ))
-    }
-}
-
+/// The Messages route: its typed headers ([`MessagesHeaders`]) are read
+/// before the body, so a malformed `anthropic-version` is refused before the
+/// body is buffered; the rules that read a beta beside the body run once the
+/// body is parsed. The raw headers are forwarded as they came.
 async fn v1_messages(
     State(state): State<Arc<AppState>>,
+    parsed: MessagesHeaders,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CreateMessageRequest>,
 ) -> Response {
-    if let Err(refused) = check_anthropic_version(&headers) {
-        return refused;
-    }
-    if let Err(refused) = check_thinking_budget(&headers, &body) {
-        return refused;
-    }
-    if let Err(refused) = check_thread_beta(&headers, &body) {
+    if let Err(refused) = parsed.validate(&body) {
         return refused;
     }
     let model = body.model.clone();
+    // As for chat: the router layers below move this pointer, not the
+    // parsed request.
+    let body = Arc::new(body);
     cancel
         .guard(
             state
@@ -512,16 +452,16 @@ async fn v1_messages(
         .await
 }
 
+/// The count-tokens route reads the typed headers for the version refusal
+/// alone: no rule of its body reads a beta.
 async fn v1_messages_count_tokens(
     State(state): State<Arc<AppState>>,
+    _parsed: MessagesHeaders,
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
     ValidatedJson(body): ValidatedJson<CountMessageTokensRequest>,
 ) -> Response {
-    if let Err(refused) = check_anthropic_version(&headers) {
-        return refused;
-    }
     let model = body.model.clone();
     cancel
         .guard(
@@ -537,7 +477,7 @@ async fn v1_classify(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    Json(body): Json<ClassifyRequest>,
+    ValidatedJson(body): ValidatedJson<ClassifyRequest>,
 ) -> Response {
     let model = body.model.clone();
     cancel
@@ -574,13 +514,15 @@ async fn v1_audio_transcriptions(
 async fn v1_responses_get(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(response_id): Path<String>,
+    ValidatedPath(response_id): ValidatedPath<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     response_handlers::get_response(
         &state.context.response_storage,
         tenant.as_deref(),
         &response_id,
+        query.as_deref(),
     )
     .await
 }
@@ -588,7 +530,7 @@ async fn v1_responses_get(
 async fn v1_responses_cancel(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(response_id): Path<String>,
+    ValidatedPath(response_id): ValidatedPath<String>,
     headers: HeaderMap,
 ) -> Response {
     state
@@ -600,7 +542,7 @@ async fn v1_responses_cancel(
 async fn v1_responses_delete(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(response_id): Path<String>,
+    ValidatedPath(response_id): ValidatedPath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     response_handlers::delete_response(
@@ -614,13 +556,15 @@ async fn v1_responses_delete(
 async fn v1_responses_list_input_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(response_id): Path<String>,
+    ValidatedPath(response_id): ValidatedPath<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     response_handlers::list_response_input_items(
         &state.context.response_storage,
         tenant.as_deref(),
         &response_id,
+        query.as_deref(),
     )
     .await
 }
@@ -628,17 +572,22 @@ async fn v1_responses_list_input_items(
 async fn v1_conversations_create(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Json(body): Json<Value>,
+    ValidatedJson(ValueBody(body)): ValidatedJson<ValueBody>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
-    conversations::create_conversation(&state.context.conversation_storage, tenant.as_deref(), body)
-        .await
+    conversations::create_conversation(
+        &state.context.conversation_storage,
+        &state.context.conversation_item_storage,
+        tenant.as_deref(),
+        body,
+    )
+    .await
 }
 
 async fn v1_conversations_get(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    ValidatedPath(conversation_id): ValidatedPath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::get_conversation(
@@ -652,8 +601,8 @@ async fn v1_conversations_get(
 async fn v1_conversations_update(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
-    Json(body): Json<Value>,
+    ValidatedPath(conversation_id): ValidatedPath<String>,
+    ValidatedJson(ValueBody(body)): ValidatedJson<ValueBody>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::update_conversation(
@@ -668,7 +617,7 @@ async fn v1_conversations_update(
 async fn v1_conversations_delete(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
+    ValidatedPath(conversation_id): ValidatedPath<String>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::delete_conversation(
@@ -689,12 +638,12 @@ struct ListItemsQuery {
 async fn v1_conversations_list_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
-    Query(ListItemsQuery {
+    ValidatedPath(conversation_id): ValidatedPath<String>,
+    ValidatedQuery(ListItemsQuery {
         limit,
         order,
         after,
-    }): Query<ListItemsQuery>,
+    }): ValidatedQuery<ListItemsQuery>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::list_conversation_items(
@@ -712,8 +661,8 @@ async fn v1_conversations_list_items(
 async fn v1_conversations_create_items(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path(conversation_id): Path<String>,
-    Json(body): Json<Value>,
+    ValidatedPath(conversation_id): ValidatedPath<String>,
+    ValidatedJson(ValueBody(body)): ValidatedJson<ValueBody>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::create_conversation_items(
@@ -729,7 +678,7 @@ async fn v1_conversations_create_items(
 async fn v1_conversations_get_item(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path((conversation_id, item_id)): Path<(String, String)>,
+    ValidatedPath((conversation_id, item_id)): ValidatedPath<(String, String)>,
     RawQuery(query): RawQuery,
 ) -> Response {
     // `include` arrives as repeated `include[]=` / `include=` pairs; each value
@@ -753,7 +702,7 @@ async fn v1_conversations_get_item(
 async fn v1_conversations_delete_item(
     State(state): State<Arc<AppState>>,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
-    Path((conversation_id, item_id)): Path<(String, String)>,
+    ValidatedPath((conversation_id, item_id)): ValidatedPath<(String, String)>,
 ) -> Response {
     let tenant = tenant::storage_tenant(&tenant_meta);
     conversations::delete_conversation_item(
@@ -768,7 +717,7 @@ async fn v1_conversations_delete_item(
 
 async fn v1_realtime_webrtc(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<RealtimeQueryParams>,
+    ValidatedQuery(params): ValidatedQuery<RealtimeQueryParams>,
     req: Request,
 ) -> Response {
     // Model may come from query param (application/sdp) or session body
@@ -779,7 +728,7 @@ async fn v1_realtime_webrtc(
 
 async fn v1_realtime_ws(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<RealtimeQueryParams>,
+    ValidatedQuery(params): ValidatedQuery<RealtimeQueryParams>,
     req: Request,
 ) -> Response {
     let model = match params.model {
@@ -836,9 +785,9 @@ async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Respo
 
 async fn start_profile(
     State(state): State<Arc<AppState>>,
-    body: Option<Json<StartProfileRequest>>,
+    body: Option<AdminJson<StartProfileRequest>>,
 ) -> Response {
-    let body = body.map_or_else(StartProfileRequest::default, |Json(body)| body);
+    let body = body.map_or_else(StartProfileRequest::default, |AdminJson(body)| body);
     WorkerManager::start_profile_all(
         &state.context.worker_registry,
         &body.options,
@@ -850,9 +799,9 @@ async fn start_profile(
 
 async fn stop_profile(
     State(state): State<Arc<AppState>>,
-    body: Option<Json<StopProfileRequest>>,
+    body: Option<AdminJson<StopProfileRequest>>,
 ) -> Response {
-    let body = body.map_or_else(StopProfileRequest::default, |Json(body)| body);
+    let body = body.map_or_else(StopProfileRequest::default, |AdminJson(body)| body);
     WorkerManager::stop_profile_all(&state.context.worker_registry, body.url.as_deref())
         .await
         .into_response()
@@ -869,7 +818,7 @@ async fn dump_heap_profile(State(state): State<Arc<AppState>>) -> Response {
 
 async fn get_loads(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<ListWorkersQuery>,
+    AdminQuery(query): AdminQuery<ListWorkersQuery>,
 ) -> Response {
     let snapshot = state
         .context
@@ -881,6 +830,7 @@ async fn get_loads(
         &state.context.worker_registry,
         &snapshot,
         query.model.as_deref(),
+        concat!("smg-", env!("CARGO_PKG_VERSION")),
     ))
     .into_response()
 }
@@ -902,7 +852,7 @@ async fn inflight_requests(State(state): State<Arc<AppState>>) -> Response {
 /// The control-plane reads the `admin` role alone may make: the gate
 /// refuses the `user` role there before any handler and writes the denial
 /// line, as for a mutation ([`smg_auth::ControlPlaneAuthState::with_admin_only_reads`]).
-pub const ADMIN_ONLY_READS: &[&str] = &["/config"];
+pub const ADMIN_ONLY_READS: &[&str] = &["/config", "/rate-limits/tenants"];
 
 /// `GET /config`: the effective configuration with every secret
 /// redacted and the keys in force named by fingerprint. The `admin` role
@@ -941,9 +891,9 @@ async fn reload_secrets(State(state): State<Arc<AppState>>) -> Response {
         )
             .into_response();
     };
-    match crate::secrets::reload_logged(reloader, "route").await {
+    match reload_logged(reloader, "route").await {
         Some(Ok(report)) => smg_auth::AuditResource::name(Json(report).into_response(), "secrets"),
-        Some(Err(crate::secrets::BadFile(error))) => (
+        Some(Err(BadFile(error))) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(serde_json::json!({ "error": error.to_string() })),
         )
@@ -961,14 +911,23 @@ fn gated_control_plane_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/config", get(admin_config))
         .route("/secrets/reload", post(reload_secrets))
+        .route(
+            "/rate-limits/tenants",
+            get(rate_limit_document::get).put(rate_limit_document::put),
+        )
 }
 
 /// The gated routes by name, in the order of `gated_control_plane_routes`.
-pub const GATED_ROUTES: &[(&str, &str)] = &[("GET", "/config"), ("POST", "/secrets/reload")];
+pub const GATED_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/config"),
+    ("POST", "/secrets/reload"),
+    ("GET", "/rate-limits/tenants"),
+    ("PUT", "/rate-limits/tenants"),
+];
 
 async fn list_workers_rest(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<ListWorkersQuery>,
+    AdminQuery(query): AdminQuery<ListWorkersQuery>,
 ) -> Response {
     let mut result = state
         .context
@@ -988,11 +947,15 @@ async fn list_workers_rest(
 
 async fn get_worker(
     State(state): State<Arc<AppState>>,
-    Path(worker_id_raw): Path<String>,
+    AdminPath(worker_id_raw): AdminPath<String>,
 ) -> Response {
     match state.context.worker_service.get_worker(&worker_id_raw) {
         Ok(mut result) => {
-            if let Some(monitor) = state.context.worker_monitor.as_ref() {
+            // Only a worker in the registry has a load of its own: the
+            // address of a pending view can be another worker's.
+            let id = WorkerId::from_string(result.0.id.clone());
+            let registered = state.context.worker_registry.get(&id).is_some();
+            if let Some(monitor) = state.context.worker_monitor.as_ref().filter(|_| registered) {
                 let snapshot = monitor.load_snapshot();
                 result.0.engine_load = snapshot.get(&result.0.spec.url).cloned();
             }
@@ -1004,7 +967,7 @@ async fn get_worker(
 
 async fn delete_worker(
     State(state): State<Arc<AppState>>,
-    Path(worker_id_raw): Path<String>,
+    AdminPath(worker_id_raw): AdminPath<String>,
 ) -> Response {
     match state
         .context
@@ -1019,7 +982,7 @@ async fn delete_worker(
 
 async fn update_worker(
     State(state): State<Arc<AppState>>,
-    Path(worker_id_raw): Path<String>,
+    AdminPath(worker_id_raw): AdminPath<String>,
     AdminJson(update): AdminJson<WorkerUpdateRequest>,
 ) -> Response {
     match state
@@ -1035,7 +998,7 @@ async fn update_worker(
 
 async fn replace_worker(
     State(state): State<Arc<AppState>>,
-    Path(worker_id_raw): Path<String>,
+    AdminPath(worker_id_raw): AdminPath<String>,
     AdminJson(config): AdminJson<WorkerSpec>,
 ) -> Response {
     match state
@@ -1055,16 +1018,16 @@ async fn replace_worker(
 
 async fn v1_tokenize(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<TokenizeRequest>,
+    ValidatedJson(request): ValidatedJson<TokenizeRequest>,
 ) -> Response {
-    tokenize::tokenize(&state.context.tokenizer_registry, request).await
+    tokenize::tokenize(&state.context, request).await
 }
 
 async fn v1_detokenize(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<DetokenizeRequest>,
+    ValidatedJson(request): ValidatedJson<DetokenizeRequest>,
 ) -> Response {
-    tokenize::detokenize(&state.context.tokenizer_registry, request).await
+    tokenize::detokenize(&state.context, request).await
 }
 
 async fn v1_tokenizers_add(
@@ -1080,24 +1043,28 @@ async fn v1_tokenizers_list(State(state): State<Arc<AppState>>) -> Response {
 
 async fn v1_tokenizers_get(
     State(state): State<Arc<AppState>>,
-    Path(tokenizer_id): Path<String>,
+    AdminPath(tokenizer_id): AdminPath<String>,
 ) -> Response {
     tokenize::get_tokenizer_info(&state.context, &tokenizer_id).await
 }
 
 async fn v1_tokenizers_status(
     State(state): State<Arc<AppState>>,
-    Path(tokenizer_id): Path<String>,
+    AdminPath(tokenizer_id): AdminPath<String>,
 ) -> Response {
     tokenize::get_tokenizer_status(&state.context, &tokenizer_id).await
 }
 
 async fn v1_tokenizers_remove(
     State(state): State<Arc<AppState>>,
-    Path(tokenizer_id): Path<String>,
+    AdminPath(tokenizer_id): AdminPath<String>,
 ) -> Response {
     tokenize::remove_tokenizer(&state.context, &tokenizer_id).await
 }
+
+/// The shutdown grace in seconds a start takes when none is configured: the
+/// CLI flag's default and [`ServerConfig::minimal`]'s.
+pub const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 180;
 
 pub struct ServerConfig {
     /// The router configuration, which carries the listener settings too:
@@ -1136,7 +1103,7 @@ pub struct ServerConfig {
     /// The files the keys were read from, where a file was the source: the
     /// targets of `POST /secrets/reload`; a caller that did not track them
     /// leaves the default, and the route answers 409.
-    pub secret_files: crate::secrets::SecretFiles,
+    pub secret_files: SecretFiles,
     /// `--secrets-auto-reload`: the key files watched, a change reloading
     /// them as the route does. Nothing to watch without a file source; the
     /// start says so.
@@ -1146,7 +1113,7 @@ pub struct ServerConfig {
 impl ServerConfig {
     /// A server with the listener `router_config` names and nothing else: no
     /// log file, no discovery, no mesh, no metrics endpoint, no control-plane
-    /// authentication, no secret source, a five-second shutdown grace. A
+    /// authentication, no secret source, the CLI's default shutdown grace. A
     /// library caller or a test starts from it and sets what it needs by a
     /// struct update, so a field added here with its default breaks no
     /// hand-built literal.
@@ -1159,7 +1126,7 @@ impl ServerConfig {
             service_discovery_config: None,
             mesh_discovery_config: None,
             prometheus_config: None,
-            shutdown_grace_period_secs: 5,
+            shutdown_grace_period_secs: DEFAULT_SHUTDOWN_GRACE_SECS,
             shutdown_settle_secs: None,
             control_plane_auth: None,
             mesh_server_config: None,
@@ -1169,6 +1136,86 @@ impl ServerConfig {
             secret_files: Default::default(),
             secrets_auto_reload: false,
         }
+    }
+}
+
+/// What a host binary adds to the gateway at startup.
+#[non_exhaustive]
+pub struct Extensions {
+    connector: Option<Arc<dyn EngineConnector>>,
+    policy_stages: Option<StageRegistry>,
+}
+
+impl Extensions {
+    /// Use the stock connector and the stock policy stages.
+    pub fn new() -> Self {
+        Self {
+            connector: None,
+            policy_stages: None,
+        }
+    }
+
+    /// Set the connector workers of this gateway use to probe and connect
+    /// to their engines. Delegate to [`BackendConnector::shared`] for engines
+    /// you want the gateway to connect to as usual.
+    ///
+    /// A gRPC connection of your own carries a worker's health, loads and
+    /// events. The gateway puts it behind a front ([`Fronted`]) and sends
+    /// requests through its own client, which it connects to the worker's
+    /// address and runtime at the first request. So an engine the gateway's
+    /// client speaks to must listen there. The worker's connection is the
+    /// front: read your own type back through [`Fronted::front`]. If you
+    /// hold the gateway's client already, return [`Fronted::over`] of yours
+    /// and it, and the two share one channel.
+    ///
+    /// For ZMQ inference, and for a ZMQ worker's label refresh, the gateway
+    /// requires a [`BackendClient`] as the worker's connection. It refuses
+    /// another with `its engine connection is not the gateway's backend
+    /// client`.
+    /// If the connection supplies load reports, let the worker runtime be
+    /// the only poller of that engine's load.
+    ///
+    /// An HTTP worker connects no engine, and its load is polled over HTTP.
+    /// A connector that keeps such a worker's load on a service of its own
+    /// answers [`EngineConnector::http_load_source`]: the worker runtime
+    /// then polls that source alone and sends the worker no load request.
+    ///
+    /// [`BackendConnector::shared`]: crate::routers::grpc::backend_client::BackendConnector::shared
+    /// [`BackendClient`]: crate::routers::grpc::backend_client::BackendClient
+    /// [`Fronted`]: crate::routers::grpc::backend_client::Fronted
+    /// [`Fronted::front`]: crate::routers::grpc::backend_client::Fronted::front
+    /// [`Fronted::over`]: crate::routers::grpc::backend_client::Fronted::over
+    #[must_use]
+    pub fn connector(mut self, connector: Arc<dyn EngineConnector>) -> Self {
+        self.connector = Some(connector);
+        self
+    }
+
+    /// Set the table of stages a policy document of this gateway may name,
+    /// where the gateway runs Grand Central (`grand_central`
+    /// on). Start from the stock table ([`StageRegistry::builtin`]) and add
+    /// each stage of your own under a new name, with
+    /// [`StageRegistry::filter`], [`StageRegistry::scorer`] or
+    /// [`StageRegistry::picker`]. A supplied document (`policy_spec`) then
+    /// names your stage as it names a stock one, and the engine that places
+    /// this gateway's requests runs it.
+    ///
+    /// The gateway validates its document against this table first, before
+    /// it opens a store or listens. A document that names a stage the table
+    /// does not hold ends the start by the stage's name. Without this call
+    /// the document is validated against the stock table.
+    ///
+    /// With Grand Central off the table is not read.
+    #[must_use]
+    pub fn policy_stages(mut self, stages: StageRegistry) -> Self {
+        self.policy_stages = Some(stages);
+        self
+    }
+}
+
+impl Default for Extensions {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1243,6 +1290,22 @@ pub fn build_app(
     .map(|apps| apps.data)
 }
 
+/// The control-plane auth state as the gateway attaches it: the admin-only
+/// reads named, and the in-flight tracker handed out as the hold a recorded
+/// mutation's task keeps until its outcome line is written. The shutdown's
+/// drain waits on that count and the exit waits for the drain before its
+/// teardown (see [`drain_before_teardown`]), so a mutation whose client left
+/// is waited for as one whose client is still connected.
+fn control_plane_state(
+    state: smg_auth::ControlPlaneAuthState,
+    tracker: &Arc<InFlightRequestTracker>,
+) -> smg_auth::ControlPlaneAuthState {
+    let tracker = Arc::clone(tracker);
+    state
+        .with_admin_only_reads(ADMIN_ONLY_READS)
+        .with_mutation_hold(move || Box::new(tracker.track()))
+}
+
 /// `serving_auth_config` covers inference-serving routes and may include
 /// per-tenant keys. `admin_auth_config` is the admin/worker-management
 /// fallback (used when `control_plane_auth_state` is `None`) and must
@@ -1264,10 +1327,11 @@ pub fn build_apps(
     cors_allowed_origins: Vec<String>,
     admin_listener: bool,
 ) -> Result<GatewayApps, InvalidHeaderName> {
-    // The admin-only reads join the state once, for every attachment of
-    // the control-plane layer below: the shared groups and the gated group.
-    let control_plane_auth_state =
-        control_plane_auth_state.map(|state| state.with_admin_only_reads(ADMIN_ONLY_READS));
+    // The admin-only reads and the in-flight hold join the state once, for
+    // every attachment of the control-plane layer below: the shared groups
+    // and the gated group.
+    let control_plane_auth_state = control_plane_auth_state
+        .map(|state| control_plane_state(state, &app_state.context.inflight_tracker));
     // Pending (upgrade not completed): 30s TTL
     // Disconnected: 60 min TTL
     app_state.context.realtime_registry.start_reaper(
@@ -1438,9 +1502,9 @@ pub fn build_apps(
         );
     let protected_routes = typed_routes.merge(plain_protected_routes);
 
-    // WebSocket and WebRTC routes: auth + admission but NO WASM middleware.
-    // WASM OnResponse reconstructs the response from status/headers/body,
-    // dropping the response extensions that carry the WebSocket upgrade future.
+    // WebSocket and WebRTC routes: auth + admission but no WASM middleware.
+    // The hooks filter HTTP requests and responses; a realtime session is
+    // upgraded away from HTTP and its frames are not run through modules.
     let realtime_routes = Router::new()
         .route("/v1/realtime", get(v1_realtime_ws))
         .route("/v1/realtime/calls", post(v1_realtime_webrtc))
@@ -1456,7 +1520,9 @@ pub fn build_apps(
     // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject
     // to the WASM manager's `max_body_size` (10MB default). Audio uploads
     // routinely exceed that, so WASM middleware would reject them with 400
-    // before reaching the handler.
+    // before reaching the handler. No request-body deadline either: the
+    // innermost layer only measures how long the read of the upload waited
+    // for the client, for the dispatch wait counted without the upload.
     let multipart_upload_routes = Router::new()
         .route("/v1/audio/transcriptions", post(v1_audio_transcriptions))
         .route_layer(
@@ -1464,7 +1530,10 @@ pub fn build_apps(
                 .layer(InertLayer(serving_auth_layer.clone()))
                 .layer(tenant_resolution_state.layer())
                 .layer(InertLayer(priority_admission))
-                .layer(InertLayer(legacy_limit)),
+                .layer(InertLayer(legacy_limit))
+                .layer(tower::util::MapRequestLayer::new(|request: Request| {
+                    request.map(middleware::body_timeout::upload_measured)
+                })),
         );
 
     let public_routes = Router::new()
@@ -1492,6 +1561,7 @@ pub fn build_apps(
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
+        .route("/policy/explain/{request_id}", get(policy_explain::get))
         .route("/wasm", post(add_wasm_module))
         .route("/wasm/{module_uuid}", delete(remove_wasm_module))
         .route("/wasm", get(list_wasm_modules))
@@ -1586,9 +1656,13 @@ pub fn build_apps(
     let access_log_fields = middleware::AccessLogFields::from_fields(
         &app_state.context.router_config.access_log_fields,
     );
+    // Under a policy spec that keeps a sample, each router also gets the
+    // write of a request's own id, directly inside the edge layers
+    // ([`own_request_id_layer`]). Every other gateway installs nothing.
+    let own_request_id = own_request_id_layer(app_state.context.policy_registry.engine());
     let finish = |app: Router<Arc<AppState>>| {
         attach_edge_layers(
-            app,
+            app.layer_if_some(own_request_id.clone()),
             max_payload_size,
             app_state.context.inflight_tracker.clone(),
             request_id_headers.clone(),
@@ -1616,6 +1690,27 @@ pub fn build_apps(
             admin: None,
         })
     }
+}
+
+/// The layer that restates each request's chosen id on the request
+/// (`middleware::request_id::restate`), for a gateway whose Grand Central
+/// keeps a sample of its decisions: `engine` runs under a policy spec whose
+/// `explain.sample` is not zero. `None` for every other gateway, a classic
+/// one among them: it installs nothing and its requests pay nothing for it
+/// (see [`LayerIfSome`]).
+///
+/// The engine reads a host's id of a request only where it keeps a
+/// decision, so the id is stated only there. The engine starts with the
+/// context, ahead of the applications' build, and the answer is taken once,
+/// at that build. A policy spec put in force later on the running engine
+/// does not move it.
+fn own_request_id_layer(
+    engine: Option<&smg_grand_central::engine::InProcess>,
+) -> Option<tower::util::MapRequestLayer<impl Fn(Request) -> Request + Clone + Send + Sync + 'static>>
+{
+    engine
+        .is_some_and(|engine| engine.spec().engine().explain_sample() != 0)
+        .then(|| tower::util::MapRequestLayer::new(middleware::request_id::restate))
 }
 
 /// The middleware every request crosses, matched or not: body limits, the
@@ -1734,9 +1829,9 @@ async fn start_observability(
     config: &ServerConfig,
     app_context: &Arc<AppContext>,
     metrics_handle: Option<PrometheusHandle>,
-) -> Result<Arc<crate::health::ProbeState>, Box<dyn std::error::Error>> {
-    let probe_state = crate::health::ProbeState::new(app_context.inflight_tracker.clone());
-    let _readiness_maintainer = crate::health::spawn_readiness_maintainer(
+) -> Result<Arc<ProbeState>, Box<dyn std::error::Error>> {
+    let probe_state = ProbeState::new(app_context.inflight_tracker.clone());
+    let _readiness_maintainer = spawn_readiness_maintainer(
         probe_state.clone(),
         app_context.worker_registry.clone(),
         app_context.tokenizer_registry.clone(),
@@ -1748,6 +1843,7 @@ async fn start_observability(
             handle,
             prometheus_config.host.clone(),
             prometheus_config.port,
+            app_context.policy_registry.engine(),
         )
         .await?;
         runtime_metrics::spawn_observer();
@@ -1759,11 +1855,8 @@ async fn start_observability(
     );
 
     if let Some(probe_port) = config.router_config.health_check_port {
-        let probe_addr = crate::health::start_probe_listener(
-            &config.router_config.host,
-            probe_port,
-            probe_state.clone(),
-        )?;
+        let probe_addr =
+            start_probe_listener(&config.router_config.host, probe_port, probe_state.clone())?;
         info!("Probe listener started on {probe_addr} (--health-check-port {probe_port})");
     }
     Ok(probe_state)
@@ -1906,6 +1999,7 @@ async fn start_workflow_engines(
             chat_template_path: config.router_config.chat_template.clone(),
             cache_config: config.router_config.tokenizer_cache.to_option(),
             fail_on_duplicate: false,
+            for_worker: false,
         };
 
         let job = Job::AddTokenizer {
@@ -1919,6 +2013,11 @@ async fn start_workflow_engines(
 
         info!("Startup tokenizer job submitted (will complete in background)");
     }
+
+    // A worker that no workflow registers or removes here (a mesh peer's)
+    // gets its model's tokenizer job and the close of its pooled encode
+    // connections from the registry's events.
+    spawn_worker_event_reactions(app_context);
 
     info!(
         "Initializing workers for routing mode: {:?}",
@@ -1994,24 +2093,34 @@ async fn prepare_mesh_server(
     Ok(Some(prepared))
 }
 
-/// [`startup`] on `runtime` to its end, then the process-wide observability
+/// Run the gateway on `runtime` with no extension of a host. See
+/// [`run_with`] for shutdown behavior.
+pub fn run(
+    runtime: &tokio::runtime::Runtime,
+    config: ServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_with(runtime, config, Extensions::default())
+}
+
+/// [`startup_with`] on `runtime` to its end, then the process-wide observability
 /// closed behind it, on every exit alike: the log writers are flushed and
 /// stopped, then the tracer is flushed and shut down (a bounded wait, see
 /// [`otel_trace::shutdown_otel`]), and only then is the result read. A
 /// failed start-up used to return before the tracer's shutdown, and the
 /// spans the batch exporter still held were lost with the process. The
-/// result is `startup`'s own: the error line and the exit code are the
+/// result is `startup_with`'s own: the error line and the exit code are the
 /// caller's, as before. The runtime stays up throughout: the exporter's
 /// connection lives on it, and the shutdown is driven from it, so a
 /// current-thread runtime serves as well as a multi-thread one.
 ///
 /// For a caller whose process goes on after the server (a language
-/// binding), [`startup`] alone is the entry point.
-pub fn run(
+/// binding), [`startup_with`] alone is the entry point.
+pub fn run_with(
     runtime: &tokio::runtime::Runtime,
     config: ServerConfig,
+    extensions: Extensions,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let served = runtime.block_on(Box::pin(startup(config)));
+    let served = runtime.block_on(Box::pin(startup_with(config, extensions)));
     // The writer threads outlive `startup` (a process may start more than one
     // router); flush and stop them now that this process is done logging.
     logging::close_logging();
@@ -2039,11 +2148,33 @@ struct BoundListeners {
     admin: Option<std::net::TcpListener>,
 }
 
+/// The accept queue a client-facing listener asks for: more than a host
+/// allows, so the kernel caps it at the host's own maximum
+/// (`net.core.somaxconn` on Linux).
+const LISTEN_QUEUE: u32 = i32::MAX.unsigned_abs();
+
+/// A listener on `addr` with [`LISTEN_QUEUE`] asked for. The runtime's own
+/// bind takes no queue length and its socket queued 128 connections on a
+/// host that allows 4096: a burst of new connections overflowed it. Runs
+/// inside the runtime: the socket registers with its reactor before
+/// `into_std` hands it back.
+fn listen_on(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    let socket = match addr {
+        std::net::SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        std::net::SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
+    // As the runtime's bind sets it: a restart takes its port back at once.
+    #[cfg(not(windows))]
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(LISTEN_QUEUE)?.into_std()
+}
+
 /// The admin and HTTP listeners, bound in that order after the mesh
 /// listener, eagerly: a port another process holds fails the start here,
 /// before anything serves (the comments inside say why each binds where it
 /// does and how).
-async fn bind_listeners(
+fn bind_listeners(
     addr: std::net::SocketAddr,
     admin_addr: Option<std::net::SocketAddr>,
 ) -> Result<BoundListeners, Box<dyn std::error::Error>> {
@@ -2051,26 +2182,17 @@ async fn bind_listeners(
     // listener did in `startup` before this call: a port another process
     // holds fails the start here, before anything serves.
     let admin_listener = match admin_addr {
-        Some(admin_addr) => Some(
-            tokio::net::TcpListener::bind(admin_addr)
-                .await
-                .and_then(tokio::net::TcpListener::into_std)
-                .map_err(|e| {
-                    format!("Failed to bind the admin listener on {admin_addr} (--admin-port): {e}")
-                })?,
-        ),
+        Some(admin_addr) => Some(listen_on(admin_addr).map_err(|e| {
+            format!("Failed to bind the admin listener on {admin_addr} (--admin-port): {e}")
+        })?),
         None => None,
     };
     // The HTTP listener binds now, eagerly, the last of the listeners: a port
     // another process holds fails the start here, before `startup` lets the
-    // mesh server join the cluster. Bound through tokio, as axum-server
-    // binds (the same socket options and accept backlog; std's bind would
-    // queue 128 connections instead of 1024), and served from the socket in
+    // mesh server join the cluster. Served from the socket in
     // `serve_listeners`.
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .and_then(tokio::net::TcpListener::into_std)
-        .map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
+    let listener =
+        listen_on(addr).map_err(|e| format!("Failed to bind the HTTP listener on {addr}: {e}"))?;
     info!("Starting server on {addr}");
     Ok(BoundListeners {
         addr,
@@ -2125,9 +2247,7 @@ fn serve_listeners(
     // The admission limit the bound is compared with is the effective one
     // (the one resolution of `max_concurrent_requests`, shared with the
     // admission bucket).
-    let admission_limit = crate::app_context::effective_max_concurrent_requests(
-        router_config.max_concurrent_requests,
-    );
+    let admission_limit = effective_max_concurrent_requests(router_config.max_concurrent_requests);
     if let Some(admission_limit) =
         admission_limit.filter(|limit| max_connections > 0 && max_connections < *limit)
     {
@@ -2218,8 +2338,47 @@ fn serve_listeners(
     Ok((data_serving, admin_serving))
 }
 
+/// The context of this process, built over what the host added: its
+/// worker connector and its table of policy stages.
+async fn build_app_context(
+    config: &ServerConfig,
+    extensions: Extensions,
+) -> Result<Arc<AppContext>, String> {
+    Ok(Arc::new(
+        AppContext::from_config_with_extensions(
+            config.router_config.clone(),
+            config.router_config.request_timeout_secs,
+            config.webrtc_bind_addr,
+            config.webrtc_stun_server.clone(),
+            extensions.connector,
+            extensions.policy_stages,
+        )
+        .await?,
+    ))
+}
+
+/// What the start line says places this process's requests: the policy
+/// document Grand Central runs in place of the one the routing
+/// settings mean, by its path where it was read from one, and the routing
+/// settings' policy everywhere else.
+fn start_line_policy(config: &RouterConfig) -> String {
+    match (&config.policy_spec, &config.policy_spec_path) {
+        (None, _) => format!("{:?}", config.policy),
+        (Some(_), Some(path)) => format!("document {path}"),
+        (Some(_), None) => "a supplied document".to_owned(),
+    }
+}
+
 /// Start the gateway listeners and drain them within the configured shutdown budget.
 pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    Box::pin(startup_with(config, Extensions::default())).await
+}
+
+/// [`startup`] with the host's extensions.
+pub async fn startup_with(
+    config: ServerConfig,
+    extensions: Extensions,
+) -> Result<(), Box<dyn std::error::Error>> {
     install_crypto_provider();
 
     // Defense in depth: the CLI and Python bindings both validate via
@@ -2235,7 +2394,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // not part of `RouterConfig`, so the validator cannot see it, and this is
     // the one place the CLI, the Python binding and a library caller all pass.
     if let Some(mesh_server_config) = &config.mesh_server_config {
-        crate::config::validate_mesh_listener_port(
+        validate_mesh_listener_port(
             mesh_server_config.bind_addr.port(),
             config.router_config.port,
             config
@@ -2313,12 +2472,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     if let Some(warning) = config
         .router_config
         .runtime_worker_threads
-        .and_then(|threads| {
-            crate::config::runtime_worker_threads_oversubscription(
-                threads,
-                crate::config::available_cpus(),
-            )
-        })
+        .and_then(|threads| runtime_worker_threads_oversubscription(threads, available_cpus()))
     {
         tracing::warn!("{warning}");
     }
@@ -2326,15 +2480,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // once per listed URL, where the line reaches the log (the validator runs
     // before the subscriber exists); the add-worker route says it at
     // registration.
-    for warning in crate::config::unused_credentials_warnings(&config.router_config.mode) {
+    for warning in unused_credentials_warnings(&config.router_config.mode) {
         tracing::warn!("{warning}");
     }
-    // A rank scheduler under rank expansion chooses nothing: the operator's
-    // configuration runs, with the word that one of its flags does nothing.
-    if let Some(warning) = crate::config::dp_minimum_tokens_scheduler_scope_warning(
-        config.router_config.dp_aware,
-        config.router_config.dp_minimum_tokens_scheduler,
-    ) {
+    // Two settings the operator's configuration still carries and that
+    // choose nothing where an engine's ranks are registered as workers: the
+    // configuration runs, with the word that the setting does nothing.
+    for warning in [
+        dp_aware_deprecation_warning(config.router_config.dp_aware),
+        dp_minimum_tokens_scheduler_scope_warning(config.router_config.dp_minimum_tokens_scheduler),
+    ]
+    .into_iter()
+    .flatten()
+    {
         tracing::warn!("{warning}");
     }
 
@@ -2359,7 +2517,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // resolved router config; per-worker specs still override at request time.
     use crate::routers::grpc::multimodal::{
         enforce_jpeg_decoder_policy, init_mm_settings, init_mm_transport_defaults,
-        report_jpeg_decoder, MultimodalSettings,
+        report_jpeg_decoder, spawn_buffer_pool_trim, MultimodalSettings,
     };
     init_mm_transport_defaults(
         config.router_config.multimodal_tensor_transport,
@@ -2380,6 +2538,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // before a fatal configuration error.
     let metrics_handle = config.prometheus_config.as_ref().map(|prometheus_config| {
         let handle = metrics::start_prometheus(prometheus_config.clone());
+        // This start hands the handle to its own metrics listener and to
+        // nothing else, and that listener's scrape appends the per-worker
+        // store's text to the exporter's: the histogram families record in
+        // the store's fixed cells, from the first series on.
+        if worker_series::keep_histograms() {
+            debug!("Histogram families record in the per-worker series store's cells");
+        } else {
+            warn!("Histogram families stay with the exporter: one registered there first");
+        }
         metrics::init_startup_series();
         // Under Symphony the series of a request no table reads exist at zero
         // from the start; a table's own follow its model's first registration.
@@ -2416,27 +2583,21 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     };
 
     info!(
-        "Starting router on {}:{} | mode: {:?} | policy: {:?} | max_payload: {}MB",
+        "Starting router on {}:{} | mode: {:?} | policy: {} | max_payload: {}MB",
         config.router_config.host,
         config.router_config.port,
         config.router_config.mode,
-        config.router_config.policy,
+        start_line_policy(&config.router_config),
         config.router_config.max_payload_size / (1024 * 1024)
     );
 
-    let app_context = Arc::new(
-        AppContext::from_config(
-            config.router_config.clone(),
-            config.router_config.request_timeout_secs,
-            config.webrtc_bind_addr,
-            config.webrtc_stun_server.clone(),
-        )
-        .await?,
-    );
+    let app_context = build_app_context(&config, extensions).await?;
     // The history store's size on /metrics, from the stores that can count.
     if config.prometheus_config.is_some() {
         history_metrics::spawn_sampler(Arc::clone(&app_context));
     }
+    // The media crate's buffer pool gives its idle buffers back at rest.
+    spawn_buffer_pool_trim();
 
     // Register the CRDT namespaces and start the inbound sync adapters now;
     // gossip starts further down, after the metrics and probe listeners are
@@ -2470,7 +2631,6 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     );
 
     let gateway = Gateway::from_config(&config, &app_context).await?;
-    let router: Arc<dyn RouterTrait> = gateway.clone();
 
     // WorkerManager owns the background health check loop. Its handle must
     // outlive the server to keep the task alive — bind it here so its Drop
@@ -2486,7 +2646,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             default_check_interval_secs: config.router_config.health_check.check_interval_secs,
             remove_unhealthy: config.router_config.unhealthy_removal_scope(),
         },
-        app_context.worker_job_queue.get().cloned(),
+        app_context
+            .worker_job_queue
+            .get()
+            .map(|queue| Arc::clone(queue) as Arc<dyn WorkerJobs>),
         !config.router_config.health_check.disable_health_check,
         config.router_config.connection_mode == ConnectionMode::Zmq,
     );
@@ -2555,28 +2718,32 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // the serving set, the control-plane set, and the admin routes' fallback
     // when no control-plane keys are configured, so a rotated shared key
     // leaves the admin routes too.
-    let secrets = crate::secrets::SecretReloader::new(
+    let secrets = SecretReloader::new(
         config.secret_files.clone(),
         &config.secret_sources,
         config.router_config.api_key.as_deref(),
         &config.router_config.tenant_api_keys,
-        app_context.gateway_auth.clone(),
-        control_plane_auth_state
-            .as_ref()
-            .map(|state| state.keys.clone()),
-        control_plane_auth_state
-            .is_none()
-            .then(|| admin_auth_config.clone()),
+        KeySets {
+            serving: app_context.gateway_auth.clone(),
+            control_plane: control_plane_auth_state
+                .as_ref()
+                .map(|state| state.keys.clone()),
+            admin_fallback: control_plane_auth_state
+                .is_none()
+                .then(|| admin_auth_config.clone()),
+        },
     )
     .map(Arc::new);
     // `--secrets-auto-reload`: the key files watched, a change reloading
     // them as the route does; a directory that cannot be watched refuses the
-    // start. The sources record says which it is.
+    // start. The sources record says which it is, and names the settings
+    // whose files are watched.
     let secrets_auto_reload = match (config.secrets_auto_reload, &secrets) {
         (false, _) => "off".to_string(),
         (true, Some(reloader)) => {
-            crate::secrets::start_auto_reload(Arc::clone(reloader))?;
-            format!("on ({} files)", reloader.files().count())
+            start_auto_reload(Arc::clone(reloader))?;
+            let names: Vec<&str> = reloader.files().names().collect();
+            format!("on ({})", names.join(", "))
         }
         (true, None) => {
             warn!("--secrets-auto-reload is set and no key came from a file: nothing to watch");
@@ -2585,7 +2752,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     };
 
     let app_state = Arc::new(AppState {
-        router,
+        router: gateway.clone(),
         context: app_context.clone(),
         admission_queue,
         gateway: Some(gateway),
@@ -2637,7 +2804,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // (port, host, distinct ports), whichever way the caller built it.
     let admin_addr = match config.router_config.admin_port {
         Some(admin_port) => Some(
-            crate::config::bind_socket_addr(
+            bind_socket_addr(
                 config
                     .router_config
                     .admin_host
@@ -2680,13 +2847,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     )?;
 
     // One bind-host rule for every listener: IPv6 with or without brackets.
-    let addr =
-        crate::config::bind_socket_addr(&config.router_config.host, config.router_config.port)
-            .map_err(|e| format!("Invalid address: {e}"))?;
+    let addr = bind_socket_addr(&config.router_config.host, config.router_config.port)
+        .map_err(|e| format!("Invalid address: {e}"))?;
     // The mesh listener binds and the mesh server prepares now, eagerly,
     // before the admin and HTTP listeners bind (see `prepare_mesh_server`).
     let mesh_server = prepare_mesh_server(mesh_server, config.mesh_server_config.as_ref()).await?;
-    let listeners = bind_listeners(addr, admin_addr).await?;
+    let listeners = bind_listeners(addr, admin_addr)?;
 
     // The mesh server serves once every listener is bound: a member that
     // joined the cluster and vanished with a failed bind is the partial start
@@ -2720,35 +2886,24 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.shutdown_settle_secs,
     );
     let drain_timeout = budget.drain;
+    // A listener's failure leaves the mesh too (see `serve_until_drained`).
+    let failure_mesh = mesh_handler.clone();
     #[expect(
         clippy::disallowed_methods,
         reason = "shutdown signal handler must outlive the server to trigger graceful shutdown"
     )]
-    spawn(async move {
+    let shutdown = spawn(async move {
         shutdown_signal().await;
         // The mesh hears of the stop first: `Leaving` goes to the live
         // members during the settle window (the broadcast is bounded by 3 s,
         // then a second for propagation, then the gossip loop stops), so
         // they know as soon as this member stops serving, instead of finding
         // out from failed probes once it is gone. The leave gets the window
-        // and no more (with no window, what the grace allows); cut short, its
-        // broadcast tasks run on and the gossip loop is stopped by
-        // `stop_mesh`.
-        let leave_mesh = async {
-            if let Some(mesh) = &mesh_handler {
-                if let Err(e) = mesh.graceful_shutdown().await {
-                    warn!("Leaving the mesh failed: {e:#}");
-                }
-            }
-        };
-        // The leave's own stop of the gossip loop did not run: stop it as a
-        // finished leave would have, so both paths end the same way; the
-        // broadcast tasks the leave spawned run on.
-        let stop_mesh = || {
-            if let Some(mesh) = &mesh_handler {
-                mesh.shutdown();
-            }
-        };
+        // and no more (with no window, what the grace allows); cut short, the
+        // pings it still had pending are dropped with it (no dial outlives
+        // the call) and the gossip loop is stopped by `stop_mesh`.
+        let leave_mesh = leave_the_mesh(mesh_handler.as_deref());
+        let stop_mesh = || stop_the_mesh(mesh_handler.as_deref());
         graceful_shutdown(
             &inflight_tracker,
             budget,
@@ -2759,7 +2914,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                 admin_handle_clone.graceful_shutdown(Some(drain_timeout));
             },
         )
-        .await;
+        .await
     });
 
     let (data_serving, admin_serving) = serve_listeners(
@@ -2771,17 +2926,23 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         admin_handle,
     )?;
     // Until both listeners have stopped; one that fails stops the other
-    // (see `serve_together`), so the gateway is never half-served.
-    let (server_result, admin_result) = serve_together(
+    // (see `serve_together`), so the gateway is never half-served. The
+    // listeners end with their connections; work that holds none is still in
+    // flight, and the teardown waits for it within the shutdown's time.
+    let (server_result, admin_result) = serve_until_drained(
         data_serving,
         admin_serving,
-        move || data_stop.graceful_shutdown(Some(drain_timeout)),
-        move || admin_stop.graceful_shutdown(Some(drain_timeout)),
+        OnFailure {
+            stop_data: move || data_stop.graceful_shutdown(Some(drain_timeout)),
+            stop_admin: move || admin_stop.graceful_shutdown(Some(drain_timeout)),
+            leave_mesh: leave_the_mesh(failure_mesh.as_deref()),
+            stop_mesh: || stop_the_mesh(failure_mesh.as_deref()),
+        },
+        &app_context.inflight_tracker,
+        shutdown,
+        drain_timeout,
     )
     .await;
-    if let Err(e) = &admin_result {
-        error!("Admin listener stopped with an error: {e}");
-    }
 
     // Graceful Shutdown
 
@@ -2835,6 +2996,27 @@ impl ShutdownBudget {
     }
 }
 
+/// Leaving the mesh: `Leaving` goes to the live members (see
+/// `MeshServerHandler::graceful_shutdown`). A second leave finds the member
+/// `Leaving`, sends nothing and stops the gossip loop at once. With no mesh
+/// there is nothing to leave.
+async fn leave_the_mesh(mesh_handler: Option<&MeshServerHandler>) {
+    if let Some(mesh) = mesh_handler {
+        if let Err(e) = mesh.graceful_shutdown().await {
+            warn!("Leaving the mesh failed: {e:#}");
+        }
+    }
+}
+
+/// A leave that was cut short did not get to its own stop of the gossip
+/// loop: this stops it as a finished leave would have, so both end the same
+/// way. The pings the leave still had pending went with it.
+fn stop_the_mesh(mesh_handler: Option<&MeshServerHandler>) {
+    if let Some(mesh) = mesh_handler {
+        mesh.shutdown();
+    }
+}
+
 /// The graceful shutdown after the signal, in its phases. Phase 1: readiness
 /// flips to 503 and the listeners stay open through the settle window, during
 /// which `leave_mesh` runs (with no window, it gets what the grace allows;
@@ -2842,14 +3024,18 @@ impl ShutdownBudget {
 /// then `stop_listeners` gates new connections with what is left of the
 /// grace. Phase 2: the in-flight requests drain within that, or the drain
 /// gives up and says so. Phase 3, the teardown, is the caller's once the
-/// listeners have stopped.
+/// listeners have stopped and this drain has ended (see
+/// [`drain_before_teardown`]). Returns the end of the grace, the deadline
+/// the phases share, for the caller's own wait to end by; `None` when this
+/// drain ran to that deadline and gave up there, which it said: the caller
+/// has nothing left to wait for or to say.
 async fn graceful_shutdown(
     inflight_tracker: &InFlightRequestTracker,
     budget: ShutdownBudget,
     leave_mesh: impl Future<Output = ()>,
     stop_mesh: impl FnOnce(),
     stop_listeners: impl FnOnce(Duration),
-) {
+) -> Option<tokio::time::Instant> {
     // Phase 1: Flip readiness to 503, hold the listener open through the
     // settle window so propagation-lagged requests still land, then gate
     // new connections.
@@ -2858,8 +3044,10 @@ async fn graceful_shutdown(
         "Beginning graceful shutdown: readiness draining"
     );
     // Everything below shares the grace: the drain takes what the settle
-    // window and the leave of the mesh leave of it.
-    let deadline = tokio::time::Instant::now() + budget.grace;
+    // window and the leave of the mesh leave of it. A grace the clock cannot
+    // hold ends at the far future: the plain sum would panic here, in the
+    // signal's task, before readiness drains.
+    let deadline = middleware::body_timeout::deadline_from_now(budget.grace);
     inflight_tracker.begin_drain();
     let left_in_time = if budget.settle.is_zero() {
         tokio::time::timeout(budget.grace, leave_mesh).await.is_ok()
@@ -2878,8 +3066,8 @@ async fn graceful_shutdown(
         stop_mesh();
         if !budget.grace.is_zero() {
             info!(
-                "Leaving the mesh was cut short by the settle window; its broadcast runs on \
-                 and the gossip loop is stopped now"
+                "Leaving the mesh was cut short by the settle window; its pending pings were \
+                 dropped and the gossip loop is stopped now"
             );
         }
     }
@@ -2899,9 +3087,190 @@ async fn graceful_shutdown(
                 timeout_secs = drain_timeout.as_secs(),
                 "Drain timed out, forcing shutdown with requests still in-flight"
             );
+            return None;
         }
     }
-    // Phase 3: Teardown proceeds after axum server stops (in the main task)
+    // Phase 3: the teardown is the main task's, once the listeners have
+    // stopped and this drain has ended (`drain_before_teardown`).
+    Some(deadline)
+}
+
+/// What a listener's failure does about the rest of the gateway. Every
+/// caller writes every hook: a way out with nothing to stop or to leave says
+/// so.
+struct OnFailure<D, A, L, M> {
+    /// Stops the data listener: called when the admin listener failed.
+    stop_data: D,
+    /// Stops the admin listener: called when the data listener failed.
+    stop_admin: A,
+    /// Leaves the mesh: begun at the failure, when no shutdown is under way.
+    leave_mesh: L,
+    /// Stops the mesh's gossip loop: called when the drain's end cut the
+    /// leave short.
+    stop_mesh: M,
+}
+
+/// Serving to its end, the part of `startup` between its listeners and its
+/// teardown: both listeners until they have stopped (see
+/// [`serve_together`]), the admin listener's error reported, then the wait
+/// for the work that is still in flight (see [`drain_before_teardown`]). A
+/// listener's failure stops the other with `drain`, when another is still
+/// serving; that work shares the same `drain`, counted from the failure,
+/// and from the failure the probes read draining, whether or not another
+/// listener was there to stop: the gateway is on its way out. Both results
+/// come back for the caller to return.
+///
+/// A failure with no shutdown under way leaves the mesh too. The leave
+/// begins at the failure and runs beside the listeners' close and the wait
+/// for the work in flight. It gets what is left of `drain`, and the exit
+/// waits for it. One the drain's end cuts short has its gossip loop stopped,
+/// as a shutdown's has. A failure during a shutdown starts no leave here:
+/// the shutdown task leaves.
+async fn serve_until_drained(
+    data: Serving,
+    admin: Serving,
+    on_failure: OnFailure<impl FnOnce(), impl FnOnce(), impl Future<Output = ()>, impl FnOnce()>,
+    inflight_tracker: &InFlightRequestTracker,
+    shutdown: tokio::task::JoinHandle<Option<tokio::time::Instant>>,
+    drain: Duration,
+) -> (std::io::Result<()>, std::io::Result<()>) {
+    let OnFailure {
+        stop_data,
+        stop_admin,
+        leave_mesh,
+        stop_mesh,
+    } = on_failure;
+    // What a listener's failure found: the instant, and whether a shutdown
+    // was under way. The drain flag is read before it is set, so the
+    // failure's own mark never passes for a shutdown's. The note is taken
+    // at the failure whether or not another listener is there to stop: in
+    // the stop closures, or below when none ran. The first note stands.
+    let failure = OnceLock::new();
+    // Wakes the leave: at a failure's note, and at the end of the exit's own
+    // wait when no listener failed.
+    let noted = tokio::sync::Notify::new();
+    // The first note says which listener failed: from here the probes read
+    // draining, and no other line says why until the listeners have ended.
+    let note_failure = |listener: &str| {
+        let found = (tokio::time::Instant::now(), inflight_tracker.is_draining());
+        if failure.set(found).is_ok() {
+            error!(
+                listener,
+                in_flight = inflight_tracker.len(),
+                "A listener failed: stopping the gateway, readiness draining"
+            );
+        }
+        inflight_tracker.begin_drain();
+        noted.notify_one();
+    };
+    let served = async {
+        let (data_result, admin_result) = serve_together(
+            data,
+            admin,
+            || {
+                note_failure("admin");
+                stop_data();
+            },
+            || {
+                note_failure("data");
+                stop_admin();
+            },
+        )
+        .await;
+        // A failure that found the other serving ended had nothing to stop,
+        // so no stop closure ran: with no admin listener, the default, the
+        // admin serving ends at once. That failure ended the listeners, now.
+        if data_result.is_err() {
+            note_failure("data");
+        } else if admin_result.is_err() {
+            note_failure("admin");
+        }
+        if let Err(e) = &admin_result {
+            error!("Admin listener stopped with an error: {e}");
+        }
+        drain_before_teardown(inflight_tracker, shutdown, failure.get().copied(), drain).await;
+        noted.notify_one();
+        (data_result, admin_result)
+    };
+    // The members hear of a failure's stop as they hear of a signal's: from
+    // the member itself, not from failed probes once the process is gone.
+    let leave = async {
+        noted.notified().await;
+        if let Some(&(stopped, false)) = failure.get() {
+            let left = drain.saturating_sub(stopped.elapsed());
+            if tokio::time::timeout(left, leave_mesh).await.is_err() {
+                stop_mesh();
+                info!(
+                    "Leaving the mesh was cut short by the end of the drain; its pending pings \
+                     were dropped and the gossip loop is stopped now"
+                );
+            }
+        }
+    };
+    let (results, ()) = tokio::join!(served, leave);
+    results
+}
+
+/// The wait between the listeners' end and the teardown, for work that is in
+/// flight and holds no connection. A request holds its connection, so the
+/// listeners' own end waited for it; a recorded control-plane mutation whose
+/// client left holds none and is in the in-flight count alone (see
+/// [`control_plane_state`]). With nothing in flight there is nothing to wait
+/// for. Otherwise the count is waited for to the deadline the listeners'
+/// connections had, and no longer. With a shutdown under way that is the end
+/// of the grace: the `shutdown` task hands it back once its own drain has
+/// ended (the settle window first, when a listener failed inside it), and
+/// what was admitted after that drain, while the listeners still closed
+/// their connections, gets what is left of the grace. What is still in
+/// flight at its end is said, with no time left too; a task whose own drain
+/// ran to the deadline hands nothing back, having said what it gave up on.
+/// With none (a listener failed, and no shutdown was under way by then) it
+/// is one `drain` after the failure, the end of the `drain` a listener it
+/// stopped was given; a signal that comes after the failure does not move
+/// it. `failure` is what the failure found: its instant, and whether a
+/// shutdown was under way.
+async fn drain_before_teardown(
+    inflight_tracker: &InFlightRequestTracker,
+    shutdown: tokio::task::JoinHandle<Option<tokio::time::Instant>>,
+    failure: Option<(tokio::time::Instant, bool)>,
+    drain: Duration,
+) {
+    if inflight_tracker.is_empty() {
+        return;
+    }
+    // With no failure the listeners ended on their own, now, and the drain
+    // flag is a shutdown's alone.
+    let (stopped, shutdown_under_way) =
+        failure.unwrap_or_else(|| (tokio::time::Instant::now(), inflight_tracker.is_draining()));
+    if shutdown_under_way {
+        match shutdown.await {
+            // The task's drain ended before the deadline and said nothing
+            // of what was admitted since: that work gets what is left, and
+            // with no time left it is given up on here, and said.
+            Ok(Some(deadline)) => {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if !inflight_tracker.wait_for_drain(left).await {
+                    warn!(
+                        remaining = inflight_tracker.len(),
+                        "Drain timed out, forcing shutdown with requests still in-flight"
+                    );
+                }
+            }
+            // The task's own drain ran to the deadline and said so.
+            Ok(None) => {}
+            Err(e) => error!("The shutdown task ended abnormally: {e}"),
+        }
+    } else {
+        // What is left of the drain since the failure; a listener it stopped
+        // closed its connections inside the same drain.
+        let left = drain.saturating_sub(stopped.elapsed());
+        if !inflight_tracker.wait_for_drain(left).await {
+            warn!(
+                remaining = inflight_tracker.len(),
+                "Drain timed out after a listener failed, tearing down with requests still in-flight"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3089,6 +3458,71 @@ mod graceful_shutdown_tests {
             1,
             "the stuck request is reported, not waited for"
         );
+    }
+
+    /// A grace the clock cannot hold (an operator's "never", written as the
+    /// largest number) still drains: its end is the far future, thirty years
+    /// on. Readiness drains at once, the listeners are gated after the settle
+    /// window with what is left to that end, and a request in flight is
+    /// waited for. The plain sum of such a grace and the clock panics before
+    /// readiness drains. A grace the clock holds ends where it always did,
+    /// one past the far future too.
+    #[tokio::test(start_paused = true)]
+    async fn a_grace_past_the_clocks_range_still_drains() {
+        const YEAR: u64 = 86400 * 365;
+        let far_future = Duration::from_secs(30 * YEAR);
+        for (grace_secs, end) in [
+            (u64::MAX, far_future),
+            // The clock counts seconds in a signed 64-bit number: 2^63 does
+            // not fit, and neither does one second less once added to now.
+            (1 << 63, far_future),
+            ((1 << 63) - 1, far_future),
+            (10 * YEAR, Duration::from_secs(10 * YEAR)),
+            (40 * YEAR, Duration::from_secs(40 * YEAR)),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let request = tracker.track();
+            let start = tokio::time::Instant::now();
+            let gated = Arc::new(Mutex::new(None));
+            let stop_listeners = {
+                let gated = Arc::clone(&gated);
+                let tracker = Arc::clone(&tracker);
+                move |drain_timeout| {
+                    *gated.lock().expect("no poison") =
+                        Some((start.elapsed(), drain_timeout, tracker.is_draining()));
+                }
+            };
+            // The request ends an hour in, during the drain.
+            let release = async {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                drop(request);
+            };
+            let shutdown = graceful_shutdown(
+                &tracker,
+                ShutdownBudget::from_grace_secs(grace_secs, None),
+                async {},
+                || panic!("a completed mesh leave must not be stopped again"),
+                stop_listeners,
+            );
+            let (deadline, ()) = tokio::join!(shutdown, release);
+            assert_eq!(
+                gated.lock().expect("no poison").take(),
+                Some((Duration::from_secs(5), end - Duration::from_secs(5), true)),
+                "{grace_secs}: gated after the settle window, with what is left of the grace, \
+                 while draining"
+            );
+            assert_eq!(
+                start.elapsed(),
+                Duration::from_secs(3600),
+                "{grace_secs}: the drain ended with the request"
+            );
+            assert_eq!(
+                deadline,
+                Some(start + end),
+                "{grace_secs}: the end of the grace the caller waits to"
+            );
+            assert!(tracker.is_empty());
+        }
     }
 
     /// With no grace there is no settle window: the leave gets no time (a
@@ -3346,6 +3780,7 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
             .allow_methods([
                 http::Method::GET,
                 http::Method::POST,
+                http::Method::PUT,
                 http::Method::PATCH,
                 http::Method::DELETE,
                 http::Method::OPTIONS,
@@ -3353,18 +3788,22 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
             .allow_headers([
                 http::header::CONTENT_TYPE,
                 http::header::AUTHORIZATION,
+                http::header::IF_MATCH,
                 http::header::HeaderName::from_static("anthropic-version"),
                 http::header::HeaderName::from_static("anthropic-beta"),
                 http::header::HeaderName::from_static("traceparent"),
                 http::header::HeaderName::from_static("tracestate"),
             ])
-            // The request id under both of its names and the echoed trace
-            // context, readable by browser clients.
+            // The request id under both of its names, the echoed trace
+            // context, and the document routes' ETag and revision, readable
+            // by browser clients.
             .expose_headers([
                 http::header::HeaderName::from_static("x-request-id"),
                 http::header::HeaderName::from_static("request-id"),
                 http::header::HeaderName::from_static("traceparent"),
                 http::header::HeaderName::from_static("tracestate"),
+                http::header::ETAG,
+                rate_limit_document::REVISION_HEADER,
             ])
     };
 
@@ -3373,112 +3812,143 @@ fn create_cors_layer(allowed_origins: Vec<String>) -> Option<tower_http::cors::C
 
 #[cfg(test)]
 mod tests {
+    mod connector;
+    mod load_source;
+    mod policy_stages;
+    mod worker_data;
+
     use std::convert::Infallible;
 
     use axum::response::sse::{Event, Sse};
     use axum_server::accept::Accept;
+    use serde_json::Value;
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
     use crate::config::TenantApiKeyEntry;
 
-    /// A request without `anthropic-version` is served (this gateway's own
-    /// SDK clients send none); a version that is not a real calendar date of
-    /// 2023 or later is refused, as the public API refuses it.
-    #[test]
-    fn messages_requests_take_a_missing_version_and_refuse_a_malformed_one() {
-        let with = |value: &'static str| {
-            let mut headers = HeaderMap::new();
-            headers.insert("anthropic-version", http::HeaderValue::from_static(value));
-            headers
+    /// The gateway's start hands its metrics endpoint the Grand Central it
+    /// started. A scrape of a gateway whose policy document names a shadow
+    /// holds that binding's shadow series, at zero before any request.
+    #[tokio::test]
+    async fn the_started_metrics_endpoint_publishes_the_engines_shadow_counts() {
+        use crate::observability::metrics::test_support::{shadow_kinds, shadowing_document};
+
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let _guard = ::metrics::set_default_local_recorder(&recorder);
+        let router_config = RouterConfig {
+            grand_central: true,
+            policy_spec: Some(shadowing_document()),
+            ..RouterConfig::default()
         };
-        assert!(check_anthropic_version(&HeaderMap::new()).is_ok());
-        for ok in ["2023-06-01", "2023-01-01", "2024-02-29", "2026-12-31"] {
-            assert!(check_anthropic_version(&with(ok)).is_ok(), "{ok}");
-        }
-        for bad in [
-            "1999-01-01",
-            "latest",
-            "2023-6-1",
-            "2023-02-30",
-            "2023-13-01",
-            "2023-00-10",
-            "2023-02-29",
-        ] {
-            let refused = check_anthropic_version(&with(bad)).expect_err(bad);
-            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{bad}");
-            assert_eq!(
-                route_error::extract_error_code_from_response(&refused),
-                "invalid_anthropic_version",
-                "{bad}"
-            );
-        }
-    }
-
-    /// A thinking budget at or above `max_tokens` is refused as the public
-    /// API refuses it, except under the interleaved-thinking beta, where the
-    /// public API takes it.
-    #[test]
-    fn thinking_budget_must_stay_under_max_tokens_unless_interleaved() {
-        let request = |max_tokens: u32, budget: u32| -> CreateMessageRequest {
-            serde_json::from_value(serde_json::json!({
-                "model": "m", "max_tokens": max_tokens,
-                "thinking": {"type": "enabled", "budget_tokens": budget},
-                "messages": [{"role": "user", "content": "hi"}]
-            }))
-            .unwrap()
-        };
-        let plain = HeaderMap::new();
-        assert!(check_thinking_budget(&plain, &request(4096, 1024)).is_ok());
-        let refused = check_thinking_budget(&plain, &request(1024, 1024)).expect_err("refused");
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            route_error::extract_error_code_from_response(&refused),
-            "thinking_budget_exceeds_max_tokens"
-        );
-
-        let mut interleaved = HeaderMap::new();
-        interleaved.insert(
-            "anthropic-beta",
-            http::HeaderValue::from_static(
-                "fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14",
-            ),
-        );
-        assert!(check_thinking_budget(&interleaved, &request(1024, 1024)).is_ok());
-        assert!(check_thinking_budget(&interleaved, &request(1024, 8192)).is_ok());
-    }
-
-    /// A `thread` field needs the message-threads beta header, as the public
-    /// API requires; a request without `thread` needs no header.
-    #[test]
-    fn a_thread_field_needs_the_message_threads_beta_header() {
-        let request = |thread: bool| -> CreateMessageRequest {
-            let mut body = serde_json::json!({
-                "model": "m", "max_tokens": 64,
-                "messages": [{"role": "user", "content": "hi"}]
-            });
-            if thread {
-                body["thread"] = serde_json::json!({"type": "create"});
+        // The start binds the port its configuration names. A port read as
+        // free is held by nobody until then, so another case may take it: a
+        // start that fails is tried again on another port.
+        let mut tries = 0;
+        let (port, _probes) = loop {
+            let free = TcpListener::bind("127.0.0.1:0").await.expect("a free port");
+            let port = free.local_addr().expect("the port's address").port();
+            drop(free);
+            let prometheus = PrometheusConfig {
+                port,
+                host: "127.0.0.1".to_string(),
+                duration_buckets: None,
+            };
+            let config = ServerConfig {
+                prometheus_config: Some(prometheus),
+                ..ServerConfig::minimal(router_config.clone())
+            };
+            let app = build_app_context(&config, Extensions::new())
+                .await
+                .expect("the gateway starts");
+            match start_observability(&config, &app, Some(recorder.handle())).await {
+                Ok(probes) => break (port, probes),
+                Err(error) => {
+                    tries += 1;
+                    assert!(tries < 8, "the metrics endpoint starts: {error}");
+                }
             }
-            serde_json::from_value(body).unwrap()
         };
-        let plain = HeaderMap::new();
-        assert!(check_thread_beta(&plain, &request(false)).is_ok());
-        let refused = check_thread_beta(&plain, &request(true)).expect_err("refused");
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            route_error::extract_error_code_from_response(&refused),
-            "thread_beta_required"
-        );
 
-        let mut named = HeaderMap::new();
-        named.insert(
-            "anthropic-beta",
-            http::HeaderValue::from_static(
-                "interleaved-thinking-2025-05-14, message-threads-2026-08-12",
-            ),
+        let url = format!("http://127.0.0.1:{port}/metrics");
+        let scrape = http_client().get(url).send().await.expect("a scrape");
+        let body = scrape.text().await.expect("the scrape's text");
+        assert_eq!(shadow_kinds(&body), [Some(0); 4], "{body}");
+    }
+
+    /// A gRPC worker imported from a mesh peer runs no registration workflow
+    /// here; without its model's tokenizer, readiness answers 503.
+    #[tokio::test]
+    async fn an_imported_grpc_workers_model_gets_its_tokenizer() {
+        use openai_protocol::model_card::ModelCard;
+        use smg_worker::{
+            identity::basic::ConnectionMode,
+            registry::RemoteWorkerState,
+            worker::{WorkerModels, WorkerSpec},
+        };
+
+        use crate::{
+            routers::grpc::backend_client::BasicWorkerBuilder,
+            workflow::tokenizer_registration::test_support::tokenizer_dir,
+        };
+
+        let tokenizer = tokenizer_dir();
+        let config = ServerConfig::minimal(RouterConfig::default());
+        let context = Arc::new(
+            AppContext::from_config(config.router_config.clone(), 10, None, None)
+                .await
+                .unwrap(),
         );
-        assert!(check_thread_beta(&named, &request(true)).is_ok());
+        let import = |model: &str, url: &str| {
+            let mut spec = WorkerSpec::new(url);
+            spec.connection_mode = ConnectionMode::Grpc;
+            spec.models = WorkerModels::Single(Box::new(ModelCard::new(model)));
+            spec.labels.insert(
+                "tokenizer_path".to_string(),
+                tokenizer.path().to_str().unwrap().to_string(),
+            );
+            context
+                .worker_registry
+                .on_remote_worker_state(&RemoteWorkerState {
+                    worker_id: model.to_string(),
+                    model_id: model.to_string(),
+                    url: url.to_string(),
+                    health: true,
+                    version: 1,
+                    spec: serde_json::to_vec(&spec).unwrap(),
+                });
+        };
+        import("imported-early", "grpc://127.0.0.1:1");
+        start_workflow_engines(&context, &config).await.unwrap();
+        // A worker registered here is its own workflow's: no job from the task.
+        context.worker_registry.register(Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:3")
+                .model(ModelCard::new("registered-here"))
+                .label("tokenizer_path", tokenizer.path().to_str().unwrap())
+                .connection_mode(ConnectionMode::Grpc)
+                .build(),
+        ));
+        import("imported-late", "grpc://127.0.0.1:2");
+        for model in ["imported-early", "imported-late"] {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !context.tokenizer_registry.contains(model) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("no tokenizer for the model of the import {model}"));
+        }
+        // A peer's tombstone takes an import and runs no removal workflow.
+        let late = context.worker_registry.get_id_by_url("grpc://127.0.0.1:2");
+        context.worker_registry.remove_remote(&late.unwrap());
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while context.tokenizer_registry.contains("imported-late") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the tokenizer of the import that left is still loaded");
+        assert!(!context.tokenizer_registry.contains("registered-here"));
     }
 
     /// The not-found fallback sits inside the edge layers: an unknown route
@@ -3513,6 +3983,962 @@ mod tests {
                 "{path} skipped the edge middleware"
             );
         }
+    }
+
+    /// The write of a request's own id stands under a policy spec that
+    /// keeps a sample, and under no other. A gateway with no engine and one
+    /// whose policy spec keeps no sample get no layer: a client's value
+    /// under the private name reaches the route as it came. Under a
+    /// sampling spec the route sees the id the response's `x-request-id`
+    /// shows, whatever the client sent under the name. Each router is built
+    /// as `build_apps` finishes one: the write, then the edge layers around
+    /// it.
+    #[tokio::test]
+    async fn the_own_request_id_is_written_under_a_sampling_policy_spec_alone() {
+        use axum::body::Body;
+        use http_body_util::BodyExt;
+        use smg_grand_central::{
+            document::{AppliedSpec, PolicySpec},
+            engine::InProcess,
+        };
+        use tower::ServiceExt;
+
+        /// Every value the route received under the private name, joined
+        /// by `,`.
+        async fn seen(request: Request) -> String {
+            let values: Vec<_> = request
+                .headers()
+                .get_all(&middleware::request_id::OWN_REQUEST_ID)
+                .iter()
+                .map(|value| value.to_str().unwrap_or("?"))
+                .collect();
+            values.join(",")
+        }
+
+        let engine = |sample: u32| {
+            let mut document = PolicySpec::preset("round_robin").expect("a stock preset");
+            document.explain.sample = sample;
+            InProcess::new(AppliedSpec::validate(&document).expect("a valid policy spec"))
+        };
+        let (keeps_none, keeps_all) = (engine(0), engine(1));
+        let own = middleware::request_id::OWN_REQUEST_ID.as_str();
+        for (engine, written) in [
+            (None, false),
+            (Some(&keeps_none), false),
+            (Some(&keeps_all), true),
+        ] {
+            let own_request_id = own_request_id_layer(engine);
+            assert_eq!(own_request_id.is_some(), written);
+            let app = attach_edge_layers(
+                Router::new()
+                    .route("/seen", get(seen))
+                    .layer_if_some(own_request_id),
+                1024,
+                InFlightRequestTracker::new(),
+                vec![],
+                vec![],
+                middleware::AccessLogFields::NONE,
+            );
+            let response = app
+                .oneshot(
+                    http::Request::builder()
+                        .uri("/seen")
+                        .header(own, "a-clients")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let echoed = response.headers()["x-request-id"]
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            let expected = if written {
+                echoed.as_str()
+            } else {
+                "a-clients"
+            };
+            assert_eq!(body, expected, "written: {written}");
+        }
+    }
+
+    /// A client's call into the edge stack; dropping it is the client
+    /// leaving.
+    type ClientCall = Pin<Box<dyn Future<Output = Result<Response, Infallible>>>>;
+
+    /// A recorded control-plane mutation whose handler waits at a gate, sent
+    /// through the real edge stack over the control-plane layer with the
+    /// state the gateway attaches. Returns the call, polled once (the
+    /// handler waits and the client is still there), and the gate that lets
+    /// the handler answer.
+    fn a_mutation_at_its_gate(
+        tracker: &Arc<InFlightRequestTracker>,
+    ) -> (ClientCall, Arc<tokio::sync::Notify>) {
+        use std::task::{Context, Waker};
+
+        use axum::{body::Body, extract::State, middleware::from_fn_with_state};
+        use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, Role};
+        use tokio::sync::Notify;
+        use tower::ServiceExt;
+
+        async fn wait_at_the_gate(State(gate): State<Arc<Notify>>) -> StatusCode {
+            gate.notified().await;
+            StatusCode::ACCEPTED
+        }
+
+        let gate = Arc::new(Notify::new());
+        let state = control_plane_state(
+            ControlPlaneAuthState::new(
+                ControlPlaneAuthConfig {
+                    jwt: None,
+                    api_keys: vec![ApiKeyEntry::new("admin", "Admin", "admin-key", Role::Admin)],
+                    audit_enabled: true,
+                },
+                None,
+            ),
+            tracker,
+        );
+        let admin_routes = Router::new()
+            .route("/workers", post(wait_at_the_gate))
+            .route_layer(from_fn_with_state(
+                state,
+                smg_auth::control_plane_auth_middleware,
+            ))
+            .with_state(Arc::clone(&gate));
+        let app = attach_edge_layers(
+            admin_routes,
+            1024,
+            Arc::clone(tracker),
+            vec![],
+            vec![],
+            middleware::AccessLogFields::NONE,
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/workers")
+            .header(http::header::AUTHORIZATION, "Bearer admin-key")
+            .body(Body::empty())
+            .unwrap();
+
+        let mut call: ClientCall = Box::pin(app.oneshot(request));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            call.as_mut().poll(&mut cx).is_pending(),
+            "the handler waits at its gate"
+        );
+        (call, gate)
+    }
+
+    /// A control-plane mutation whose client left stays in the in-flight
+    /// count until its handler answers. While the client waits, the mutation
+    /// counts twice: the edge's guard and the task's hold.
+    #[tokio::test]
+    async fn a_departed_clients_mutation_stays_in_flight_until_it_answers() {
+        let tracker = InFlightRequestTracker::new();
+        let (call, gate) = a_mutation_at_its_gate(&tracker);
+        assert_eq!(
+            tracker.len(),
+            2,
+            "the waiting client's request counts twice: the edge's guard and the task's hold"
+        );
+        // The client leaves: the edge's future goes, the mutation's task runs on.
+        drop(call);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            tracker.len(),
+            1,
+            "the departed client's mutation is in flight until it answers"
+        );
+        gate.notify_one();
+        for _ in 0..1_000 {
+            if tracker.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            tracker.is_empty(),
+            "the mutation answered and left the count"
+        );
+    }
+
+    /// The ways out of serving: the shutdown signal; a listener that fails
+    /// with no signal; a listener that fails once the signal has come; a
+    /// listener that fails, and the signal three seconds later; the only
+    /// listener, with no admin listener beside it, failing with no signal;
+    /// the admin listener failing with no signal.
+    #[derive(Clone, Copy, Debug)]
+    enum WayOut {
+        Signal,
+        ListenerFailure,
+        Both,
+        FailureThenSignal,
+        OnlyListenerFailure,
+        AdminFailure,
+    }
+
+    /// The exit as `startup` runs it, on a paused clock: the shutdown task,
+    /// then `serve_until_drained`, the function `startup` serves through,
+    /// over both listeners. A stopped listener takes `closing` to close its
+    /// connections: no time with none to close, the whole drain when one
+    /// holds out. The listeners are stopped when the settle window ends
+    /// under the signal; the data listener's failure stops the other at once
+    /// with no signal, and a second into the settle window with one; on the
+    /// fourth way the signal comes three seconds after the failure. On the
+    /// fifth there is no admin listener, as by default: the data listener
+    /// fails a second into serving, with no signal and nothing to stop: a
+    /// second in, because a listener ready at its first poll, beside an admin
+    /// serving that has ended, would leave the pick of the first to end to
+    /// chance. On the last the admin listener fails at once, with no signal,
+    /// and stops the data listener. A failure's leave of the mesh is
+    /// `leave_mesh`, and `stop_mesh` the stop of one the drain cut short.
+    /// Returns when the listeners ended and when the exit did.
+    async fn exit_leaving(
+        tracker: &Arc<InFlightRequestTracker>,
+        budget: ShutdownBudget,
+        way: WayOut,
+        closing: Duration,
+        leave_mesh: impl Future<Output = ()>,
+        stop_mesh: impl FnOnce(),
+    ) -> (Duration, Duration) {
+        use tokio::sync::watch;
+
+        let start = tokio::time::Instant::now();
+        let (stop, stopped) = watch::channel(false);
+        let stop = Arc::new(stop);
+        let until_closed = |mut stopped: watch::Receiver<bool>| -> Serving {
+            Box::pin(async move {
+                let _ = stopped.wait_for(|stopped| *stopped).await;
+                tokio::time::sleep(closing).await;
+                Ok(())
+            })
+        };
+        let failing_after = |delay: Duration| -> Serving {
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Err(std::io::Error::other("accept failed"))
+            })
+        };
+        // The last listener to end notes when it does: the admin listener,
+        // or the data listener where it is the only one or the one stopped.
+        let (ended, listeners_ended) = watch::channel(Duration::ZERO);
+        let noting_its_end = move |serving: Serving| -> Serving {
+            Box::pin(async move {
+                let result = serving.await;
+                ended.send_replace(start.elapsed());
+                result
+            })
+        };
+        let data = match way {
+            WayOut::Signal | WayOut::AdminFailure => until_closed(stopped.clone()),
+            WayOut::ListenerFailure | WayOut::FailureThenSignal => failing_after(Duration::ZERO),
+            WayOut::Both | WayOut::OnlyListenerFailure => failing_after(Duration::from_secs(1)),
+        };
+        let (data, admin) = match way {
+            // The admin serving `serve_listeners` builds with no admin
+            // listener: ended before it began.
+            WayOut::OnlyListenerFailure => {
+                let no_admin: Serving = Box::pin(std::future::ready(Ok(())));
+                (noting_its_end(data), no_admin)
+            }
+            // The data listener, stopped by the admin listener's failure, is
+            // the last to end.
+            WayOut::AdminFailure => (noting_its_end(data), failing_after(Duration::ZERO)),
+            _ => (data, noting_its_end(until_closed(stopped))),
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the stand-in for the shutdown task `startup` spawns"
+        )]
+        let shutdown = spawn({
+            let tracker = Arc::clone(tracker);
+            let stop = Arc::clone(&stop);
+            async move {
+                match way {
+                    // The signal never comes.
+                    WayOut::ListenerFailure
+                    | WayOut::OnlyListenerFailure
+                    | WayOut::AdminFailure => {
+                        std::future::pending::<()>().await;
+                    }
+                    WayOut::FailureThenSignal => {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                    WayOut::Signal | WayOut::Both => {}
+                }
+                graceful_shutdown(
+                    &tracker,
+                    budget,
+                    async {},
+                    || {},
+                    move |_| {
+                        stop.send_replace(true);
+                    },
+                )
+                .await
+            }
+        });
+        // The shutdown task is under way before the listeners are served on.
+        // An exit that never ends (it waits on a signal that never comes)
+        // fails its case here; it does not hang the run.
+        tokio::task::yield_now().await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(3600),
+            serve_until_drained(
+                data,
+                admin,
+                OnFailure {
+                    stop_data: {
+                        let stop = Arc::clone(&stop);
+                        move || {
+                            stop.send_replace(true);
+                        }
+                    },
+                    stop_admin: move || {
+                        stop.send_replace(true);
+                    },
+                    leave_mesh,
+                    stop_mesh,
+                },
+                tracker,
+                shutdown,
+                budget.drain,
+            ),
+        )
+        .await
+        .expect("the exit ends");
+        let listeners_ended = *listeners_ended.borrow();
+        (listeners_ended, start.elapsed())
+    }
+
+    /// That exit for a gateway with no mesh: nothing to leave or to stop.
+    async fn exit(
+        tracker: &Arc<InFlightRequestTracker>,
+        budget: ShutdownBudget,
+        way: WayOut,
+        closing: Duration,
+    ) -> (Duration, Duration) {
+        let (leave_mesh, stop_mesh) = (leave_the_mesh(None), || stop_the_mesh(None));
+        exit_leaving(tracker, budget, way, closing, leave_mesh, stop_mesh).await
+    }
+
+    /// With nothing in flight the exit ends when the listeners do, on every
+    /// way out: the wait before the teardown takes no time.
+    #[tokio::test(start_paused = true)]
+    async fn with_nothing_in_flight_the_exit_ends_with_the_listeners() {
+        let secs = Duration::from_secs;
+        for (way, ended) in [
+            (WayOut::Signal, 5),
+            (WayOut::ListenerFailure, 0),
+            (WayOut::Both, 1),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+            assert_eq!(
+                exit(&tracker, budget, way, Duration::ZERO).await,
+                (secs(ended), secs(ended)),
+                "{way:?}"
+            );
+        }
+    }
+
+    /// A departed client's mutation holds the exit until it answers, on every
+    /// way out: the listeners end with no connection to wait for, and the
+    /// teardown still waits for the mutation's task, so its outcome line is
+    /// written before logging closes.
+    #[tokio::test(start_paused = true)]
+    async fn a_departed_clients_mutation_holds_the_exit_until_it_answers() {
+        let secs = Duration::from_secs;
+        for (way, ended) in [
+            (WayOut::Signal, 5),
+            (WayOut::ListenerFailure, 0),
+            (WayOut::Both, 1),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let (call, gate) = a_mutation_at_its_gate(&tracker);
+            drop(call);
+            tokio::task::yield_now().await;
+            assert_eq!(tracker.len(), 1, "{way:?}: the mutation is in flight");
+            let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+            // The handler answers 8 s in.
+            let answer = async {
+                tokio::time::sleep(secs(8)).await;
+                gate.notify_one();
+            };
+            let (times, ()) = tokio::join!(exit(&tracker, budget, way, Duration::ZERO), answer);
+            assert_eq!(
+                times,
+                (secs(ended), secs(8)),
+                "{way:?}: the exit waited for the mutation, past the listeners' end"
+            );
+            assert!(
+                tracker.is_empty(),
+                "{way:?}: the mutation answered before the teardown"
+            );
+        }
+    }
+
+    /// A mutation that never answers holds the exit to the shutdown's
+    /// deadline and no longer: the end of the grace under the signal, the
+    /// drain's time when a listener failed with no signal.
+    #[tokio::test(start_paused = true)]
+    async fn a_mutation_that_never_answers_holds_the_exit_to_the_deadline_and_no_longer() {
+        let secs = Duration::from_secs;
+        for (way, ended, deadline) in [
+            (WayOut::Signal, 5, 30),
+            (WayOut::ListenerFailure, 0, 25),
+            (WayOut::Both, 1, 30),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let (call, _gate) = a_mutation_at_its_gate(&tracker);
+            drop(call);
+            tokio::task::yield_now().await;
+            let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+            assert_eq!(
+                exit(&tracker, budget, way, Duration::ZERO).await,
+                (secs(ended), secs(deadline)),
+                "{way:?}"
+            );
+            assert_eq!(
+                tracker.len(),
+                1,
+                "{way:?}: the mutation is given up on, still in flight"
+            );
+        }
+    }
+
+    /// With no signal a listener's failure stops the other with the drain,
+    /// and a departed client's mutation shares that drain with the stopped
+    /// listener's connections: the exit ends one drain after the failure,
+    /// however much of it the connections took to close, never two.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_listener_and_a_departed_clients_mutation_share_one_drain() {
+        let secs = Duration::from_secs;
+        for closing in [25, 10, 0] {
+            let tracker = InFlightRequestTracker::new();
+            let (call, _gate) = a_mutation_at_its_gate(&tracker);
+            drop(call);
+            tokio::task::yield_now().await;
+            let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+            assert_eq!(
+                exit(&tracker, budget, WayOut::ListenerFailure, secs(closing)).await,
+                (secs(closing), secs(25)),
+                "the stopped listener closed its connections in {closing} s"
+            );
+            assert_eq!(
+                tracker.len(),
+                1,
+                "the mutation is given up on, still in flight"
+            );
+        }
+    }
+
+    /// Under the signal the shutdown task's own drain ends as soon as nothing
+    /// is in flight. A mutation admitted after that, while the listeners
+    /// still close their connections, and whose client leaves, is waited for
+    /// until it answers, or to the end of the grace when it never does.
+    #[tokio::test(start_paused = true)]
+    async fn a_mutation_admitted_while_the_listeners_close_holds_the_exit() {
+        let secs = Duration::from_secs;
+        for (answers_at, exit_at) in [(Some(9), 9), (None, 30)] {
+            let tracker = InFlightRequestTracker::new();
+            let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+            // The listeners are stopped at 5 s, with nothing in flight, and
+            // take 2 s to close; the mutation is admitted in between.
+            let admitted = async {
+                tokio::time::sleep(secs(6)).await;
+                let (call, gate) = a_mutation_at_its_gate(&tracker);
+                drop(call);
+                if let Some(at) = answers_at {
+                    tokio::time::sleep(secs(at - 6)).await;
+                    gate.notify_one();
+                }
+            };
+            let (times, ()) =
+                tokio::join!(exit(&tracker, budget, WayOut::Signal, secs(2)), admitted);
+            assert_eq!(
+                times,
+                (secs(7), secs(exit_at)),
+                "the mutation answers at {answers_at:?} s"
+            );
+        }
+    }
+
+    /// Whether the probes read draining at each of `at`, the seconds since
+    /// the exit began.
+    async fn draining_at<const N: usize>(
+        tracker: &InFlightRequestTracker,
+        at: [u64; N],
+    ) -> [bool; N] {
+        let start = tokio::time::Instant::now();
+        let mut read = [false; N];
+        for (slot, at) in read.iter_mut().zip(at) {
+            tokio::time::sleep_until(start + Duration::from_secs(at)).await;
+            *slot = tracker.is_draining();
+        }
+        read
+    }
+
+    /// A listener's failure with no signal takes the gateway down. From the
+    /// instant it stops the other listener the probes read draining, for as
+    /// long as that listener takes to close its connections: a gateway that
+    /// no longer accepts connections is not ready.
+    #[tokio::test(start_paused = true)]
+    async fn a_listeners_failure_reports_not_ready_while_the_other_listener_closes() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let (times, draining) = tokio::join!(
+            exit(&tracker, budget, WayOut::ListenerFailure, secs(10)),
+            draining_at(&tracker, [1, 9]),
+        );
+        assert_eq!(times, (secs(10), secs(10)));
+        assert_eq!(draining, [true, true]);
+    }
+
+    /// The same while the exit waits for a departed client's mutation with
+    /// both listeners closed, and the wait still ends one drain after the
+    /// failure: the failure's own mark is not a shutdown's, so the exit does
+    /// not wait on a shutdown task whose signal never comes.
+    #[tokio::test(start_paused = true)]
+    async fn a_listeners_failure_reports_not_ready_while_the_exit_waits_for_a_mutation() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let (call, _gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let (times, draining) = tokio::join!(
+            exit(&tracker, budget, WayOut::ListenerFailure, Duration::ZERO),
+            draining_at(&tracker, [1, 24]),
+        );
+        assert_eq!(times, (secs(0), secs(25)));
+        assert_eq!(draining, [true, true]);
+    }
+
+    /// The same with no admin listener, the default: the failure finds no
+    /// other listener to stop, and it takes the gateway down all the same.
+    /// The probes read ready until the failure, a second into serving, and
+    /// draining from it; the exit ends one drain after the failure.
+    #[tokio::test(start_paused = true)]
+    async fn the_only_listeners_failure_reports_not_ready_while_the_exit_waits_for_a_mutation() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let (call, _gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let (times, draining) = tokio::join!(
+            exit(
+                &tracker,
+                budget,
+                WayOut::OnlyListenerFailure,
+                Duration::ZERO
+            ),
+            draining_at(&tracker, [0, 2, 25]),
+        );
+        assert_eq!(times, (secs(1), secs(26)));
+        assert_eq!(draining, [false, true, true]);
+    }
+
+    /// A signal that comes after a listener's failure does not move the
+    /// exit's deadline: the failure stopped the gateway with no shutdown
+    /// under way, and the exit ends one drain after it.
+    #[tokio::test(start_paused = true)]
+    async fn a_signal_after_a_listeners_failure_does_not_move_the_exits_deadline() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let (call, _gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        assert_eq!(
+            exit(&tracker, budget, WayOut::FailureThenSignal, secs(10)).await,
+            (secs(10), secs(25))
+        );
+    }
+
+    /// Work the exit gives up on at the deadline is said, once, with its
+    /// count: by the exit's own wait when it runs out, by the exit when the
+    /// listeners took until the deadline and no time is left, and by the
+    /// shutdown task alone when its own drain ran to the deadline.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn work_given_up_on_at_the_deadline_is_said_once() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        // The drain lines so far that count one request in flight.
+        let said_so_far = || {
+            let said = std::cell::Cell::new(0);
+            logs_assert(|lines: &[&str]| {
+                said.set(
+                    lines
+                        .iter()
+                        .filter(|line| line.contains("Drain timed out"))
+                        .filter(|line| line.contains("remaining=1"))
+                        .count(),
+                );
+                Ok(())
+            });
+            said.get()
+        };
+        let mut said = Vec::new();
+        // A mutation admitted at 6 s, after the shutdown task's drain ended
+        // on an empty count, never answers: the listeners close in 2 s, then
+        // take the whole 25 s that were left.
+        for closing in [2, 25] {
+            let tracker = InFlightRequestTracker::new();
+            let admitted = async {
+                tokio::time::sleep(secs(6)).await;
+                let (call, _gate) = a_mutation_at_its_gate(&tracker);
+                drop(call);
+            };
+            let (times, ()) = tokio::join!(
+                exit(&tracker, budget, WayOut::Signal, secs(closing)),
+                admitted
+            );
+            assert_eq!(
+                times,
+                (secs(5 + closing), secs(30)),
+                "closing in {closing} s"
+            );
+            said.push(said_so_far());
+        }
+        // A mutation in flight from the start never answers: the shutdown
+        // task's own drain runs to the deadline.
+        let tracker = InFlightRequestTracker::new();
+        let (call, _gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let times = exit(&tracker, budget, WayOut::Signal, Duration::ZERO).await;
+        assert_eq!(times, (secs(5), secs(30)));
+        said.push(said_so_far());
+        assert_eq!(
+            said,
+            [1, 2, 3],
+            "the drain lines after each exit: one more every time"
+        );
+    }
+
+    /// A mutation that answers inside the settle window holds nothing: the
+    /// exit ends with the listeners, takes no drain wait and writes no drain
+    /// line.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn a_mutation_that_answers_inside_the_settle_window_holds_nothing() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let tracker = InFlightRequestTracker::new();
+        let (call, gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let answered = async {
+            tokio::time::sleep(secs(3)).await;
+            gate.notify_one();
+        };
+        let signal = exit(&tracker, budget, WayOut::Signal, secs(2));
+        let (times, ()) = tokio::join!(signal, answered);
+        assert_eq!(times, (secs(7), secs(7)));
+        assert!(!logs_contain("Drain timed out"));
+    }
+
+    /// Work admitted after the shutdown task's drain ended that answers
+    /// before the deadline is waited for, and nothing is said of it: the
+    /// exit ends at its answer.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn work_that_ends_before_the_deadline_is_waited_for_and_not_said() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let tracker = InFlightRequestTracker::new();
+        // Admitted at 6 s, after the task's drain ended on an empty count;
+        // it answers at 12 s. The listeners close in 2 s.
+        let admitted = async {
+            tokio::time::sleep(secs(6)).await;
+            let (call, gate) = a_mutation_at_its_gate(&tracker);
+            drop(call);
+            tokio::time::sleep(secs(6)).await;
+            gate.notify_one();
+        };
+        let signal = exit(&tracker, budget, WayOut::Signal, secs(2));
+        let (times, ()) = tokio::join!(signal, admitted);
+        assert_eq!(times, (secs(7), secs(12)));
+        assert!(!logs_contain("Drain timed out"));
+    }
+
+    /// A listener's failure is said at its own instant, once, at error
+    /// level: which listener failed, and that readiness drains. The line is
+    /// there two seconds in, while the stopped listener still closes; the
+    /// listeners' end adds none, and a signal alone writes none. The admin
+    /// listener's failure is noted at its instant like the data listener's:
+    /// the exit ends one drain after it.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn a_listeners_failure_is_said_at_its_own_instant() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        // The error lines so far that name the data listener, and the admin
+        // listener, as the one that failed.
+        let said_so_far = || {
+            let said = std::cell::Cell::new((0, 0));
+            logs_assert(|lines: &[&str]| {
+                let naming = |listener: &str| {
+                    let field = format!("listener=\"{listener}\"");
+                    lines
+                        .iter()
+                        .filter(|line| line.contains("ERROR") && line.contains("A listener failed"))
+                        .filter(|line| line.contains(&field))
+                        .count()
+                };
+                said.set((naming("data"), naming("admin")));
+                Ok(())
+            });
+            said.get()
+        };
+        for (way, wanted) in [
+            (WayOut::Signal, (0, 0)),
+            (WayOut::ListenerFailure, (1, 0)),
+            (WayOut::OnlyListenerFailure, (2, 0)),
+            (WayOut::Both, (3, 0)),
+            (WayOut::AdminFailure, (3, 1)),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let (call, _gate) = a_mutation_at_its_gate(&tracker);
+            drop(call);
+            tokio::task::yield_now().await;
+            let two_seconds_in = async {
+                tokio::time::sleep(secs(2)).await;
+                said_so_far()
+            };
+            let (times, early) =
+                tokio::join!(exit(&tracker, budget, way, secs(10)), two_seconds_in);
+            assert_eq!(early, wanted, "{way:?}: the lines two seconds in");
+            assert_eq!(said_so_far(), wanted, "{way:?}: the lines after the exit");
+            if matches!(way, WayOut::AdminFailure) {
+                assert_eq!(
+                    times,
+                    (secs(10), secs(25)),
+                    "the exit ends one drain after the admin listener's failure"
+                );
+            }
+        }
+    }
+
+    /// A leave of the mesh that takes `leaving`, and the read of when it
+    /// began, counted from now: `None` while it has not.
+    fn a_leave_taking(
+        leaving: Duration,
+    ) -> (impl Future<Output = ()>, impl Fn() -> Option<Duration>) {
+        use tokio::sync::watch;
+
+        let start = tokio::time::Instant::now();
+        let (began, leave_began) = watch::channel(None);
+        let leave = async move {
+            began.send_replace(Some(start.elapsed()));
+            tokio::time::sleep(leaving).await;
+        };
+        (leave, move || *leave_began.borrow())
+    }
+
+    /// The stop of the mesh where no leave is cut short: never called.
+    fn no_stop() -> impl FnOnce() {
+        || panic!("the mesh is stopped only when the drain cuts a leave short")
+    }
+
+    /// A listener's failure with no shutdown under way leaves the mesh from
+    /// its own instant: at once while the other listener still closes, and
+    /// when the only listener fails. A failure during a shutdown starts no
+    /// leave of its own, the shutdown task has left; nor does a signal.
+    #[tokio::test(start_paused = true)]
+    async fn a_listeners_failure_leaves_the_mesh_from_its_own_instant() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        for (way, wanted) in [
+            (WayOut::ListenerFailure, Some(secs(0))),
+            (WayOut::OnlyListenerFailure, Some(secs(1))),
+            (WayOut::FailureThenSignal, Some(secs(0))),
+            (WayOut::Both, None),
+            (WayOut::Signal, None),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            let (leave, began) = a_leave_taking(secs(1));
+            exit_leaving(&tracker, budget, way, secs(10), leave, no_stop()).await;
+            assert_eq!(began(), wanted, "{way:?}");
+        }
+    }
+
+    /// The exit waits for the failure's leave of the mesh: with nothing in
+    /// flight it ends when the leave does.
+    #[tokio::test(start_paused = true)]
+    async fn the_exit_waits_for_the_failures_leave() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        for (leaving, ended) in [(0, 1), (4, 5)] {
+            let tracker = InFlightRequestTracker::new();
+            let (leave, began) = a_leave_taking(secs(leaving));
+            let way = WayOut::OnlyListenerFailure;
+            let times = exit_leaving(&tracker, budget, way, Duration::ZERO, leave, no_stop()).await;
+            assert_eq!(times, (secs(1), secs(ended)), "a leave of {leaving} s");
+            assert_eq!(began(), Some(secs(1)), "a leave of {leaving} s");
+        }
+    }
+
+    /// A leave the drain cannot hold is cut short at the drain's end and the
+    /// mesh is stopped outright: the exit ends one drain after the failure,
+    /// not when the leave would have.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn a_leave_that_outlasts_the_drain_is_cut_short_at_the_deadline() {
+        let secs = Duration::from_secs;
+        let tracker = InFlightRequestTracker::new();
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        let (leave, began) = a_leave_taking(secs(40));
+        let mesh_stopped = Arc::new(AtomicBool::new(false));
+        let stop_mesh = {
+            let mesh_stopped = Arc::clone(&mesh_stopped);
+            move || mesh_stopped.store(true, Ordering::SeqCst)
+        };
+        let way = WayOut::OnlyListenerFailure;
+        let times = exit_leaving(&tracker, budget, way, Duration::ZERO, leave, stop_mesh).await;
+        assert_eq!(times, (secs(1), secs(26)));
+        assert_eq!(began(), Some(secs(1)));
+        assert!(
+            mesh_stopped.load(Ordering::SeqCst),
+            "the leave was cut short"
+        );
+        assert!(logs_contain(
+            "Leaving the mesh was cut short by the end of the drain"
+        ));
+    }
+
+    /// With no mesh a listener's failure waits for no leave: the exit ends
+    /// with the listeners.
+    #[tokio::test(start_paused = true)]
+    async fn with_no_mesh_a_listeners_failure_waits_for_no_leave() {
+        let secs = Duration::from_secs;
+        let budget = ShutdownBudget::from_grace_secs(30, Some(5));
+        for (way, ended) in [
+            (WayOut::ListenerFailure, 0),
+            (WayOut::OnlyListenerFailure, 1),
+        ] {
+            let tracker = InFlightRequestTracker::new();
+            assert_eq!(
+                exit(&tracker, budget, way, Duration::ZERO).await,
+                (secs(ended), secs(ended)),
+                "{way:?}"
+            );
+        }
+    }
+
+    /// A mesh member on an ephemeral loopback port, serving and joining
+    /// `peers`.
+    async fn a_mesh_member(
+        name: &str,
+        peers: Vec<std::net::SocketAddr>,
+    ) -> (std::net::SocketAddr, Arc<MeshServerHandler>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, handler) = MeshServerBuilder::new(name.to_string(), addr, addr, peers).build();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the member serves for the length of the case"
+        )]
+        spawn(async move {
+            let _ = server.start_with_listener(listener).await;
+        });
+        (addr, Arc::new(handler))
+    }
+
+    /// What `member` holds for the member named `of`, read every 50 ms until
+    /// it is `wanted` or `within` has passed: the last status read.
+    async fn status_read_by(
+        member: &MeshServerHandler,
+        of: &str,
+        wanted: smg_mesh::gossip::NodeStatus,
+        within: Duration,
+    ) -> Option<smg_mesh::gossip::NodeStatus> {
+        let start = tokio::time::Instant::now();
+        loop {
+            let status = member.state.read().get(of).map(smg_mesh::status_of);
+            if status == Some(wanted) || start.elapsed() >= within {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A listener's failure with no signal leaves the mesh, as a signal does:
+    /// while the failed member's exit still waits for a departed client's
+    /// mutation, the other member reads it `Leaving`. A second leave, as the
+    /// shutdown task's is when a signal follows the failure, finds the member
+    /// `Leaving`: it changes nothing and returns at once.
+    #[tokio::test]
+    async fn a_listeners_failure_leaves_the_mesh() {
+        use smg_mesh::gossip::NodeStatus;
+
+        let secs = Duration::from_secs;
+        let (addr_a, a) = a_mesh_member("A", Vec::new()).await;
+        let (_addr_b, b) = a_mesh_member("B", vec![addr_a]).await;
+        assert_eq!(
+            status_read_by(&a, "B", NodeStatus::Alive, secs(20)).await,
+            Some(NodeStatus::Alive),
+            "A sees B join"
+        );
+        assert_eq!(
+            status_read_by(&b, "A", NodeStatus::Alive, secs(20)).await,
+            Some(NodeStatus::Alive),
+            "B sees A"
+        );
+
+        // B's exit: its only listener fails, with no signal, and a departed
+        // client's mutation holds the exit.
+        let tracker = InFlightRequestTracker::new();
+        let (call, gate) = a_mutation_at_its_gate(&tracker);
+        drop(call);
+        tokio::task::yield_now().await;
+        let data: Serving = Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Err(std::io::Error::other("accept failed"))
+        });
+        let no_admin: Serving = Box::pin(std::future::ready(Ok(())));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the stand-in for the shutdown task `startup` spawns; its signal never comes"
+        )]
+        let shutdown = spawn(std::future::pending::<Option<tokio::time::Instant>>());
+        let exit = serve_until_drained(
+            data,
+            no_admin,
+            OnFailure {
+                stop_data: || {},
+                stop_admin: || {},
+                leave_mesh: leave_the_mesh(Some(&b)),
+                stop_mesh: || stop_the_mesh(Some(&b)),
+            },
+            &tracker,
+            shutdown,
+            secs(30),
+        );
+        tokio::pin!(exit);
+        tokio::select! {
+            _ = &mut exit => panic!("the exit ended while the mutation was in flight"),
+            status = status_read_by(&a, "B", NodeStatus::Leaving, secs(20)) => assert_eq!(
+                status,
+                Some(NodeStatus::Leaving),
+                "what A reads of B behind B's listener failure"
+            ),
+        }
+        let own_entry = || b.state.read().get("B").map(|b| (b.status, b.version));
+        let left = own_entry();
+        tokio::time::timeout(Duration::from_millis(500), leave_the_mesh(Some(&b)))
+            .await
+            .expect("a second leave returns at once");
+        assert_eq!(own_entry(), left, "a second leave changes nothing");
+        gate.notify_one();
+        let _ = exit.await;
+        a.shutdown();
     }
 
     /// An unknown URL and a wrong method answer a JSON envelope in the shape
@@ -3970,6 +5396,83 @@ mod tests {
         }
     }
 
+    /// A browser client under a named origin can replace the tenant
+    /// rate-limit document: the preflight allows `PUT` and `If-Match`, and
+    /// the answer's `ETag` and revision are readable.
+    #[tokio::test]
+    async fn configured_cors_allows_the_document_write() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/admin/v1/rate-limits/tenants",
+                axum::routing::put(|| async { StatusCode::OK }),
+            )
+            .layer(
+                create_cors_layer(vec!["https://client.example".into()])
+                    .expect("a configured origin list attaches the layer"),
+            );
+        let preflight = app
+            .clone()
+            .oneshot(
+                http::Request::builder()
+                    .method("OPTIONS")
+                    .uri("/admin/v1/rate-limits/tenants")
+                    .header("origin", "https://client.example")
+                    .header("access-control-request-method", "PUT")
+                    .header("access-control-request-headers", "content-type,if-match")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(preflight.status().is_success());
+        let listed = |name: &str| {
+            preflight.headers()[name]
+                .to_str()
+                .unwrap()
+                .split(',')
+                .map(|value| value.trim().to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            listed("access-control-allow-methods")
+                .iter()
+                .any(|m| m == "put"),
+            "PUT is not allowed"
+        );
+        assert!(
+            listed("access-control-allow-headers")
+                .iter()
+                .any(|h| h == "if-match"),
+            "If-Match is not allowed"
+        );
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .method("PUT")
+                    .uri("/admin/v1/rate-limits/tenants")
+                    .header("origin", "https://client.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let exposed = response.headers()["access-control-expose-headers"]
+            .to_str()
+            .unwrap();
+        for header in ["etag", "x-smg-config-revision"] {
+            assert!(
+                exposed
+                    .split(',')
+                    .any(|value| value.trim().eq_ignore_ascii_case(header)),
+                "{header} is not exposed"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn plain_http_acceptor_enables_nodelay() {
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -4113,12 +5616,91 @@ mod tests {
 
         // The refusal named, not any error: a listener that failed to bind
         // would also be one.
-        let error = startup(ServerConfig::minimal(router_config))
+        let error = Box::pin(startup(ServerConfig::minimal(router_config)))
             .await
             .expect_err("startup must validate router_config even when constructed directly");
         assert!(
             error.to_string().contains("must have a non-empty key"),
             "startup refused for another reason: {error}"
         );
+    }
+
+    /// The start line names what places requests. Under the classic
+    /// policies, and where Grand Central runs the document the
+    /// settings mean, it is the settings' policy in its debug form. A
+    /// supplied document is named in its place: by its path where it was
+    /// read from one, and without one where the caller set it.
+    #[test]
+    fn the_start_line_names_a_supplied_document() {
+        let classic = RouterConfig::default();
+        assert_eq!(start_line_policy(&classic), format!("{:?}", classic.policy));
+
+        let the_settings_own = RouterConfig {
+            grand_central: true,
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            start_line_policy(&the_settings_own),
+            format!("{:?}", the_settings_own.policy)
+        );
+
+        let document = classic
+            .policy_document()
+            .expect("the default settings mean a document");
+        let read_from_a_path = RouterConfig {
+            grand_central: true,
+            policy_spec_path: Some("routing.yaml".to_owned()),
+            policy_spec: Some(document.clone()),
+            ..RouterConfig::default()
+        };
+        assert_eq!(
+            start_line_policy(&read_from_a_path),
+            "document routing.yaml"
+        );
+
+        let set_by_the_caller = RouterConfig {
+            grand_central: true,
+            policy_spec: Some(document),
+            ..RouterConfig::default()
+        };
+        assert_eq!(start_line_policy(&set_by_the_caller), "a supplied document");
+    }
+
+    /// `minimal` leaves a library caller on the CLI's shutdown grace, not a
+    /// shorter one of its own: in-flight streams get the product's drain.
+    #[test]
+    fn minimal_takes_the_default_shutdown_grace() {
+        let config = ServerConfig::minimal(RouterConfig::default());
+        assert_eq!(
+            config.shutdown_grace_period_secs,
+            DEFAULT_SHUTDOWN_GRACE_SECS
+        );
+        assert_eq!(config.shutdown_grace_period_secs, 180);
+    }
+
+    /// The HTTP listener queues as many unaccepted connections as its host
+    /// allows: the runtime's own bind stopped at 128.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_http_listener_queues_what_its_host_allows() {
+        let allowed: usize = std::fs::read_to_string("/proc/sys/net/core/somaxconn")
+            .expect("the host's accept queue maximum")
+            .trim()
+            .parse()
+            .expect("a number");
+        let listeners = bind_listeners("127.0.0.1:0".parse().expect("an address"), None)
+            .expect("the listeners");
+        let addr = listeners.data.local_addr().expect("its address");
+        // Nothing accepts: a connection past the queue waits on the kernel's
+        // retries and is never queued.
+        let queued = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut held = Vec::new();
+            for _ in 0..allowed.min(256) {
+                held.push(TcpStream::connect(addr).await.expect("a connection"));
+            }
+            held
+        })
+        .await;
+        assert!(queued.is_ok(), "a connection past 128 was not queued");
     }
 }

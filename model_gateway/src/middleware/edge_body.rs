@@ -16,13 +16,15 @@
 //!
 //! The hand-over rides on the response's extensions, so it holds across the
 //! layers that keep them. A layer between a producer and the edge that
-//! builds the response again from scratch (the WASM middleware's reject and
-//! modify phases do, with `Response::builder()`) drops the duties handed so
-//! far with the old response: the permit and the keep-alive end there, as
-//! their in-body wrappers did when such a layer drained the old body, and
-//! the span closes with the head (`BodyDuties`' drop). A layer that
-//! replaces the body but keeps the parts (the Messages error envelope) keeps
-//! them.
+//! built the response again from scratch (the WASM middleware's reject and
+//! modify phases did, with `Response::builder()`) dropped the duties handed
+//! so far with the old response: the permit and the keep-alive ended there,
+//! as their in-body wrappers did when such a layer drained the old body, and
+//! the span closed with the head (`BodyDuties`' drop). A layer that replaces
+//! the body but keeps the parts (the Messages error envelope, the WASM hooks
+//! now) keeps them. A layer that drops the parts but keeps a body whose
+//! producer carried the cell (`BodyFailure::carry`) leaves the duties in
+//! that cell until the body goes.
 //!
 //! The duties end as they did. At the body's end (its last frame, the length
 //! the response declared, or an error of the body) the response is counted,
@@ -33,7 +35,10 @@
 
 use std::{
     pin::Pin,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, PoisonError,
+    },
     task::{ready, Context, Poll},
     time::Instant,
 };
@@ -46,7 +51,7 @@ use http_body::{Body as HttpBody, Frame, SizeHint};
 
 use super::{
     logging::SpanDuty,
-    metrics::{BodyFailure, BodyProgress, ResponseOutcome},
+    metrics::{BodyProgress, ResponseOutcome},
     sse_keepalive::KeepAlive,
 };
 use crate::observability::{
@@ -79,18 +84,40 @@ pub(crate) struct BodyDuties {
     /// The request span, open until the body ends, with the client-close
     /// line the access log owes if the body is dropped first.
     pub(crate) span: Option<SpanDuty>,
-    /// The producer's word on a streamed body that tells the client of a
-    /// failure and then ends as planned: read at the body's end, so the
-    /// response counts as what the client read (see [`BodyFailure`]).
-    pub(crate) failure: Option<BodyFailure>,
+    /// The response's cell, when the body's producer holds it for its word
+    /// on a streamed body that tells the client of a failure and then ends
+    /// as planned (see [`BodyFailure`]): set by [`take`](Self::take) alone,
+    /// read at the body's end, so the response counts as what the client
+    /// read. Private: a word a layer handed through [`hand`](Self::hand)
+    /// would be overwritten by `take`'s shared-cell arm, and a carried cell
+    /// handed as well would sit inside its own mutex, a cycle only `take`
+    /// breaks. [`carry`](BodyFailure::carry) is the one way in.
+    failure: Option<BodyFailure>,
 }
 
-/// The response extension that carries [`BodyDuties`] out to the metrics
-/// layer. `http::Extensions` holds `Clone` values only, so the duties, none
-/// of them clonable, travel in a shared cell; the metrics layer takes them
-/// out before the response reaches the server.
+#[cfg(test)]
+impl BodyDuties {
+    /// The cell taken out, for the tests that read the word through it.
+    pub(crate) fn take_failure(&mut self) -> Option<BodyFailure> {
+        self.failure.take()
+    }
+}
+
+/// The one shared cell of a response: the [`BodyDuties`] on their way out to
+/// the metrics layer, and the producer's word on the body ([`BodyFailure`]).
+/// `http::Extensions` holds `Clone` values only, so the duties, none of them
+/// clonable, travel behind a lock, and the metrics layer takes them out
+/// before the response reaches the server; the word is an atomic the
+/// producer sets from the body and the edge reads at the body's end.
+#[derive(Default)]
+struct DutyCell {
+    duties: Mutex<BodyDuties>,
+    failed: AtomicBool,
+}
+
+/// The response extension that carries the [`DutyCell`].
 #[derive(Clone, Default)]
-struct DutySlot(Arc<Mutex<BodyDuties>>);
+struct DutySlot(Arc<DutyCell>);
 
 impl BodyDuties {
     /// Hands the edge's body wrapper a duty through `response`'s extensions:
@@ -99,21 +126,71 @@ impl BodyDuties {
         let slot = response
             .extensions_mut()
             .get_or_insert_default::<DutySlot>();
-        fill(&mut slot.0.lock().unwrap_or_else(PoisonError::into_inner));
+        fill(&mut slot.0.duties.lock().unwrap_or_else(PoisonError::into_inner));
     }
 
     /// Takes the duties handed over for `response`; none when no layer
-    /// inside had one.
+    /// inside had one. A cell the body's producer still holds, for its word,
+    /// stays shared and comes along as the duties' `failure`.
     pub(crate) fn take(response: &mut Response) -> Self {
         let Some(DutySlot(cell)) = response.extensions_mut().remove::<DutySlot>() else {
             return Self::default();
         };
         match Arc::try_unwrap(cell) {
-            Ok(duties) => duties.into_inner().unwrap_or_else(PoisonError::into_inner),
+            Ok(cell) => cell
+                .duties
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner),
             Err(shared) => {
-                std::mem::take(&mut *shared.lock().unwrap_or_else(PoisonError::into_inner))
+                let mut duties = std::mem::take(
+                    &mut *shared.duties.lock().unwrap_or_else(PoisonError::into_inner),
+                );
+                duties.failure = Some(BodyFailure(shared));
+                duties
             }
         }
+    }
+}
+
+/// The word of a streamed body's producer that the body told the client of a
+/// failure on its way out: the error event a stream the worker failed ends
+/// with, before its `[DONE]`. Such a body ends with its own last frame, so
+/// the frames alone say it went out in full; counted by them, a stream the
+/// engine cut was a plain 200. The word lives in the response's one cell,
+/// with no allocation of its own: the producer builds the cell with its
+/// body, puts it on the response ([`carry`](Self::carry)) for the layers
+/// outside to hand their duties into, and tells the word from the body; the
+/// edge reads it once the body has ended, and the response then counts as
+/// its head's status with [`BODY_FAILED_CODE`], what the client read. A body
+/// with no producer's word is counted by its frames alone.
+///
+/// [`BODY_FAILED_CODE`]: super::metrics::BODY_FAILED_CODE
+#[derive(Clone, Default)]
+pub(crate) struct BodyFailure(Arc<DutyCell>);
+
+impl BodyFailure {
+    /// Makes the cell this word lives in `response`'s one: the layers
+    /// outside hand their duties into it, the edge reads the word from it.
+    /// A duty handed inside before this moves over.
+    pub(crate) fn carry(&self, response: &mut Response) {
+        let inside = response
+            .extensions_mut()
+            .insert(DutySlot(Arc::clone(&self.0)));
+        if let Some(DutySlot(inside)) = inside {
+            let handed =
+                std::mem::take(&mut *inside.duties.lock().unwrap_or_else(PoisonError::into_inner));
+            *self.0.duties.lock().unwrap_or_else(PoisonError::into_inner) = handed;
+        }
+    }
+
+    /// The producer's word: the body ended with the client told of a failure.
+    pub(crate) fn tell(&self) {
+        self.0.failed.store(true, Ordering::Release);
+    }
+
+    /// Whether the producer told of a failure.
+    pub(crate) fn told(&self) -> bool {
+        self.0.failed.load(Ordering::Acquire)
     }
 }
 
@@ -145,7 +222,8 @@ pub(crate) struct EdgeBody {
     span: Option<SpanDuty>,
     permit: Option<Box<dyn Permit>>,
     keep_alive: Option<KeepAlive>,
-    /// The producer's word on how the body ended, when it gives one.
+    /// The response's cell, when the body's producer holds it for its word
+    /// on how the body ended.
     failure: Option<BodyFailure>,
     /// Whether a frame was ever asked for. A body dropped before any poll is
     /// one the server never meant to send (the answer to a HEAD request), not
@@ -361,7 +439,7 @@ pub(crate) fn at_the_edge(mut response: Response) -> Response {
     let tracker = InFlightRequestTracker::new();
     let guard = tracker.track();
     let mut outcome = ResponseOutcome::pending(super::metrics::PathLabel::Static("/test"));
-    outcome.head(&response);
+    outcome.head(&mut response);
     let progress = BodyProgress::new(&response);
     let duties = BodyDuties::take(&mut response);
     response.map(|body| {
@@ -372,264 +450,5 @@ pub(crate) fn at_the_edge(mut response: Response) -> Response {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        convert::Infallible,
-        sync::{Arc, Mutex},
-        time::Duration,
-    };
-
-    use axum::{
-        http::{header::CONTENT_TYPE, Request, StatusCode},
-        routing::get,
-        Router,
-    };
-    use http_body_util::BodyExt;
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
-    use tower::ServiceExt;
-    use tracing::Level;
-
-    use super::*;
-    use crate::{
-        middleware::{
-            create_logging_layer, sse_keepalive_middleware, AccessLogFields, HttpMetricsLayer,
-            SseKeepAlive,
-        },
-        observability::logging::test_support::{test_subscriber, ResponseLines},
-    };
-
-    /// A permit that records its release and refuses the first frame when
-    /// told to.
-    struct TestPermit {
-        released: Arc<Mutex<bool>>,
-        lets_first_frame_pass: bool,
-    }
-
-    impl Permit for TestPermit {
-        fn first_data_frame(&mut self) -> bool {
-            self.lets_first_frame_pass
-        }
-    }
-
-    impl Drop for TestPermit {
-        fn drop(&mut self) {
-            *self.released.lock().expect("released") = true;
-        }
-    }
-
-    /// The server's edge over `/stream`, which hands out `body` once as an
-    /// SSE response with a permit: the admission and keep-alive layers inside,
-    /// the request span and the metrics layer outside, in the server's order.
-    fn app(body: Body, permit: TestPermit, tracker: Arc<InFlightRequestTracker>) -> Router {
-        let slot = Arc::new(Mutex::new(Some((body, permit))));
-        Router::new()
-            .route(
-                "/v1/chat/completions",
-                get(move || {
-                    let (body, permit) = slot
-                        .lock()
-                        .expect("slot")
-                        .take()
-                        .expect("handler called once");
-                    async move {
-                        let mut response = Response::builder()
-                            .header(CONTENT_TYPE, "text/event-stream")
-                            .body(body)
-                            .expect("response");
-                        BodyDuties::hand(&mut response, |duties| {
-                            duties.permit = Some(Box::new(permit));
-                        });
-                        response
-                    }
-                }),
-            )
-            .route_layer(axum::middleware::from_fn_with_state(
-                SseKeepAlive::every_secs(15),
-                sse_keepalive_middleware,
-            ))
-            .layer(create_logging_layer(AccessLogFields::NONE))
-            .layer(HttpMetricsLayer::new(tracker))
-    }
-
-    fn request() -> Request<Body> {
-        Request::builder()
-            .uri("/v1/chat/completions")
-            .body(Body::empty())
-            .expect("request")
-    }
-
-    fn permit(released: &Arc<Mutex<bool>>, lets_first_frame_pass: bool) -> TestPermit {
-        TestPermit {
-            released: released.clone(),
-            lets_first_frame_pass,
-        }
-    }
-
-    fn line(level: Level, message: &str) -> (Level, String) {
-        (level, message.to_owned())
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn every_duty_ends_with_the_body() {
-        let sink = ResponseLines::default();
-        let _subscriber = test_subscriber(sink.clone());
-        let tracker = InFlightRequestTracker::new();
-        let released = Arc::new(Mutex::new(false));
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = app(
-            Body::from_stream(ReceiverStream::new(rx)),
-            permit(&released, true),
-            tracker.clone(),
-        )
-        .oneshot(request())
-        .await
-        .expect("response");
-        assert_eq!(response.status(), StatusCode::OK);
-        let mut body = response.into_body();
-
-        // The handler has answered, the body is open: in flight, the permit
-        // held, the access log at its response line.
-        assert_eq!(tracker.len(), 1);
-        assert!(!*released.lock().expect("released"));
-        tx.send(Ok(Bytes::from_static(b"data: x\n\n")))
-            .await
-            .expect("send");
-        let frame = body.frame().await.expect("a frame").expect("frame ok");
-        assert_eq!(
-            frame.data_ref().map(|data| &data[..]),
-            Some(&b"data: x\n\n"[..])
-        );
-        assert_eq!(tracker.len(), 1);
-        assert!(!*released.lock().expect("released"));
-
-        // Silence: the keep-alive comment comes through the one wrapper.
-        let next = tokio::time::timeout(Duration::from_secs(16), body.frame())
-            .await
-            .expect("a keep-alive within the interval")
-            .expect("a frame")
-            .expect("frame ok");
-        assert_eq!(
-            next.data_ref().map(|data| &data[..]),
-            Some(&b": ping\n\n"[..])
-        );
-
-        // The end of the stream: everything goes, the response is complete.
-        drop(tx);
-        assert!(body.frame().await.is_none());
-        assert_eq!(tracker.len(), 0);
-        assert!(*released.lock().expect("released"));
-        assert_eq!(
-            sink.lines(),
-            vec![line(Level::INFO, "finished processing request")]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_body_the_client_dropped_mid_stream_releases_every_duty_and_logs_the_close_once() {
-        let sink = ResponseLines::default();
-        let _subscriber = test_subscriber(sink.clone());
-        let tracker = InFlightRequestTracker::new();
-        let released = Arc::new(Mutex::new(false));
-        let (tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(4);
-        let response = app(
-            Body::from_stream(ReceiverStream::new(rx)),
-            permit(&released, true),
-            tracker.clone(),
-        )
-        .oneshot(request())
-        .await
-        .expect("response");
-        tx.send(Ok(Bytes::from_static(b"data: x\n\n")))
-            .await
-            .expect("send");
-        let mut body = response.into_body();
-        body.frame().await.expect("a frame").expect("frame ok");
-        drop(body);
-        assert_eq!(tracker.len(), 0);
-        assert!(*released.lock().expect("released"));
-        assert_eq!(
-            sink.lines(),
-            vec![
-                line(Level::INFO, "finished processing request"),
-                line(
-                    Level::INFO,
-                    "client closed the connection before the response stream ended"
-                ),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_permit_that_refuses_the_first_frame_ends_the_body_without_it() {
-        let tracker = InFlightRequestTracker::new();
-        let released = Arc::new(Mutex::new(false));
-        let response = app(
-            Body::from("data: never\n\n"),
-            permit(&released, false),
-            tracker.clone(),
-        )
-        .oneshot(request())
-        .await
-        .expect("response");
-        let mut body = response.into_body();
-        assert!(!body.is_end_stream());
-        assert!(
-            body.frame().await.is_none(),
-            "the refused frame is not sent"
-        );
-        assert!(body.is_end_stream(), "the body stays ended");
-        assert!(body.frame().await.is_none());
-        assert_eq!(tracker.len(), 0);
-        assert!(*released.lock().expect("released"));
-    }
-
-    #[tokio::test]
-    async fn an_already_complete_body_is_finished_at_the_edge() {
-        let tracker = InFlightRequestTracker::new();
-        let released = Arc::new(Mutex::new(false));
-        let response = app(Body::empty(), permit(&released, true), tracker.clone())
-            .oneshot(request())
-            .await
-            .expect("response");
-        assert_eq!(tracker.len(), 0);
-        assert!(*released.lock().expect("released"));
-        drop(response);
-    }
-
-    /// A stack with no metrics layer outside takes no duties: the span ends
-    /// with the response head, without a client-close line for a stream
-    /// nobody cut.
-    #[tokio::test]
-    async fn duties_nobody_took_keep_the_access_log_quiet() {
-        let sink = ResponseLines::default();
-        let _subscriber = test_subscriber(sink.clone());
-        let (_tx, rx) = mpsc::channel::<Result<Bytes, Infallible>>(1);
-        let slot = Arc::new(Mutex::new(Some(Body::from_stream(ReceiverStream::new(rx)))));
-        let app = Router::new()
-            .route(
-                "/stream",
-                get(move || {
-                    let body = slot.lock().expect("slot").take().expect("once");
-                    async move { Response::new(body) }
-                }),
-            )
-            .layer(create_logging_layer(AccessLogFields::NONE));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/stream")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        let (parts, body) = response.into_parts();
-        drop(parts);
-        assert_eq!(
-            sink.lines(),
-            vec![line(Level::INFO, "finished processing request")]
-        );
-        drop(body);
-    }
-}
+#[path = "../../tests/unit/middleware/edge_body/tests.rs"]
+mod tests;

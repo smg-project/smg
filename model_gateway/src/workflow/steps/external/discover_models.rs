@@ -8,13 +8,15 @@ use openai_protocol::{model_card::ModelCard, model_type::ModelType, worker::Prov
 use regex::Regex;
 use reqwest::Client;
 use serde::Deserialize;
+use smg_worker::{identity::endpoint::Endpoint, workflow::WorkerKind};
 use tracing::{debug, info, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
+    admin::worker_service::{control_character_refusal, logged_strings},
     routers::provider_support,
-    worker::endpoint::Endpoint,
-    workflow::data::{WorkerKind, WorkerWorkflowData},
+    server::http_client_builder,
+    workflow::data::WorkerWorkflowData,
 };
 
 // HTTP client for API calls
@@ -23,7 +25,7 @@ use crate::{
     reason = "Lazy static initialization — reqwest::Client::build() only fails on TLS backend misconfiguration which is unrecoverable"
 )]
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
-    crate::server::http_client_builder()
+    http_client_builder()
         .timeout(Duration::from_secs(30))
         .build()
         .expect("Failed to create HTTP client")
@@ -239,7 +241,7 @@ async fn fetch_models(
     let response = req
         .send()
         .await
-        .map_err(|e| format!("Failed to connect to {shown}: {e}"))?;
+        .map_err(|e| format!("Failed to connect to {shown}: {}", e.without_url()))?;
 
     if !response.status().is_success() {
         return Err(format!(
@@ -248,10 +250,12 @@ async fn fetch_models(
         ));
     }
 
-    let models_response: ModelsResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse models response: {e}"))?;
+    let models_response: ModelsResponse = response.json().await.map_err(|e| {
+        format!(
+            "Failed to parse models response from {shown}: {}",
+            e.without_url()
+        )
+    })?;
 
     debug!(
         "Fetched {} raw models from {}",
@@ -260,6 +264,10 @@ async fn fetch_models(
     );
 
     let model_cards = group_models_into_cards(models_response.data);
+    // The ids are the provider's own report, which no door checked.
+    if let Some(refusal) = control_character_refusal(model_cards.iter().flat_map(logged_strings)) {
+        return Err(refusal);
+    }
 
     debug!(
         "Grouped into {} model cards with aliases",
@@ -347,7 +355,9 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
                 message: format!(
                     "every model discovered from {} needs the {} router, which this build does \
                      not carry; rebuild with the `{}` Cargo feature",
-                    config.url, missing.label, missing.feature
+                    Endpoint::redacted_str(&config.url),
+                    missing.label,
+                    missing.feature
                 ),
             });
         }
@@ -366,3 +376,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverModelsStep {
         true
     }
 }
+
+#[cfg(test)]
+#[path = "../../../../tests/unit/workflow/steps/external/discover_models/tests.rs"]
+mod tests;

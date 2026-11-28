@@ -66,21 +66,9 @@ impl LamportClock {
         }
     }
 
-    /// Increment and return new timestamp
+    /// Increment and return the new timestamp: an update from a clock at zero.
     pub fn tick(&self) -> u64 {
-        let mut current = self.counter.load(Ordering::Acquire);
-        loop {
-            let new_value = current.saturating_add(1);
-            match self.counter.compare_exchange(
-                current,
-                new_value,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return new_value,
-                Err(actual) => current = actual,
-            }
-        }
+        self.update(0)
     }
 
     /// Update clock to max(local, remote) + 1

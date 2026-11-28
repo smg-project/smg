@@ -1,17 +1,23 @@
-//! Response processing stage for embedding requests
+//! Response processing stage for embedding requests: one vector per input,
+//! in the request's order and in the encoding it asked for, under the
+//! request's summed usage.
 
 use async_trait::async_trait;
 use axum::response::Response;
-use openai_protocol::embedding::{EmbeddingObject, EmbeddingResponse};
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+use openai_protocol::{
+    common::UsageInfo,
+    embedding::{Embedding, EmbeddingObject, EmbeddingResponse},
+};
 use tracing::error;
 
 use crate::routers::{
     error,
     grpc::{
         common::stages::ProcessStage,
-        context::{DispatchContext, ExecutionResult, FinalResponse},
+        context::{wrong_response_spec, DispatchContext, ExecutionResult, FinalResponse},
         proto_wrapper::ProtoEmbedComplete,
-        spec::ResponseSpec,
+        spec::{EmbeddingResponseSpec, ResponseSpec},
     },
 };
 
@@ -24,12 +30,6 @@ impl EmbeddingResponseProcessingStage {
     }
 }
 
-impl Default for EmbeddingResponseProcessingStage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl ProcessStage for EmbeddingResponseProcessingStage {
     async fn process(
@@ -37,16 +37,11 @@ impl ProcessStage for EmbeddingResponseProcessingStage {
         ctx: &mut DispatchContext,
         spec: ResponseSpec,
     ) -> Result<Option<Response>, Response> {
-        if !matches!(spec, ResponseSpec::Embedding) {
-            error!(
-                function = "EmbeddingResponseProcessingStage::process",
-                "Wrong response spec"
-            );
-            return Err(error::internal_error(
-                "wrong_response_spec",
-                "Wrong response spec",
+        let ResponseSpec::Embedding(EmbeddingResponseSpec { base64 }) = spec else {
+            return Err(wrong_response_spec(
+                "EmbeddingResponseProcessingStage::process",
             ));
-        }
+        };
 
         // Extract execution result
         let execution_result = ctx.response.execution_result.take().ok_or_else(|| {
@@ -58,9 +53,7 @@ impl ProcessStage for EmbeddingResponseProcessingStage {
         })?;
 
         // Expect Embedding result variant
-        let proto_response = if let ExecutionResult::Embedding { response } = execution_result {
-            response
-        } else {
+        let ExecutionResult::Embedding { responses } = execution_result else {
             error!(
                 function = "EmbeddingResponseProcessingStage::process",
                 "Invalid execution result: expected Embedding"
@@ -71,13 +64,22 @@ impl ProcessStage for EmbeddingResponseProcessingStage {
             ));
         };
 
-        // Convert proto response to HTTP response
-        let embedding_response = self
-            .convert_response(ctx, proto_response)
-            .map_err(|boxed_err| *boxed_err)?;
+        let dispatch = ctx.dispatch.take().ok_or_else(|| {
+            error!(
+                function = "EmbeddingResponseProcessingStage::convert_response",
+                "Dispatch metadata missing in context"
+            );
+            error::internal_error("dispatch_missing", "Dispatch metadata missing")
+        })?;
 
-        // Store in context for pipeline to extract
-        ctx.response.final_response = Some(FinalResponse::Embedding(embedding_response));
+        // Store in context for pipeline to extract; the encoding is the spec's:
+        // the engine's wire carries the floats whatever the request said, so
+        // the gateway encodes here.
+        ctx.response.final_response = Some(FinalResponse::Embedding(embedding_response(
+            dispatch.model,
+            &responses,
+            base64,
+        )));
 
         Ok(None)
     }
@@ -87,50 +89,57 @@ impl ProcessStage for EmbeddingResponseProcessingStage {
     }
 }
 
-impl EmbeddingResponseProcessingStage {
-    #[expect(
-        clippy::unused_self,
-        reason = "method on stage struct for consistency with other stage convert_response methods"
-    )]
-    fn convert_response(
-        &self,
-        ctx: &DispatchContext,
-        proto: ProtoEmbedComplete,
-    ) -> Result<EmbeddingResponse, Box<Response>> {
-        let dispatch = ctx.dispatch.as_ref().ok_or_else(|| {
-            error!(
-                function = "EmbeddingResponseProcessingStage::convert_response",
-                "Dispatch metadata missing in context"
-            );
-            error::internal_error("dispatch_missing", "Dispatch metadata missing")
-        })?;
+/// The public API's `base64` encoding of a vector: the base64 of its
+/// little-endian f32 bytes, four per value, in order.
+fn base64_of(vector: &[f32]) -> String {
+    let mut bytes = Vec::with_capacity(vector.len() * 4);
+    for value in vector {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    BASE64_STANDARD.encode(bytes)
+}
 
-        let model = dispatch.model.clone();
-
-        // Convert flat embedding vector to response
-        // single input -> single embedding object
-
-        let embedding_data = EmbeddingObject {
-            object: "embedding".to_string(),
-            embedding: proto.embedding().to_vec(),
-            index: 0,
-        };
-
-        let prompt_tokens = proto.prompt_tokens();
-
-        let usage = openai_protocol::common::UsageInfo {
+/// The response to the request: the engine's answers as the list of
+/// vectors, `data[i]` the vector of input `i`, each the float array or, when
+/// `base64`, the base64 of its little-endian bytes; the usage their prompt
+/// tokens summed (an embedding has no completion tokens).
+fn embedding_response(
+    model: String,
+    responses: &[ProtoEmbedComplete],
+    base64: bool,
+) -> EmbeddingResponse {
+    let mut prompt_tokens = 0u32;
+    let data = responses
+        .iter()
+        .enumerate()
+        .map(|(index, proto)| {
+            prompt_tokens = prompt_tokens.saturating_add(proto.prompt_tokens());
+            let embedding = if base64 {
+                Embedding::Base64(base64_of(proto.embedding()))
+            } else {
+                Embedding::Floats(proto.embedding().to_vec())
+            };
+            EmbeddingObject {
+                object: "embedding".to_string(),
+                embedding,
+                index: index as u32,
+            }
+        })
+        .collect();
+    EmbeddingResponse {
+        object: "list".to_string(),
+        data,
+        model,
+        usage: UsageInfo {
             prompt_tokens,
-            total_tokens: prompt_tokens, // Embedding has no completion tokens
+            total_tokens: prompt_tokens,
             completion_tokens: 0,
             prompt_tokens_details: None,
             reasoning_tokens: None,
-        };
-
-        Ok(EmbeddingResponse {
-            object: "list".to_string(),
-            data: vec![embedding_data],
-            model,
-            usage,
-        })
+        },
     }
 }
+
+#[cfg(test)]
+#[path = "../../../../../../tests/unit/routers/grpc/regular/stages/embedding/response_processing/tests.rs"]
+mod tests;

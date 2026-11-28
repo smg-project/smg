@@ -1,6 +1,6 @@
 //! The formats: how each model family writes reasoning and tool calls, each a [`Format`] table
 //! the [`Engine`] runs. One module per table, named after the family that writes it; the README's
-//! models table, written by `tests/readme.rs` from the registry, lists every checkpoint each table
+//! models table, held to the registry by `tests/readme.rs`, lists every checkpoint each table
 //! reads, and `docs/tables.md` holds the notes on each table: what its template writes, what the
 //! table decides beyond the others, and what it leaves open.
 //!
@@ -13,6 +13,7 @@
 
 use crate::shape::{Layout, Message};
 
+pub mod command;
 pub mod deepseek_v3;
 pub mod deepseek_v3_1;
 pub mod deepseek_v3_2;
@@ -24,8 +25,11 @@ pub mod function_gemma;
 pub mod gemma4;
 pub mod glm;
 pub mod glm4;
+pub mod gpt_oss;
 pub mod hy4;
+pub mod hy_v3;
 pub mod inkling;
+pub mod inkling2;
 pub mod iquest;
 pub mod json;
 pub mod k2_horizon;
@@ -35,6 +39,7 @@ pub mod lfm2_5;
 pub mod ling;
 pub mod llama4;
 pub mod llama_nemotron;
+pub mod longcat;
 pub mod minicpm5;
 pub mod minimax_m2;
 pub mod minimax_m3;
@@ -47,8 +52,10 @@ pub mod qwen2_5;
 pub mod qwen3;
 pub mod registry;
 pub mod seed_oss;
+pub mod steptml;
 pub mod xlam;
 
+pub use command::command;
 pub use deepseek_v3::deepseek_v3;
 pub use deepseek_v3_1::deepseek_v3_1;
 pub use deepseek_v3_2::deepseek_v3_2;
@@ -60,17 +67,21 @@ pub use function_gemma::function_gemma;
 pub use gemma4::gemma4;
 pub use glm::glm;
 pub use glm4::glm4;
+pub use gpt_oss::gpt_oss;
 pub use hy4::hy4;
+pub use hy_v3::hy_v3;
 pub use inkling::inkling;
+pub use inkling2::inkling2;
 pub use iquest::iquest;
 pub use json::json;
 pub use k2_horizon::k2_horizon;
-pub use kimi_k2::kimi_k2;
+pub use kimi_k2::{kimi, kimi_k2};
 pub use kimi_k3::kimi_k3;
 pub use lfm2_5::lfm2_5;
 pub use ling::ling;
 pub use llama4::llama4;
 pub use llama_nemotron::llama_nemotron;
+pub use longcat::longcat;
 pub use minicpm5::minicpm5;
 pub use minimax_m2::minimax_m2;
 pub use minimax_m3::minimax_m3;
@@ -83,6 +94,7 @@ pub use qwen2_5::qwen2_5;
 pub use qwen3::qwen3;
 pub use registry::{for_model, for_model_shared, groups, table_for, Table};
 pub use seed_oss::seed_oss;
+pub use steptml::steptml;
 pub use xlam::xlam;
 
 /// The one part of its chat template's layout a registry table that thinks carries: the thought

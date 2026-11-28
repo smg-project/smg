@@ -4,6 +4,7 @@ use anyhow::{Error, Result};
 use tracing::debug;
 
 use crate::{
+    chat_template::{load_chat_template_from_file, ConfigChatTemplates},
     hub::download_tokenizer_from_hf,
     huggingface::HuggingFaceTokenizer,
     tekken,
@@ -330,15 +331,13 @@ pub(crate) fn processor_chat_template(
     });
     dir.filter(|_| checkpoints_own_template)
         .and_then(discover_processor_chat_template_in_dir)
-        .and_then(
-            |path| match crate::chat_template::load_chat_template_from_file(&path) {
-                Ok(template) => template,
-                Err(e) => {
-                    debug!("the processor's chat template at {path} does not load: {e}");
-                    None
-                }
-            },
-        )
+        .and_then(|path| match load_chat_template_from_file(&path) {
+            Ok(template) => template,
+            Err(e) => {
+                debug!("the processor's chat template at {path} does not load: {e}");
+                None
+            }
+        })
 }
 
 /// Whether `tokenizer_config.json` in `dir` carries a `chat_template` the
@@ -348,9 +347,7 @@ fn config_has_chat_template(dir: &Path) -> bool {
     std::fs::read_to_string(dir.join("tokenizer_config.json"))
         .ok()
         .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-        .is_some_and(|config| {
-            crate::chat_template::ConfigChatTemplates::read(config.get("chat_template")).is_some()
-        })
+        .is_some_and(|config| ConfigChatTemplates::read(config.get("chat_template")).is_some())
 }
 
 /// Helper function to resolve and log chat template selection
@@ -456,16 +453,26 @@ pub async fn create_tokenizer_async_with_chat_template(
     model_name_or_path: &str,
     chat_template_path: Option<&str>,
 ) -> Result<Arc<dyn traits::Tokenizer>> {
+    // Each parse below runs off the runtime (see `off_the_runtime`); the
+    // download is awaited here, so it stops when this future is dropped.
     // Check if it's a file path
     let path = Path::new(model_name_or_path);
     if path.exists() {
-        return create_tokenizer_with_chat_template(model_name_or_path, chat_template_path);
+        let (source, chat_template) = (
+            model_name_or_path.to_owned(),
+            chat_template_path.map(str::to_owned),
+        );
+        return off_the_runtime(move || {
+            create_tokenizer_with_chat_template(&source, chat_template.as_deref())
+        })
+        .await;
     }
 
     // Check if it's a GPT model name that should use Tiktoken
-    if is_likely_openai_model(model_name_or_path) {
+    if !starts_as_a_path(model_name_or_path) && is_likely_openai_model(model_name_or_path) {
         // Try tiktoken first, but fall back to HuggingFace if it fails
-        match TiktokenTokenizer::from_model_name(model_name_or_path) {
+        let name = model_name_or_path.to_owned();
+        match off_the_runtime(move || TiktokenTokenizer::from_model_name(&name)).await {
             Ok(tokenizer) => return Ok(Arc::new(tokenizer)),
             Err(e) => {
                 debug!(
@@ -476,15 +483,56 @@ pub async fn create_tokenizer_async_with_chat_template(
         }
     }
 
+    // A path that is not on this host fails here: the Hub is never asked for it.
+    if names_a_path(model_name_or_path) {
+        return Err(Error::msg(format!("File not found: {model_name_or_path}")));
+    }
+
     // Try to download tokenizer files from HuggingFace
     match download_tokenizer_from_hf(model_name_or_path).await {
         Ok(cache_dir) => {
-            create_tokenizer_from_downloaded_dir(&cache_dir, model_name_or_path, chat_template_path)
+            let (name, chat_template) = (
+                model_name_or_path.to_owned(),
+                chat_template_path.map(str::to_owned),
+            );
+            off_the_runtime(move || {
+                create_tokenizer_from_downloaded_dir(&cache_dir, &name, chat_template.as_deref())
+            })
+            .await
         }
         Err(e) => Err(Error::msg(format!(
             "Failed to download tokenizer from HuggingFace: {e}"
         ))),
     }
+}
+
+/// `parse` on the blocking pool of the runtime that drives the caller: a
+/// parse of hundreds of milliseconds holds no runtime worker from the tasks
+/// it serves. A parse that panics unwinds the caller, as it did inline; with
+/// no runtime to hand it to, the parse runs inline as before.
+async fn off_the_runtime<T: Send + 'static>(parse: impl FnOnce() -> T + Send + 'static) -> T {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return parse();
+    };
+    match runtime.spawn_blocking(parse).await {
+        Ok(parsed) => parsed,
+        Err(ended) => std::panic::resume_unwind(ended.into_panic()),
+    }
+}
+
+/// Whether `name` can only be a path, never a repository id (`owner/name`):
+/// absolute, relative to `.` or `~`, or more than one separator. The Python
+/// binding's loader holds the same rule; the gateway's `names_a_local_path`
+/// is close to it.
+fn names_a_path(name: &str) -> bool {
+    starts_as_a_path(name) || name.matches('/').count() > 1
+}
+
+/// Whether `name` starts as only a path does: absolute, or relative to `.`
+/// or `~`. No repository id and no model name starts so, and the guess of an
+/// OpenAI model reads the last segment alone: such a name is not guessed.
+fn starts_as_a_path(name: &str) -> bool {
+    Path::new(name).is_absolute() || name.starts_with(['.', '~'])
 }
 
 /// The tokenizer of a checkpoint downloaded from the Hub, from the files in
@@ -558,7 +606,7 @@ pub fn create_tokenizer_with_chat_template_blocking(
 
     // Check if it's a GPT model name that should use Tiktoken
     // Try tiktoken first, but fall back to HuggingFace if it fails
-    if is_likely_openai_model(model_name_or_path) {
+    if !starts_as_a_path(model_name_or_path) && is_likely_openai_model(model_name_or_path) {
         match TiktokenTokenizer::from_model_name(model_name_or_path) {
             Ok(tokenizer) => return Ok(Arc::new(tokenizer)),
             Err(e) => {
@@ -636,6 +684,7 @@ mod tests {
         create_tokenizer_from_file, get_tokenizer_info, is_likely_json, is_likely_openai_model,
         TokenizerType,
     };
+    use crate::huggingface::QWEN2_PRETOKENIZE_REGEX;
 
     /// A checkpoint that ships `tekken.json` loads it ahead of the
     /// `tokenizer.json` conversion beside it, from a directory, from a Hub
@@ -857,7 +906,7 @@ mod tests {
                 "normalizer": {"type": "NFC"},
                 "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
                     {"type": "Split",
-                     "pattern": {"Regex": crate::huggingface::QWEN2_PRETOKENIZE_REGEX},
+                     "pattern": {"Regex": QWEN2_PRETOKENIZE_REGEX},
                      "behavior": "Isolated", "invert": false},
                     {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false,
                      "use_regex": false}
@@ -929,6 +978,37 @@ mod tests {
         let encoding = tokenizer.encode(text, false).unwrap();
         let decoded = tokenizer.decode(encoding.token_ids(), false).unwrap();
         assert_eq!(decoded, text);
+    }
+
+    /// A path that is not on this host is no repository id: the load fails
+    /// as a missing file, and the Hub is not asked for it.
+    #[tokio::test]
+    async fn a_path_that_does_not_exist_is_not_asked_of_the_hub() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        for name in [missing.to_str().unwrap(), "./owner/name"] {
+            let error = create_tokenizer_async(name)
+                .await
+                .err()
+                .expect("nothing to load")
+                .to_string();
+            assert_eq!(error, format!("File not found: {name}"));
+        }
+    }
+
+    /// A path that is not on this host is no model name either: its last
+    /// segment picks no built-in vocabulary. The blocking factory hands the
+    /// name on to the async one, so one load holds both to the rule.
+    #[test]
+    fn a_path_that_does_not_exist_is_not_read_as_an_openai_model_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gpt-4o");
+        let name = missing.to_str().unwrap();
+        let error = create_tokenizer(name)
+            .err()
+            .expect("nothing to load")
+            .to_string();
+        assert_eq!(error, format!("File not found: {name}"));
     }
 
     #[tokio::test]
@@ -1073,5 +1153,27 @@ mod tests {
         );
         std::fs::remove_file(path.join("chat_template.json")).unwrap();
         assert_eq!(super::discover_processor_chat_template_in_dir(path), None);
+    }
+
+    /// A parse that panics on the pool unwinds the caller, as it did when it
+    /// ran inline: the panic is not turned into a failed load.
+    #[tokio::test]
+    #[should_panic(expected = "the parse panicked")]
+    async fn a_parse_that_panics_unwinds_the_caller() {
+        super::off_the_runtime(|| panic!("the parse panicked")).await;
+    }
+
+    /// With no runtime to hand the parse to, it runs inline as before: the
+    /// future is ready at its first poll.
+    #[test]
+    fn a_parse_with_no_runtime_runs_inline() {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+
+        let parse = std::pin::pin!(super::off_the_runtime(|| 7));
+        let ready = parse.poll(&mut Context::from_waker(Waker::noop()));
+        assert_eq!(ready, Poll::Ready(7));
     }
 }

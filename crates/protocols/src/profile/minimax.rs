@@ -7,6 +7,21 @@ use crate::{
     common::{invalid, ContentPart},
 };
 
+/// The `reasoning_effort` levels the contract names, the values the template
+/// renders into its effort tag
+/// ([`super::ProviderProfile::template_reasoning_effort`]); `minimal` is
+/// rendered as the lowest, `none` switches thinking off instead, any other
+/// value is the default depth.
+pub(super) const EFFORT_LEVELS: [&str; 5] = [EFFORT_LOW, "medium", "high", "xhigh", "max"];
+pub(super) const EFFORT_LOW: &str = "low";
+pub(super) const EFFORT_MINIMAL: &str = "minimal";
+/// The MiniMax templates' own thinking switch, sent as a template kwarg: the
+/// tri-state key and the two values that decide the mode (`adaptive`, or any
+/// other value, leaves the template's default).
+pub(super) const THINKING_MODE_KEY: &str = "thinking_mode";
+pub(super) const THINKING_MODE_ENABLED: &str = "enabled";
+pub(super) const THINKING_MODE_DISABLED: &str = "disabled";
+
 /// Tool-protocol strictness for conversation history (MPV tests 16_08, 16_09,
 /// 16_12): tool messages must answer a pending tool_call id, every tool_call
 /// must be answered, ids are unique across the whole conversation, and
@@ -113,19 +128,35 @@ pub(super) fn apply_defaults(req: &mut ChatCompletionRequest) {
 }
 
 /// The root messages as one: the first one's name, the contents joined in
-/// order.
+/// order, and for the date and for the location the first one a root names
+/// (the template prints one of each, and no line for an empty text, so an
+/// empty one names none).
 fn merge_roots(roots: Vec<ChatMessage>) -> Option<ChatMessage> {
     let mut merged: Option<(MessageContent, Option<String>)> = None;
+    let (mut date, mut location) = (None, None);
     for root in roots {
-        let ChatMessage::Root { content, name } = root else {
+        let ChatMessage::Root {
+            content,
+            name,
+            current_date,
+            current_location,
+        } = root
+        else {
             continue;
         };
+        date = date.or_else(|| current_date.filter(|text| !text.is_empty()));
+        location = location.or_else(|| current_location.filter(|text| !text.is_empty()));
         merged = Some(match merged {
             None => (content, name),
             Some((joined, first_name)) => (join_content(joined, content), first_name),
         });
     }
-    merged.map(|(content, name)| ChatMessage::Root { content, name })
+    merged.map(|(content, name)| ChatMessage::Root {
+        content,
+        name,
+        current_date: date,
+        current_location: location,
+    })
 }
 
 /// Two contents as one: texts joined by a blank line (an empty text adds

@@ -54,6 +54,12 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      {{- /* The Rust servicer drains in-flight streams on SIGTERM (up to
+           SMG_*_SERVICER_DRAIN_SECS, 30 s), then stops its server (5 s) and
+           terminates the engine (on vLLM, its process manager's
+           --shutdown-timeout first, 5 s when it is 0; then up to 30 s): 70 s,
+           past the kubelet's default grace of 30 s. */}}
+      terminationGracePeriodSeconds: {{ ternary 90 $worker.terminationGracePeriodSeconds (kindIs "invalid" $worker.terminationGracePeriodSeconds) | int }}
       containers:
         - name: worker
           image: {{ include "smg.workerImage" (dict "worker" $worker "global" $.Values.global "chart" $.Chart "defaults" $.Values.engineDefaults) }}

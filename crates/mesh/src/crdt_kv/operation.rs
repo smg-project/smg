@@ -46,26 +46,20 @@ impl Operation {
 
     /// Get the key of the operation
     pub fn key(&self) -> &str {
-        match self {
-            Self::Insert { key, .. } => key,
-            Self::Remove { key, .. } => key,
-        }
+        let (Self::Insert { key, .. } | Self::Remove { key, .. }) = self;
+        key
     }
 
     /// Get the timestamp of the operation
     pub fn timestamp(&self) -> u64 {
-        match self {
-            Self::Insert { timestamp, .. } => *timestamp,
-            Self::Remove { timestamp, .. } => *timestamp,
-        }
+        let (Self::Insert { timestamp, .. } | Self::Remove { timestamp, .. }) = self;
+        *timestamp
     }
 
     /// Get the replica ID of the operation
     pub fn replica_id(&self) -> ReplicaId {
-        match self {
-            Self::Insert { replica_id, .. } => *replica_id,
-            Self::Remove { replica_id, .. } => *replica_id,
-        }
+        let (Self::Insert { replica_id, .. } | Self::Remove { replica_id, .. }) = self;
+        *replica_id
     }
 }
 

@@ -16,16 +16,20 @@ use openai_protocol::{
     },
     responses::ResponsesRequest,
     transcription::{AudioFile, TranscriptionRequest},
+    UNKNOWN_MODEL_ID,
 };
-use tracing::{debug, warn};
+use smg_worker::identity::basic::WorkerType;
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::{
     common::{
         responses::{
-            background, handlers::cancel_response_impl, streaming::build_sse_response_from_stream,
-            utils::validate_worker_availability, BackgroundResponses, BackgroundStream,
-            ResponsesContext,
+            background,
+            handlers::cancel_response_impl,
+            streaming::build_sse_response_from_stream,
+            utils::{refuse_tools_without_a_direct_caller, validate_worker_availability},
+            BackgroundResponses, BackgroundStream, ResponsesContext,
         },
         stages::{
             context_length_exceeded, helpers::resolve_request_id_stamp, smallest_context_length,
@@ -41,17 +45,24 @@ use super::{
         responses, stages::decisions::supports_worker as supports_decisions_worker,
         streaming::StreamingProcessor,
     },
+    spec::MessagesTools,
     utils::{message_utils, missing_tokenizer_response, ParserResolver},
 };
 use crate::{
     app_context::AppContext,
-    config::types::RetryConfig,
+    config::{types::RetryConfig, GroupedDpSticky},
     middleware::TenantRequestMeta,
     observability::metrics::metrics_labels,
     routers::{
-        common::json_response, error, grpc::regular::symphony::template::Templates, RouterTrait,
+        common::{
+            json_response,
+            snapshot::{RoutingPool, WorkerRegistry, WorkerRegistryExt},
+        },
+        error,
+        grpc::regular::symphony::template::Templates,
+        RouterTrait,
     },
-    worker::{RoutingPool, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
+    tenant::storage_tenant,
 };
 
 /// The gRPC family router: one router over the gRPC request pipelines, built for one `Mode`.
@@ -107,15 +118,15 @@ impl GrpcRouter {
         // What can fail here is the operator's own setting, so the router
         // stops rather than coming up with media handling quietly switched
         // off and every media request failing later for no stated reason.
-        let multimodal = Some(Arc::new(
-            MultimodalComponents::new(
-                ctx.multimodal_config_registry.clone(),
-                ctx.router_config.mm_per_request_image_limit,
-                ctx.router_config.multimodal_max_inflight_bytes,
-                mm_settings(),
-            )
-            .map_err(|e| format!("multimodal components: {e:#}"))?,
-        ));
+        let mut multimodal = MultimodalComponents::new(
+            ctx.multimodal_config_registry.clone(),
+            ctx.router_config.mm_per_request_image_limit,
+            ctx.router_config.multimodal_max_inflight_bytes,
+            mm_settings(),
+        )
+        .map_err(|e| format!("multimodal components: {e:#}"))?;
+        multimodal.pixels_go_to = mode.pixels_go_to();
+        let multimodal = Some(Arc::new(multimodal));
 
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
@@ -129,7 +140,8 @@ impl GrpcRouter {
                 ctx.configured_reasoning_parser.clone(),
                 &tool_parser_factory,
                 &reasoning_parser_factory,
-            ),
+            )
+            .reading_by_alias(Arc::clone(&ctx.by_alias)),
             multimodal,
             tokenizer_autoload: !ctx.router_config.disable_tokenizer_autoload,
             tokenizer_load_failures: ctx.tokenizer_load_failures.clone(),
@@ -143,6 +155,26 @@ impl GrpcRouter {
         // The gRPC request timeout bounds each attempt's calls to its workers
         // and the streams they open; zero, the default, arms no deadline.
         let request_timeout = Duration::from_secs(ctx.router_config.grpc_request_timeout_secs);
+        // `--grouped-dp-sticky`: a sticky request to a grouped data-parallel
+        // worker is pinned to one of its engines at dispatch, and a
+        // disaggregated one to an engine of its grouped prefill worker
+        // through its bootstrap room. EPD requests are not pinned, so only
+        // the regular and PD routers announce the setting.
+        let grouped_dp_sticky = ctx.router_config.grouped_dp_sticky;
+        if grouped_dp_sticky != GroupedDpSticky::Off {
+            match mode {
+                Mode::Regular => info!(
+                    grouped_dp_sticky = grouped_dp_sticky.as_str(),
+                    "Sticky keys are pinned to the engines of grouped data-parallel workers"
+                ),
+                Mode::PrefillDecode => info!(
+                    grouped_dp_sticky = grouped_dp_sticky.as_str(),
+                    "Sticky keys are pinned to the engines of grouped data-parallel prefill \
+                     workers through their bootstrap rooms"
+                ),
+                Mode::EncodePrefillDecode => {}
+            }
+        }
         // Deps for the parser-consuming endpoints (chat/messages/harmony).
         let configured_deps = PipelineDeps::new(
             worker_registry.clone(),
@@ -155,7 +187,8 @@ impl GrpcRouter {
             ctx.rate_limit_manager.clone(),
             queue_timeout,
         )
-        .with_request_timeout(request_timeout);
+        .with_request_timeout(request_timeout)
+        .with_grouped_dp_sticky(grouped_dp_sticky);
         // Deps for the parser-free endpoints (completion/embeddings/classify/
         // decisions/transcription).
         let pair_deps = PipelineDeps::pair(
@@ -165,7 +198,8 @@ impl GrpcRouter {
             ctx.rate_limit_manager.clone(),
             queue_timeout,
         )
-        .with_request_timeout(request_timeout);
+        .with_request_timeout(request_timeout)
+        .with_grouped_dp_sticky(grouped_dp_sticky);
 
         // Present in every mode: chat/generate, messages, completion.
         let pipeline = RequestPipeline::build(Endpoint::Chat, mode, &configured_deps)
@@ -194,8 +228,6 @@ impl GrpcRouter {
                 .ok_or_else(|| "gRPC router requires MCP manager".to_string())?
                 .clone();
 
-            // Capture storage request context from middleware task-local (before any spawn)
-            let storage_request_context = smg_data_connector::current_request_context();
             // One registry of background responses for both contexts: one cap,
             // one place a cancel looks a running id up.
             let background_responses = Arc::new(BackgroundResponses::new(
@@ -212,7 +244,11 @@ impl GrpcRouter {
                     ctx.conversation_item_storage.clone(),
                     mcp_orchestrator.clone(),
                     ctx.mcp_format_registry.clone(),
-                    storage_request_context.clone(),
+                    // No storage context at start-up (outside any request):
+                    // each Responses branch of `route_responses_impl` derives
+                    // this request's context in the request task, and a cancel
+                    // runs under the middleware's live task-local.
+                    None,
                     background_responses.clone(),
                 )
             };
@@ -309,7 +345,7 @@ impl GrpcRouter {
     /// their state machines, not a copy of the 1 KiB request per hop.
     fn chat_request_for_pipeline(
         &self,
-        body: ChatCompletionRequest,
+        mut body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Result<(Arc<ChatCompletionRequest>, String, &RequestPipeline), Response> {
         if let Err(response) = super::validate_text_only_output(&body) {
@@ -339,9 +375,10 @@ impl GrpcRouter {
         // would no-op and otherwise leave the alias sitting in the body for
         // response metadata and parser selection to read.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
-        let mut canonical_body = body;
-        canonical_body.model.clone_from(&model_id_cloned);
-        Ok((Arc::new(canonical_body), model_id_cloned, pipeline))
+        if body.model != model_id_cloned {
+            Arc::make_mut(&mut body).model.clone_from(&model_id_cloned);
+        }
+        Ok((body, model_id_cloned, pipeline))
     }
 
     /// Main route_chat implementation, over the request
@@ -451,18 +488,12 @@ impl GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ResponsesRequest,
+        mut body: ResponsesRequest,
         model_id: &str,
     ) -> Response {
         let (Some(responses_context), Some(harmony_responses_context)) =
             (&self.responses_context, &self.harmony_responses_context)
         else {
-            return error::not_implemented(
-                "responses_not_implemented",
-                "Responses endpoint not implemented",
-            );
-        };
-        let Some(harmony_pipeline) = self.harmony_pipeline.as_ref() else {
             return error::not_implemented(
                 "responses_not_implemented",
                 "Responses endpoint not implemented",
@@ -474,9 +505,14 @@ impl GrpcRouter {
         {
             return error_response;
         }
+        // A tool only code may call has no caller on this router, which runs
+        // no programmatic tool calls.
+        if let Some(error_response) = refuse_tools_without_a_direct_caller(body.tools.as_deref()) {
+            return error_response;
+        }
 
-        let (body, canonical_model_id) =
-            canonicalize_responses_request(&self.worker_registry, &body, model_id);
+        let canonical_model_id =
+            canonicalize_responses_request(&self.worker_registry, &mut body, model_id);
         let model_id = canonical_model_id.as_ref();
 
         // Choose implementation based on Harmony model detection (checks worker metadata)
@@ -486,21 +522,18 @@ impl GrpcRouter {
         // `background: true` answers the queued object at once and runs the
         // work behind the response id; with the mode switched off such a
         // request runs in the foreground, and its object says so.
-        let mut body = body.into_owned();
+        clear_unapplied_reasoning_keys(&mut body);
         if body.background == Some(true) {
             if responses_context.background.enabled() {
                 let request_context = smg_data_connector::current_request_context();
-                let ctx = if is_harmony {
-                    self.harmony_responses_context(
-                        harmony_pipeline,
-                        harmony_responses_context,
-                        request_context,
-                    )
+                let base = if is_harmony {
+                    harmony_responses_context
                 } else {
-                    ResponsesContext {
-                        request_context,
-                        ..responses_context.clone()
-                    }
+                    responses_context
+                };
+                let ctx = ResponsesContext {
+                    request_context,
+                    ..base.clone()
                 };
                 return self
                     .route_background_responses(
@@ -522,11 +555,10 @@ impl GrpcRouter {
                 model_id,
                 body.stream.unwrap_or(false)
             );
-            let harmony_ctx = self.harmony_responses_context(
-                harmony_pipeline,
-                harmony_responses_context,
-                smg_data_connector::current_request_context(),
-            );
+            let harmony_ctx = ResponsesContext {
+                request_context: smg_data_connector::current_request_context(),
+                ..harmony_responses_context.clone()
+            };
 
             if body.stream.unwrap_or(false) {
                 serve_harmony_responses_stream(&harmony_ctx, body, tenant_meta.clone(), None).await
@@ -537,8 +569,15 @@ impl GrpcRouter {
                 }
             }
         } else {
+            // This request's storage context, read in the request task: the
+            // stream persists from a task of its own, where the middleware's
+            // task-local is gone.
+            let ctx = ResponsesContext {
+                request_context: smg_data_connector::current_request_context(),
+                ..responses_context.clone()
+            };
             responses::route_responses(
-                responses_context,
+                &ctx,
                 Arc::new(body),
                 headers.cloned(),
                 tenant_meta.clone(),
@@ -546,28 +585,6 @@ impl GrpcRouter {
             )
             .await
         }
-    }
-
-    /// The per-request context of the Harmony Responses path: the Harmony
-    /// pipeline with the shared storage and MCP handles and this request's
-    /// storage context.
-    fn harmony_responses_context(
-        &self,
-        harmony_pipeline: &RequestPipeline,
-        harmony_responses_context: &ResponsesContext,
-        request_context: Option<smg_data_connector::RequestContext>,
-    ) -> ResponsesContext {
-        ResponsesContext::new(
-            Arc::new(harmony_pipeline.clone()),
-            self.shared_components.clone(),
-            harmony_responses_context.response_storage.clone(),
-            harmony_responses_context.conversation_storage.clone(),
-            harmony_responses_context.conversation_item_storage.clone(),
-            harmony_responses_context.mcp_orchestrator.clone(),
-            harmony_responses_context.mcp_format_registry.clone(),
-            request_context,
-            harmony_responses_context.background.clone(),
-        )
     }
 
     /// `background: true`: the `queued` Response object is stored under a new
@@ -598,7 +615,7 @@ impl GrpcRouter {
             &ctx.response_storage,
             &queued,
             &request,
-            crate::tenant::storage_tenant(tenant_meta).as_deref(),
+            storage_tenant(tenant_meta).as_deref(),
             ctx.request_context.clone(),
         )
         .await
@@ -730,18 +747,25 @@ impl GrpcRouter {
     /// per hop.
     fn messages_request_for_pipeline(
         &self,
-        body: CreateMessageRequest,
+        mut body: Arc<CreateMessageRequest>,
         model_id: &str,
-    ) -> (Arc<CreateMessageRequest>, String) {
+    ) -> (Arc<CreateMessageRequest>, String, MessagesTools) {
         debug!("Processing messages request for model: {}", model_id);
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
         // doc comment. Rewrite the body's `model` field to match; see
         // `chat_request_for_pipeline`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
-        let mut canonical_body = body;
+        // The handler's `Arc` is the only handle at this point, so this
+        // borrows the request in place.
+        let canonical_body = Arc::make_mut(&mut body);
         canonical_body.model.clone_from(&model_id_cloned);
-        (Arc::new(canonical_body), model_id_cloned)
+        // The tools leave the request here, before the pipeline shares it:
+        // converted once, by value, into the chat tools the pipeline carries
+        // beside the request; the request's own `tools` reads `None` from
+        // here on, and whether it was set travels with them.
+        let tools = MessagesTools::take_from(canonical_body);
+        (body, model_id_cloned, tools)
     }
 
     /// Main route_messages implementation, over the request
@@ -752,6 +776,7 @@ impl GrpcRouter {
         tenant_meta: &TenantRequestMeta,
         canonical_body: Arc<CreateMessageRequest>,
         model_id_cloned: String,
+        tools: MessagesTools,
     ) -> Response {
         // `max_tokens: 0` is answered as the public API answers it: an empty
         // message that reports the prompt's token count; nothing is generated.
@@ -767,7 +792,7 @@ impl GrpcRouter {
                 canonical_body.stream.unwrap_or(false),
             );
             let response = self
-                .empty_message_response(tenant_meta, canonical_body, &model_id_cloned)
+                .empty_message_response(tenant_meta, canonical_body, &model_id_cloned, &tools)
                 .await;
             if !response.status().is_success() {
                 self.messages_pipeline
@@ -782,6 +807,7 @@ impl GrpcRouter {
                 self.messages_pipeline
                     .execute_messages(
                         canonical_body,
+                        tools,
                         headers.cloned(),
                         model_id,
                         self.shared_components.clone(),
@@ -835,7 +861,8 @@ impl GrpcRouter {
     /// failed for good will not get one on its own (503 without); a served
     /// model with no tokenizer when the gateway does not load tokenizers
     /// itself is a gateway fault (500), as is a prompt that does not encode;
-    /// a prompt that does not render is a 400.
+    /// a prompt that does not render is a 400, and a 500 where the model's
+    /// chat template failed on its own account whatever the request holds.
     /// `record_media` says whether the prompt's media counts in the
     /// per-request media series: the `max_tokens: 0` answer is a Messages
     /// request, a token count is not.
@@ -871,6 +898,7 @@ impl GrpcRouter {
             &*tokenizer,
             prompt.messages,
             record_media,
+            !tools.is_empty(),
         )
         .await?;
         message_utils::count_input_tokens(
@@ -883,8 +911,16 @@ impl GrpcRouter {
         .await
         .map_err(|e| match e {
             message_utils::CountError::Render(e) => {
-                debug!(model = %model_id, error = %e, "the request does not render");
-                error::bad_request("process_messages_failed", e)
+                // A failure that is the template's own whatever the request
+                // holds is the deployment's to fix and gets a line an
+                // operator reads; any other render failure may be the
+                // client's.
+                if e.is_template_failure() {
+                    tracing::error!(model = %model_id, error = %e, "the chat template failed to render");
+                } else {
+                    debug!(model = %model_id, error = %e, "the request does not render");
+                }
+                e.answer()
             }
             message_utils::CountError::Encode(e) => {
                 tracing::error!(model = %model_id, error = %e, "tokenization failed");
@@ -916,12 +952,13 @@ impl GrpcRouter {
         tenant_meta: &TenantRequestMeta,
         body: Arc<CreateMessageRequest>,
         model_id: &str,
+        tools: &MessagesTools,
     ) -> Response {
         let input_tokens = match self
             .count_prompt_tokens(
                 model_id,
                 message_utils::MessagesPrompt::from(&*body),
-                &body.chat_tools(),
+                &tools.chat_tools,
                 body.tool_choice.as_ref(),
                 true,
             )
@@ -1167,7 +1204,7 @@ impl RouterTrait for GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: ChatCompletionRequest,
+        body: Arc<ChatCompletionRequest>,
         model_id: &str,
     ) -> Response {
         match self.chat_request_for_pipeline(body, model_id) {
@@ -1202,7 +1239,7 @@ impl RouterTrait for GrpcRouter {
                 "Cancel response not implemented",
             );
         };
-        let tenant = crate::tenant::storage_tenant(tenant_meta);
+        let tenant = storage_tenant(tenant_meta);
         cancel_response_impl(responses_context, tenant.as_deref(), response_id).await
     }
 
@@ -1291,11 +1328,11 @@ impl RouterTrait for GrpcRouter {
         &self,
         headers: Option<&HeaderMap>,
         tenant_meta: &TenantRequestMeta,
-        body: CreateMessageRequest,
+        body: Arc<CreateMessageRequest>,
         model_id: &str,
     ) -> Response {
-        let (body, model_id) = self.messages_request_for_pipeline(body, model_id);
-        self.route_messages_impl(headers, tenant_meta, body, model_id)
+        let (body, model_id, tools) = self.messages_request_for_pipeline(body, model_id);
+        self.route_messages_impl(headers, tenant_meta, body, model_id, tools)
             .await
     }
 
@@ -1322,25 +1359,41 @@ impl RouterTrait for GrpcRouter {
 /// gone before dispatch. Otherwise a plain answer reports the canonical ID
 /// while a tool call answer reports the alias.
 ///
-/// Returns both halves together so a caller cannot take the canonical model ID
-/// and forget the body, or the reverse. The common path borrows both untouched
+/// The id is rewritten on the body the router already owns, so neither the
+/// alias nor the canonical case copies the request. Returns the canonical
+/// model ID the workers are selected by; the common path borrows it untouched
 /// and allocates nothing.
 fn canonicalize_responses_request<'a>(
     worker_registry: &WorkerRegistry,
-    body: &'a ResponsesRequest,
+    body: &mut ResponsesRequest,
     model_id: &'a str,
-) -> (Cow<'a, ResponsesRequest>, Cow<'a, str>) {
+) -> Cow<'a, str> {
     let Some(canonical_model) = worker_registry.resolve_model_alias(model_id) else {
-        return (Cow::Borrowed(body), Cow::Borrowed(model_id));
+        return Cow::Borrowed(model_id);
     };
-    let mut canonical_body = body.clone();
-    canonical_body.model.clear();
-    canonical_body.model.push_str(&canonical_model);
-    (
-        Cow::Owned(canonical_body),
-        Cow::Owned(canonical_model.to_string()),
-    )
+    body.model.clear();
+    body.model.push_str(&canonical_model);
+    Cow::Owned(canonical_model.to_string())
+}
+
+/// Clears the reasoning config's `mode`, `context` and `generate_summary`,
+/// which no engine behind this router applies.
+///
+/// The router reads only `effort` from the config (the chat request's
+/// `reasoning_effort`, or the Harmony prompt's). Every Response object it
+/// writes for the request echoes the config: the streamed terminal event,
+/// the non-streamed body and the stored object that
+/// `GET /v1/responses/{id}` reads back. Left in, a `mode: "pro"` request
+/// would read back as run in `pro` mode on an engine that ran in its
+/// default. `effort` and `summary` are echoed as before.
+fn clear_unapplied_reasoning_keys(body: &mut ResponsesRequest) {
+    if let Some(reasoning) = body.reasoning.as_mut() {
+        reasoning.mode = None;
+        reasoning.context = None;
+        reasoning.generate_summary = None;
+    }
 }
 
 #[cfg(test)]
+#[path = "../../../tests/unit/routers/grpc/router/tests.rs"]
 mod tests;

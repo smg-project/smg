@@ -8,7 +8,7 @@
 //! value on a line of its own and MiMo writes it between the tags directly, which the syntax's
 //! [`Placement`] says.
 //!
-//! The table carries the one part of its chat template's layout the tags write: after the
+//! The table carries the parts of its chat template's layout the tags write: after the
 //! thought's close the Qwen3 and Qwen 3.5 templates write two newlines before the content or the
 //! first call (`</think>\n\n<tool_call>`), so a forced call written where the close left the
 //! engine begins with them, as the template writes it, and the call's marker is not the grammar's
@@ -16,7 +16,9 @@
 //! close, so the table under the direct placement carries none; the NVIDIA Nemotron 3 groups and
 //! Step 3.5 Flash, which read with the tagged table, write one newline there, which their entries
 //! in `groups.json` carry in the table's place (`after`). The thought the model opens and closes
-//! itself: a `<tool_call>` inside it is thought text, as the template reads it.
+//! itself: a `<tool_call>` inside it is thought text, as the template reads it. Between two calls
+//! the templates write one newline, which the table carries too; a required turn's tag takes it
+//! once or twice, since the LFM3 templates and d1-2B's write two.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -49,7 +51,9 @@ pub fn qwen3(syntax: CallSyntax) -> Format {
     if matches!(syntax, CallSyntax::Tagged(_, Placement::Direct)) {
         return format;
     }
-    format.with_layout(super::thought_layout("</think>", "\n\n"))
+    let mut layout = super::thought_layout("</think>", "\n\n");
+    layout.between_calls = Some("\n".into());
+    format.with_layout(layout)
 }
 
 #[cfg(test)]
@@ -76,7 +80,7 @@ mod tests {
     use crate::{
         adapt::chat,
         engine::Engine,
-        event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
+        event::{CallEnd, DropReason, Event, Events, FinishReason, MalformedReason, Text},
         input::{EngineFinish, Input, TokenSpan},
         parser::{ParseError, Parser},
         Declared,
@@ -236,6 +240,7 @@ mod tests {
                 Event::ToolCallEnd {
                     index: 0,
                     source: Text::uncounted("}"),
+                    ended: CallEnd::Closed,
                 },
                 dropped("\n"),
                 dropped("</tool_call>"),
@@ -429,6 +434,12 @@ mod tests {
                 "{pieces:?}"
             );
         }
+        // Two newlines between two calls, as a group's own template writes them, are spacing too.
+        let doubled = format!("\n</think>\n\n{TAGGED_CALL}\n\n{TAGGED_CALL}");
+        let events = after_prompt(prompt, &doubled);
+        assert_eq!(content(&events), "");
+        assert_eq!(spacing(&events), ["\n\n", "\n\n"]);
+        assert_eq!(arguments_of(&events, 1), r#"{"city": "Paris", "days": 3}"#);
         // Text after the thought keeps the spacing around it as content, whole and streamed:
         // the stream shows the spacing with the text it belongs to.
         let output = format!("\n</think>\n\nSure.\n{TAGGED_CALL}");
@@ -656,6 +667,7 @@ mod tests {
                 Event::ToolCallEnd {
                     index: 0,
                     source: Text::default(),
+                    ended: CallEnd::Closed,
                 },
                 dropped("</tool_call>"),
                 Event::Finish {
@@ -1164,6 +1176,7 @@ mod tests {
                 Event::ToolCallEnd {
                     index: 0,
                     source: Text::uncounted("</function>"),
+                    ended: CallEnd::Closed,
                 },
                 dropped("\n"),
                 dropped("</tool_call>"),
@@ -1358,7 +1371,7 @@ mod tests {
         assert_eq!(bytes(&events), output);
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::ToolCallEnd { index: 0, source } if source.text.is_empty()
+            Event::ToolCallEnd { index: 0, source, .. } if source.text.is_empty()
         )));
         assert!(matches!(
             events.last(),

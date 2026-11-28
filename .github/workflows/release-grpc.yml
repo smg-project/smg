@@ -101,9 +101,9 @@ jobs:
 
       - name: Copy proto files (replace symlink with real files)
         run: |
-          rm -f crates/grpc_client/python/smg_grpc_proto/proto
+          rm -rf crates/grpc_client/python/smg_grpc_proto/proto
           mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
-          cp crates/grpc_client/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
+          cp crates/grpc_client/proto/*.proto crates/worker/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
 
       - name: Build package
         run: cd crates/grpc_client/python && python -m build

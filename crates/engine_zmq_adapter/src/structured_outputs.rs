@@ -231,6 +231,62 @@ impl ConstraintRef<'_> {
     }
 }
 
+/// The JSON schema to send in place of a structural tag that is a JSON
+/// answer's schema alone, where the engine's backend is not the one the tag
+/// is spelled for; `None` for every other constraint and support, which
+/// leaves the constraint as it came. Every wire applies it on its request
+/// path, before the refusal below reads the constraint that is sent.
+///
+/// A structural tag is spelled for xgrammar, the one backend that compiles
+/// the triggered-tags format, and a JSON answer's schema comes wrapped in a
+/// tag of that one node where the white space between its tokens is bounded.
+/// An engine pinned to another backend, or one whose backend compiles a JSON
+/// schema and no structural tag, fails such a tag at grammar compile or is
+/// refused it below, and enforces the schema itself: it gets the schema, as
+/// it does where nothing bounds the white space, and the bound only the tag
+/// carries is dropped. Under the engine's default (`Auto`), under xgrammar
+/// pinned and under a backend this adapter does not know the tag goes on; a
+/// disabled backend refuses it as the tag it is. The tag is the schema alone
+/// when its `format` is a `json_schema` node in the plain JSON style that
+/// excludes nothing: a call's tag, and an answer's tag with anything around
+/// its schema, stay tags. The schema is written with its keys in the order
+/// the tag carries them, the order a grammar writes an object's properties
+/// in.
+pub(crate) fn answer_schema_in_place_of_tag(
+    constraint: Option<ConstraintRef<'_>>,
+    support: StructuredOutputsSupport,
+) -> Option<String> {
+    let Some(ConstraintRef::StructuralTag(tag)) = constraint else {
+        return None;
+    };
+    let another_backend = match support.backend {
+        StructuredOutputsBackendConfig::Pinned(backend) => {
+            backend != StructuredOutputBackend::Xgrammar
+        }
+        StructuredOutputsBackendConfig::Auto | StructuredOutputsBackendConfig::Other => false,
+        StructuredOutputsBackendConfig::Disabled => return None,
+    };
+    if !support.kinds.json_schema || (support.kinds.structural_tag && !another_backend) {
+        return None;
+    }
+    let tag: serde_json::Value = serde_json::from_str(tag).ok()?;
+    let format = tag.get("format")?;
+    let plain_json = format.get("style").is_none_or(|style| style == "json");
+    let excludes_nothing = format
+        .get("excludes")
+        .and_then(serde_json::Value::as_array)
+        .is_none_or(Vec::is_empty);
+    if format.get("type")? != "json_schema" || !plain_json || !excludes_nothing {
+        return None;
+    }
+    let schema = format.get("json_schema")?.to_string();
+    tracing::debug!(
+        backend = support.backend.name(),
+        "a structural tag that is a JSON answer's schema alone goes to the engine as that schema"
+    );
+    Some(schema)
+}
+
 /// Refuse, before the engine, a constraint its grammar backend cannot
 /// enforce; `Ok` for a request without one, and for one the backend compiles
 /// whole. Every wire applies it on its request path, with the support the
@@ -250,7 +306,9 @@ impl ConstraintRef<'_> {
 /// and the engine answers off the schema with a 200, which is why an engine's
 /// own frontend refuses it under an xgrammar backend (a 400); a backend that
 /// enforces such a schema itself takes the constraint
-/// as is, and so does one this adapter does not know. The message names the
+/// as is, and so does one this adapter does not know. The caller sends the
+/// refusal as [`smg_grpc_client::constraint_refused_status`], whose trailer a
+/// router answers as the request's 400. The message names the
 /// constraint's source, the keyword, where it stands and, in a tag, the tags
 /// around it by their `begin` (a call's opens with the tool's name).
 pub fn refuse_unenforceable_constraint(
@@ -520,6 +578,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The tag of a JSON answer's schema alone goes as that schema to a
+    /// backend pinned to another name than the one tags are spelled for and
+    /// to a backend that compiles a schema and no tag; it stays a tag under
+    /// the default, under xgrammar pinned, under an unknown backend and
+    /// under a disabled one, and so does every tag that is more than that
+    /// schema.
+    #[test]
+    fn an_answer_tag_goes_as_its_schema_only_where_the_backend_takes_no_such_tag() {
+        use engine_zmq_client::protocol::vllm::structured_outputs::StructuredOutputBackend::{
+            Guidance, LmFormatEnforcer, Outlines, Xgrammar,
+        };
+
+        use crate::test_support::{answer_tag, call_tag, ANSWER_SCHEMA};
+
+        let schema_and_no_tag = ConstraintKinds {
+            structural_tag: false,
+            ..ConstraintKinds::ALL
+        };
+        let no_schema = ConstraintKinds {
+            json_schema: false,
+            ..ConstraintKinds::ALL
+        };
+        let tag = answer_tag();
+        let sent = |tag: &str, support: StructuredOutputsSupport| {
+            answer_schema_in_place_of_tag(Some(ConstraintRef::StructuralTag(tag)), support)
+        };
+        for support in [
+            Pinned(Guidance).into(),
+            Pinned(Outlines).into(),
+            Pinned(LmFormatEnforcer).into(),
+            StructuredOutputsSupport::new(Pinned(Xgrammar), schema_and_no_tag),
+            StructuredOutputsSupport::new(Other, schema_and_no_tag),
+        ] {
+            assert_eq!(
+                sent(&tag, support).as_deref(),
+                Some(ANSWER_SCHEMA),
+                "{support:?}"
+            );
+        }
+        for support in [
+            Auto.into(),
+            Pinned(Xgrammar).into(),
+            Other.into(),
+            Disabled.into(),
+            StructuredOutputsSupport::new(Pinned(Guidance), no_schema),
+        ] {
+            assert_eq!(sent(&tag, support), None, "{support:?}");
+        }
+        let guidance: StructuredOutputsSupport = Pinned(Guidance).into();
+        let bound = r#","max_whitespace_cnt":32"#;
+        let styled = tag.replace(bound, r#","style":"qwen_xml""#);
+        let excluding = tag.replace(bound, r#","excludes":["</answer>"]"#);
+        for more_than_the_schema in [call_tag(), styled, excluding] {
+            assert_eq!(
+                sent(&more_than_the_schema, guidance),
+                None,
+                "{more_than_the_schema}"
+            );
+        }
+        let schema = Some(ConstraintRef::JsonSchema(ANSWER_SCHEMA));
+        assert_eq!(answer_schema_in_place_of_tag(schema, guidance), None);
     }
 
     /// A connection nobody configured keeps what its wire ran before: the

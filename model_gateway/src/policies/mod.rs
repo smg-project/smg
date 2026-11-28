@@ -3,25 +3,46 @@
 //! This module provides a unified abstraction for routing policies that work
 //! across both regular and prefill-decode (PD) routing modes.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{any::TypeId, fmt::Debug, sync::Arc};
 
+use openai_protocol::UNKNOWN_MODEL_ID;
 use rand::RngExt as _;
+use smg_worker::{identity::basic::Worker, load::state::LoadReceiver, runtime::RoutingState};
 
-use crate::{
-    config::CacheIndexKind,
-    worker::{load_state::LoadReceiver, runtime::RoutingState, HashRing, Worker},
-};
+use crate::{config::CacheIndexKind, policies::hash_ring::HashRing};
 
 mod bucket;
 mod cache_aware;
 mod cache_namespace;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_all_vetoed_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_cache_aware_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_manual_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_prefix_hash_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_rows;
+#[cfg(test)]
+#[expect(clippy::print_stdout, reason = "a recorder says where its sheet went")]
+mod classic_sticky_override_rows;
 mod consistent_hashing;
 pub mod cost;
 mod dp_min_token;
-pub mod engine_host;
+pub mod expected_wait;
 mod factory;
-pub mod host_stores;
+pub mod hash_ring;
+mod kept_rings;
+pub mod kv_index;
+mod labels;
 mod least_load;
+mod lent_trees;
 mod manual;
 mod passthrough;
 mod power_of_two;
@@ -31,25 +52,30 @@ mod registry;
 mod round_robin;
 #[cfg(test)]
 pub(crate) mod test_support;
-pub(crate) mod utils;
+#[cfg(test)]
+mod worker_load_tests;
 
+// Re-export PrefixMatchResult from kv_index for production use
+pub use ::kv_index::PrefixMatchResult;
 pub use bucket::BucketPolicy;
 pub use cache_aware::{CacheAwarePolicy, TreeHandle, TreeKind};
 pub use cache_namespace::{CacheNamespace, TEXT_MARKER_LEN, TOKEN_MARKER_LEN};
 pub use consistent_hashing::ConsistentHashingPolicy;
 pub use dp_min_token::MinimumTokensPolicy;
-pub use engine_host::Decider;
 pub use factory::PolicyFactory;
-// Re-export PrefixMatchResult from kv_index for production use
-pub use kv_index::PrefixMatchResult;
+pub(crate) use labels::{cut_mark, Respec};
 pub use least_load::LeastLoadPolicy;
+pub(crate) use lent_trees::{EngineCaches, LentTrees};
 pub use manual::{ManualConfig, ManualPolicy};
 pub use passthrough::PassthroughPolicy;
 pub use power_of_two::PowerOfTwoPolicy;
 pub use prefix_hash::{PrefixHashConfig, PrefixHashPolicy};
 pub use random::RandomPolicy;
-pub use registry::PolicyRegistry;
+pub use registry::{PolicyRegistry, Side};
 pub use round_robin::RoundRobinPolicy;
+// The periodic task lives beside the worker runtime. The path it had here is
+// kept: the policies name it.
+pub(crate) use smg_worker::periodic_task as utils;
 
 /// Core trait for load balancing policies
 ///
@@ -73,8 +99,29 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// outcome itself is not carried here: it reaches the worker's circuit
     /// breaker through `record_outcome`, and a policy that wants a failure
     /// signal reads the worker's breaker state.
+    ///
+    /// A policy that gives this a body answers `true` from
+    /// [`Self::hears_request_complete`] (the default): while no policy of a
+    /// registry hears, the registry calls this on no policy.
     fn on_request_complete(&self, _worker_url: &str) {
         // Default: no-op for stateless policies
+    }
+
+    /// Whether this policy acts on a request's end
+    /// ([`Self::on_request_complete`]).
+    ///
+    /// The registry asks where a policy enters it, and while none of its
+    /// policies hears, a request's end is reported to no policy. Yes by
+    /// default, so a policy that says nothing is told of every end as before;
+    /// a policy that leaves `on_request_complete` empty says no.
+    ///
+    /// A policy's answer is a constant for its lifetime: the registry reads
+    /// it once, where the policy enters, so a policy that says no and acts
+    /// on an end later may never be told of one. Once one policy of a
+    /// registry hears, the registry reports every end again, to the policies
+    /// that say no as well.
+    fn hears_request_complete(&self) -> bool {
+        true
     }
 
     /// Get policy name for metrics and debugging
@@ -137,8 +184,19 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// owner. Single-worker placement over regular workers then leaves the
     /// absolute overload veto off the selection instead of moving the session
     /// off the worker holding its cache each time that worker crosses a
-    /// threshold (see `placement::select_from`).
+    /// threshold (see `placement::select_single`).
     fn routes_by_session_key(&self, _info: &SelectWorkerInfo) -> bool {
+        false
+    }
+
+    /// Whether this policy places a request that carries a routing key by
+    /// that key itself, reading the header ahead of the key derived from
+    /// the request id as the sticky routing-key override does (`manual`,
+    /// `consistent_hashing`). The override leaves such a policy its own
+    /// handling and places a keyed request of every other policy. The
+    /// registry asks the policy, and never reads its name for it: a name is
+    /// a label. A constant for the policy's lifetime.
+    fn honors_routing_key(&self) -> bool {
         false
     }
 
@@ -155,8 +213,9 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     ///
     /// Every request end reaches [`Self::on_request_complete`] through the
     /// worker's load guard; this is the safety net behind it. The worker
-    /// monitor calls it once per load poll with the requests the router still
-    /// holds on the worker. A dispatch books once and a completion releases
+    /// monitor calls it at every batch of a group's load answers, for every
+    /// worker of the group, with the requests the router still holds on the
+    /// worker. A dispatch books once and a completion releases
     /// once, so whatever a policy holds beyond `in_flight` is a completion
     /// that never arrived (a worker that moved under another policy, a sink
     /// never installed) and is released here rather than kept for good.
@@ -196,15 +255,30 @@ pub(crate) fn as_bucket(policy: &dyn LoadBalancingPolicy) -> Option<&BucketPolic
 
 /// Whether a built-in policy applies the complete [`Worker::is_available`]
 /// predicate before selecting. Other policies keep the caller-side filter.
+///
+/// The policy says its type once and the types are compared as values, so
+/// a type late in the list costs a compare for each type ahead of it and
+/// no call.
 pub(crate) fn policy_filters_unavailable_workers(policy: &dyn LoadBalancingPolicy) -> bool {
+    let policy = policy.as_any().type_id();
+    policy == TypeId::of::<RandomPolicy>()
+        || policy == TypeId::of::<RoundRobinPolicy>()
+        || policy == TypeId::of::<LeastLoadPolicy>()
+        || policy == TypeId::of::<PowerOfTwoPolicy>()
+        || policy == TypeId::of::<CacheAwarePolicy>()
+        || policy == TypeId::of::<ManualPolicy>()
+        || policy == TypeId::of::<PassthroughPolicy>()
+}
+
+/// Whether a built-in policy reads the model's hash ring
+/// ([`SelectWorkerInfo::hash_ring`]). Single-worker placement fetches the
+/// ring for these alone: the fetch is a keyed read of the registry and a
+/// shared count, up and down, on every request. A policy that starts to read
+/// the ring joins this list; left out, it is handed none and places by its
+/// ring-less fallback.
+pub(crate) fn policy_reads_hash_ring(policy: &dyn LoadBalancingPolicy) -> bool {
     let policy = policy.as_any();
-    policy.is::<RandomPolicy>()
-        || policy.is::<RoundRobinPolicy>()
-        || policy.is::<LeastLoadPolicy>()
-        || policy.is::<PowerOfTwoPolicy>()
-        || policy.is::<CacheAwarePolicy>()
-        || policy.is::<ManualPolicy>()
-        || policy.is::<PassthroughPolicy>()
+    policy.is::<ConsistentHashingPolicy>() || policy.is::<PrefixHashPolicy>()
 }
 
 pub trait DPRankLoadPolicy: Send + Sync + Debug {
@@ -405,7 +479,7 @@ pub(crate) fn draw_eligible(
 #[inline]
 pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     if model_id.is_empty() {
-        crate::worker::UNKNOWN_MODEL_ID
+        UNKNOWN_MODEL_ID
     } else {
         model_id
     }
@@ -462,8 +536,15 @@ pub struct SelectWorkerInfo<'a> {
     /// body access populate it); used when no valid routing-key header is
     /// present under the routing-key override.
     pub rid_key: Option<&'a str>,
-    /// Pre-computed hash ring for O(log n) consistent hashing
-    /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
+    /// The hash ring the model's requests are placed on, for O(log n)
+    /// consistent hashing: the ring of the model's membership generation,
+    /// or the ring kept from another generation while that one is
+    /// filled, so no request builds it. The ring can therefore name workers
+    /// that left and lack workers that joined: a policy that walks it takes
+    /// a URL only where its own workers hold an eligible worker there, and
+    /// places a request that no URL takes as with no ring. A placement
+    /// hands the ring to a policy that reads it (`policy_reads_hash_ring`)
+    /// and `None` to any other, and to all before a model's first ring.
     pub hash_ring: Option<Arc<HashRing>>,
     /// Which PD role this selection is for (default `Single`); namespaces
     /// header-based sticky routing so prefill and decode stick independently.
@@ -479,6 +560,44 @@ pub struct SelectWorkerInfo<'a> {
     /// placement over regular workers also sets it for a request its policy
     /// places by session key ([`LoadBalancingPolicy::routes_by_session_key`]).
     pub overload_lifted: bool,
+    /// The list of the routing snapshot the candidates are cut from, when
+    /// the caller names it ([`NamedList`]). A policy that keeps state per
+    /// list finds it by the list's own address, whatever part of the list
+    /// this request may use; without a name the policy reads which workers
+    /// it was handed.
+    pub named: Option<NamedList<'a>>,
+}
+
+/// The candidates of a selection as a part of a list the routing snapshot
+/// owns. The list never changes while it lives (a membership change makes a
+/// new one), so its address names it, and a candidate is a position in it.
+#[derive(Clone, Copy)]
+pub struct NamedList<'a> {
+    /// The snapshot's own list.
+    pub list: &'a Arc<[Arc<dyn Worker>]>,
+    /// Candidate `k` is `list[positions[k]]`, ascending; `None` when the
+    /// candidates are the whole list in its order.
+    pub positions: Option<&'a [usize]>,
+}
+
+impl NamedList<'_> {
+    /// The candidate that is the list's worker at `row`, when the request
+    /// may use that worker.
+    pub(crate) fn candidate(&self, row: usize) -> Option<usize> {
+        match self.positions {
+            None => Some(row),
+            Some(positions) => positions.binary_search(&row).ok(),
+        }
+    }
+}
+
+impl Debug for NamedList<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NamedList")
+            .field("list", &self.list.len())
+            .field("positions", &self.positions.map(<[usize]>::len))
+            .finish()
+    }
 }
 
 impl SelectWorkerInfo<'_> {
@@ -497,11 +616,14 @@ impl SelectWorkerInfo<'_> {
 #[cfg(test)]
 mod tests {
     use openai_protocol::worker::WorkerStatus;
+    use smg_worker::{
+        identity::basic::{WorkerLoadGuard, WorkerType},
+        runtime::StallReason,
+        test_support::no_health_check,
+    };
 
     use super::*;
-    use crate::worker::{
-        runtime::StallReason, test_support::no_health_check, BasicWorkerBuilder, WorkerType,
-    };
+    use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
     #[test]
     fn test_get_healthy_worker_indices() {
@@ -598,7 +720,7 @@ mod tests {
         );
 
         // A busy worker is still eligible: load alone is not the veto.
-        let _guard = crate::worker::WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
+        let _guard = WorkerLoadGuard::with_key(Arc::clone(&workers[1]), None);
         assert_eq!(
             get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
             vec![0, 1, 2]
@@ -676,8 +798,9 @@ mod tests {
         use std::{sync::Arc, time::Duration};
 
         use openai_protocol::worker::WorkerStatus;
+        use smg_worker::{health::circuit_breaker::CircuitBreakerConfig, identity::basic::Worker};
 
-        use crate::worker::{circuit_breaker::CircuitBreakerConfig, BasicWorkerBuilder, Worker};
+        use crate::routers::grpc::backend_client::BasicWorkerBuilder;
 
         fn worker(url: &str) -> Arc<dyn Worker> {
             let worker: Arc<dyn Worker> = Arc::new(

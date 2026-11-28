@@ -11,15 +11,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import errno
 import inspect
 import json
 import logging
 import os
 import re
+import socket
 import time
 import uuid
-from collections.abc import Awaitable, Iterable, Mapping, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 from smg_grpc_servicer.mm_sidecar_protocol import (
     CLIENT_ERROR_CODES,
@@ -47,13 +50,18 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     resolve_namespace,
 )
 from smg_grpc_servicer.vllm import config_view
+from smg_grpc_servicer.vllm.media_host_guard import (
+    MediaHostRefused,
+    MediaRedirectRefused,
+    media_connector_kwargs,
+    raised_by_fetch,
+)
 from smg_grpc_servicer.vllm.media_refs import (
     BASE_SCHEMES,
     FETCHABLE_MODALITIES,
     advertised_schemes,
     parse_scheme_list,
 )
-from smg_grpc_servicer.vllm.short_side_floor import FloorRule, floor_rule, raise_to_floor_off_loop
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +73,7 @@ ENV_MAX_ITEMS = "SMG_VLLM_MM_MAX_ITEMS"
 ENV_TURBOJPEG = "SMG_VLLM_MM_TURBOJPEG"
 ENV_FETCH_TIMEOUT_MS = "SMG_VLLM_MM_FETCH_TIMEOUT_MS"
 ENV_VIDEO_FETCH_TIMEOUT_MS = "SMG_VLLM_MM_VIDEO_FETCH_TIMEOUT_MS"
+ENV_ALLOW_PRIVATE_MEDIA_HOSTS = "SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS"
 TURBOJPEG_FLAG = "--mm-turbojpeg"
 
 MODE_OFF = "off"
@@ -90,6 +99,134 @@ MIN_VLLM_VERSION = "0.20.0"
 
 class MmProcessorUnavailable(Exception):
     """Retryable backend failure (sidecar down, overloaded, timed out)."""
+
+
+# The public codes a failure of the request's own media answers under, as the
+# router names them: media refused as the request sent it, a fetch or read
+# that failed, and a size cap.
+INVALID_MULTIMODAL_REQUEST = "invalid_multimodal_request"
+MEDIA_FETCH_FAILED = "media_fetch_failed"
+MEDIA_TOO_LARGE = "media_too_large"
+_CLIENT_MEDIA_CODE_ATTR = "smg_client_media_code"
+
+
+def mark_client_media(exc: BaseException, code: str = MEDIA_FETCH_FAILED) -> BaseException:
+    """`exc`, marked as the request's own media failing under the public `code`."""
+    setattr(exc, _CLIENT_MEDIA_CODE_ATTR, code)
+    return exc
+
+
+def client_media_code(exc: BaseException) -> str | None:
+    """The public code `mark_client_media` put on `exc`, if any."""
+    code = getattr(exc, _CLIENT_MEDIA_CODE_ATTR, None)
+    return code if isinstance(code, str) else None
+
+
+def _raised_from(exc: BaseException | None):
+    """`exc` and the exceptions it was raised from, newest first."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        yield exc
+        # As the traceback reads it: the explicit cause (`from`), else the
+        # exception being handled when this one was raised.
+        exc = exc.__cause__ if exc.__suppress_context__ else exc.__context__
+
+
+# The gateway's media-fault kinds, as the media-fault trailer names them.
+MEDIA_FAULT_CLIENT = "client"
+MEDIA_FAULT_TRANSIENT = "transient"
+
+
+class MmMediaFetchFault(MmProcessorUnavailable):
+    """A reference's fetch that failed for the reference's own reason, with
+    its media-fault kind. Still an `MmProcessorUnavailable`: a caller that
+    does not read the kind keeps the retryable answer."""
+
+    def __init__(self, fault: str, message: str) -> None:
+        super().__init__(message)
+        self.fault = fault
+
+
+# Connect errors that name this worker, not the reference's host: its
+# limits, its route, its egress rules. Another worker may connect.
+_LOCAL_CONNECT_ERRNOS = frozenset(
+    {
+        errno.EMFILE,
+        errno.ENFILE,
+        errno.ENOBUFS,
+        errno.ENOMEM,
+        errno.EADDRNOTAVAIL,
+        errno.ENETDOWN,
+        errno.ENETUNREACH,
+        errno.EHOSTUNREACH,
+        errno.EACCES,
+        errno.EPERM,
+    }
+)
+
+# A resolver's codes for a name that does not exist or has no address. Any
+# other resolver failure may be this worker's resolver.
+_UNRESOLVED_NAME_CODES = frozenset(
+    {socket.EAI_NONAME, getattr(socket, "EAI_NODATA", socket.EAI_NONAME)}
+)
+
+
+def fetch_fault_classifier(http: Any) -> Callable[[BaseException, str], str | None]:
+    """The media-fault kind of a fetch failure, read from its type and the
+    reference's URL, or None for one that stays the worker's and retryable.
+    `http` is the fetcher's HTTP client library: its exception classes. An
+    allow-list: only a failure that names the reference's host or origin is
+    typed."""
+    # Resolved here: a client library without these classes fails where the
+    # classifier is built, not inside a request's failure arm.
+    proxy = (http.ClientProxyConnectionError, http.ClientHttpProxyError)
+    connector = http.ClientConnectorError
+    dns = http.ClientConnectorDNSError
+    tls = http.ClientSSLError
+    response = http.ClientResponseError
+    timeouts = (TimeoutError, asyncio.TimeoutError)
+
+    def classify(error: BaseException, url: str) -> str | None:
+        # The proxy's failures are connector and response errors too.
+        if isinstance(error, proxy):
+            return None
+        if isinstance(error, timeouts):
+            return MEDIA_FAULT_TRANSIENT
+        if isinstance(error, connector):
+            os_error = getattr(error, "os_error", None)
+            # The kernel's connect timeout arrives inside a connector error.
+            if isinstance(os_error, timeouts):
+                return MEDIA_FAULT_TRANSIENT
+            # The error names the host the connection was for. Any other
+            # host than the reference's is the worker's proxy or a
+            # redirect's target.
+            try:
+                reference_host = urlsplit(url).hostname
+            except ValueError:
+                return None
+            host = getattr(error, "host", None)
+            if host is None or host != reference_host:
+                return None
+            code = getattr(os_error, "errno", None)
+            # A name is the reference's only when the resolver says it does
+            # not exist.
+            if isinstance(error, dns):
+                return MEDIA_FAULT_CLIENT if code in _UNRESOLVED_NAME_CODES else None
+            # Read by its class: the TLS library's codes share numbers with
+            # the system's (its generic error is 1, as EPERM is).
+            if isinstance(error, tls):
+                return MEDIA_FAULT_CLIENT
+            # A reset during an HTTPS handshake may be the worker's proxy
+            # dropping a tunnel it opened.
+            if isinstance(os_error, ConnectionResetError) or code in _LOCAL_CONNECT_ERRNOS:
+                return None
+            return MEDIA_FAULT_CLIENT
+        if isinstance(error, response) and error.status >= 500:
+            return MEDIA_FAULT_TRANSIENT
+        return None
+
+    return classify
 
 
 def resolve_mm_processor_mode(env: Mapping[str, str] = os.environ) -> str:
@@ -146,9 +283,12 @@ def enforce_item_bytes(items: Sequence[Any], max_bytes: int) -> None:
     for index, item in enumerate(items):
         size = data_url_payload_bytes(item.url)
         if size is not None and size > max_bytes:
-            raise ValueError(
-                f"media_refs[{index}]: inline payload is {size} bytes, above the "
-                f"{max_bytes}-byte cap (the worker's --mm-max-item-bytes, {ENV_MAX_ITEM_BYTES})"
+            raise mark_client_media(
+                ValueError(
+                    f"media_refs[{index}]: inline payload is {size} bytes, above the "
+                    f"{max_bytes}-byte cap (the worker's --mm-max-item-bytes, {ENV_MAX_ITEM_BYTES})"
+                ),
+                MEDIA_TOO_LARGE,
             )
 
 
@@ -286,9 +426,11 @@ class InProcessMediaProcessor:
     """Fetch with vLLM's MediaConnector and process with the engine's own renderer."""
 
     name = MODE_INPROCESS
-    # The served family's short-side floor (`floor_rule`), applied to a
-    # fetched image before the engine's processor sees it; None raises nothing.
-    _short_side_floor: FloorRule | None = None
+    # vLLM's download size caps, the releases that have them.
+    _download_too_large: tuple[type[BaseException], ...] = ()
+    # The media-fault kind of a fetch failure (`fetch_fault_classifier`),
+    # bound at construction; this default types nothing.
+    _fetch_fault: Callable[[BaseException, str], str | None] = staticmethod(lambda error, url: None)
 
     def __init__(
         self,
@@ -298,6 +440,7 @@ class InProcessMediaProcessor:
         max_inflight: int = DEFAULT_MAX_INFLIGHT,
         max_items: int | None = None,
         max_video_frames: int = DEFAULT_MAX_VIDEO_FRAMES,
+        allow_private_media_hosts: bool = False,
     ) -> None:
         _require_inprocess_apis(engine)
         import vllm
@@ -321,6 +464,26 @@ class InProcessMediaProcessor:
         self.max_inflight = max_inflight
         # The fetcher already decides which failures are the caller's.
         self._caller_error = VLLMClientError
+        import vllm.connections as vllm_connections
+
+        self._download_too_large = tuple(
+            cls
+            for name in ("MediaDownloadSizeExceededError", "HTTPResponseSizeExceededError")
+            if isinstance(cls := getattr(vllm_connections, name, None), type)
+        )
+        # The allow-list vLLM checks the first URL against and the guarded
+        # connection every hop goes through, both read as the router reads it.
+        connector_kwargs = media_connector_kwargs(
+            model_config.allowed_media_domains, allow_private_media_hosts
+        )
+        # Without the fetcher's HTTP client, or with one that lacks the
+        # exception types, nothing is typed and every failure stays retryable.
+        try:
+            import aiohttp
+
+            self._fetch_fault = fetch_fault_classifier(aiohttp)
+        except (ImportError, AttributeError) as e:
+            logger.warning("Media fetch failures are not typed and stay retryable: %s", e)
         # Same construction as vLLM's OpenAI frontend, so the engine-level
         # allowlists and media_io_kwargs apply to refs fetched here.
         self._connector = MEDIA_CONNECTOR_REGISTRY.load(
@@ -329,22 +492,15 @@ class InProcessMediaProcessor:
                 mm_config.media_io_kwargs, max_video_frames, vllm_default_video_frames()
             ),
             allowed_local_media_path=model_config.allowed_local_media_path,
-            allowed_media_domains=model_config.allowed_media_domains,
+            **connector_kwargs,
         )
         self._video_processor = get_video_processor_cls_name(model_config)
         self.schemes = advertised_schemes(model_config.allowed_local_media_path)
         self.accepted_schemes = parse_scheme_list(self.schemes)
-        self._short_side_floor = floor_rule(model_config)
-        if self._short_side_floor is not None:
-            logger.info(
-                "images below a %d px short side are raised to it before the engine's "
-                "processor, as the router's own pipeline does for this model family",
-                self._short_side_floor.floor,
-            )
-        if not model_config.allowed_media_domains:
+        if not connector_kwargs["allowed_media_domains"]:
             logger.warning(
                 "%s=inprocess with no --allowed-media-domains: this worker will fetch media "
-                "from any host the router forwards",
+                "from any public host the router forwards",
                 PROCESSOR_FLAG,
             )
 
@@ -390,22 +546,26 @@ class InProcessMediaProcessor:
         A bad URL or unusable media is the caller's and terminal, and so is a
         data URL in a form the fetcher does not take (one that is not base64,
         which it refuses as not implemented): no other worker takes it either.
-        A timeout, a refused connection, an origin 5xx or a loader the worker
-        lacks (whatever the reference, a base64 data URL included) is not: the
-        same request can succeed elsewhere or later, so it leaves here as
-        retryable.
+        Each leaves marked as the request's own media (`mark_client_media`)
+        under the code the router answers it with (`_client_media_code`). A
+        loader the worker lacks (whatever the reference, a base64 data URL
+        included) is not: the same request can succeed elsewhere, so it leaves
+        here as retryable. A refused connection, a name that does not resolve,
+        a timeout or an origin 5xx names the reference's host or origin: it
+        leaves as `MmMediaFetchFault`, which a servicer that reads its kind
+        reports as the media's and one that does not keeps retryable.
         """
         try:
             if item.modality == "image":
-                image = await self._connector.fetch_image_async(item.url)
-                return await raise_to_floor_off_loop(image, self._short_side_floor)
+                return await self._connector.fetch_image_async(item.url)
             if item.modality == "audio":
                 return await self._connector.fetch_audio_async(item.url)
             if item.modality == "video":
                 return await self._connector.fetch_video_async(
                     item.url, video_processor=self._video_processor
                 )
-        except (self._caller_error, ValueError):
+        except (self._caller_error, ValueError) as e:
+            mark_client_media(e, self._client_media_code(e))
             raise
         except Exception as e:
             # The fetcher refuses a non-base64 data URL as not implemented: no
@@ -416,10 +576,38 @@ class InProcessMediaProcessor:
             if isinstance(e, NotImplementedError) and _is_unencoded_data_url(
                 item.url, first_semicolon=self._data_url_first_semicolon
             ):
-                raise ValueError(f"media_refs[{index}]: {e}") from e
+                raise mark_client_media(
+                    ValueError(f"media_refs[{index}]: {e}"), INVALID_MULTIMODAL_REQUEST
+                ) from e
             logger.warning("media_refs[%d]: fetch failed for %s: %s", index, item.modality, e)
+            fault = self._fetch_fault(e, item.url)
+            if fault is not None:
+                # A timeout carries no words of its own.
+                words = str(e) or "timed out"
+                raise MmMediaFetchFault(fault, f"media_refs[{index}]: fetch failed: {words}") from e
             raise MmProcessorUnavailable(f"media_refs[{index}]: fetch failed: {e}") from e
         raise ValueError(f"unsupported media modality {item.modality!r}")
+
+    def _client_media_code(self, exc: BaseException) -> str:
+        """The public code for the caller's error `exc`, by where the fetcher
+        raised it, as the router names the same failure: a download the origin
+        refused (a 4xx) or redirected to a host the policy refuses is
+        `media_fetch_failed`, and one over the download size cap
+        `media_too_large`; a named host the policy refuses, and anything
+        raised before the download (a URL, a domain or a data URL refused as
+        sent, a named URL aiohttp will not send) or while decoding the bytes it delivered (an image that does
+        not decode, bad base64), is `invalid_multimodal_request`. vLLM wraps
+        a download's error before it gets here, so the whole chain is read."""
+        chain = list(_raised_from(exc))
+        if any(isinstance(e, MediaRedirectRefused) for e in chain):
+            return MEDIA_FETCH_FAILED
+        if any(isinstance(e, MediaHostRefused) for e in chain):
+            return INVALID_MULTIMODAL_REQUEST
+        if any(isinstance(e, self._download_too_large) for e in chain):
+            return MEDIA_TOO_LARGE
+        if any(raised_by_fetch(e) for e in chain):
+            return MEDIA_FETCH_FAILED
+        return INVALID_MULTIMODAL_REQUEST
 
 
 # A modality name vLLM never configures: its resolved count is the unset default.
@@ -750,6 +938,11 @@ _MM_SETTING_SPECS: dict[str, tuple[str, str, Any]] = {
     "turbojpeg": (TURBOJPEG_FLAG, ENV_TURBOJPEG, TURBOJPEG_PREFER),
     "fetch_timeout_ms": ("--mm-fetch-timeout-ms", ENV_FETCH_TIMEOUT_MS, 10_000),
     "video_fetch_timeout_ms": ("--mm-video-fetch-timeout-ms", ENV_VIDEO_FETCH_TIMEOUT_MS, 30_000),
+    "allow_private_media_hosts": (
+        "--mm-allow-private-media-hosts",
+        ENV_ALLOW_PRIVATE_MEDIA_HOSTS,
+        False,
+    ),
 }
 _MM_INT_SETTINGS = frozenset(
     {
@@ -765,7 +958,10 @@ _MM_INT_SETTINGS = frozenset(
 # The variables that are not legacy spellings of their flag: documented beside
 # it as a supported way to set the value (as the router's SMG_MM_TURBOJPEG
 # is), so no deprecation line when the launcher defines the flag.
-_ENV_NOT_LEGACY = frozenset({"turbojpeg", "fetch_timeout_ms", "video_fetch_timeout_ms"})
+_ENV_NOT_LEGACY = frozenset(
+    {"turbojpeg", "fetch_timeout_ms", "video_fetch_timeout_ms", "allow_private_media_hosts"}
+)
+_MM_BOOL_SETTINGS = frozenset({"allow_private_media_hosts"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -787,6 +983,7 @@ class MmSettings:
     turbojpeg: str | None = None
     fetch_timeout_ms: int | None = None
     video_fetch_timeout_ms: int | None = None
+    allow_private_media_hosts: bool | None = None
     sources: Mapping[str, str] = dataclasses.field(default_factory=dict, compare=False)
     # The settings whose flag the launcher defines (`from_args`), set or not.
     # For the rest the environment variable is the documented way to set them,
@@ -870,6 +1067,10 @@ _MM_FLAG_HELP: dict[str, str] = {
     ),
     "fetch_timeout_ms": "Image/audio download timeout in milliseconds (--mm-processor smg; default 10000).",
     "video_fetch_timeout_ms": "Video download timeout in milliseconds (--mm-processor smg; default 30000).",
+    "allow_private_media_hosts": (
+        "Let worker-side media fetches (--mm-processor inprocess|redis) reach loopback, "
+        "link-local and private addresses, which they refuse by default as the router does."
+    ),
     "max_inflight": "Media requests this worker processes at once.",
     "max_item_bytes": "Cap on an inline (data:) media item's decoded size, in bytes.",
     "max_items": "Media items a request may carry per modality.",
@@ -915,6 +1116,9 @@ def add_mm_arguments(parser: argparse.ArgumentParser) -> list[str]:
             kwargs["choices"] = list(VALID_TURBOJPEG)
         elif name in _MM_INT_SETTINGS:
             kwargs["type"] = int
+        elif name in _MM_BOOL_SETTINGS:
+            kwargs["action"] = "store_const"
+            kwargs["const"] = True
         parser.add_argument(flag, **kwargs)
         added.append(flag)
     return added
@@ -998,7 +1202,20 @@ def _validate_flag(name: str, flag: str, value: Any) -> Any:
         if int(value) <= 0:
             raise ValueError(f"{flag}={value} must be positive")
         return int(value)
+    if name in _MM_BOOL_SETTINGS:
+        return _parse_bool(flag, value)
     return value
+
+
+def _parse_bool(where: str, value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{where}={value!r} is not a boolean")
 
 
 def _read_env(name: str, env: Mapping[str, str], env_name: str) -> Any:
@@ -1011,6 +1228,9 @@ def _read_env(name: str, env: Mapping[str, str], env_name: str) -> Any:
         return resolve_mm_turbojpeg(env) if raw is not None and raw.strip() else None
     if name in _MM_INT_SETTINGS:
         return env_int_opt(env, env_name)
+    if name in _MM_BOOL_SETTINGS:
+        raw = env.get(env_name)
+        return _parse_bool(env_name, raw) if raw is not None and raw.strip() else None
     raw = env.get(env_name)
     return raw if raw else None
 
@@ -1082,6 +1302,7 @@ def build_mm_processor(
             max_inflight=resolved.max_inflight,
             max_items=resolved.max_items,
             max_video_frames=max_video_frames,
+            allow_private_media_hosts=resolved.allow_private_media_hosts,
         )
     return RedisMediaProcessor(
         engine,

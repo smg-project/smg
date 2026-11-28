@@ -80,10 +80,7 @@ impl MuseSparkSpec {
     }
 
     fn unsupported(modality: Modality) -> ModelRegistryError {
-        ModelRegistryError::UnsupportedModality {
-            spec: "muse_spark",
-            modality,
-        }
+        ModelRegistryError::unsupported("muse_spark", modality)
     }
 
     fn token_counts(preprocessed: &PreprocessedEncoderInputs) -> RegistryResult<&[usize]> {
@@ -489,10 +486,7 @@ impl ModelProcessorSpec for MuseSparkSpec {
             Modality::Image | Modality::Video => Ok(Box::new(
                 MuseSparkVisionProcessor::from_preprocessor_config(preprocessor_config),
             )),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

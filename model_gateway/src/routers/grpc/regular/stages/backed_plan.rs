@@ -50,6 +50,10 @@ pub(crate) struct Inputs<'a> {
     /// The rendered prompt; it rides on the wire only when the request
     /// carries media (`helpers::wire_prompt_text`).
     pub processed_text: String,
+    /// A chat request's `return_prompt_text`: a request that sends no media
+    /// keeps the rendered prompt for its answer
+    /// (`ResponseState::prompt_text`).
+    pub return_prompt_text: bool,
     pub token_ids: Vec<u32>,
     /// The constraint as the request carries it, before the worker's shaping.
     pub tool_constraints: Option<(String, String)>,
@@ -96,7 +100,8 @@ pub(crate) fn build(
         function,
         id_prefix,
         model,
-        processed_text,
+        mut processed_text,
+        return_prompt_text,
         token_ids,
         tool_constraints,
         format_set_aside,
@@ -144,6 +149,12 @@ pub(crate) fn build(
     // The ids are the prompt; the text rides along only when the request
     // carries media (see `helpers::wire_prompt_text`).
     let carries_media = multimodal_data.is_some() || ctx.state.multimodal_refs.is_some();
+    // A request that asked for its rendered prompt and sends no media keeps
+    // the text the wire lets go: it moves to the response state, for the
+    // answer.
+    if return_prompt_text && !carries_media {
+        ctx.state.response.prompt_text = Some(std::mem::take(&mut processed_text));
+    }
     let mut proto_request = build_request(
         builder_client,
         request_id,
@@ -254,60 +265,5 @@ fn thinking_mode_kwargs(
 }
 
 #[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    /// Match the rendered tri-state mode and leave other template switches untouched.
-    #[test]
-    fn minimax_thinking_mode_matches_template_precedence() {
-        for (mut body, expected) in [
-            (json!({}), None),
-            (json!({"thinking": {"type": "adaptive"}}), None),
-            (
-                json!({"thinking": {"type": "enabled"}}),
-                Some(json!("enabled")),
-            ),
-            (
-                json!({"thinking": {"type": "disabled"}}),
-                Some(json!("disabled")),
-            ),
-            (
-                json!({"thinking": {"type": "enabled"}, "chat_template_kwargs": {"thinking_mode": "adaptive"}}),
-                Some(json!("adaptive")),
-            ),
-            (
-                json!({"thinking": {"type": "disabled"}, "chat_template_kwargs": {"thinking_mode": "enabled"}}),
-                Some(json!("enabled")),
-            ),
-            (
-                json!({"chat_template_kwargs": {"thinking_mode": null}}),
-                Some(json!(null)),
-            ),
-            (json!({"reasoning_effort": "none"}), None),
-        ] {
-            body["model"] = json!("minimax-m3");
-            body["messages"] = json!([]);
-            let request = RequestType::Chat(Arc::new(serde_json::from_value(body).unwrap()));
-            let actual = thinking_mode_kwargs(
-                &request,
-                ProviderProfile::Minimax,
-                Some(ThinkingKeyName::ThinkingMode),
-            )
-            .map(|s| serde_json::from_str::<serde_json::Value>(&s).unwrap());
-            assert_eq!(actual, expected.map(|mode| json!({"thinking_mode": mode})));
-            for key in [
-                None,
-                Some(ThinkingKeyName::EnableThinking),
-                Some(ThinkingKeyName::Thinking),
-                Some(ThinkingKeyName::ReasoningEffort),
-            ] {
-                assert_eq!(
-                    thinking_mode_kwargs(&request, ProviderProfile::Minimax, key),
-                    None
-                );
-            }
-        }
-    }
-}
+#[path = "../../../../../tests/unit/routers/grpc/regular/stages/backed_plan/tests.rs"]
+mod tests;

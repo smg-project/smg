@@ -10,7 +10,7 @@ use std::{sync::Arc, time::Duration};
 use axum::{
     body::{Body, HttpBody},
     extract::{Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, response::Parts, HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -26,7 +26,7 @@ use crate::{
         spec::{
             apply_modify_action_to_headers, build_wasm_headers_from_axum_headers,
             smg::gateway::middleware_types::{
-                Action, Request as WasmRequest, Response as WasmResponse,
+                Action, ModifyAction, Request as WasmRequest, Response as WasmResponse,
             },
         },
         types::WasmComponentInput,
@@ -103,6 +103,11 @@ async fn run_request_hook(
     let extensions = parts.extensions;
 
     let max_body_size = wasm_manager.get_max_body_size();
+    let mut body_replaced = false;
+    // The hook reads the body ahead of the request-body deadline layer, so it
+    // reads it under that layer's upload wait. The bytes it hands on are in
+    // memory: the layer's own read of them waits for nothing.
+    let body = super::body_timeout::upload_measured(body);
     let mut body_bytes = match axum::body::to_bytes(body, max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
         Err(e) if super::body_timeout::crossed_payload_limit(&e) => {
@@ -159,15 +164,13 @@ async fn run_request_hook(
                 );
             }
             Action::Modify(modify) => {
-                apply_modify_action_to_headers(&mut headers, &modify);
-                if let Some(new_body) = modify.body_replace {
-                    body_bytes = new_body;
-                }
+                body_replaced |= apply_modify(&mut headers, &mut body_bytes, modify);
             }
         }
     }
 
     // Reconstruct request with modifications, preserving original extensions
+    frame_body(&mut headers, body_bytes.len(), body_replaced);
     let mut final_request = Request::builder()
         .method(method)
         .uri(uri)
@@ -218,10 +221,14 @@ async fn run_response_hook(wasm_manager: &WasmModuleManager, response: Response)
         return response;
     }
 
-    // Extract response data once before processing modules
-    let mut status = response.status();
-    let mut headers = response.headers().clone();
-    let mut body_bytes = match axum::body::to_bytes(response.into_body(), max_body_size).await {
+    // Take the response apart once before the modules run; the parts carry
+    // the extensions the layers inside handed the edge (the admission permit,
+    // the request span, the keep-alive), which ride on into the rebuilt one.
+    let (mut parts, body) = response.into_parts();
+    let mut status = parts.status;
+    let mut headers = std::mem::take(&mut parts.headers);
+    let mut body_replaced = false;
+    let mut body_bytes = match axum::body::to_bytes(body, max_body_size).await {
         Ok(bytes) => bytes.to_vec(),
         Err(e) if super::body_timeout::crossed_payload_limit(&e) => {
             // A size unknown before the read, over the cap: the body is
@@ -264,22 +271,19 @@ async fn run_response_hook(wasm_manager: &WasmModuleManager, response: Response)
             Action::Continue => {}
             Action::Reject(status_code) => {
                 let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::BAD_REQUEST);
-                return rebuild_response(status, headers, body_bytes);
+                return rebuild_response(parts, status, headers, body_bytes, body_replaced);
             }
             Action::Modify(modify) => {
                 if let Some(new_status) = modify.status {
                     status = StatusCode::from_u16(new_status).unwrap_or(status);
                 }
-                apply_modify_action_to_headers(&mut headers, &modify);
-                if let Some(new_body) = modify.body_replace {
-                    body_bytes = new_body;
-                }
+                body_replaced |= apply_modify(&mut headers, &mut body_bytes, modify);
             }
         }
     }
 
     // Reconstruct final response with all modifications
-    rebuild_response(status, headers, body_bytes)
+    rebuild_response(parts, status, headers, body_bytes, body_replaced)
 }
 
 /// Whether `response` is known to be over `max_body_size` before it is read:
@@ -296,13 +300,20 @@ fn known_to_exceed(response: &Response, max_body_size: usize) -> bool {
 }
 
 /// Whether `response` streams: an event stream, newline-delimited JSON or a
-/// chunked transfer, none of which the response hook may buffer.
+/// chunked transfer, none of which the response hook may buffer. An event
+/// stream is one in any spelling of its media type, as the routes that relay
+/// it read it: a relayed stream carries no length and no transfer encoding,
+/// so its type is all this hook has to go on.
 fn is_streaming(response: &Response) -> bool {
     response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|ct| ct.contains("text/event-stream") || ct.contains("application/x-ndjson"))
+        .is_some_and(|ct| {
+            super::sse_keepalive::names_event_stream(ct)
+                || ct.contains("text/event-stream")
+                || ct.contains("application/x-ndjson")
+        })
         || response
             .headers()
             .get(header::TRANSFER_ENCODING)
@@ -310,14 +321,53 @@ fn is_streaming(response: &Response) -> bool {
             .is_some_and(|te| te.contains("chunked"))
 }
 
-/// The response the modules left: `status`, `headers` and `body`.
-fn rebuild_response(status: StatusCode, headers: HeaderMap, body: Vec<u8>) -> Response {
-    let mut response = Response::builder()
-        .status(status)
-        .body(Body::from(body))
-        .unwrap_or_else(|_| Response::new(Body::empty()));
-    *response.headers_mut() = headers;
-    response
+/// The response the modules left: `status`, `headers` and `body` on the
+/// original `parts`, so the extensions the layers inside handed the edge
+/// ride on; the headers frame the body as it is now.
+fn rebuild_response(
+    mut parts: Parts,
+    status: StatusCode,
+    mut headers: HeaderMap,
+    body: Vec<u8>,
+    body_replaced: bool,
+) -> Response {
+    frame_body(&mut headers, body.len(), body_replaced);
+    parts.status = status;
+    parts.headers = headers;
+    Response::from_parts(parts, Body::from(body))
+}
+
+/// Apply a module's `Modify` to the headers and body in hand, and say whether
+/// the body was replaced. A replacement first drops the content encoding
+/// declared for the body it replaces, then the module's own header edits
+/// apply, so a module that encodes its replacement and says so keeps its
+/// word; a body left in place keeps its encoding.
+fn apply_modify(headers: &mut HeaderMap, body: &mut Vec<u8>, modify: ModifyAction) -> bool {
+    if modify.body_replace.is_some() {
+        headers.remove(header::CONTENT_ENCODING);
+    }
+    apply_modify_action_to_headers(headers, &modify);
+    match modify.body_replace {
+        Some(new_body) => {
+            *body = new_body;
+            true
+        }
+        None => false,
+    }
+}
+
+/// The framing of a body the hook forwards whole: its length is the body's
+/// (an upstream's declaration described the body it replaced), and a
+/// transfer encoding no longer applies to a body held in memory; the
+/// content encoding is the body's own, settled when a module's `Modify` was
+/// applied. An empty body no module touched keeps the length it came with:
+/// a HEAD answer or a 304 declares the entity it stands for, and a bodiless
+/// request declares nothing.
+fn frame_body(headers: &mut HeaderMap, len: usize, body_replaced: bool) {
+    if body_replaced || len > 0 {
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    }
+    headers.remove(header::TRANSFER_ENCODING);
 }
 
 /// The wall clock in milliseconds since the epoch, as the modules read it.
@@ -329,356 +379,5 @@ fn now_epoch_ms() -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{io, sync::Arc};
-
-    use axum::{
-        body::{Body, Bytes},
-        extract::Request,
-        http::{header, StatusCode},
-        response::Response,
-    };
-    use tokio::sync::mpsc;
-    use tokio_stream::wrappers::ReceiverStream;
-    use uuid::Uuid;
-
-    use super::{is_streaming, run_request_hook, run_response_hook, RequestHook};
-    use crate::wasm::{
-        module::{MiddlewareAttachPoint, WasmModule, WasmModuleAttachPoint, WasmModuleMeta},
-        module_manager::WasmModuleManager,
-        WasmRuntimeConfig,
-    };
-
-    /// A request extension the hook must carry across its reconstruction.
-    #[derive(Clone, Debug, PartialEq)]
-    struct Marker(&'static str);
-
-    /// A manager with one module at both middleware hooks whose component is
-    /// valid but exports nothing, so running it yields no action: the hooks
-    /// walk their whole path (list, take apart, read, run, put back
-    /// together) with no module changing the message.
-    fn manager_with_an_inert_module() -> WasmModuleManager {
-        manager_with_an_inert_module_under(WasmRuntimeConfig::default())
-    }
-
-    /// [`manager_with_an_inert_module`] under `config` (a small body cap, say).
-    fn manager_with_an_inert_module_under(config: WasmRuntimeConfig) -> WasmModuleManager {
-        use wasm_encoder::{Component, Module, ModuleSection, TypeSection};
-        let mut module = Module::new();
-        module.section(&TypeSection::new());
-        let mut component = Component::new();
-        component.section(&ModuleSection(&module));
-        let bytes = component.as_slice().to_vec();
-        let manager = WasmModuleManager::new(config);
-        manager
-            .register_module_internal(WasmModule {
-                module_uuid: Uuid::now_v7(),
-                module_meta: WasmModuleMeta {
-                    name: "inert".to_string(),
-                    file_path: String::new(),
-                    sha256_hash: [0; 32],
-                    size_bytes: bytes.len() as u64,
-                    created_at: 0,
-                    last_accessed_at: 0,
-                    access_count: 0,
-                    attach_points: vec![
-                        WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnRequest),
-                        WasmModuleAttachPoint::Middleware(MiddlewareAttachPoint::OnResponse),
-                    ],
-                    wasm_bytes: Arc::new(bytes),
-                },
-            })
-            .expect("the inert module registers");
-        manager
-    }
-
-    async fn body_of(body: Body) -> Vec<u8> {
-        axum::body::to_bytes(body, usize::MAX)
-            .await
-            .expect("the body reads")
-            .to_vec()
-    }
-
-    /// The request hook puts a request back together with its extensions,
-    /// method, uri, headers and body when no module changes it.
-    #[tokio::test]
-    async fn the_request_hook_keeps_the_requests_extensions_and_parts() {
-        let manager = manager_with_an_inert_module();
-        let mut request = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions?x=1")
-            .header("x-kept", "yes")
-            .body(Body::from("{\"k\":1}"))
-            .expect("a request");
-        request.extensions_mut().insert(Marker("kept"));
-
-        let RequestHook::Run(request) = run_request_hook(&manager, request, "req-1").await else {
-            panic!("the request runs");
-        };
-        assert_eq!(manager.get_metrics().0, 1, "the module ran once");
-        assert_eq!(request.extensions().get::<Marker>(), Some(&Marker("kept")));
-        assert_eq!(request.method(), "POST");
-        assert_eq!(request.uri(), "/v1/chat/completions?x=1");
-        assert_eq!(
-            request.headers().get("x-kept").map(|v| v.as_bytes()),
-            Some(&b"yes"[..])
-        );
-        assert_eq!(body_of(request.into_body()).await, b"{\"k\":1}");
-    }
-
-    /// A manager without a module at the request hook passes the request on
-    /// as it is.
-    #[tokio::test]
-    async fn the_request_hook_passes_a_request_through_an_empty_hook() {
-        let manager = WasmModuleManager::with_default_config();
-        let request = Request::builder()
-            .uri("/v1/models")
-            .body(Body::from("body"))
-            .expect("a request");
-        let RequestHook::Run(request) = run_request_hook(&manager, request, "req-2").await else {
-            panic!("the request runs");
-        };
-        assert_eq!(request.uri(), "/v1/models");
-        assert_eq!(body_of(request.into_body()).await, b"body");
-    }
-
-    /// A streaming response passes the response hook untouched, and no
-    /// module runs: an event stream, newline-delimited JSON, or a chunked
-    /// transfer.
-    #[tokio::test]
-    async fn the_response_hook_leaves_a_streaming_response_alone() {
-        let manager = manager_with_an_inert_module();
-        for (name, value) in [
-            (header::CONTENT_TYPE, "text/event-stream"),
-            (header::CONTENT_TYPE, "application/x-ndjson"),
-            (header::TRANSFER_ENCODING, "chunked"),
-        ] {
-            let response = Response::builder()
-                .status(StatusCode::OK)
-                .header(name.clone(), value)
-                .header("x-stream", "1")
-                .body(Body::from("data: x\n\n"))
-                .expect("a response");
-            let response = run_response_hook(&manager, response).await;
-            assert_eq!(manager.get_metrics().0, 0, "{value}: no module ran");
-            assert_eq!(response.status(), StatusCode::OK, "{value}");
-            assert_eq!(
-                response.headers().get(&name).map(|v| v.as_bytes()),
-                Some(value.as_bytes()),
-                "{value}"
-            );
-            assert_eq!(
-                response.headers().get("x-stream").map(|v| v.as_bytes()),
-                Some(&b"1"[..])
-            );
-            assert_eq!(
-                body_of(response.into_body()).await,
-                b"data: x\n\n",
-                "{value}"
-            );
-        }
-    }
-
-    /// A plain response is read and put back together with its status,
-    /// headers and body when no module changes it.
-    #[tokio::test]
-    async fn the_response_hook_rebuilds_a_plain_response_unchanged() {
-        let manager = manager_with_an_inert_module();
-        let response = Response::builder()
-            .status(StatusCode::CREATED)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header("x-kept", "yes")
-            .body(Body::from("{\"ok\":true}"))
-            .expect("a response");
-        let response = run_response_hook(&manager, response).await;
-        assert_eq!(manager.get_metrics().0, 1, "the module ran once");
-        assert_eq!(response.status(), StatusCode::CREATED);
-        assert_eq!(
-            response.headers().get("x-kept").map(|v| v.as_bytes()),
-            Some(&b"yes"[..])
-        );
-        assert_eq!(body_of(response.into_body()).await, b"{\"ok\":true}");
-    }
-
-    /// The streaming check reads the content type and the transfer encoding.
-    #[test]
-    fn a_response_streams_by_its_content_type_or_transfer_encoding() {
-        let with = |name: header::HeaderName, value: &str| {
-            Response::builder()
-                .header(name, value)
-                .body(Body::empty())
-                .expect("a response")
-        };
-        assert!(is_streaming(&with(
-            header::CONTENT_TYPE,
-            "text/event-stream; charset=utf-8"
-        )));
-        assert!(is_streaming(&with(
-            header::CONTENT_TYPE,
-            "application/x-ndjson"
-        )));
-        assert!(is_streaming(&with(header::TRANSFER_ENCODING, "chunked")));
-        assert!(!is_streaming(&with(
-            header::CONTENT_TYPE,
-            "application/json"
-        )));
-        assert!(!is_streaming(&Response::new(Body::empty())));
-    }
-
-    /// The status, the `X-SMG-Error-Code` header and the JSON body of
-    /// `response`.
-    async fn envelope_of(response: Response) -> (StatusCode, String, serde_json::Value) {
-        let status = response.status();
-        let code = response
-            .headers()
-            .get("x-smg-error-code")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or_default()
-            .to_string();
-        let body: serde_json::Value =
-            serde_json::from_slice(&body_of(response.into_body()).await).expect("a JSON body");
-        (status, code, body)
-    }
-
-    fn unreadable_body() -> Body {
-        let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(1);
-        tx.try_send(Err(io::Error::other("the stream broke")))
-            .expect("the channel takes one item");
-        drop(tx);
-        Body::from_stream(ReceiverStream::new(rx))
-    }
-
-    /// A request body that cannot be read answers in the gateway's error
-    /// envelope, not a bare text under `error`: a 400 with the code
-    /// `wasm_request_body_unreadable` and the envelope's `type`.
-    #[tokio::test]
-    async fn the_request_hook_answers_an_unreadable_body_with_the_error_envelope() {
-        let manager = manager_with_an_inert_module();
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .body(unreadable_body())
-            .expect("a request");
-        let RequestHook::Answer(response) = run_request_hook(&manager, request, "req-1").await
-        else {
-            panic!("an unreadable body is answered, not forwarded");
-        };
-        let (status, code, body) = envelope_of(response).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(code, "wasm_request_body_unreadable");
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert_eq!(body["error"]["code"], "wasm_request_body_unreadable");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .is_some_and(|m| m.starts_with("Failed to read request body")),
-            "{body}"
-        );
-    }
-
-    /// A response body that cannot be read answers in the gateway's error
-    /// envelope: a 500 with the code `wasm_response_body_unreadable` and the
-    /// envelope's `type`.
-    #[tokio::test]
-    async fn the_response_hook_answers_an_unreadable_body_with_the_error_envelope() {
-        let manager = manager_with_an_inert_module();
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(unreadable_body())
-            .expect("a response");
-        let response = run_response_hook(&manager, response).await;
-        let (status, code, body) = envelope_of(response).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(code, "wasm_response_body_unreadable");
-        assert_eq!(body["error"]["type"], "server_error");
-        assert_eq!(body["error"]["code"], "wasm_response_body_unreadable");
-        assert_eq!(body["error"]["message"], "Failed to read response body");
-    }
-
-    fn small_cap() -> WasmRuntimeConfig {
-        WasmRuntimeConfig {
-            max_body_size: 1024,
-            ..WasmRuntimeConfig::default()
-        }
-    }
-
-    /// A request body over a limit (the edge limit or the WASM cap) is the
-    /// gateway's 413 `request_body_too_large`, not a read failure.
-    #[tokio::test]
-    async fn the_request_hook_answers_a_body_over_the_cap_with_the_gateways_413() {
-        let manager = manager_with_an_inert_module_under(small_cap());
-        let request = Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .body(Body::from(vec![b'x'; 4096]))
-            .expect("a request");
-        let RequestHook::Answer(response) = run_request_hook(&manager, request, "req-2").await
-        else {
-            panic!("a body over the cap is answered, not forwarded");
-        };
-        let (status, code, body) = envelope_of(response).await;
-        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(code, "request_body_too_large");
-        assert_eq!(body["error"]["code"], "request_body_too_large");
-    }
-
-    /// A response that declares a length over the cap passes through the hook
-    /// untouched, as a streaming response does.
-    #[tokio::test]
-    async fn the_response_hook_passes_a_declared_body_over_the_cap_through() {
-        let manager = manager_with_an_inert_module_under(small_cap());
-        let payload = vec![b'y'; 4096];
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CONTENT_LENGTH, payload.len())
-            .body(Body::from(payload.clone()))
-            .expect("a response");
-        let response = run_response_hook(&manager, response).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_of(response.into_body()).await, payload);
-    }
-
-    /// A response whose body is already in memory, over the cap, passes
-    /// through as a declared one does though it declares no length: a typed
-    /// JSON response carries none before it is written out.
-    #[tokio::test]
-    async fn the_response_hook_passes_an_in_memory_body_over_the_cap_through() {
-        let manager = manager_with_an_inert_module_under(small_cap());
-        let payload = vec![b'y'; 4096];
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(payload.clone()))
-            .expect("a response");
-        assert!(response.headers().get(header::CONTENT_LENGTH).is_none());
-        let response = run_response_hook(&manager, response).await;
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_of(response.into_body()).await, payload);
-    }
-
-    /// A response over the cap whose size is not known before the read (a
-    /// stream) cannot be relayed once read: its refusal carries its own code,
-    /// not the unreadable one.
-    #[tokio::test]
-    async fn the_response_hook_names_a_streamed_body_over_the_cap() {
-        let manager = manager_with_an_inert_module_under(small_cap());
-        let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
-        for _ in 0..3 {
-            tx.try_send(Ok(Bytes::from(vec![b'z'; 1024])))
-                .expect("the channel takes the chunks");
-        }
-        drop(tx);
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from_stream(ReceiverStream::new(rx)))
-            .expect("a response");
-        let response = run_response_hook(&manager, response).await;
-        let (status, code, body) = envelope_of(response).await;
-        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(code, "wasm_response_body_too_large");
-        assert_eq!(body["error"]["code"], "wasm_response_body_too_large");
-    }
-}
+#[path = "../../tests/unit/middleware/wasm/tests.rs"]
+mod tests;

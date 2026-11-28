@@ -5,12 +5,14 @@ use std::{
     sync::Arc,
 };
 
+use axum::response::Response;
 use openai_protocol::responses::{McpAllowedTools, ResponseTool, ResponsesRequest};
 use serde_json::{json, Value};
 use smg_mcp::{BuiltinToolType, McpOrchestrator, McpServerBinding, McpServerConfig, McpTransport};
 use tracing::{debug, warn};
 
 use crate::{
+    error,
     openai_bridge::{
         self, apply_hosted_tool_overrides, extract_hosted_tool_overrides, FormatRegistry,
         ResponseFormat,
@@ -66,7 +68,9 @@ pub struct McpServerInput {
 ///
 /// For each input:
 /// - If `url` is present, connects a dynamic MCP server (SSE or Streamable).
-/// - If `url` is absent, registers the label as a static server reference.
+/// - If `url` is absent, binds the configured server held under the label; a
+///   label no connected server is held under binds nothing (a warning names
+///   it).
 ///
 /// Returns a list of [`McpServerBinding`]s for successfully connected servers.
 pub async fn connect_mcp_servers(
@@ -130,12 +134,19 @@ pub async fn connect_mcp_servers(
             )
             .await
             {
-                Ok(_) => {
-                    if !mcp_servers.iter().any(|b| b.server_key == server_key) {
+                Ok(connected) => {
+                    // One binding per label: a server named under two labels
+                    // shares its pooled client and lists under each label.
+                    if !mcp_servers
+                        .iter()
+                        .any(|b| b.server_key == server_key && b.label == input.label)
+                    {
                         mcp_servers.push(McpServerBinding {
                             label: input.label.clone(),
                             server_key,
                             allowed_tools: input.allowed_tools.clone(),
+                            list_error: connected.list_error,
+                            pool_key: Some(connected.pool_key),
                         });
                     }
                 }
@@ -144,12 +155,23 @@ pub async fn connect_mcp_servers(
                 }
             }
         }
-        // Case B: Static Server (No URL)
-        else if !mcp_servers.iter().any(|b| b.server_key == input.label) {
+        // Case B: a configured server named by its label (no URL). A label no
+        // connected server is held under binds nothing: next to servers that
+        // bind it is dropped with the warning, alone it leaves the request to
+        // fail on the missing connection (`ensure_request_mcp_routing`),
+        // instead of listing no tools under a key that resolves to nothing.
+        else if !mcp_orchestrator.has_static_server(&input.label) {
+            warn!(
+                "Ignoring MCP tool '{}': no server_url and no connected MCP server of that name",
+                input.label
+            );
+        } else if !mcp_servers.iter().any(|b| b.server_key == input.label) {
             mcp_servers.push(McpServerBinding {
                 label: input.label.clone(),
                 server_key: input.label.clone(),
                 allowed_tools: input.allowed_tools.clone(),
+                list_error: mcp_orchestrator.list_error_for_server(&input.label),
+                pool_key: None,
             });
         }
     }
@@ -302,10 +324,13 @@ pub async fn ensure_mcp_servers(
                 "Adding static server for built-in tool routing"
             );
             if !mcp_servers.iter().any(|b| b.server_key == server_name) {
+                let list_error = orchestrator.list_error_for_server(&server_name);
                 mcp_servers.push(McpServerBinding {
                     label: server_name.clone(),
                     server_key: server_name,
                     allowed_tools: None,
+                    list_error,
+                    pool_key: None,
                 });
             }
         } else {
@@ -353,6 +378,49 @@ pub async fn ensure_request_mcp_client(
     let builtin_types = extract_builtin_types(tools);
 
     ensure_mcp_servers(mcp_orchestrator, format_registry, &inputs, &builtin_types).await
+}
+
+/// The Responses routes' MCP routing, one rule for the HTTP and the gRPC
+/// routers: a request that names an `mcp` tool and binds no server is refused
+/// on the missing connection (424 `connect_mcp_server_failed`) before anything
+/// goes upstream; built-in tools without MCP routing pass through to the model
+/// (`Ok(None)`).
+pub async fn ensure_request_mcp_routing(
+    mcp_orchestrator: &Arc<McpOrchestrator>,
+    format_registry: &FormatRegistry,
+    tools: &[ResponseTool],
+) -> Result<Option<Vec<McpServerBinding>>, Response> {
+    for (idx, tool) in tools.iter().enumerate() {
+        if tool.allows_direct_calls() {
+            continue;
+        }
+        let gateway_managed = matches!(tool, ResponseTool::Mcp(_))
+            || openai_bridge::builtin_type_for_response_tool(tool)
+                .is_some_and(|kind| mcp_orchestrator.find_builtin_server(kind).is_some());
+        if gateway_managed {
+            return Err(error::bad_request(
+                "tool_not_supported",
+                format!(
+                    "Invalid 'tools[{idx}].allowed_callers': gateway-managed tools must allow the 'direct' caller."
+                ),
+            ));
+        }
+    }
+    match ensure_request_mcp_client(mcp_orchestrator, format_registry, tools).await {
+        Some(servers) => Ok(Some(servers)),
+        None if tools
+            .iter()
+            .any(|tool| matches!(tool, ResponseTool::Mcp(_))) =>
+        {
+            warn!("Failed to connect to MCP servers: the request names an mcp tool and none bound");
+            Err(error::failed_dependency(
+                "connect_mcp_server_failed",
+                "Failed to connect to MCP servers. Check server_url and authorization, or that \
+                 a server_label without server_url names a configured server.",
+            ))
+        }
+        None => Ok(None),
+    }
 }
 
 /// Forward the caller's `user` identifier into hosted-tool dispatch arguments.
@@ -439,609 +507,5 @@ pub fn prepare_hosted_dispatch_args(
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{collections::HashMap, sync::Arc};
-
-    use openai_protocol::{
-        common::Function,
-        responses::{
-            CodeInterpreterTool, FunctionTool, ImageGenerationTool, McpTool, ResponseTool,
-            WebSearchPreviewTool,
-        },
-    };
-    use serde_json::json;
-    use smg_mcp::{McpConfig, ResponseFormatConfig, ToolConfig};
-
-    use super::*;
-
-    /// Create a test orchestrator with a built-in server configuration,
-    /// plus a `FormatRegistry` mirroring the same per-tool ResponseFormat
-    /// values that production code populates at server-registration time.
-    async fn create_test_orchestrator_with_builtin() -> (Arc<McpOrchestrator>, FormatRegistry) {
-        let mut tools_config = HashMap::new();
-        tools_config.insert(
-            "web_search".to_string(),
-            ToolConfig {
-                response_format: Some(ResponseFormatConfig::WebSearchCall),
-                ..Default::default()
-            },
-        );
-
-        let server = McpServerConfig {
-            name: "search-server".to_string(),
-            transport: McpTransport::Streamable {
-                url: "http://localhost:9999/mcp".to_string(),
-                token: None,
-                headers: HashMap::new(),
-            },
-            proxy: None,
-            required: false,
-            tools: Some(tools_config),
-            builtin_type: Some(BuiltinToolType::WebSearchPreview),
-            builtin_tool_name: Some("web_search".to_string()),
-            internal: false,
-        };
-
-        let config = McpConfig {
-            servers: vec![server.clone()],
-            pool: Default::default(),
-            proxy: None,
-            warmup: Vec::new(),
-            inventory: Default::default(),
-            policy: Default::default(),
-        };
-
-        let registry = FormatRegistry::new();
-        registry.populate_from_server_config(&server);
-
-        // Note: This will fail to connect but still create the orchestrator with config
-        (
-            Arc::new(McpOrchestrator::new(config).await.unwrap()),
-            registry,
-        )
-    }
-
-    /// Create a test orchestrator without built-in server configuration
-    async fn create_test_orchestrator_no_builtin() -> (Arc<McpOrchestrator>, FormatRegistry) {
-        let config = McpConfig {
-            servers: vec![],
-            pool: Default::default(),
-            proxy: None,
-            warmup: Vec::new(),
-            inventory: Default::default(),
-            policy: Default::default(),
-        };
-
-        (
-            Arc::new(McpOrchestrator::new(config).await.unwrap()),
-            FormatRegistry::new(),
-        )
-    }
-
-    /// A server URL of a scheme the connector does not take is refused with
-    /// a line that names it masked: credentials in it stay out of the log.
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn a_refused_server_url_is_named_masked() {
-        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
-        let inputs = [McpServerInput {
-            label: "tools".to_string(),
-            url: Some("wss://user:secret@127.0.0.1:1/sse".to_string()),
-            authorization: None,
-            headers: HashMap::new(),
-            allowed_tools: None,
-        }];
-
-        let bindings = connect_mcp_servers(&orchestrator, &format_registry, &inputs).await;
-
-        assert!(!logs_contain("secret"));
-        assert!(bindings.is_empty());
-        assert!(logs_contain(
-            "Ignoring MCP server_url with unsupported scheme: wss://***@127.0.0.1:1/sse"
-        ));
-    }
-
-    #[tokio::test]
-    async fn test_collect_builtin_routing_with_configured_server() {
-        let (orchestrator, format_registry) = create_test_orchestrator_with_builtin().await;
-
-        let tools = vec![ResponseTool::WebSearchPreview(
-            WebSearchPreviewTool::default(),
-        )];
-
-        let routing = collect_builtin_routing(&orchestrator, &format_registry, Some(&tools));
-
-        assert_eq!(routing.len(), 1);
-        assert_eq!(routing[0].builtin_type, BuiltinToolType::WebSearchPreview);
-        assert_eq!(routing[0].server_name, "search-server");
-        assert_eq!(routing[0].tool_name, "web_search");
-        assert_eq!(routing[0].response_format, ResponseFormat::WebSearchCall);
-    }
-
-    #[tokio::test]
-    async fn test_collect_builtin_routing_no_configured_server() {
-        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
-
-        let tools = vec![ResponseTool::WebSearchPreview(
-            WebSearchPreviewTool::default(),
-        )];
-
-        let routing = collect_builtin_routing(&orchestrator, &format_registry, Some(&tools));
-
-        // No routing because no server configured for this built-in type
-        assert!(routing.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_collect_builtin_routing_ignores_mcp_tools() {
-        let (orchestrator, format_registry) = create_test_orchestrator_with_builtin().await;
-
-        let tools = vec![ResponseTool::Mcp(McpTool {
-            server_url: Some("http://example.com/mcp".to_string()),
-            authorization: None,
-            headers: None,
-            server_label: "mcp".to_string(),
-            server_description: None,
-            require_approval: None,
-            allowed_tools: None,
-            connector_id: None,
-            defer_loading: None,
-        })];
-
-        let routing = collect_builtin_routing(&orchestrator, &format_registry, Some(&tools));
-
-        // MCP tools are not built-in types, should be empty
-        assert!(routing.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_collect_builtin_routing_ignores_function_tools() {
-        let (orchestrator, format_registry) = create_test_orchestrator_with_builtin().await;
-
-        let tools = vec![ResponseTool::Function(FunctionTool {
-            function: Function {
-                name: "dummy".to_string(),
-                description: None,
-                parameters: Some(json!({})),
-                strict: None,
-                extra: Default::default(),
-            },
-        })];
-
-        let routing = collect_builtin_routing(&orchestrator, &format_registry, Some(&tools));
-
-        // Function tools are not built-in types, should be empty
-        assert!(routing.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_collect_builtin_routing_none_tools() {
-        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
-
-        let routing = collect_builtin_routing(&orchestrator, &format_registry, None);
-
-        assert!(routing.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_collect_builtin_routing_multiple_builtin_tools() {
-        // Create orchestrator with both web search and code interpreter
-        let mut web_search_tools = HashMap::new();
-        web_search_tools.insert(
-            "web_search".to_string(),
-            ToolConfig {
-                response_format: Some(ResponseFormatConfig::WebSearchCall),
-                ..Default::default()
-            },
-        );
-
-        let mut code_interp_tools = HashMap::new();
-        code_interp_tools.insert(
-            "run_code".to_string(),
-            ToolConfig {
-                response_format: Some(ResponseFormatConfig::CodeInterpreterCall),
-                ..Default::default()
-            },
-        );
-
-        let config = McpConfig {
-            servers: vec![
-                McpServerConfig {
-                    name: "search-server".to_string(),
-                    transport: McpTransport::Streamable {
-                        url: "http://localhost:9999/search".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: Some(web_search_tools),
-                    builtin_type: Some(BuiltinToolType::WebSearchPreview),
-                    builtin_tool_name: Some("web_search".to_string()),
-                    internal: false,
-                },
-                McpServerConfig {
-                    name: "code-server".to_string(),
-                    transport: McpTransport::Streamable {
-                        url: "http://localhost:9998/code".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: Some(code_interp_tools),
-                    builtin_type: Some(BuiltinToolType::CodeInterpreter),
-                    builtin_tool_name: Some("run_code".to_string()),
-                    internal: false,
-                },
-            ],
-            pool: Default::default(),
-            proxy: None,
-            warmup: Vec::new(),
-            inventory: Default::default(),
-            policy: Default::default(),
-        };
-
-        let format_registry = FormatRegistry::new();
-        for server in &config.servers {
-            format_registry.populate_from_server_config(server);
-        }
-        let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
-
-        let tools = vec![
-            ResponseTool::WebSearchPreview(WebSearchPreviewTool::default()),
-            ResponseTool::CodeInterpreter(CodeInterpreterTool::default()),
-        ];
-
-        let routing = collect_builtin_routing(&orchestrator, &format_registry, Some(&tools));
-
-        assert_eq!(routing.len(), 2);
-
-        // Find web search routing
-        let web_routing = routing
-            .iter()
-            .find(|r| r.builtin_type == BuiltinToolType::WebSearchPreview)
-            .expect("Should have web search routing");
-        assert_eq!(web_routing.server_name, "search-server");
-        assert_eq!(web_routing.tool_name, "web_search");
-        assert_eq!(web_routing.response_format, ResponseFormat::WebSearchCall);
-
-        // Find code interpreter routing
-        let code_routing = routing
-            .iter()
-            .find(|r| r.builtin_type == BuiltinToolType::CodeInterpreter)
-            .expect("Should have code interpreter routing");
-        assert_eq!(code_routing.server_name, "code-server");
-        assert_eq!(code_routing.tool_name, "run_code");
-        assert_eq!(
-            code_routing.response_format,
-            ResponseFormat::CodeInterpreterCall
-        );
-    }
-
-    #[tokio::test]
-    async fn test_collect_builtin_routing_image_generation() {
-        // Image generation is wired through the same hosted-tool MCP plumbing
-        // as web_search / code_interpreter / file_search. This test proves
-        // BuiltinToolType::ImageGeneration → ResponseFormat::ImageGenerationCall
-        // so per-router wiring can rely on the infrastructure.
-        let mut image_gen_tools = HashMap::new();
-        image_gen_tools.insert(
-            "generate_image".to_string(),
-            ToolConfig {
-                response_format: Some(ResponseFormatConfig::ImageGenerationCall),
-                ..Default::default()
-            },
-        );
-
-        let config = McpConfig {
-            servers: vec![McpServerConfig {
-                name: "image-server".to_string(),
-                transport: McpTransport::Streamable {
-                    url: "http://localhost:9997/image".to_string(),
-                    token: None,
-                    headers: HashMap::new(),
-                },
-                proxy: None,
-                required: false,
-                tools: Some(image_gen_tools),
-                builtin_type: Some(BuiltinToolType::ImageGeneration),
-                builtin_tool_name: Some("generate_image".to_string()),
-                internal: false,
-            }],
-            pool: Default::default(),
-            proxy: None,
-            warmup: Vec::new(),
-            inventory: Default::default(),
-            policy: Default::default(),
-        };
-
-        let format_registry = FormatRegistry::new();
-        for server in &config.servers {
-            format_registry.populate_from_server_config(server);
-        }
-        let orchestrator = Arc::new(McpOrchestrator::new(config).await.unwrap());
-
-        let tools = vec![ResponseTool::ImageGeneration(ImageGenerationTool::default())];
-
-        let routing = collect_builtin_routing(&orchestrator, &format_registry, Some(&tools));
-
-        assert_eq!(routing.len(), 1);
-        assert_eq!(routing[0].builtin_type, BuiltinToolType::ImageGeneration);
-        assert_eq!(routing[0].server_name, "image-server");
-        assert_eq!(routing[0].tool_name, "generate_image");
-        assert_eq!(
-            routing[0].response_format,
-            ResponseFormat::ImageGenerationCall
-        );
-    }
-
-    // =========================================================================
-    // ensure_request_mcp_client tests
-    // =========================================================================
-
-    #[tokio::test]
-    async fn test_ensure_request_mcp_client_with_builtin_routing() {
-        // Create orchestrator with a built-in server configured
-        let (orchestrator, format_registry) = create_test_orchestrator_with_builtin().await;
-
-        // Request has web_search_preview tool (no server_url, not MCP type)
-        let tools = vec![ResponseTool::WebSearchPreview(
-            WebSearchPreviewTool::default(),
-        )];
-
-        let result = ensure_request_mcp_client(&orchestrator, &format_registry, &tools).await;
-
-        // Should return Some because built-in routing is configured
-        assert!(result.is_some());
-
-        let mcp_servers = result.unwrap();
-        assert_eq!(mcp_servers.len(), 1);
-
-        // The server key should be the static server name
-        assert_eq!(mcp_servers[0].label, "search-server");
-        assert_eq!(mcp_servers[0].server_key, "search-server");
-    }
-
-    #[tokio::test]
-    async fn test_ensure_request_mcp_client_no_builtin_routing() {
-        // Create orchestrator WITHOUT built-in server configured
-        let (orchestrator, format_registry) = create_test_orchestrator_no_builtin().await;
-
-        // Request has web_search_preview tool
-        let tools = vec![ResponseTool::WebSearchPreview(
-            WebSearchPreviewTool::default(),
-        )];
-
-        let result = ensure_request_mcp_client(&orchestrator, &format_registry, &tools).await;
-
-        // Should return None because no MCP or built-in routing is available
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_ensure_request_mcp_client_function_tools_only() {
-        let (orchestrator, format_registry) = create_test_orchestrator_with_builtin().await;
-
-        // Request has only function tools (no MCP, no built-in)
-        let tools = vec![ResponseTool::Function(FunctionTool {
-            function: Function {
-                name: "dummy".to_string(),
-                description: None,
-                parameters: Some(json!({})),
-                strict: None,
-                extra: Default::default(),
-            },
-        })];
-
-        let result = ensure_request_mcp_client(&orchestrator, &format_registry, &tools).await;
-
-        // Should return None - function tools don't need MCP processing
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_ensure_request_mcp_client_mixed_tools() {
-        // Create orchestrator with built-in server
-        let (orchestrator, format_registry) = create_test_orchestrator_with_builtin().await;
-
-        // Request has mixed tools: function + web_search_preview
-        let tools = vec![
-            ResponseTool::Function(FunctionTool {
-                function: Function {
-                    name: "dummy".to_string(),
-                    description: None,
-                    parameters: Some(json!({})),
-                    strict: None,
-                    extra: Default::default(),
-                },
-            }),
-            ResponseTool::WebSearchPreview(WebSearchPreviewTool::default()),
-        ];
-
-        let result = ensure_request_mcp_client(&orchestrator, &format_registry, &tools).await;
-
-        // Should return Some because web_search_preview has built-in routing
-        assert!(result.is_some());
-
-        let mcp_servers = result.unwrap();
-        assert_eq!(mcp_servers.len(), 1);
-        assert_eq!(mcp_servers[0].label, "search-server");
-    }
-
-    // ---- T11 projection ---------------------------------------------------
-
-    use openai_protocol::responses::McpToolFilter;
-
-    #[test]
-    fn test_project_allowed_tools_none() {
-        assert_eq!(project_allowed_tools(None), None);
-    }
-
-    #[test]
-    fn test_project_allowed_tools_list_variant() {
-        let value = McpAllowedTools::List(vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(
-            project_allowed_tools(Some(&value)),
-            Some(vec!["a".to_string(), "b".to_string()])
-        );
-    }
-
-    #[test]
-    fn test_project_allowed_tools_filter_with_tool_names() {
-        let value = McpAllowedTools::Filter(McpToolFilter {
-            read_only: None,
-            tool_names: Some(vec!["x".to_string()]),
-        });
-        assert_eq!(
-            project_allowed_tools(Some(&value)),
-            Some(vec!["x".to_string()])
-        );
-    }
-
-    /// `Filter { read_only: Some(true) }` with no `tool_names` must project
-    /// to `Some(vec![])` (fail-closed) so downstream does not expose the full
-    /// tool surface when the caller explicitly asked to restrict. See
-    /// [`project_allowed_tools`] rationale.
-    #[test]
-    fn test_project_allowed_tools_filter_read_only_only_is_fail_closed() {
-        let value = McpAllowedTools::Filter(McpToolFilter {
-            read_only: Some(true),
-            tool_names: None,
-        });
-        assert_eq!(project_allowed_tools(Some(&value)), Some(Vec::new()));
-    }
-
-    /// `Filter { read_only: None, tool_names: None }` — both sub-fields
-    /// absent — is indistinguishable from an absent allowlist and projects
-    /// to `None` so the downstream retain path treats it as unconstrained.
-    #[test]
-    fn test_project_allowed_tools_filter_empty_is_unconstrained() {
-        let value = McpAllowedTools::Filter(McpToolFilter::default());
-        assert_eq!(project_allowed_tools(Some(&value)), None);
-    }
-
-    /// `Filter { read_only: Some(_), tool_names: Some(_) }` — both set — must
-    /// still fail-closed. Any `read_only` restriction disables the normal
-    /// name-list projection because `readOnlyHint`-based filtering is
-    /// unimplemented; honoring only the `tool_names` half would broaden
-    /// exposure past caller intent (e.g. `tool_names: ["mutating_tool"]` with
-    /// `read_only: true` must not expose `mutating_tool`).
-    #[test]
-    fn test_project_allowed_tools_filter_read_only_plus_names_is_fail_closed() {
-        let value = McpAllowedTools::Filter(McpToolFilter {
-            read_only: Some(true),
-            tool_names: Some(vec!["mutating_tool".to_string()]),
-        });
-        assert_eq!(project_allowed_tools(Some(&value)), Some(Vec::new()));
-    }
-
-    /// When the synthesized function tool exposes `user` as a parameter,
-    /// the model emits `{"user": null}` even though no value is supplied.
-    /// That null must not block request-level forwarding — the helper
-    /// treats absent and null as equivalent for injection purposes.
-    #[test]
-    fn inject_user_hosted_format_overwrites_model_supplied_null() {
-        let mut args = json!({"prompt": "a cat", "user": null});
-        inject_user_into_hosted_args(
-            &mut args,
-            ResponseFormat::ImageGenerationCall,
-            Some("user-123"),
-        );
-        assert_eq!(args.get("user"), Some(&json!("user-123")));
-    }
-
-    #[test]
-    fn inject_user_hosted_format_inserts_user_into_clean_args() {
-        let mut args = json!({"prompt": "a cat"});
-        inject_user_into_hosted_args(
-            &mut args,
-            ResponseFormat::ImageGenerationCall,
-            Some("user-123"),
-        );
-        assert_eq!(args.get("user"), Some(&json!("user-123")));
-        assert_eq!(args.get("prompt"), Some(&json!("a cat")));
-    }
-
-    #[test]
-    fn inject_user_hosted_format_preserves_existing_user_key() {
-        // Model-supplied `user` wins over the request-level identifier; the
-        // helper must not clobber it.
-        let mut args = json!({"prompt": "a cat", "user": "model-supplied"});
-        inject_user_into_hosted_args(
-            &mut args,
-            ResponseFormat::ImageGenerationCall,
-            Some("request-level"),
-        );
-        assert_eq!(args.get("user"), Some(&json!("model-supplied")));
-    }
-
-    #[test]
-    fn inject_user_passthrough_format_is_noop() {
-        // Plain MCP function tools have caller-defined schemas; injecting
-        // `user` could surprise tools that don't expect that key.
-        let mut args = json!({"q": "weather"});
-        inject_user_into_hosted_args(&mut args, ResponseFormat::Passthrough, Some("user-123"));
-        assert!(
-            !args.as_object().unwrap().contains_key("user"),
-            "passthrough format must not receive an injected user key"
-        );
-    }
-
-    #[test]
-    fn inject_user_empty_or_missing_user_is_noop() {
-        let mut args_none = json!({"prompt": "x"});
-        inject_user_into_hosted_args(&mut args_none, ResponseFormat::WebSearchCall, None);
-        assert!(!args_none.as_object().unwrap().contains_key("user"));
-
-        let mut args_empty = json!({"prompt": "x"});
-        inject_user_into_hosted_args(&mut args_empty, ResponseFormat::WebSearchCall, Some(""));
-        assert!(!args_empty.as_object().unwrap().contains_key("user"));
-    }
-
-    #[test]
-    fn inject_user_non_object_args_is_noop() {
-        let mut args = json!("not-an-object");
-        inject_user_into_hosted_args(&mut args, ResponseFormat::FileSearchCall, Some("u1"));
-        assert_eq!(args, json!("not-an-object"));
-    }
-
-    #[test]
-    fn inject_user_covers_every_hosted_format() {
-        // All four hosted formats should accept the injection identically.
-        for format in [
-            ResponseFormat::ImageGenerationCall,
-            ResponseFormat::WebSearchCall,
-            ResponseFormat::CodeInterpreterCall,
-            ResponseFormat::FileSearchCall,
-        ] {
-            let mut args = json!({});
-            inject_user_into_hosted_args(&mut args, format, Some("user-xyz"));
-            assert_eq!(
-                args.get("user"),
-                Some(&json!("user-xyz")),
-                "expected user injection for format {format:?}"
-            );
-        }
-    }
-    #[test]
-    fn collect_namespace_function_names_preserves_user_routing() {
-        let request: ResponsesRequest = serde_json::from_value(json!({
-            "model": "test-model", "input": "Check the weather",
-            "tools": [
-                {"type": "namespace", "name": "weather", "description": "Weather tools", "tools": [
-                    {"type": "function", "name": "lookup", "parameters": {}}
-                ]},
-                {"type": "namespace", "name": "travel", "description": "Travel tools", "tools": [
-                    {"type": "function", "name": "lookup", "parameters": {}}
-                ]}
-            ]
-        }))
-        .unwrap();
-        let names = collect_user_function_names(&request);
-        assert_eq!(
-            names,
-            HashSet::from(["weather.lookup".into(), "travel.lookup".into()])
-        );
-    }
-}
+#[path = "../tests/unit/mcp_utils/tests.rs"]
+mod tests;

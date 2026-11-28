@@ -28,7 +28,16 @@ process (its parallel layout, off the server arguments): the hang needs a
 collective waiting on a peer, and a one-process engine pays a count's first
 use as a pause, so it plans the length classes alone, as the other engines
 do, and an 8k window is a few hundred steps rather than eight thousand. An
-unknown layout keeps them.
+unknown layout keeps them. ``SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS``
+overrides that choice (:func:`parse_remainders`; the launchers read it with
+their other knobs and refuse to start on a value it does not take): ``on``
+plans them whatever the layout, ``off`` plans none (for an engine that loads
+those kernels itself before it reports ready; on an engine of more than one
+process or of an unknown layout the start log warns that the hazard is
+otherwise open), and ``auto``, the default, keeps the rule above. The
+engine's prefill graphs are no reason to turn them off: those library GEMMs
+run eagerly (in the attention graph break or the eager narrowing layer) at
+each forward's real token count.
 
 The plan's longest prompt leaves the engine's scheduler what it keeps back
 (:func:`context_reserve_tokens`): its request handler clamps a request's
@@ -50,11 +59,26 @@ from collections.abc import Mapping
 from typing import Any
 
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
-from smg_grpc_servicer.warmup import WarmupInputs, WarmupRequest, refused, unserved
+from smg_grpc_servicer.warmup import (
+    OFF_VALUES,
+    WarmupInputs,
+    WarmupRequest,
+    refused,
+    unserved,
+)
 
 logger = logging.getLogger(__name__)
 
 WARMUP_ENV = "SMG_TOKENSPEED_SERVICER_WARMUP"
+#: Whether the full level plans the chunk remainders (the module's doc,
+#: :func:`parse_remainders`): ``auto`` (unset; on an engine of more than one
+#: process or of an unknown layout), ``on`` or ``off``.
+REMAINDERS_ENV = "SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS"
+#: The values of :data:`REMAINDERS_ENV` that read as ``on`` (``off`` takes the
+#: shared :data:`~smg_grpc_servicer.warmup.OFF_VALUES`).
+REMAINDERS_ON_VALUES = ("on", "1", "true", "yes")
+#: The setting when :data:`REMAINDERS_ENV` is unset: the layout rule.
+DEFAULT_REMAINDERS = "auto"
 #: The engine's own prefill budget when the arguments carry neither a chunk
 #: size nor a prefill budget as a count.
 DEFAULT_STEP_TOKENS = 8192
@@ -74,11 +98,16 @@ SCHEDULER_RESERVE_TOKENS = 2
 _MAX_MESSAGE_BYTES = 1024 * 1024 * 256
 
 
-def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | None:
+def warmup_inputs(
+    server_args: Any, facts: Mapping[str, Any], *, remainders: str = DEFAULT_REMAINDERS
+) -> WarmupInputs | None:
     """What the planner needs, off the server arguments and the advertised
     model facts (``max_context_length``, ``vocab_size``): the running window,
     the step budget (the chunk size under chunked prefill, else the prefill
-    budget, else the engine's default), the context. ``None`` for a
+    budget, else the engine's default), the context, and whether the full
+    level visits the chunk remainders under ``remainders`` (the setting of
+    :data:`REMAINDERS_ENV` as :func:`parse_remainders` reads it; the
+    launchers read it before any engine work). ``None`` for a
     disaggregation role (encode, prefill, decode), whose requests need
     bootstrap fields a warm-up does not carry. The plan is one rank's: the
     servicer routes this engine's requests to the least-loaded rank and reads
@@ -109,7 +138,7 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
         # Every count a chunk can hold, once, before serving (the module's
         # doc), where a count's first use can meet a collective in flight:
         # an engine of more than one process. An unknown layout keeps them.
-        every_prefill_length=args.world_size != 1,
+        every_prefill_length=chunk_remainders(args.world_size, remainders),
     )
 
 
@@ -123,6 +152,49 @@ def context_reserve_tokens(args: Any) -> int:
     warm-up request already covers."""
     draft = args.speculative_num_draft_tokens if args.speculative_algorithm else None
     return max(SCHEDULER_RESERVE_TOKENS, (draft or 1) - 1)
+
+
+def parse_remainders(text: str | None) -> str:
+    """The setting a value of :data:`REMAINDERS_ENV` stands for: unset, empty
+    or ``auto`` is :data:`DEFAULT_REMAINDERS` (the layout rule);
+    :data:`REMAINDERS_ON_VALUES` read as ``on``, the shared
+    :data:`~smg_grpc_servicer.warmup.OFF_VALUES` as ``off``. Anything else
+    is a ``ValueError`` naming the variable and the value."""
+    raw = (text or "").strip().lower()
+    if raw in ("", DEFAULT_REMAINDERS):
+        return DEFAULT_REMAINDERS
+    if raw in REMAINDERS_ON_VALUES:
+        return "on"
+    if raw in OFF_VALUES:
+        return "off"
+    raise ValueError(
+        f"{REMAINDERS_ENV}={text!r}: expected auto, on or off (the default is {DEFAULT_REMAINDERS})"
+    )
+
+
+def chunk_remainders(world_size: int | None, setting: str) -> bool:
+    """Whether the full level plans the chunk remainders under ``setting``
+    (:func:`parse_remainders`): under ``auto``, on an engine of more than one
+    process or of an unknown layout (the module's doc); ``on`` and ``off``
+    decide alone. ``off`` on an engine of more than one process or of an
+    unknown layout logs a WARNING: the remainders are what keeps a count's
+    first use out of serving there, unless the engine loads those kernels
+    itself before it reports ready."""
+    if setting == "on":
+        return True
+    if setting == DEFAULT_REMAINDERS:
+        return world_size != 1
+    if setting != "off":
+        raise ValueError(f"not a setting of {REMAINDERS_ENV}: {setting!r}")
+    if world_size != 1:
+        logger.warning(
+            "Planned warm-up plans no chunk remainders (%s=off) on an engine of %s processes: "
+            "a prompt length's first use during serving stays a hazard unless the engine "
+            "loads those kernels itself before it reports ready",
+            REMAINDERS_ENV,
+            world_size if world_size is not None else "an unknown number of",
+        )
+    return False
 
 
 class GrpcWire:

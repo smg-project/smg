@@ -9,7 +9,10 @@ use redis::{AsyncCommands, AsyncConnectionConfig};
 use serde_json::Value;
 
 use crate::{
-    common::{parse_json_value, parse_raw_response, resolve_extra_column_values},
+    common::{
+        parse_conversation_metadata, parse_json_value, parse_raw_response,
+        resolve_extra_column_values,
+    },
     config::RedisConfig,
     context::current_extra_columns,
     core::{
@@ -124,6 +127,15 @@ impl RedisConversationStorage {
         Self { store }
     }
 
+    /// A pooled connection, or this store's error for an unavailable pool.
+    async fn conn(&self) -> Result<Connection, ConversationStorageError> {
+        self.store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ConversationStorageError::pool_unavailable(&e))
+    }
+
     fn conversation_key(&self, id: &str) -> String {
         match &self.store.schema.owner {
             Some(owner) => format!("{owner}:conversation:{id}"),
@@ -134,8 +146,7 @@ impl RedisConversationStorage {
     fn parse_metadata(
         metadata: Option<String>,
     ) -> Result<Option<ConversationMetadata>, ConversationStorageError> {
-        crate::common::parse_conversation_metadata(metadata)
-            .map_err(ConversationStorageError::StorageError)
+        parse_conversation_metadata(metadata).map_err(ConversationStorageError::StorageError)
     }
 
     /// The tenant stored on a conversation's hash: `None` when the schema
@@ -172,12 +183,7 @@ impl ConversationStorage for RedisConversationStorage {
 
         let s = &self.store.schema.conversations;
 
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
         let key = self.conversation_key(id_str);
 
         let mut pipe = redis::pipe();
@@ -223,12 +229,7 @@ impl ConversationStorage for RedisConversationStorage {
 
         let id_str = id.0.as_str();
         let key = self.conversation_key(id_str);
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         let exists: bool = conn
             .exists(&key)
@@ -278,12 +279,7 @@ impl ConversationStorage for RedisConversationStorage {
 
         let id_str = id.0.as_str();
         let key = self.conversation_key(id_str);
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         let exists: bool = conn
             .exists(&key)
@@ -335,12 +331,7 @@ impl ConversationStorage for RedisConversationStorage {
         let key = self.conversation_key(id_str);
         let items_key = format!("{key}:items");
 
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         // The pipeline answers one count per DEL (the conversation key, then
         // its item index); the conversation existed if its key was deleted.
@@ -362,6 +353,15 @@ pub(super) struct RedisConversationItemStorage {
 impl RedisConversationItemStorage {
     pub fn new(store: RedisStore) -> Self {
         Self { store }
+    }
+
+    /// A pooled connection, or this store's error for an unavailable pool.
+    async fn conn(&self) -> Result<Connection, ConversationItemStorageError> {
+        self.store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))
     }
 
     fn item_key(&self, id: &str) -> String {
@@ -528,12 +528,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
         let id_str = conversation_item.id.0.as_str();
         let key = self.item_key(id_str);
 
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         let mut fields: Vec<(&str, String)> = vec![(si.col("id"), id_str.to_string())];
         if !si.is_skipped("response_id") {
@@ -611,12 +606,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
 
         let score = link_score(added_at);
 
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
         // The link and the index's expiry in the one round trip.
         let mut pipe = redis::pipe();
         pipe.zadd(&key, iid, score).ignore();
@@ -640,12 +630,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
         let cid = conversation_id.0.as_str();
         let key = self.conv_items_key(cid);
 
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         let mut pipe = redis::pipe();
         for (item_id, added_at) in items {
@@ -667,12 +652,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
     ) -> ConversationItemResult<Vec<ConversationItem>> {
         let cid = conversation_id.0.as_str();
         let key = self.conv_items_key(cid);
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         let mut min = "-inf".to_string();
         let mut max = "+inf".to_string();
@@ -754,12 +734,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
     ) -> ConversationItemResult<Option<ConversationItem>> {
         let iid = item_id.0.as_str();
         let key = self.item_key(iid);
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         let map: HashMap<String, String> = conn
             .hgetall(&key)
@@ -782,12 +757,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
         let iid = item_id.0.as_str();
         let key = self.conv_items_key(cid);
 
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
         let score: Option<f64> = conn
             .zscore(&key, iid)
             .await
@@ -805,12 +775,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
         let iid = item_id.0.as_str();
         let key = self.conv_items_key(cid);
 
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
         conn.zrem::<_, _, ()>(&key, iid)
             .await
             .map_err(ConversationItemStorageError::from_redis)?;
@@ -826,6 +791,15 @@ pub(super) struct RedisResponseStorage {
 impl RedisResponseStorage {
     pub fn new(store: RedisStore) -> Self {
         Self { store }
+    }
+
+    /// A pooled connection, or this store's error for an unavailable pool.
+    async fn conn(&self) -> Result<Connection, ResponseStorageError> {
+        self.store
+            .pool
+            .get()
+            .await
+            .map_err(|e| ResponseStorageError::pool_unavailable(&e))
     }
 
     fn response_key(&self, id: &str) -> String {
@@ -1198,12 +1172,7 @@ impl ResponseStorage for RedisResponseStorage {
         let key = self.response_key(&response_id.0);
         let fields = self.hash_fields(&response)?;
 
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         // The hash, the keys that go with it and the identifier's index
         // entry in the one round trip.
@@ -1227,12 +1196,7 @@ impl ResponseStorage for RedisResponseStorage {
         let key = self.response_key(&response.id.0);
         let fields = self.hash_fields(&response)?;
 
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         // The status check, the hash write, the output-item keys and the
         // expiry run as one script: nothing closes the record between the
@@ -1293,12 +1257,7 @@ impl ResponseStorage for RedisResponseStorage {
         }
         let key = self.response_key(&id.0);
         let json_raw_response = serde_json::to_string(&raw_response)?;
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
         // The same script as the full store, with the object's field alone;
         // the output-item keys and the expiry follow the object in the same
         // run.
@@ -1345,12 +1304,7 @@ impl ResponseStorage for RedisResponseStorage {
     ) -> Result<Option<StoredResponse>, ResponseStorageError> {
         let id = response_id.0.as_str();
         let key = self.response_key(id);
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         let map: HashMap<String, String> = conn
             .hgetall(&key)
@@ -1371,12 +1325,7 @@ impl ResponseStorage for RedisResponseStorage {
         if self.store.schema.responses.is_skipped("raw_response") {
             return Ok(None);
         }
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         let response_id: Option<String> = conn
             .get(self.output_item_key(item_id))
@@ -1393,12 +1342,7 @@ impl ResponseStorage for RedisResponseStorage {
 
         let id = response_id.0.as_str();
         let key = self.response_key(id);
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         let output_item_keys = self
             .output_item_keys_of_many(&mut conn, std::slice::from_ref(&key))
@@ -1441,12 +1385,7 @@ impl ResponseStorage for RedisResponseStorage {
         after: Duration,
     ) -> ResponseResult<()> {
         let key = self.response_key(response_id.0.as_str());
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         // The record and the output-item keys pointing at it go together;
         // the identifier index tolerates a member whose record is gone.
@@ -1478,12 +1417,7 @@ impl ResponseStorage for RedisResponseStorage {
         }
 
         let key = self.safety_key(identifier);
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         // The whole index, newest first: the tenant is a field of each
         // record, so the limit applies after the records the caller may not
@@ -1519,12 +1453,7 @@ impl ResponseStorage for RedisResponseStorage {
         }
 
         let key = self.safety_key(identifier);
-        let mut conn = self
-            .store
-            .pool
-            .get()
-            .await
-            .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
+        let mut conn = self.conn().await?;
 
         let response_ids: Vec<String> = conn
             .zrange(&key, 0, -1)
@@ -1634,148 +1563,5 @@ fn output_item_ids(raw_response: &Value) -> Vec<&str> {
 }
 
 #[cfg(test)]
-mod tests {
-    use serde_json::json;
-
-    use super::*;
-
-    #[test]
-    fn output_item_ids_reads_the_output_array_only() {
-        let raw = json!({
-            "id": "resp_1",
-            "output": [
-                {"type": "reasoning", "id": "rs_1"},
-                {"type": "message", "id": "msg_1"},
-                {"type": "message"}
-            ]
-        });
-        assert_eq!(output_item_ids(&raw), vec!["rs_1", "msg_1"]);
-        assert!(output_item_ids(&json!({"id": "resp_2"})).is_empty());
-        assert!(output_item_ids(&Value::Null).is_empty());
-    }
-
-    #[test]
-    fn link_scores_a_microsecond_apart_keep_their_order() {
-        let base = DateTime::from_timestamp_micros(1_700_000_000_123_456).unwrap();
-        let later = base + chrono::TimeDelta::microseconds(1);
-        assert!(link_score(base) < link_score(later));
-        assert!(link_score(later) < link_score(later + chrono::TimeDelta::microseconds(1)));
-    }
-
-    #[test]
-    fn link_score_of_a_whole_millisecond_is_its_millisecond_count() {
-        // The score links were stored with before, so stored and new links sort together.
-        let whole = DateTime::from_timestamp_millis(1_700_000_000_123).unwrap();
-        assert_eq!(
-            link_score(whole).to_bits(),
-            1_700_000_000_123.0_f64.to_bits()
-        );
-    }
-
-    #[test]
-    fn create_item_script_answers_an_existing_hash_and_writes_only_a_missing_one() {
-        let script = CREATE_ITEM_SCRIPT;
-        let answered = script
-            .find("if redis.call('EXISTS', KEYS[1]) == 1 then return redis.call('HGETALL', KEYS[1]) end")
-            .expect("an existing hash is answered as it is");
-        for write in [
-            "for i = 2, #ARGV - 1, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end",
-            "if ARGV[1] ~= '' then redis.call('EXPIRE', KEYS[1], ARGV[1]) end",
-        ] {
-            let at = script
-                .find(write)
-                .unwrap_or_else(|| panic!("the script writes: {write}"));
-            assert!(
-                at > answered,
-                "written only past the existence check: {write}"
-            );
-        }
-        assert!(script.trim_end().ends_with("return {}"));
-    }
-
-    #[test]
-    fn store_if_open_script_writes_an_existing_hash_without_a_status_and_refuses_a_missing_one() {
-        let script = store_if_open_script();
-        // The object field is read only when the schema has one.
-        assert!(
-            script.contains("if ARGV[1] ~= '' then raw = redis.call('HGET', KEYS[1], ARGV[1]) end")
-        );
-        // Without it, or without the field in the hash, the hash itself
-        // decides between missing and open.
-        assert!(script.contains(
-            "if not raw and redis.call('EXISTS', KEYS[1]) == 0 then return 'missing' end"
-        ));
-        assert!(script.contains(
-            "if status == 'completed' or status == 'incomplete' or status == 'failed' or \
-             status == 'cancelled' then return 'closed' end"
-        ));
-        assert!(script.trim_end().ends_with("return 'stored'"));
-    }
-
-    #[test]
-    fn store_if_open_script_writes_the_output_item_keys_and_the_expiry_with_the_fields() {
-        let script = store_if_open_script();
-        let check = script.find("return 'closed'").expect("the status check");
-        // Everything a stored record carries is written in the one run, after
-        // the check: the fields, one key per output item under the retention
-        // (a plain SET without one), the hash's expiry.
-        for write in [
-            "for i = 4, #ARGV - 1, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end",
-            "for k = 2, #KEYS do",
-            "if ARGV[3] == '' then redis.call('SET', KEYS[k], ARGV[2]) \
-             else redis.call('SETEX', KEYS[k], ARGV[3], ARGV[2]) end",
-            "if ARGV[3] ~= '' then redis.call('EXPIRE', KEYS[1], ARGV[3]) end",
-        ] {
-            let at = script
-                .find(write)
-                .unwrap_or_else(|| panic!("the script writes: {write}"));
-            assert!(at > check, "written after the status check: {write}");
-        }
-        assert!(script.trim_end().ends_with("return 'stored'"));
-    }
-
-    #[test]
-    fn the_object_field_argument_is_empty_when_the_schema_skips_the_column() {
-        let storage = |schema: Option<SchemaConfig>| {
-            RedisResponseStorage::new(
-                RedisStore::new(RedisConfig {
-                    url: "redis://127.0.0.1:1/0".to_string(),
-                    pool_max: 1,
-                    op_timeout_secs: 1,
-                    schema,
-                    retention_days: None,
-                })
-                .expect("a pool is built without a connection"),
-            )
-        };
-        assert_eq!(storage(None).object_field_arg(), "raw_response");
-        let mut mapped = SchemaConfig::default();
-        mapped
-            .responses
-            .columns
-            .insert("raw_response".to_string(), "payload".to_string());
-        assert_eq!(storage(Some(mapped)).object_field_arg(), "payload");
-        let mut skipped = SchemaConfig::default();
-        skipped
-            .responses
-            .skip_columns
-            .insert("raw_response".to_string());
-        assert_eq!(storage(Some(skipped)).object_field_arg(), "");
-    }
-
-    #[test]
-    fn the_retention_in_seconds_is_the_configured_days() {
-        let store = |retention_days: Option<u64>| {
-            RedisStore::new(RedisConfig {
-                url: "redis://127.0.0.1:1/0".to_string(),
-                pool_max: 1,
-                op_timeout_secs: 1,
-                schema: None,
-                retention_days,
-            })
-            .expect("a pool is built without a connection")
-        };
-        assert_eq!(store(Some(2)).retention_seconds(), Some(172_800));
-        assert_eq!(store(None).retention_seconds(), None);
-    }
-}
+#[path = "../tests/unit/redis/tests.rs"]
+mod tests;

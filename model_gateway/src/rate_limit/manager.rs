@@ -13,11 +13,15 @@ use uuid::Uuid;
 use super::{
     backend::{RateLimitBackend, ReserveOutcome, ReserveRequest, UsageSettlement},
     config::RateLimitYaml,
+    document::{PolicyChanges, PolicySummary},
     local_backend::{LocalRateLimitBackend, PolicyReplacement},
     policy::CompiledPolicySet,
     reservation::SharedReservationHandle,
 };
-use crate::config::types::RouterConfig;
+use crate::{
+    admin::document::{etag, AdminDocument, Applied},
+    config::types::RouterConfig,
+};
 
 /// Outcome of [`RateLimitManager::reserve`] — bundles admission with the
 /// handle, since every admitted caller needs one immediately.
@@ -80,6 +84,45 @@ impl From<Arc<dyn RateLimitBackend>> for Backend {
 /// settle.
 pub struct RateLimitManager {
     backend: Backend,
+    /// The policy document in force with its revision: the start's file,
+    /// then each document [`Self::replace_document`] applied. `None` for a
+    /// manager over a backend of its own, which took no document.
+    document: Option<AdminDocument<RateLimitYaml>>,
+    /// Whether `header:` tenant keys can match a request, as the start
+    /// checked its file; a replacement document is held to the same rule.
+    trusts_tenant_header: bool,
+}
+
+/// What [`RateLimitManager::replace_document`] did.
+#[derive(Debug)]
+pub struct DocumentOutcome {
+    /// The revision in force after the call: the new one when applied, the
+    /// live one a dry run was checked against.
+    pub revision: Arc<Applied<RateLimitYaml>>,
+    /// `false` for a dry run: nothing was swapped and the revision stands.
+    pub applied: bool,
+    /// The shape of the document given.
+    pub summary: PolicySummary,
+    /// What it changes against the revision it was checked against.
+    pub changes: PolicyChanges,
+    /// What the application did to the live buckets; `None` for a dry run.
+    pub buckets: Option<PolicyReplacement>,
+}
+
+/// Why [`RateLimitManager::replace_document`] refused.
+#[derive(Debug)]
+pub enum DocumentRefusal {
+    /// The manager took no document: it runs over a backend of its own.
+    NoDocument,
+    /// The document fails the checks the start applies to its file; the
+    /// message says where.
+    Invalid(String),
+    /// The ETag given is not the live revision's, carried here.
+    Stale(Arc<Applied<RateLimitYaml>>),
+    /// The backend in use takes no new policy while running.
+    BackendFixed(String),
+    /// The document has no JSON form to hash; nothing was applied.
+    Record(serde_json::Error),
 }
 
 impl RateLimitManager {
@@ -90,6 +133,8 @@ impl RateLimitManager {
     pub fn new(backend: Arc<dyn RateLimitBackend>) -> Self {
         Self {
             backend: Backend::Dyn(backend),
+            document: None,
+            trusts_tenant_header: false,
         }
     }
 
@@ -104,23 +149,71 @@ impl RateLimitManager {
 
     fn try_build(rc: &RouterConfig) -> Result<Self, String> {
         let yaml = load_yaml(rc.tenant_rate_limit_config.as_deref())?;
-        // header: overrides are unreachable without trust_tenant_header --
-        // tenant_resolution never constructs that key form otherwise.
-        if !rc.tenant_resolution.trust_tenant_header {
-            if let Some(tenant_key) = yaml.tenants.iter().find_map(|t| {
-                t.tenant_key
-                    .as_deref()
-                    .filter(|key| key.starts_with("header:"))
-            }) {
-                return Err(format!(
-                    "tenant_rate_limit_config has tenant_key '{tenant_key}' but tenant_resolution.trust_tenant_header is not set -- this override can never match a real request"
-                ));
-            }
-        }
+        let trusts_tenant_header = rc.tenant_resolution.trust_tenant_header;
+        header_keys_reachable(&yaml, trusts_tenant_header)?;
         let compiled = CompiledPolicySet::compile(&yaml).map_err(|e| e.to_string())?;
         let backend = LocalRateLimitBackend::start(compiled)?;
+        let document = AdminDocument::from_startup(yaml)
+            .map_err(|e| format!("recording the tenant rate-limit document: {e}"))?;
         Ok(Self {
             backend: Backend::Local(backend),
+            document: Some(document),
+            trusts_tenant_header,
+        })
+    }
+
+    /// The policy document in force with its revision and ETag; `None` for
+    /// a manager over a backend of its own, which took no document.
+    pub fn document(&self) -> Option<Arc<Applied<RateLimitYaml>>> {
+        self.document.as_ref().map(AdminDocument::load)
+    }
+
+    /// `document` checked as the start checks its file, compiled and, unless
+    /// `dry_run`, put in force as the next revision under `principal`; the
+    /// live buckets follow the backend's `replace_policy` rule. `expected_etag`
+    /// is the ETag of the revision the caller read: a write against a
+    /// revision another writer replaced is refused with the live one. One
+    /// writer at a time runs from the check to the swap.
+    pub fn replace_document(
+        &self,
+        expected_etag: &str,
+        document: RateLimitYaml,
+        principal: &str,
+        dry_run: bool,
+    ) -> Result<DocumentOutcome, DocumentRefusal> {
+        let Some(holder) = &self.document else {
+            return Err(DocumentRefusal::NoDocument);
+        };
+        header_keys_reachable(&document, self.trusts_tenant_header)
+            .map_err(DocumentRefusal::Invalid)?;
+        let compiled = CompiledPolicySet::compile(&document)
+            .map_err(|error| DocumentRefusal::Invalid(error.to_string()))?;
+        let etag = etag(&document).map_err(DocumentRefusal::Record)?;
+        let writer = holder.write();
+        let live = writer.live();
+        if live.etag != expected_etag {
+            return Err(DocumentRefusal::Stale(live));
+        }
+        let summary = PolicySummary::of(&document);
+        let changes = PolicyChanges::between(&live.document, &document);
+        if dry_run {
+            return Ok(DocumentOutcome {
+                revision: live,
+                applied: false,
+                summary,
+                changes,
+                buckets: None,
+            });
+        }
+        let buckets = self
+            .replace_policy(compiled)
+            .map_err(DocumentRefusal::BackendFixed)?;
+        Ok(DocumentOutcome {
+            revision: writer.apply(document, etag, principal),
+            applied: true,
+            summary,
+            changes,
+            buckets: Some(buckets),
         })
     }
 
@@ -129,8 +222,9 @@ impl RateLimitManager {
     /// from to the start's checks (a `header:` tenant key needs the trusted
     /// tenant header), since a compiled set carries no such rule. A backend
     /// behind the trait object takes no new policy while running: `Err`
-    /// says so.
-    pub fn replace_policy(&self, policy: CompiledPolicySet) -> Result<PolicyReplacement, String> {
+    /// says so. [`Self::replace_document`] alone calls it: a policy put in
+    /// force past the document would leave the revision and its ETag behind.
+    fn replace_policy(&self, policy: CompiledPolicySet) -> Result<PolicyReplacement, String> {
         match &self.backend {
             Backend::Local(backend) => Ok(backend.replace_policy(policy)),
             Backend::Dyn(_) => {
@@ -150,6 +244,26 @@ impl RateLimitManager {
     }
 }
 
+/// `header:` tenant keys match a request only when the tenant header is
+/// trusted; `tenant_resolution` never builds that key form otherwise, so a
+/// policy naming one would never apply. The start checks its file by this
+/// rule and a replacement document is held to it too.
+fn header_keys_reachable(yaml: &RateLimitYaml, trusts_tenant_header: bool) -> Result<(), String> {
+    if trusts_tenant_header {
+        return Ok(());
+    }
+    match yaml.tenants.iter().find_map(|t| {
+        t.tenant_key
+            .as_deref()
+            .filter(|key| key.starts_with("header:"))
+    }) {
+        Some(tenant_key) => Err(format!(
+            "tenant_rate_limit_config has tenant_key '{tenant_key}' but tenant_resolution.trust_tenant_header is not set -- this override can never match a real request"
+        )),
+        None => Ok(()),
+    }
+}
+
 fn load_yaml(path: Option<&str>) -> Result<RateLimitYaml, String> {
     let path = path.ok_or_else(|| {
         "tenant_rate_limit_enabled is set but tenant_rate_limit_config is not".to_string()
@@ -159,156 +273,5 @@ fn load_yaml(path: Option<&str>) -> Result<RateLimitYaml, String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rate_limit::{config::TenantPolicySpec, test_support::reserve_request};
-
-    fn manager_with_limits(tpm: u32, rpm: u32) -> RateLimitManager {
-        let yaml = RateLimitYaml {
-            default_policy: TenantPolicySpec {
-                tenant_key: None,
-                tokens_per_minute: tpm,
-                requests_per_minute: rpm,
-                model_rules: Vec::new(),
-            },
-            tenants: Vec::new(),
-        };
-        let compiled = CompiledPolicySet::compile(&yaml).unwrap();
-        RateLimitManager {
-            backend: Backend::Local(Arc::new(LocalRateLimitBackend::new(compiled))),
-        }
-    }
-
-    #[tokio::test]
-    async fn admitted_reservation_carries_a_handle() {
-        let manager = manager_with_limits(100, 5);
-        match manager.reserve(reserve_request("auth:team-red", 50)).await {
-            Reservation::Admitted(handle) => {
-                // The handle is independently usable -- settle through it,
-                // not through the backend directly.
-                handle.settle_success(UsageSettlement::default()).await;
-            }
-            Reservation::Denied { .. } => panic!("expected admission"),
-        }
-    }
-
-    #[tokio::test]
-    async fn denied_reservation_carries_no_handle() {
-        let manager = manager_with_limits(100, 5);
-        assert!(matches!(
-            manager.reserve(reserve_request("auth:team-red", 200)).await,
-            Reservation::Denied { .. }
-        ));
-    }
-
-    fn router_config(enabled: bool, config_path: Option<String>) -> RouterConfig {
-        RouterConfig::builder()
-            .worker_startup_timeout_secs(1)
-            .tenant_rate_limit_enabled(enabled)
-            .tenant_rate_limit_config(config_path)
-            .build_unchecked()
-    }
-
-    #[test]
-    fn disabled_returns_ok_none() {
-        let rc = router_config(false, None);
-        assert!(matches!(RateLimitManager::from_config(&rc), Ok(None)));
-    }
-
-    #[test]
-    fn enabled_without_config_path_fails_startup() {
-        let rc = router_config(true, None);
-        assert!(RateLimitManager::from_config(&rc).is_err());
-    }
-
-    #[test]
-    fn enabled_with_missing_file_fails_startup() {
-        let rc = router_config(true, Some("/nonexistent/path/rate_limit.yaml".to_string()));
-        assert!(RateLimitManager::from_config(&rc).is_err());
-    }
-
-    #[test]
-    fn enabled_with_invalid_policy_fails_startup() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rate_limit.yaml");
-        // default_policy must not set tenant_key -- this is invalid.
-        std::fs::write(
-            &path,
-            "default_policy:\n  tenant_key: auth:oops\n  tokens_per_minute: 1000\n  requests_per_minute: 60\n",
-        )
-        .unwrap();
-
-        let rc = router_config(true, Some(path.to_str().unwrap().to_string()));
-        assert!(RateLimitManager::from_config(&rc).is_err());
-    }
-
-    #[tokio::test]
-    async fn enabled_with_valid_policy_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rate_limit.yaml");
-        std::fs::write(
-            &path,
-            "default_policy:\n  tokens_per_minute: 1000\n  requests_per_minute: 60\n",
-        )
-        .unwrap();
-
-        let rc = router_config(true, Some(path.to_str().unwrap().to_string()));
-        assert!(matches!(RateLimitManager::from_config(&rc), Ok(Some(_))));
-    }
-
-    /// The in-memory backend's idle sweep needs a runtime to run on: a
-    /// valid policy built outside one fails startup rather than panicking
-    /// or running without the sweep.
-    #[test]
-    fn enabled_outside_a_runtime_fails_startup() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rate_limit.yaml");
-        std::fs::write(
-            &path,
-            "default_policy:\n  tokens_per_minute: 1000\n  requests_per_minute: 60\n",
-        )
-        .unwrap();
-
-        let rc = router_config(true, Some(path.to_str().unwrap().to_string()));
-        assert!(RateLimitManager::from_config(&rc).is_err());
-    }
-
-    #[test]
-    fn header_tenant_key_without_trust_tenant_header_fails_startup() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rate_limit.yaml");
-        std::fs::write(
-            &path,
-            "default_policy:\n  tokens_per_minute: 1000\n  requests_per_minute: 60\ntenants:\n  - tenant_key: header:team-red\n    tokens_per_minute: 500\n    requests_per_minute: 30\n",
-        )
-        .unwrap();
-
-        // trust_tenant_header defaults to false, so this override could
-        // never match a real request.
-        let rc = RouterConfig::builder()
-            .worker_startup_timeout_secs(1)
-            .tenant_rate_limit_enabled(true)
-            .tenant_rate_limit_config(Some(path.to_str().unwrap().to_string()))
-            .build_unchecked();
-        assert!(RateLimitManager::from_config(&rc).is_err());
-    }
-
-    #[tokio::test]
-    async fn header_tenant_key_with_trust_tenant_header_succeeds() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("rate_limit.yaml");
-        std::fs::write(
-            &path,
-            "default_policy:\n  tokens_per_minute: 1000\n  requests_per_minute: 60\ntenants:\n  - tenant_key: header:team-red\n    tokens_per_minute: 500\n    requests_per_minute: 30\n",
-        )
-        .unwrap();
-
-        let rc = RouterConfig::builder()
-            .worker_startup_timeout_secs(1)
-            .tenant_rate_limit_enabled(true)
-            .tenant_rate_limit_config(Some(path.to_str().unwrap().to_string()))
-            .trust_tenant_header(true)
-            .build_unchecked();
-        assert!(matches!(RateLimitManager::from_config(&rc), Ok(Some(_))));
-    }
-}
+#[path = "../../tests/unit/rate_limit/manager/tests.rs"]
+mod tests;

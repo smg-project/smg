@@ -21,7 +21,7 @@
 )]
 mod common;
 
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Arc};
 
 use common::{bytes_of, chunkings, replay_after};
 use openai_protocol::common::{Function, Tool};
@@ -1502,6 +1502,108 @@ fn accepts(grammar: &Grammar, text: &str) -> bool {
     ends(grammar, text, 0).contains(&text.len())
 }
 
+/// The registry's tagged table, by the acceptor above: the tag of a required call takes one call
+/// and two calls, with one newline between them, two or none, and no other text after a call,
+/// wherever the prompt and the engine leave the model, after what the thought owes there; a tag
+/// of one call takes one and no second.
+#[test]
+fn a_required_tag_takes_its_calls_and_no_text_after_them() {
+    const CALL: &str = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+    const BLOCK: &str = "<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>";
+    let tools = [Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "get_weather".to_string(),
+            description: None,
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            })),
+            strict: None,
+            extra: Default::default(),
+        },
+    }];
+    let format = symphony::formats::Table::Qwen3Tagged.format();
+    for start in [
+        GrammarStart::Unknown,
+        GrammarStart::Either,
+        GrammarStart::AfterReasoning,
+        GrammarStart::FirstToken,
+    ] {
+        for (reasoning_open, thought_closed) in [(false, false), (true, false), (false, true)] {
+            // What the thought owes before the calls: its text and close where the engine starts
+            // the grammar inside it, the template's two newlines after a close the prompt did not
+            // write, nothing where the prompt wrote them itself.
+            let before = match (reasoning_open, thought_closed, start) {
+                (true, _, GrammarStart::FirstToken) => "\nNo tool fits.\n</think>\n\n",
+                (true, ..) | (false, false, GrammarStart::AfterReasoning) => "\n\n",
+                _ => "",
+            };
+            let tag = |one_call| {
+                format
+                    .grammar_for(
+                        &tools,
+                        Options {
+                            at_least_one: true,
+                            reasoning_open,
+                            thought_closed,
+                            one_call,
+                            start,
+                        },
+                    )
+                    .expect("a tag")
+            };
+            let (required, one) = (tag(false), tag(true));
+            let what = format!("{start:?}, thought open {reasoning_open}, closed {thought_closed}");
+            assert!(
+                accepts(&required, &format!("{before}{CALL}")),
+                "{what}: one call"
+            );
+            assert!(
+                accepts(&required, &format!("{before}{CALL}{CALL}")),
+                "{what}: two calls"
+            );
+            assert!(
+                accepts(&required, &format!("{before}{CALL}\n{CALL}")),
+                "{what}: two calls with the template's spacing"
+            );
+            assert!(
+                accepts(&required, &format!("{before}{CALL}\n")),
+                "{what}: the template's spacing before the turn ends"
+            );
+            assert!(
+                accepts(&required, &format!("{before}{CALL}\n\n{CALL}")),
+                "{what}: two calls with the two newlines a group's own template writes"
+            );
+            assert!(
+                accepts(&required, &format!("{before}{CALL}\n\n")),
+                "{what}: two newlines before the turn ends"
+            );
+            assert!(
+                !accepts(&required, &format!("{before}{CALL}\n\n\n{CALL}")),
+                "{what}: three newlines between two calls"
+            );
+            assert!(
+                !accepts(&required, &format!("{before}{CALL}\nDone.")),
+                "{what}: words after a call"
+            );
+            assert!(
+                !accepts(&required, &format!("{before}{CALL}\n{BLOCK}")),
+                "{what}: call-shaped text after a call"
+            );
+            assert!(
+                accepts(&one, &format!("{before}{CALL}")),
+                "{what}: the one call"
+            );
+            assert!(
+                !accepts(&one, &format!("{before}{CALL}{CALL}")),
+                "{what}: a second call"
+            );
+        }
+    }
+}
+
 #[test]
 fn every_layout_here_fits_its_table() {
     let Some((word, space)) = classes() else {
@@ -1554,13 +1656,95 @@ fn modes(format: &Format, reasoning_open: bool) -> [Grammar; 4] {
         tag(options(true, true)),
         tag(options(false, true)),
         format
-            .answer_grammar(&json!({"type": "object"}), reasoning_open)
+            .answer_grammar(&Arc::new(json!({"type": "object"})), reasoning_open)
             .expect("an answer tag"),
     ];
     for grammar in &grammars {
         grammar.check().expect("a tag the engines take");
     }
     grammars
+}
+
+/// Inside a value written as text, the tagged tables' tag takes none of the tags the table reads
+/// in a call: a value that goes on over the next parameter's tag is refused where that tag would
+/// stand. The opener ends the value at its word, whatever follows it, while a bare less-than sign
+/// remains part of the value.
+#[test]
+fn a_tagged_value_stops_before_the_next_parameters_opening_word() {
+    const CLOSED: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    // The first value is not closed before the next parameter's tag; it is closed late, and the
+    // required member comes once more.
+    const RUN_ON: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n<parameter=days>\n3\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    const MISSPELLED_SIGN: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon\n<parameter>days>\n3\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    const SPLIT_OPENER: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon <parameters>\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    const LESS_THAN: &str = "<tool_call>\n<function=forecast>\n<parameter=location>\nLondon < Paris\n</parameter>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>";
+    let tools = [Tool {
+        tool_type: "function".to_string(),
+        function: Function {
+            name: "forecast".to_string(),
+            description: None,
+            parameters: Some(json!({
+                "type": "object",
+                "properties": {"location": {"type": "string"}, "days": {"type": "integer"}},
+                "required": ["location", "days"],
+            })),
+            strict: None,
+            extra: Default::default(),
+        },
+    }];
+    let format = symphony::formats::Table::Qwen3Tagged.format();
+    for start in [
+        GrammarStart::Unknown,
+        GrammarStart::Either,
+        GrammarStart::AfterReasoning,
+        GrammarStart::FirstToken,
+    ] {
+        for (reasoning_open, thought_closed) in [(false, false), (true, false), (false, true)] {
+            let before = match (reasoning_open, thought_closed, start) {
+                (true, _, GrammarStart::FirstToken) => "\nNo tool fits.\n</think>\n\n",
+                (true, ..) | (false, false, GrammarStart::AfterReasoning) => "\n\n",
+                _ => "",
+            };
+            for one_call in [true, false] {
+                let tag = format
+                    .grammar_for(
+                        &tools,
+                        Options {
+                            at_least_one: true,
+                            reasoning_open,
+                            thought_closed,
+                            one_call,
+                            start,
+                        },
+                    )
+                    .expect("a tag");
+                let what = format!(
+                    "{start:?}, thought open {reasoning_open}, closed {thought_closed}, one call \
+                     {one_call}"
+                );
+                assert!(
+                    accepts(&tag, &format!("{before}{CLOSED}")),
+                    "{what}: every value closed"
+                );
+                assert!(
+                    !accepts(&tag, &format!("{before}{RUN_ON}")),
+                    "{what}: a value over the next parameter's tag"
+                );
+                assert!(
+                    !accepts(&tag, &format!("{before}{SPLIT_OPENER}")),
+                    "{what}: the opener's word in the plural"
+                );
+                assert!(
+                    !accepts(&tag, &format!("{before}{MISSPELLED_SIGN}")),
+                    "{what}: the opener's word with its sign misspelled"
+                );
+                assert!(
+                    accepts(&tag, &format!("{before}{LESS_THAN}")),
+                    "{what}: a value that holds a tag's first character"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -1581,9 +1765,9 @@ fn muse_glimmers_tags_take_what_its_chat_template_writes() {
         "no call owed: the answer is free text"
     );
     assert!(accepts(&answer, MUSE_ANSWER));
-    // A forced call starts with the lead the template writes for the tool, and the invoke's
-    // marker triggers each call.
-    let payload = required.payload();
+    // One forced call starts with the lead the template writes for the tool, and the invoke's
+    // marker triggers the call.
+    let payload = named.payload();
     assert_eq!(
         payload["format"]["elements"][0],
         json!({"type": "or", "elements": [
@@ -1591,15 +1775,28 @@ fn muse_glimmers_tags_take_what_its_chat_template_writes() {
             {"type": "const_string", "value": " to=fn_beta<|message|><atem:function_calls>\n"},
         ]})
     );
-    let calls = &payload["format"]["elements"][1];
-    assert_eq!(calls["triggers"], json!(["<atem:invoke"]));
+    let call = &payload["format"]["elements"][1];
+    assert_eq!(call["triggers"], json!(["<atem:invoke"]));
+    assert_eq!(call["tags"][1]["begin"], "<atem:invoke name=\"fn_beta\">\n");
+    // A forced call that allows more: each call is a message of its own, after its lead, with
+    // what the template writes between two messages and after the last.
+    let payload = required.payload();
+    let calls = &payload["format"]["elements"][0];
+    assert_eq!(
+        calls["separator"],
+        "\n</atem:function_calls><|eom|><|start|>assistant"
+    );
     assert_eq!(
         calls["tags"][1]["begin"],
-        "<atem:invoke name=\"fn_beta\">\n"
+        " to=fn_beta<|message|><atem:function_calls>\n<atem:invoke name=\"fn_beta\">\n"
     );
     assert_eq!(
         calls["tags"][1]["end"], "</atem:invoke>",
         "the newline after the last parameter is its own"
+    );
+    assert_eq!(
+        payload["format"]["elements"][1],
+        json!({"type": "const_string", "value": "\n</atem:function_calls>"})
     );
     // Near misses: an unknown tool, a missing required key, a call without its lead or without
     // its close.
@@ -1651,7 +1848,11 @@ fn qwen3_5s_tags_take_what_its_chat_template_writes() {
         "the schema alone"
     );
     let led = format
-        .answer_grammar_for(&json!({"type": "object"}), true, GrammarStart::FirstToken)
+        .answer_grammar_for(
+            &Arc::new(json!({"type": "object"})),
+            true,
+            GrammarStart::FirstToken,
+        )
         .expect("an answer tag");
     led.check().expect("a tag the engines take");
     assert!(accepts(&led, "\n</think>{\"probe\": 1}"));
@@ -1697,11 +1898,12 @@ fn qwen3_5s_tags_take_what_its_chat_template_writes() {
 
 #[test]
 fn qwen3_5s_tag_is_the_tagged_tables_where_their_layouts_agree() {
-    // The registry's Qwen 3.5 table writes the same calls by hand: the same trigger, the same
-    // begin and end for every tool, and each parameter's tag, close and newline. The values
-    // differ only where the hand-written tag allows a spelling the chat template does not write:
-    // a newline on either side of a value that is not text, which the template always writes, and
-    // JSON's `true` beside Python's words. A string's text holds the same markers.
+    // The registry's Qwen 3.5 table writes the same calls by hand: the same begin and end for
+    // every tool, and each parameter's tag, close and newline. The values
+    // differ where the hand-written tag allows a spelling the chat template does not write: a
+    // newline on either side of a value that is not text, which the template always writes, and
+    // JSON's `true` beside Python's words. The hand-written tag also ends string text at the opener
+    // of a call and at a parameter opening word, where the template-generated tag does not.
     let Some((word, space)) = classes() else {
         return;
     };
@@ -1718,22 +1920,25 @@ fn qwen3_5s_tag_is_the_tagged_tables_where_their_layouts_agree() {
     .grammar(&tools, true, false)
     .expect("a tag")
     .payload();
-    let (shaped, tagged) = (&shaped["format"], &tagged["format"]);
-    assert_eq!(shaped["triggers"], tagged["triggers"]);
-    assert_eq!(shaped["at_least_one"], tagged["at_least_one"]);
+    // A call owed and more allowed: neither tag takes free text. The template's lists its calls
+    // with the newline between two; the hand-written one repeats them, and also takes calls back
+    // to back, two newlines between two, and the newline before the turn ends.
+    let newline = json!({"type": "optional", "content": {"type": "const_string", "value": "\n"}});
+    let (shaped, tagged) = (&shaped["format"], &tagged["format"]["content"]["elements"]);
+    assert_eq!(shaped["separator"], "\n");
+    assert_eq!(tagged[1], newline);
+    assert_eq!(tagged[2], newline);
+    let (shaped, tagged) = (&shaped["tags"], &tagged[0]["elements"]);
     for at in 0..2 {
         for field in ["begin", "end"] {
-            assert_eq!(
-                shaped["tags"][at][field], tagged["tags"][at][field],
-                "{field} of tag {at}"
-            );
+            assert_eq!(shaped[at][field], tagged[at][field], "{field} of tag {at}");
         }
     }
     let parameter = |tag: &Value, at: usize| tag["content"]["elements"][at].clone();
-    let newline = json!({"type": "optional", "content": {"type": "const_string", "value": "\n"}});
-    let alpha = (&shaped["tags"][0], &tagged["tags"][0]);
+    let alpha = (&shaped[0], &tagged[0]);
     // `s`, a string: the tag, the text, the close and the newline, alike but for the text's
-    // markers, which leave out the opener of a call that would be text inside the value.
+    // markers, which leave out the opener of a call and the parameter opening word, both of which
+    // the hand-written tag excludes.
     assert_eq!(
         parameter(alpha.0, 0),
         json!({"type": "sequence", "elements": [

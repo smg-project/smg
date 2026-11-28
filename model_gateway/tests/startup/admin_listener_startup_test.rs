@@ -196,7 +196,7 @@ fn the_admin_listener_refuses_connections_beyond_its_bound_at_accept() {
     // at accept. Its answer proves it holds the permit before the probe: a
     // bare connect returns before the acceptor has admitted it, and the
     // `/health` connection above may still hold the permit for a moment.
-    let held = served_connection(admin, EXIT_TIMEOUT);
+    let held = served_connection(admin, EXIT_TIMEOUT, &gateway.log);
     assert_eq!(
         status_of(admin, "/health"),
         None,

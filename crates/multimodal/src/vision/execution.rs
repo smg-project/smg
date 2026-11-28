@@ -25,6 +25,7 @@
 //! concurrent request.
 
 use std::{
+    cell::Cell,
     marker::PhantomData,
     num::NonZeroUsize,
     sync::{
@@ -135,7 +136,7 @@ fn pool(threads: NonZeroUsize) -> Option<&'static rayon::ThreadPool> {
 }
 
 /// Spawns the tasks of one `scope`: onto the pool, or inline in order.
-pub struct Spawner<'a, 'scope> {
+pub(crate) struct Spawner<'a, 'scope> {
     inner: SpawnerInner<'a, 'scope>,
 }
 
@@ -147,7 +148,7 @@ enum SpawnerInner<'a, 'scope> {
 impl<'scope> Spawner<'_, 'scope> {
     /// Run `task` within the scope: concurrently on the pool, or right now
     /// inline. The scope ends when every task has.
-    pub fn spawn<F>(&self, task: F)
+    pub(crate) fn spawn<F>(&self, task: F)
     where
         F: FnOnce(&Spawner<'_, 'scope>) + Send + 'scope,
     {
@@ -180,27 +181,60 @@ where
         Parallelism::Pool(threads) => pool(threads),
     };
     match pool {
-        Some(pool) => pool.scope(|scope| {
-            operation(&Spawner {
-                inner: SpawnerInner::Pool(scope),
+        Some(pool) => {
+            debug_assert!(
+                !ON_CALLER.get(),
+                "an operation run by `on_caller` entered a scope on the pool"
+            );
+            pool.scope(|scope| {
+                operation(&Spawner {
+                    inner: SpawnerInner::Pool(scope),
+                })
             })
-        }),
+        }
         None => operation(&Spawner {
             inner: SpawnerInner::Inline(PhantomData),
         }),
     }
 }
 
+thread_local! {
+    /// Set on a thread while [`on_caller`] runs an operation there.
+    static ON_CALLER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `operation` on the calling thread with every split it asks
+/// [`task_count`] for there read as one task, whatever the mode and the
+/// pool's load. The flag that says so is thread-local: a task spawned elsewhere
+/// does not carry it, and `operation` enters no [`scope`] on the pool, where
+/// a worker that waits would run other operations' tasks under it.
+/// For an operation whose bands on the pool would save wall time and cost
+/// more CPU time than its caller spent on it before.
+pub(crate) fn on_caller<R>(operation: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ON_CALLER.set(self.0);
+        }
+    }
+    let _restore = Restore(ON_CALLER.replace(true));
+    operation()
+}
+
 /// How many tasks to split an operation into: one unless the output is
 /// large, the mode runs tasks concurrently and the pool has threads to
 /// spare; an operation that finds the pool busy runs whole on its caller's
-/// thread rather than queueing its bands behind other operations' tasks.
+/// thread rather than queueing its bands behind other operations' tasks,
+/// and so does one run by [`on_caller`].
 pub(crate) fn task_count(
     output_bytes: usize,
     work_items: usize,
     min_items_per_task: usize,
 ) -> usize {
     debug_assert!(min_items_per_task > 0);
+    if ON_CALLER.get() {
+        return 1;
+    }
     let threads = match parallelism() {
         Parallelism::Inline => return 1,
         Parallelism::Pool(threads) => threads.get(),
@@ -236,6 +270,42 @@ mod tests {
         } else {
             assert_eq!(tasks, 1);
         }
+    }
+
+    /// An operation run by `on_caller` is one task at any size, inside a
+    /// nested call and behind it; the flag is the calling thread's alone and
+    /// is gone when the operation returns.
+    #[test]
+    fn an_operation_on_its_caller_is_one_task() {
+        let largest = || task_count(usize::MAX, usize::MAX, 1);
+        on_caller(|| {
+            assert!(ON_CALLER.get(), "the flag is set inside the operation");
+            assert_eq!(largest(), 1);
+            assert_eq!(on_caller(largest), 1);
+            assert_eq!(largest(), 1, "a nested call ends the outer one");
+            let elsewhere = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| ON_CALLER.get())
+                    .join()
+                    .expect("the thread returns")
+            });
+            assert!(!elsewhere, "another thread took the flag");
+        });
+        assert!(!ON_CALLER.get(), "the flag outlived its operation");
+    }
+
+    /// An operation that panics takes the flag with it.
+    #[test]
+    fn a_panic_on_its_caller_restores_the_word() {
+        let unwound = std::panic::catch_unwind(|| {
+            on_caller(|| {
+                if ON_CALLER.get() {
+                    std::panic::panic_any("the operation fails");
+                }
+            });
+        });
+        assert!(unwound.is_err(), "the flag was not set");
+        assert!(!ON_CALLER.get(), "the flag outlived the panic");
     }
 
     #[test]

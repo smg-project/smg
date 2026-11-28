@@ -1,6 +1,6 @@
 //! Utilities for persisting responses and conversation items across router implementations.
 
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use chrono::{DateTime, Utc};
 use openai_protocol::responses::{
@@ -40,53 +40,82 @@ pub const ITEM_TYPE_FIELDS: &[(&str, &[&str])] = &[
     // persistence whitelist so failed list-tools items round-trip through
     // conversation storage without losing the failure reason.
     ("mcp_list_tools", &["tools", "server_label", "error"]),
-    ("function_call", &["call_id", "name", "arguments", "output"]),
-    ("function_call_output", &["call_id", "output"]),
+    (
+        "function_call",
+        &[
+            "call_id",
+            "caller",
+            "name",
+            "namespace",
+            "arguments",
+            "output",
+        ],
+    ),
+    (
+        "function_call_output",
+        &["call_id", "caller", "name", "namespace", "output"],
+    ),
 ];
 
 // ============================================================================
 // JSON Serialization
 // ============================================================================
 
-/// Convert a ConversationItem to JSON, extracting specified fields based on item type
-/// or including content as-is for standard message types.
-pub fn item_to_json(item: &ConversationItem) -> Value {
-    let mut obj = serde_json::Map::new();
-    obj.insert("id".to_string(), json!(item.id.0));
-    obj.insert("type".to_string(), json!(item.item_type));
-
-    if let Some(role) = &item.role {
-        obj.insert("role".to_string(), json!(role));
-    }
+/// The object the Conversations API answers for a stored item: its id, type
+/// and role, then the fields of its stored content by the item's type (the
+/// listed fields of a tool item; a message's content with its phase hoisted; the
+/// fields of an item stored whole, hoisted back; the legacy `content` wrap of a
+/// row written before whole items were stored), then its status. The item is
+/// taken by value: every caller answers an item it owns (a page of a
+/// conversation's items, an item just created, referenced or looked up), so its
+/// content moves into the object instead of being copied part by part.
+pub fn item_to_json(item: ConversationItem) -> Value {
+    let ConversationItem {
+        id,
+        item_type,
+        role,
+        content,
+        status,
+        ..
+    } = item;
 
     // Find field mappings for this item type
     let fields = ITEM_TYPE_FIELDS
         .iter()
-        .find(|(t, _)| *t == item.item_type)
+        .find(|(t, _)| *t == item_type)
         .map(|(_, fields)| *fields);
+    let is_message = item_type == "message";
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("id".to_string(), Value::String(id.0));
+    obj.insert("type".to_string(), Value::String(item_type));
+
+    if let Some(role) = role {
+        obj.insert("role".to_string(), Value::String(role));
+    }
 
     if let Some(fields) = fields {
         // Extract specific fields from content
-        if let Some(content_obj) = item.content.as_object() {
+        if let Value::Object(mut content_obj) = content {
             for field in fields {
-                if let Some(value) = content_obj.get(*field) {
-                    obj.insert((*field).to_string(), value.clone());
+                if let Some(value) = content_obj.remove(*field) {
+                    obj.insert((*field).to_string(), value);
                 }
             }
         }
-    } else if item.item_type == "message" {
+    } else if is_message {
         // Message items may store either a bare content array (legacy) or an
         // object `{content: [...], phase: "..."}` when the message carried a
         // phase label (P3). Either way, expose `content` and hoist `phase`
         // back to the message level so round-trip is transparent to callers.
-        let (content_value, phase) = split_stored_message_content(item.content.clone());
+        let (content_value, phase) = split_stored_message_content(content);
         obj.insert("content".to_string(), content_value);
         if let Some(phase) = phase {
             if let Ok(phase_value) = serde_json::to_value(phase) {
                 obj.insert("phase".to_string(), phase_value);
             }
         }
-    } else if let Some(content_obj) = item.content.as_object() {
+    } else if let Value::Object(content_obj) = content {
         // Whole-item store path (`store_whole_item` in
         // `item_to_new_conversation_item`): `content` is the original item
         // value with its fields at the top level. Hoist them back rather
@@ -97,17 +126,17 @@ pub fn item_to_json(item: &ConversationItem) -> Value {
             if matches!(k.as_str(), "id" | "type" | "role" | "status") {
                 continue;
             }
-            obj.insert(k.clone(), v.clone());
+            obj.insert(k, v);
         }
     } else {
         // Pre-fix rows for non-listed types stored `[]` instead of the
         // whole item; preserve the legacy `{"content": …}` wrapping so we
         // don't drop data that came in under the old write path.
-        obj.insert("content".to_string(), item.content.clone());
+        obj.insert("content".to_string(), content);
     }
 
-    if let Some(status) = &item.status {
-        obj.insert("status".to_string(), json!(status));
+    if let Some(status) = status {
+        obj.insert("status".to_string(), Value::String(status));
     }
 
     Value::Object(obj)
@@ -347,12 +376,15 @@ pub fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> 
     Ok(items)
 }
 
-/// Convert a JSON item to NewConversationItem
+/// The record one of a turn's items is stored under, from the item by value:
+/// the item is the persist's own (the response record took its copy of the
+/// input before, and the output array is the persist's copy of the response's),
+/// so its content moves into the record instead of being copied once more.
 ///
 /// For input items: function_call/function_call_output store whole item as content
 /// For output items: message extracts content field, others store whole item
 fn item_to_new_conversation_item(
-    item_value: &Value,
+    item_value: Value,
     response_id: Option<String>,
     _is_input: bool,
     tenant: Option<&str>,
@@ -360,7 +392,20 @@ fn item_to_new_conversation_item(
     let item_type = item_value
         .get("type")
         .and_then(|v| v.as_str())
-        .unwrap_or("message");
+        .unwrap_or("message")
+        .to_string();
+    let id = item_value
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(ConversationItemId::from);
+    let role = item_value
+        .get("role")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let status = item_value
+        .get("status")
+        .and_then(|v| v.as_str())
+        .map(String::from);
 
     // Non-message items carry their fields at the top level (no `content`
     // field on the wire), so reading `content` on the input side would
@@ -369,45 +414,46 @@ fn item_to_new_conversation_item(
     let store_whole_item = item_type != "message";
 
     let content = if store_whole_item {
-        item_value.clone()
-    } else if item_type == "message" && item_value.get("phase").is_some_and(|v| !v.is_null()) {
-        // Message carries a phase label: wrap the content array alongside
-        // `phase` so multi-turn retrieval preserves it (P3). `item_to_json`
-        // and the history load paths both recognize this shape.
-        let content_value = item_value.get("content").cloned().unwrap_or(json!([]));
-        let phase_value = item_value.get("phase").cloned().unwrap_or(Value::Null);
-        json!({ "content": content_value, "phase": phase_value })
+        item_value
     } else {
-        item_value.get("content").cloned().unwrap_or(json!([]))
+        let (content, phase) = match item_value {
+            Value::Object(mut fields) => (fields.remove("content"), fields.remove("phase")),
+            _ => (None, None),
+        };
+        let content = content.unwrap_or_else(|| json!([]));
+        match phase {
+            // Message carries a phase label: wrap the content array alongside
+            // `phase` so multi-turn retrieval preserves it (P3). `item_to_json`
+            // and the history load paths both recognize this shape.
+            Some(phase) if !phase.is_null() => {
+                let mut wrapped = serde_json::Map::new();
+                wrapped.insert("content".to_string(), content);
+                wrapped.insert("phase".to_string(), phase);
+                Value::Object(wrapped)
+            }
+            _ => content,
+        }
     };
 
     NewConversationItem {
-        id: item_value
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(ConversationItemId::from),
+        id,
         response_id,
-        item_type: item_type.to_string(),
-        role: item_value
-            .get("role")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        item_type,
+        role,
         content,
-        status: item_value
-            .get("status")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        status,
         tenant: tenant.map(str::to_string),
     }
 }
 
 /// Link all input and output items to a conversation; the items carry the
-/// caller's `tenant`.
+/// caller's `tenant`. The two vectors are the turn's own: each item moves into
+/// the record it is stored under.
 async fn link_items_to_conversation(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &ConversationId,
-    input_items: &[Value],
-    output_items: &[Value],
+    input_items: Vec<Value>,
+    output_items: Vec<Value>,
     response_id: &str,
     tenant: Option<&str>,
 ) -> Result<(), String> {
@@ -461,7 +507,34 @@ pub async fn persist_conversation_items(
         conversation_storage,
         item_storage,
         response_storage,
-        response_json,
+        Cow::Borrowed(response_json),
+        original_body,
+        tenant,
+        false,
+    );
+    match request_context {
+        Some(ctx) => with_request_context(ctx, inner).await,
+        None => inner.await,
+    }
+    .map(|_| ())
+}
+
+/// [`persist_conversation_items`] for a caller that is done with the
+/// response: the tree is taken, where the borrowing entry copies it first.
+pub async fn persist_conversation_items_owned(
+    conversation_storage: Arc<dyn ConversationStorage>,
+    item_storage: Arc<dyn ConversationItemStorage>,
+    response_storage: Arc<dyn ResponseStorage>,
+    response_json: Value,
+    original_body: &ResponsesRequest,
+    tenant: Option<&str>,
+    request_context: Option<StorageRequestContext>,
+) -> Result<(), PersistError> {
+    let inner = persist_conversation_items_inner(
+        conversation_storage,
+        item_storage,
+        response_storage,
+        Cow::Owned(response_json),
         original_body,
         tenant,
         false,
@@ -494,7 +567,7 @@ pub async fn persist_conversation_items_if_open(
         conversation_storage,
         item_storage,
         response_storage,
-        response_json,
+        Cow::Borrowed(response_json),
         original_body,
         tenant,
         true,
@@ -601,7 +674,7 @@ async fn persist_conversation_items_inner(
     conversation_storage: Arc<dyn ConversationStorage>,
     item_storage: Arc<dyn ConversationItemStorage>,
     response_storage: Arc<dyn ResponseStorage>,
-    response_json: &Value,
+    response_json: Cow<'_, Value>,
     original_body: &ResponsesRequest,
     tenant: Option<&str>,
     if_open: bool,
@@ -611,19 +684,29 @@ async fn persist_conversation_items_inner(
         return Ok(false);
     }
 
-    // Clone once, then strip multi-MB base64 from any `image_generation_call`
+    // Own the tree, then strip multi-MB base64 from any `image_generation_call`
     // items before they reach storage. Replay only references images by `id`,
     // so storing the bytes per turn would balloon the response chain.
-    let mut response_json = response_json.clone();
+    let mut response_json = response_json.into_owned();
     if let Some(outputs) = response_json
         .get_mut("output")
         .and_then(|v| v.as_array_mut())
     {
         openai_bridge::compact_image_generation_outputs_json(outputs);
+        // The record keeps this array: drop the room a caller's filter left
+        // (at most one move of its slots, where the copy moved every node).
+        outputs.shrink_to_fit();
+    }
+    // The tool relay filters `tools` too (its hidden tools): drop that room as well.
+    if let Some(tools) = response_json
+        .get_mut("tools")
+        .and_then(|v| v.as_array_mut())
+    {
+        tools.shrink_to_fit();
     }
 
-    // Extract response ID and clone out the (already-compacted) output array
-    // before handing the rest of `response_json` to `build_stored_response`,
+    // Extract the response ID and read the (already-compacted) output array
+    // in place before handing `response_json` to `build_stored_response`,
     // which moves the value into `raw_response` without re-cloning the full
     // response tree.
     let response_id_str = response_json
@@ -637,12 +720,9 @@ async fn persist_conversation_items_inner(
     let input_items = extract_input_items(&original_body.input)
         .map_err(|e| PersistError::new(PersistStep::Input, false, e))?;
 
-    // Cloning the array here is shallow against compacted items — base64
-    // image payloads have already been stripped above.
     let output_items = response_json
         .get("output")
         .and_then(|v| v.as_array())
-        .cloned()
         .ok_or_else(|| {
             PersistError::new(PersistStep::Input, false, "No output array in response")
         })?;
@@ -652,12 +732,20 @@ async fn persist_conversation_items_inner(
         .get("status")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let written_output_ids = output_item_ids(&output_items);
+    let written_output_ids = output_item_ids(output_items);
+    let (input_count, output_count) = (input_items.len(), output_items.len());
+    // Only a request that names a conversation links its items, so only that
+    // one copies the two lists: a deep copy of each item, smaller only by the
+    // base64 image payloads stripped above.
+    let to_link = original_body
+        .conversation
+        .is_some()
+        .then(|| (input_items.clone(), output_items.clone()));
 
     // Build and store response (consumes `response_json`).
     let mut stored_response = build_stored_response(response_json, original_body);
     stored_response.id = response_id.clone();
-    stored_response.input = Value::Array(input_items.clone());
+    stored_response.input = Value::Array(input_items);
     stored_response.tenant = tenant.map(str::to_string);
 
     let store_error = |e: ResponseStorageError| {
@@ -741,13 +829,13 @@ async fn persist_conversation_items_inner(
         None
     };
 
-    // If conversation exists, link items to it
-    if let Some(conv_id) = conv_id_opt {
+    // If conversation exists, link items to it (the items move into their records)
+    if let (Some(conv_id), Some((input_items, output_items))) = (conv_id_opt, to_link) {
         link_items_to_conversation(
             &item_storage,
             &conv_id,
-            &input_items,
-            &output_items,
+            input_items,
+            output_items,
             &response_id_str,
             tenant,
         )
@@ -756,15 +844,15 @@ async fn persist_conversation_items_inner(
         info!(
             conversation_id = %conv_id.0,
             response_id = %response_id.0,
-            input_count = input_items.len(),
-            output_count = output_items.len(),
+            input_count = input_count,
+            output_count = output_count,
             "Persisted response and linked items to conversation"
         );
     } else {
         info!(
             response_id = %response_id.0,
-            input_count = input_items.len(),
-            output_count = output_items.len(),
+            input_count = input_count,
+            output_count = output_count,
             "Persisted response without conversation linking"
         );
     }
@@ -773,296 +861,5 @@ async fn persist_conversation_items_inner(
 }
 
 #[cfg(test)]
-mod tests {
-    use chrono::Utc;
-
-    use super::*;
-
-    fn stored_item(item_type: &str, content: Value) -> ConversationItem {
-        ConversationItem {
-            id: ConversationItemId::from("ig_replay_1"),
-            response_id: None,
-            item_type: item_type.to_string(),
-            role: None,
-            content,
-            status: Some("completed".to_string()),
-            created_at: Utc::now(),
-            tenant: None,
-        }
-    }
-
-    #[test]
-    fn item_to_json_restores_top_level_fields_for_whole_item_store() {
-        let stored = stored_item(
-            "image_generation_call",
-            json!({
-                "id": "ig_replay_1",
-                "type": "image_generation_call",
-                "status": "completed",
-                "revised_prompt": "cat",
-            }),
-        );
-
-        let serialized = item_to_json(&stored);
-        assert_eq!(serialized["type"], json!("image_generation_call"));
-        assert_eq!(serialized["revised_prompt"], json!("cat"));
-        assert!(
-            serialized.get("content").is_none(),
-            "non-message whole-item store must hoist top-level fields, not \
-             nest the original item under `content`: {serialized}"
-        );
-    }
-
-    #[test]
-    fn item_to_json_falls_back_to_legacy_content_wrap_for_array_content() {
-        // Pre-fix rows for non-listed types may have stored `[]`. Preserve
-        // the legacy wrapping so old data still round-trips.
-        let stored = stored_item("image_generation_call", json!([]));
-        let serialized = item_to_json(&stored);
-        assert_eq!(serialized["content"], json!([]));
-    }
-
-    #[test]
-    fn replayed_image_generation_input_item_is_stored_whole() {
-        let input_item = json!({
-            "id": "ig_replay_1",
-            "type": "image_generation_call",
-            "status": "completed",
-            "revised_prompt": "cat",
-        });
-
-        let new_item =
-            item_to_new_conversation_item(&input_item, None, /* is_input */ true, None);
-        assert_eq!(new_item.item_type, "image_generation_call");
-        assert_eq!(
-            new_item
-                .content
-                .get("revised_prompt")
-                .and_then(|v| v.as_str()),
-            Some("cat"),
-        );
-        assert_eq!(
-            new_item.content.get("type").and_then(|v| v.as_str()),
-            Some("image_generation_call"),
-        );
-    }
-
-    #[test]
-    fn replayed_message_input_item_still_extracts_content() {
-        let input_item = json!({
-            "id": "msg_1",
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": "hi"}],
-            "status": "completed",
-        });
-
-        let new_item =
-            item_to_new_conversation_item(&input_item, None, /* is_input */ true, None);
-        assert_eq!(new_item.item_type, "message");
-        assert_eq!(
-            new_item.content,
-            json!([{"type": "input_text", "text": "hi"}])
-        );
-    }
-
-    /// A turn that echoes an item id held by another tenant links nothing: the
-    /// item under the id is that tenant's, and the link would read it through
-    /// this conversation. The item's own tenant links it, as the contract says.
-    #[tokio::test]
-    async fn an_echoed_id_held_by_another_tenant_is_refused_before_the_link() {
-        use smg_data_connector::{ListParams, MemoryConversationItemStorage, SortOrder};
-
-        let items: Arc<dyn ConversationItemStorage> =
-            Arc::new(MemoryConversationItemStorage::new());
-        let echoed = |tenant: &str| NewConversationItem {
-            id: Some(ConversationItemId::from("msg_theirs")),
-            response_id: None,
-            item_type: "message".to_string(),
-            role: Some("user".to_string()),
-            content: json!([{"type": "input_text", "text": tenant}]),
-            status: None,
-            tenant: Some(tenant.to_string()),
-        };
-        items.create_item(echoed("tenant-a")).await.unwrap();
-        let conversation = ConversationId::from("conv_b");
-
-        let err = create_and_link_item(&items, Some(&conversation), echoed("tenant-b"), Utc::now())
-            .await
-            .unwrap_err();
-        assert!(err.contains("held by another tenant"), "{err}");
-        let linked = items
-            .list_items(
-                &conversation,
-                ListParams {
-                    limit: 20,
-                    order: SortOrder::Asc,
-                    after: None,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(linked.is_empty(), "nothing is linked: {linked:?}");
-
-        create_and_link_item(&items, Some(&conversation), echoed("tenant-a"), Utc::now())
-            .await
-            .unwrap();
-    }
-
-    /// A background record closed with the object this persist writes (the
-    /// status and the output items) holds an earlier attempt's write that
-    /// landed while its answer was lost: the persist goes on to link the
-    /// items, for a result and for the run's own `failed` object alike. A
-    /// record closed with anything else (a cancel from elsewhere, another
-    /// status, other items, a `failed` without items that could be a failure
-    /// written elsewhere) refuses the persist and links nothing.
-    #[tokio::test]
-    async fn a_record_that_holds_this_runs_result_is_linked_and_a_close_from_elsewhere_is_not() {
-        use smg_data_connector::{
-            ListParams, MemoryConversationItemStorage, MemoryConversationStorage,
-            MemoryResponseStorage, NewConversation, SortOrder,
-        };
-
-        let conversations: Arc<dyn ConversationStorage> =
-            Arc::new(MemoryConversationStorage::new());
-        let items: Arc<dyn ConversationItemStorage> =
-            Arc::new(MemoryConversationItemStorage::new());
-        let responses: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
-        let conversation = conversations
-            .create_conversation(NewConversation::default())
-            .await
-            .unwrap();
-        let request: ResponsesRequest = serde_json::from_value(json!({
-            "model": "m",
-            "input": "hi",
-            "background": true,
-            "conversation": conversation.id.0,
-        }))
-        .unwrap();
-        let result = |id: &str, status: &str, items: &[&str]| {
-            let output: Vec<Value> = items
-                .iter()
-                .map(|item| {
-                    json!({
-                        "type": "message",
-                        "id": item,
-                        "role": "assistant",
-                        "status": "completed",
-                        "content": [{"type": "output_text", "text": "hello", "annotations": []}]
-                    })
-                })
-                .collect();
-            json!({
-                "id": id,
-                "object": "response",
-                "model": "m",
-                "status": status,
-                "background": true,
-                "output": output
-            })
-        };
-        // What the store holds under each id when the persist runs.
-        for (id, status, items) in [
-            ("resp_own", "completed", &["msg_own"][..]),
-            ("resp_bare", "completed", &[]),
-            ("resp_failed_own", "failed", &["msg_failed"]),
-            ("resp_cancelled", "cancelled", &["msg_own"]),
-            ("resp_other_status", "completed", &["msg_own"]),
-            ("resp_other_items", "completed", &["msg_theirs"]),
-            ("resp_failed_bare", "failed", &[]),
-        ] {
-            let mut stored = build_stored_response(result(id, status, items), &request);
-            stored.id = ResponseId::from(id);
-            responses.store_response(stored).await.unwrap();
-        }
-        let linked = |id: &'static str| {
-            let items = items.clone();
-            let conversation_id = conversation.id.clone();
-            async move {
-                items
-                    .list_items(
-                        &conversation_id,
-                        ListParams {
-                            limit: 20,
-                            order: SortOrder::Asc,
-                            after: None,
-                        },
-                    )
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .filter(|item| item.response_id.as_deref() == Some(id))
-                    .count()
-            }
-        };
-        let persist = |id: &'static str, status: &'static str, output: &'static [&'static str]| {
-            let (conversations, items, responses) =
-                (conversations.clone(), items.clone(), responses.clone());
-            let request = request.clone();
-            async move {
-                persist_conversation_items_if_open(
-                    conversations,
-                    items,
-                    responses,
-                    &result(id, status, output),
-                    &request,
-                    None,
-                    None,
-                )
-                .await
-                .unwrap()
-            }
-        };
-
-        assert!(
-            persist("resp_own", "completed", &["msg_own"]).await,
-            "the record holds this run's result: stored"
-        );
-        assert_eq!(
-            linked("resp_own").await,
-            2,
-            "the input and the output are linked"
-        );
-        assert!(
-            persist("resp_bare", "completed", &[]).await,
-            "a result without output items is still this run's"
-        );
-        assert_eq!(linked("resp_bare").await, 1, "the input is linked");
-        assert!(
-            persist("resp_failed_own", "failed", &["msg_failed"]).await,
-            "the run's own failed object, with its items, is this run's write"
-        );
-        assert_eq!(linked("resp_failed_own").await, 2);
-        for (id, status, items, why) in [
-            (
-                "resp_cancelled",
-                "completed",
-                &["msg_own"][..],
-                "a cancel from elsewhere refuses the result",
-            ),
-            (
-                "resp_other_status",
-                "incomplete",
-                &["msg_own"],
-                "another status is not this write",
-            ),
-            (
-                "resp_other_items",
-                "completed",
-                &["msg_own"],
-                "other output items are not this write",
-            ),
-            (
-                "resp_failed_bare",
-                "failed",
-                &[],
-                "a failed object without items could be a failure written elsewhere",
-            ),
-        ] {
-            assert!(!persist(id, status, items).await, "{why}");
-            assert_eq!(linked(id).await, 0, "{why}");
-        }
-        assert!(is_result_status("completed") && is_result_status("incomplete"));
-        assert!(!is_result_status("cancelled") && !is_result_status("failed"));
-    }
-}
+#[path = "../tests/unit/persistence_utils/tests.rs"]
+mod tests;

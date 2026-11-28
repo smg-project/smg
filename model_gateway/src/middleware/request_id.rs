@@ -15,6 +15,26 @@
 //! response header, the access-log records or the worker's view of its
 //! request. The first configured header that is present decides, by its
 //! first value.
+//!
+//! Under a policy spec that keeps a sample of its decisions the gateway
+//! also restates the chosen id on the request, under the header
+//! `x-smg-request-id` (`restate`). The engine reads what stands there
+//! as the gateway's own id of the request, by the name a placement
+//! states to it. That
+//! write is no part of this layer: the server installs it as a layer of its
+//! own inside the edge layers, behind this one, and under no other
+//! configuration, so this layer is the same for every gateway. The write
+//! replaces whatever a client sent under that name, and no worker is sent
+//! the header: the routers forward an allow-list of request headers, and
+//! this name is not on it. Inside the gateway it is a request header like
+//! any other: a request plugin sees it and can change it, and a policy spec
+//! that names it as a header reads what stands there. Under a spec that
+//! keeps no sample, and in a gateway that places with its classic policies,
+//! nothing is written there, and a client's value stays as it came. A
+//! configuration that names that header for a use of its own is served as
+//! for any header it names so. Named as a request id header, it is read
+//! and rewritten by this layer where it is the first configured header
+//! that is present.
 
 use std::{
     future::Future,
@@ -45,6 +65,41 @@ const RANDOM_PART_LEN: usize = 24;
 static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 /// The header the Messages API's SDKs read the request id from.
 pub(crate) static REQUEST_ID: HeaderName = HeaderName::from_static("request-id");
+/// The request header the gateway restates a request's chosen id under,
+/// where its policy spec keeps a sample ([`restate`]). No route sends it to
+/// a worker: the routers' allow-list of request headers passes the
+/// request-id headers by their names and by the prefix `x-request-id-`,
+/// and this name is neither.
+pub(crate) static OWN_REQUEST_ID: HeaderName = HeaderName::from_static("x-smg-request-id");
+
+/// Restates the id the layer chose for `request` on the request itself,
+/// under [`OWN_REQUEST_ID`], as the one value there: whatever a client sent
+/// under that name is replaced. A request that holds no chosen id, because
+/// no request-id layer ran in front of this, keeps no value under the name
+/// either: a client's value never stands behind this function.
+///
+/// The server installs it as a layer of its own inside the edge layers,
+/// and only where the gateway runs Grand Central under a policy spec that
+/// keeps a sample of its decisions (`own_request_id_layer` in `server.rs`):
+/// the engine reads a host's id of a request only where it keeps a
+/// decision. That choice is made once, where the applications are built. A
+/// policy spec put in force later on the running engine does not move it.
+pub(crate) fn restate(mut request: Request) -> Request {
+    let id = request
+        .extensions()
+        .get::<RequestId>()
+        .and_then(|id| HeaderValue::from_str(&id.0).ok());
+    let headers = request.headers_mut();
+    match id {
+        Some(id) => {
+            headers.insert(&OWN_REQUEST_ID, id);
+        }
+        None => {
+            headers.remove(&OWN_REQUEST_ID);
+        }
+    }
+    request
+}
 
 /// The longest inbound request id the gateway honours, in bytes. The ids
 /// proxies and clients commonly mint are 32 to 55 characters (a hex request
@@ -250,296 +305,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use axum::{body::Body, routing::get, Router};
-    use http_body_util::BodyExt;
-    use tower::ServiceExt;
-
-    use super::*;
-
-    #[test]
-    fn generated_ids_use_endpoint_prefixes() {
-        for (path, prefix) in [
-            ("/v1/chat/completions", "chatcmpl-"),
-            ("/v1/completions", "cmpl-"),
-            ("/generate", "gnt-"),
-            ("/v1/responses", "resp-"),
-            ("/v1/messages", "msg_"),
-            ("/v1/embeddings", "req-"),
-        ] {
-            assert!(
-                generate_request_id(path).starts_with(prefix),
-                "path {path} must generate a {prefix} id"
-            );
-        }
-    }
-
-    #[test]
-    fn the_inbound_id_bound_is_one_to_128_visible_ascii_characters() {
-        for accepted in ["a", "!~", &"x".repeat(MAX_INBOUND_REQUEST_ID_LEN)] {
-            assert!(is_acceptable_inbound_id(accepted), "{accepted:?}");
-        }
-        for dropped in [
-            "",
-            " ",
-            "a b",
-            "tab\there",
-            "caf\u{e9}",
-            "\u{7f}",
-            &"x".repeat(MAX_INBOUND_REQUEST_ID_LEN + 1),
-        ] {
-            assert!(!is_acceptable_inbound_id(dropped), "{dropped:?}");
-        }
-    }
-
-    /// The id the handler found in the request extensions, the first
-    /// `x-request-id` header value it received (`-` when absent) and how many
-    /// values of that header it received come back as the body,
-    /// `extension|header|count`; the layer echoes the id it chose in
-    /// `x-request-id`.
-    fn app() -> Router {
-        app_with(vec!["x-request-id".into(), "x-correlation-id".into()])
-    }
-
-    /// [`app`] with its own list of configured request-id headers.
-    fn app_with(names: Vec<String>) -> Router {
-        Router::new()
-            .route("/v1/chat/completions", get(ids_seen))
-            .route("/v1/messages", get(ids_seen))
-            .route("/v1/models", get(ids_seen))
-            .layer(RequestIdLayer::new(names))
-    }
-
-    /// The handler of [`app_with`]'s routes.
-    async fn ids_seen(request: Request) -> String {
-        let extension = request
-            .extensions()
-            .get::<RequestId>()
-            .map(|id| id.0.clone())
-            .unwrap_or_default();
-        let header = request
-            .headers()
-            .get("x-request-id")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("-");
-        let count = request.headers().get_all("x-request-id").iter().count();
-        format!("{extension}|{header}|{count}")
-    }
-
-    /// (the echoed `x-request-id`, the id the handler saw in the extensions,
-    /// the first `x-request-id` header value the handler received, how many
-    /// values it received) for a request carrying `headers`.
-    async fn ids_for(headers: &[(&str, &str)]) -> (String, String, String, usize) {
-        let mut request = Request::builder().uri("/v1/chat/completions");
-        for (name, value) in headers {
-            request = request.header(*name, *value);
-        }
-        let response = app()
-            .oneshot(request.body(Body::empty()).expect("request"))
-            .await
-            .expect("response");
-        let echoed = response.headers()["x-request-id"]
-            .to_str()
-            .expect("visible ASCII")
-            .to_owned();
-        let body = response
-            .into_body()
-            .collect()
-            .await
-            .expect("body")
-            .to_bytes();
-        let body = String::from_utf8(body.to_vec()).expect("utf-8");
-        let mut parts = body.split('|');
-        let (extension, header, count) = (
-            parts.next().expect("extension"),
-            parts.next().expect("header"),
-            parts.next().expect("count"),
-        );
-        (
-            echoed,
-            extension.to_owned(),
-            header.to_owned(),
-            count.parse().expect("a count"),
-        )
-    }
-
-    fn is_fresh_chat_id(id: &str) -> bool {
-        id.strip_prefix("chatcmpl-")
-            .is_some_and(|rest| rest.len() == 24 && rest.bytes().all(|b| b.is_ascii_alphanumeric()))
-    }
-
-    #[tokio::test]
-    async fn an_inbound_id_within_the_bound_is_honoured() {
-        for id in [
-            "req_client_1",
-            "4bf92f3577b34da6a3ce929d0e0e4736",
-            &"a".repeat(128),
-        ] {
-            let (echoed, seen, header, count) = ids_for(&[("x-request-id", id)]).await;
-            assert_eq!(echoed, id, "the echoed id");
-            assert_eq!(seen, id, "the id the handler saw");
-            assert_eq!(
-                (header.as_str(), count),
-                (id, 1),
-                "the header reaches the handler as is"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn an_inbound_id_over_the_bound_is_replaced_by_a_fresh_one() {
-        let long = "R".repeat(129);
-        let (echoed, seen, header, _) = ids_for(&[("x-request-id", &long)]).await;
-        assert_eq!(echoed, seen, "the handler and the client see the same id");
-        assert!(is_fresh_chat_id(&echoed), "a fresh id, got {echoed:?}");
-        assert!(
-            !echoed.contains("RRRR"),
-            "nothing of the inbound value survives"
-        );
-        assert_eq!(
-            header, echoed,
-            "the request header carries the fresh id, so a worker reading or forwarding it sees the gateway's id"
-        );
-        // The first configured header that is present decides; a second one
-        // is not promoted in its place.
-        let (echoed, _, _, _) =
-            ids_for(&[("x-request-id", &long), ("x-correlation-id", "corr-1")]).await;
-        assert!(is_fresh_chat_id(&echoed), "a fresh id, got {echoed:?}");
-    }
-
-    #[tokio::test]
-    async fn an_inbound_id_that_is_not_visible_ascii_is_replaced() {
-        for value in ["tab\there", "two words", ""] {
-            let (echoed, seen, header, _) = ids_for(&[("x-request-id", value)]).await;
-            assert_eq!(echoed, seen, "the handler and the client see the same id");
-            assert!(
-                is_fresh_chat_id(&echoed),
-                "a fresh id for {value:?}, got {echoed:?}"
-            );
-            assert_eq!(
-                header, echoed,
-                "the request header is rewritten for {value:?}"
-            );
-        }
-    }
-
-    /// A repeated request-id header forwards every value; after the layer
-    /// the request carries exactly one, the honoured first value or the
-    /// fresh id, and an unchecked second value goes no further.
-    #[tokio::test]
-    async fn a_repeated_request_id_header_keeps_only_the_chosen_id() {
-        let long = "R".repeat(129);
-        let (echoed, seen, header, count) =
-            ids_for(&[("x-request-id", "ok-first"), ("x-request-id", &long)]).await;
-        assert_eq!((echoed.as_str(), seen.as_str()), ("ok-first", "ok-first"));
-        assert_eq!(
-            (header.as_str(), count),
-            ("ok-first", 1),
-            "one value, the honoured one"
-        );
-        let (echoed, _, header, count) =
-            ids_for(&[("x-request-id", &long), ("x-request-id", "ok-second")]).await;
-        assert!(
-            is_fresh_chat_id(&echoed),
-            "the first value decides: {echoed:?}"
-        );
-        assert_eq!(
-            (header.as_str(), count),
-            (echoed.as_str(), 1),
-            "one value, the fresh id"
-        );
-    }
-
-    /// A request in the Messages API's shape (a Messages route, or any route
-    /// under the `anthropic-version` header the Anthropic SDKs send on every
-    /// call) is answered with the id as `request-id` as well: the header those
-    /// SDKs read for `_request_id` and for an error's `request_id`. Every other
-    /// response carries `x-request-id` alone, as before.
-    #[tokio::test]
-    async fn a_messages_api_request_is_echoed_its_id_as_request_id_too() {
-        for (path, version, as_request_id) in [
-            ("/v1/messages", None, true),
-            ("/v1/models", Some("2023-06-01"), true),
-            ("/v1/chat/completions", Some("2023-06-01"), true),
-            ("/v1/models", None, false),
-            ("/v1/chat/completions", None, false),
-        ] {
-            let mut request = Request::builder()
-                .uri(path)
-                .header("x-request-id", "req_client_1");
-            if let Some(version) = version {
-                request = request.header("anthropic-version", version);
-            }
-            let response = app()
-                .oneshot(request.body(Body::empty()).expect("request"))
-                .await
-                .expect("response");
-            assert_eq!(response.headers()["x-request-id"], "req_client_1", "{path}");
-            assert_eq!(
-                response
-                    .headers()
-                    .get("request-id")
-                    .map(|value| value.to_str().expect("visible ASCII")),
-                as_request_id.then_some("req_client_1"),
-                "{path} under anthropic-version {version:?}"
-            );
-        }
-
-        // A fresh id is echoed under both names too, the same value.
-        let response = app()
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/messages")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        let echoed = &response.headers()["x-request-id"];
-        assert!(echoed.to_str().expect("visible ASCII").starts_with("msg_"));
-        assert_eq!(&response.headers()["request-id"], echoed);
-    }
-
-    /// A response that already carries a `request-id` (a proxying route
-    /// relaying its upstream's) keeps it; `x-request-id` still names the id
-    /// the gateway chose.
-    #[tokio::test]
-    async fn a_request_id_already_on_the_response_is_kept() {
-        let app = Router::new()
-            .route(
-                "/v1/messages",
-                get(|| async { ([("request-id", "req_upstream_1")], "relayed") }),
-            )
-            .layer(RequestIdLayer::new(vec!["x-request-id".into()]));
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/messages")
-                    .header("x-request-id", "req_client_1")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.headers()["request-id"], "req_upstream_1");
-        assert_eq!(response.headers()["x-request-id"], "req_client_1");
-    }
-
-    /// A configured name that does not parse could never match a request;
-    /// it is skipped and the next configured header is consulted.
-    #[tokio::test]
-    async fn a_configured_name_that_does_not_parse_is_skipped() {
-        let app = app_with(vec!["bad name".into(), "x-request-id".into()]);
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/chat/completions")
-                    .header("x-request-id", "ok-1")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(response.headers()["x-request-id"], "ok-1");
-    }
-}
+#[path = "../../tests/unit/middleware/request_id/tests.rs"]
+mod tests;

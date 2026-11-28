@@ -77,9 +77,9 @@ use crate::vision::{
 };
 
 /// The global view's side after the tensor resize.
-pub const IMAGE_SIZE: u32 = 728;
+pub(crate) const IMAGE_SIZE: u32 = 728;
 /// A crop's side after the tensor resize.
-pub const PATCH_SIZE: u32 = 504;
+pub(crate) const PATCH_SIZE: u32 = 504;
 /// The longest side a decoded image is scaled down to before anything else.
 const MAX_IMAGE_SIZE: u32 = 3024;
 /// The feature tokens of the global view.
@@ -89,7 +89,7 @@ pub const PATCH_FEATURE_TOKENS: usize = 81;
 /// The per-image maximum the serving engine publishes for the family: the
 /// prompt layout of a 3024 x 3024 image (36 crops, five newlines, the view),
 /// structural tokens included. A plan past it is refused; see the module doc.
-pub const MAX_IMAGE_TOKENS: usize = 3164;
+pub(crate) const MAX_IMAGE_TOKENS: usize = 3164;
 
 /// The crops, flat across the batch: `[P, 3, 504, 504]`.
 pub const PATCH_PIXEL_VALUES: &str = "patch_pixel_values";
@@ -132,7 +132,7 @@ impl CropPlan {
     }
 
     /// The newline tokens between the crop rows.
-    pub fn num_newlines(&self) -> usize {
+    pub(crate) fn num_newlines(&self) -> usize {
         self.crops.map_or(0, |grid| grid.rows - 1)
     }
 
@@ -149,7 +149,7 @@ impl CropPlan {
     /// The positions of that expansion that carry an encoder feature: the
     /// image tokens of every crop and of the view. The start, end and newline
     /// tokens around them are prompt text with no feature behind them.
-    pub fn num_features(&self) -> usize {
+    pub(crate) fn num_features(&self) -> usize {
         self.num_patches() * PATCH_FEATURE_TOKENS + IMAGE_FEATURE_TOKENS
     }
 }
@@ -245,7 +245,7 @@ impl Step3VLProcessor {
     }
 
     /// The processor with crops on or off.
-    pub fn with_crops(enable_patch: bool) -> Self {
+    pub(crate) fn with_crops(enable_patch: bool) -> Self {
         Self {
             enable_patch,
             table: transforms::to_tensor_then_normalize_table(&CLIP_MEAN, &CLIP_STD),
@@ -256,18 +256,13 @@ impl Step3VLProcessor {
     /// constants, and `vision_config.enable_patch` from the model config
     /// (crops on when the config says nothing). The family ships no
     /// preprocessor config, and the reference reads none.
-    pub fn from_model_config(config: &Value) -> Self {
+    pub(crate) fn from_model_config(config: &Value) -> Self {
         let enable_patch = config
             .get("vision_config")
             .and_then(|vision| vision.get("enable_patch"))
             .and_then(Value::as_bool)
             .unwrap_or(true);
         Self::with_crops(enable_patch)
-    }
-
-    /// Whether images take crops beside their global view.
-    pub fn crops_enabled(&self) -> bool {
-        self.enable_patch
     }
 
     /// The plan of a `width` x `height` image: the pad, the view and the crop
@@ -357,7 +352,7 @@ impl Step3VLProcessor {
     ) -> Result<(), TransformError> {
         let (width, height) = rgb.dimensions();
         if (width, height) == (side, side) {
-            let (pixels, _) = rgb.as_raw().as_chunks::<3>();
+            let (pixels, _) = transforms::rgb_pixels(rgb).as_chunks::<3>();
             for (channel, table) in self.table.iter().enumerate() {
                 planes.extend(
                     pixels
@@ -367,7 +362,7 @@ impl Step3VLProcessor {
             }
         } else {
             let resized = transforms::resize_bilinear_torch_aa_normalized(
-                rgb.as_raw(),
+                transforms::rgb_pixels(rgb),
                 width,
                 height,
                 side,
@@ -392,6 +387,8 @@ impl Step3VLProcessor {
         crops: &mut Vec<f32>,
         newlines: &mut Vec<i64>,
     ) -> Result<Vec<f32>, TransformError> {
+        // An RGB8 input is borrowed in its own container, which may be longer
+        // than its pixels: every read of its bytes below ends at them.
         let source: Cow<'_, RgbImage> = match image {
             DynamicImage::ImageRgb8(rgb) => Cow::Borrowed(rgb),
             other => Cow::Owned(other.to_rgb8()),
@@ -405,7 +402,7 @@ impl Step3VLProcessor {
             padded
         } else {
             Cow::Owned(transforms::resize_bilinear_pil_rgb(
-                padded.as_raw(),
+                transforms::rgb_pixels(&padded),
                 padded.width(),
                 padded.height(),
                 plan.view.0,
@@ -421,7 +418,7 @@ impl Step3VLProcessor {
                 Cow::Borrowed(view.as_ref())
             } else {
                 Cow::Owned(transforms::resize_bilinear_pil_rgb(
-                    view.as_raw(),
+                    transforms::rgb_pixels(&view),
                     view.width(),
                     view.height(),
                     grid.source.0,
@@ -470,9 +467,7 @@ impl VisionPreProcessor for Step3VLProcessor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let side = IMAGE_SIZE as usize;
         let view_len = 3 * side * side;
         let patch = PATCH_SIZE as usize;
@@ -565,6 +560,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::test_support::lcg_rgb_image;
 
     fn plan(width: u32, height: u32) -> CropPlan {
         Step3VLProcessor::new().plan(width, height)
@@ -708,12 +704,12 @@ mod tests {
     fn the_model_config_switches_the_crops_off() {
         let processor =
             Step3VLProcessor::from_model_config(&json!({"vision_config": {"enable_patch": false}}));
-        assert!(!processor.crops_enabled());
+        assert!(!processor.enable_patch);
         let plan = processor.plan(1920, 1080);
         assert_eq!(plan.crops, None);
         assert_eq!(plan.num_tokens(), 171);
         assert_eq!(plan.num_features(), IMAGE_FEATURE_TOKENS);
-        assert!(Step3VLProcessor::from_model_config(&json!({"vision_config": {}})).crops_enabled());
+        assert!(Step3VLProcessor::from_model_config(&json!({"vision_config": {}})).enable_patch);
     }
 
     /// The tensors of a 1000x300 image: one view, two crops of which the
@@ -802,6 +798,62 @@ mod tests {
             out.model_specific.get(PATCH_NEWLINE_MASK),
             Some(ModelSpecificValue::IntTensor { data, shape }) if data.is_empty() && shape == &[0]
         ));
+    }
+
+    /// The view's planes, the crops' planes and the newline flags `process`
+    /// makes of `image`.
+    fn processed(
+        processor: &Step3VLProcessor,
+        image: &DynamicImage,
+    ) -> (Vec<f32>, Vec<f32>, Vec<i64>) {
+        let (width, height) = (image.width(), image.height());
+        let plan = processor.checked_plan(width, height).unwrap();
+        let (mut crops, mut newlines) = (Vec::new(), Vec::new());
+        let view = processor.process(image, plan, &mut crops, &mut newlines);
+        (view.unwrap(), crops, newlines)
+    }
+
+    /// A `width` x `height` image in a container seven bytes longer than its
+    /// pixels (`ImageBuffer::from_raw` takes any that is long enough)
+    /// processes as the exact image does.
+    fn assert_a_longer_container_processes_as_its_image(width: u32, height: u32, crops: bool) {
+        let processor = Step3VLProcessor::with_crops(crops);
+        let exact = lcg_rgb_image(width, height, 5);
+        let mut container = exact.to_rgb8().into_raw();
+        container.extend_from_slice(&[0xAB; 7]);
+        let longer = RgbImage::from_raw(width, height, container).unwrap();
+        let longer = DynamicImage::ImageRgb8(longer);
+
+        assert_eq!(
+            processed(&processor, &longer),
+            processed(&processor, &exact)
+        );
+    }
+
+    /// An input at the view's size: its planes are read straight from its
+    /// bytes.
+    #[test]
+    fn a_longer_container_gives_the_planes_of_a_view_size_image() {
+        assert_a_longer_container_processes_as_its_image(728, 728, false);
+    }
+
+    /// An input under the view's size goes through the view's resize.
+    #[test]
+    fn a_longer_container_resizes_to_the_view_as_its_image() {
+        assert_a_longer_container_processes_as_its_image(600, 400, true);
+    }
+
+    /// An input past the long-side cap is resized under it first.
+    #[test]
+    fn a_longer_container_resizes_under_the_cap_as_its_image() {
+        assert_a_longer_container_processes_as_its_image(3025, 32, false);
+    }
+
+    /// An input at the view's size that takes crops is resized to a whole
+    /// number of windows for them.
+    #[test]
+    fn a_longer_container_resizes_for_the_crops_as_its_image() {
+        assert_a_longer_container_processes_as_its_image(728, 728, true);
     }
 
     /// An empty batch and a zero-sized image are refused.

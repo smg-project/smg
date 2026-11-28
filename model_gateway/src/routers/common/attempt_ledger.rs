@@ -25,19 +25,18 @@
 //! window closes on that worker only, its partner stays selectable, and
 //! when no other worker of the side's kind is available the answer stands.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::{http::StatusCode, response::Response};
 use parking_lot::Mutex;
+use smg_worker::identity::basic::{Worker, WorkerType};
 
-use crate::{
-    routers::common::retry::mark_non_retryable,
-    worker::{Worker, WorkerType},
-};
+use crate::routers::common::{placement::CandidateFilter, retry::mark_non_retryable};
 
-/// Response extension: the worker answered the request itself, so the status
-/// is the worker's verdict on this payload rather than a transport failure or
-/// a status the router synthesized.
+/// Response extension: the worker answered the request itself. The status is
+/// the worker's own, or the router's judgement of an answer the worker gave
+/// (the Decisions adapter's 502 for an answer it cannot map). A transport
+/// failure carries no mark.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct UpstreamAnswer;
 
@@ -45,6 +44,16 @@ pub(crate) struct UpstreamAnswer;
 pub(crate) fn mark_upstream_answer(response: &mut Response) {
     response.extensions_mut().insert(UpstreamAnswer);
 }
+
+/// Whether the worker itself answered `response` (see [`UpstreamAnswer`]).
+pub(crate) fn is_upstream_answer(response: &Response) -> bool {
+    response.extensions().get::<UpstreamAnswer>().is_some()
+}
+
+/// Error code of the 502 a route answers for a worker's body over the
+/// limit. The worker answered, and the route refused what it gave: the
+/// refusal bears no mark ([`UpstreamAnswer`]) and is known by this code.
+pub(crate) const WORKER_BODY_TOO_LARGE: &str = "upstream_response_too_large";
 
 /// Response extension: the attempt failed on one side of a disaggregated pair,
 /// named by its engine, and that side alone is what the request must not be
@@ -63,25 +72,81 @@ pub(crate) fn mark_failed_side(response: &mut Response, worker: &dyn Worker) {
     });
 }
 
+/// Response extension: the worker's stream failed after the worker took the
+/// call, and its breaker is not charged yet. The stream's reader has no
+/// ledger: the dispatch loop charges it ([`AttemptLedger::charge_pending`]).
+#[derive(Clone)]
+pub(crate) struct PendingCharge {
+    worker: Arc<dyn Worker>,
+    status_code: u16,
+}
+
+/// Mark `response` as the failure of `worker`'s stream, which its breaker
+/// samples as `status_code` (see [`PendingCharge`]).
+pub(crate) fn mark_pending_charge(
+    response: &mut Response,
+    worker: &Arc<dyn Worker>,
+    status_code: u16,
+) {
+    response.extensions_mut().insert(PendingCharge {
+        worker: Arc::clone(worker),
+        status_code,
+    });
+}
+
+/// The kind of the worker whose side alone failed, where `response` names
+/// one ([`FailedSide`]).
+pub(crate) fn failed_side_type(response: &Response) -> Option<WorkerType> {
+    let side = response.extensions().get::<FailedSide>();
+    side.map(|side| side.worker_type)
+}
+
 /// Whether `response` is a failure the answering worker must not see again
 /// for this request: the worker's own 500, the one retryable status a worker
 /// gives a request it processed and failed on. Its "not served now" statuses
 /// (502, 503, 504) stay replayable.
 pub(crate) fn is_definitive_failure(response: &Response) -> bool {
-    response.status() == StatusCode::INTERNAL_SERVER_ERROR
-        && response.extensions().get::<UpstreamAnswer>().is_some()
+    response.status() == StatusCode::INTERNAL_SERVER_ERROR && is_upstream_answer(response)
+}
+
+/// Whether `response` closes the retry window: it names a failed side
+/// ([`FailedSide`]) or is a definitive failure. [`AttemptLedger::settle`]
+/// passes any other response untouched, so a caller that asks this first
+/// takes its pool only for a response `settle` reads it for.
+pub(crate) fn closes_retry_window(response: &Response) -> bool {
+    failed_side_type(response).is_some() || is_definitive_failure(response)
 }
 
 /// What one request's attempts have told the worker pool so far.
 #[derive(Debug, Default)]
 pub(crate) struct AttemptLedger {
     inner: Mutex<Ledger>,
+    /// Made at the request's first failure, or for its first holder.
+    charges: OnceLock<Charges>,
+}
+
+/// The workers (by URL) one request already charged a circuit-breaker
+/// failure. A task that outlives its attempt holds a clone, so the outcome it
+/// meets late is counted by the request's rule.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Charges(Arc<Mutex<Vec<String>>>);
+
+impl Charges {
+    /// [`AttemptLedger::record_outcome`], through the request's charges.
+    pub(crate) fn record_outcome(&self, worker: &dyn Worker, status_code: u16) {
+        if worker.is_breaker_failure(status_code) {
+            let mut charged = self.0.lock();
+            if charged.iter().any(|url| url == worker.url()) {
+                return;
+            }
+            charged.push(worker.url().to_string());
+        }
+        worker.record_outcome(status_code);
+    }
 }
 
 #[derive(Debug, Default)]
 struct Ledger {
-    /// Workers (by URL) already charged a circuit-breaker failure.
-    charged: Vec<String>,
     /// Engines (by base URL, so one DP rank's answer stands for its
     /// siblings) that answered the request definitively.
     answered: Vec<String>,
@@ -93,13 +158,24 @@ impl AttemptLedger {
     /// request fails on the worker.
     pub(crate) fn record_outcome(&self, worker: &dyn Worker, status_code: u16) {
         if worker.is_breaker_failure(status_code) {
-            let mut ledger = self.inner.lock();
-            if ledger.charged.iter().any(|url| url == worker.url()) {
-                return;
-            }
-            ledger.charged.push(worker.url().to_string());
+            self.charges().record_outcome(worker, status_code);
+        } else {
+            worker.record_outcome(status_code);
         }
-        worker.record_outcome(status_code);
+    }
+
+    /// The request's charges, for a task that outlives the attempt it
+    /// reports on.
+    pub(crate) fn charges(&self) -> &Charges {
+        self.charges.get_or_init(Charges::default)
+    }
+
+    /// Charge the worker whose stream failed under the attempt
+    /// ([`PendingCharge`]), by the rule of [`Self::record_outcome`].
+    pub(crate) fn charge_pending(&self, response: &Response) {
+        if let Some(charge) = response.extensions().get::<PendingCharge>() {
+            self.record_outcome(charge.worker.as_ref(), charge.status_code);
+        }
     }
 
     /// Whether a retry attempt may select `worker`: not after it answered the
@@ -111,6 +187,29 @@ impl AttemptLedger {
             .answered
             .iter()
             .any(|url| url == worker.base_url())
+    }
+
+    /// Runs `select` with the candidate filter the request's next attempt
+    /// needs. Until a worker answered the request definitively there is
+    /// none, and nothing is asked of each candidate here: a first attempt
+    /// places over the pool as drawn, and a retry after transient failures
+    /// alone does too, but for the engines it tried, which the selection
+    /// steps past by itself while another candidate is left. After that the
+    /// filter is [`Self::admits`].
+    ///
+    /// The check and the selection are two critical sections. That stands on
+    /// a request's attempts running one after another: no answer is recorded
+    /// between the two.
+    pub(crate) fn with_candidate_filter<R>(
+        &self,
+        select: impl FnOnce(Option<CandidateFilter<'_>>) -> R,
+    ) -> R {
+        let nobody_answered = self.inner.lock().answered.is_empty();
+        if nobody_answered {
+            return select(None);
+        }
+        let admits = |worker: &dyn Worker| self.admits(worker);
+        select(Some(&admits))
     }
 
     /// Close the retry window on a definitive failure. The workers that gave
@@ -126,10 +225,10 @@ impl AttemptLedger {
         answered_by: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
         pool: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
     ) {
-        let side = response.extensions().get::<FailedSide>().cloned();
-        if side.is_none() && !is_definitive_failure(response) {
+        if !closes_retry_window(response) {
             return;
         }
+        let side = response.extensions().get::<FailedSide>().cloned();
         {
             let mut ledger = self.inner.lock();
             for worker in answered_by {
@@ -155,145 +254,5 @@ impl AttemptLedger {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use axum::response::IntoResponse;
-
-    use super::*;
-    use crate::{
-        routers::common::retry::is_retryable_response,
-        worker::{
-            circuit_breaker::{CircuitBreakerConfig, CircuitState},
-            test_support::{no_health_check, worker_of},
-            BasicWorkerBuilder,
-        },
-    };
-
-    fn worker(url: &str, failure_threshold: u32) -> Arc<dyn Worker> {
-        Arc::new(
-            BasicWorkerBuilder::new(url)
-                .circuit_breaker_config(CircuitBreakerConfig {
-                    failure_threshold,
-                    success_threshold: 1,
-                    timeout_duration: Duration::from_secs(60),
-                    window_duration: Duration::from_secs(60),
-                })
-                .health_config(no_health_check())
-                .build(),
-        )
-    }
-
-    fn answered(status: StatusCode) -> Response {
-        let mut response = (status, "upstream").into_response();
-        mark_upstream_answer(&mut response);
-        response
-    }
-
-    #[test]
-    fn a_request_charges_a_worker_once_however_often_it_retries_on_it() {
-        let worker = worker("http://w1:8080", 2);
-
-        let request = AttemptLedger::default();
-        for _ in 0..5 {
-            request.record_outcome(worker.as_ref(), 503);
-        }
-        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
-
-        // The next request is a new observation: the threshold counts requests.
-        AttemptLedger::default().record_outcome(worker.as_ref(), 503);
-        assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
-    }
-
-    #[test]
-    fn successes_and_capacity_pushback_pass_through_unchanged() {
-        let worker = worker("http://w1:8080", 2);
-        let ledger = AttemptLedger::default();
-
-        ledger.record_outcome(worker.as_ref(), 503);
-        ledger.record_outcome(worker.as_ref(), 200);
-        // The success reset the failure streak; the next failure is the
-        // first of a new streak and still only the request's one charge.
-        ledger.record_outcome(worker.as_ref(), 503);
-        ledger.record_outcome(worker.as_ref(), 429);
-        assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
-    }
-
-    #[test]
-    fn a_definitive_answer_excludes_its_worker_and_ends_the_window_when_alone() {
-        let w1 = worker("http://w1:8080", 5);
-        let w2 = worker("http://w2:8080", 5);
-        let pool = [Arc::clone(&w1), Arc::clone(&w2)];
-        let ledger = AttemptLedger::default();
-
-        let mut first = answered(StatusCode::INTERNAL_SERVER_ERROR);
-        ledger.settle(&mut first, [&w1], pool.iter());
-        assert!(!ledger.admits(w1.as_ref()));
-        assert!(ledger.admits(w2.as_ref()));
-        assert!(
-            is_retryable_response(&first),
-            "another worker can still take the request"
-        );
-
-        let mut second = answered(StatusCode::INTERNAL_SERVER_ERROR);
-        ledger.settle(&mut second, [&w2], pool.iter());
-        assert!(!ledger.admits(w2.as_ref()));
-        assert!(
-            !is_retryable_response(&second),
-            "no worker is left: the answer is terminal"
-        );
-    }
-
-    #[test]
-    fn only_the_workers_own_500_is_definitive() {
-        let w1 = worker("http://w1:8080", 5);
-        let pool = [Arc::clone(&w1)];
-        let ledger = AttemptLedger::default();
-
-        // A 503 the worker sent is "not served now": replayable.
-        let mut busy = answered(StatusCode::SERVICE_UNAVAILABLE);
-        ledger.settle(&mut busy, [&w1], pool.iter());
-        assert!(ledger.admits(w1.as_ref()));
-        assert!(is_retryable_response(&busy));
-
-        // A 500 the router synthesized (connect failure) is not the worker's answer.
-        let mut transport = (StatusCode::INTERNAL_SERVER_ERROR, "connect").into_response();
-        ledger.settle(&mut transport, [&w1], pool.iter());
-        assert!(ledger.admits(w1.as_ref()));
-        assert!(is_retryable_response(&transport));
-    }
-
-    #[test]
-    fn a_failed_side_excludes_its_worker_alone_and_ends_the_window_without_another_of_its_kind() {
-        // A silent prefill side: the pair's decode did nothing wrong and stays
-        // selectable; the retry goes to the other prefill worker, and once
-        // that one has failed too the 504 stands even though a decode worker
-        // is still available.
-        let p1 = worker_of("grpc://p1:8000", WorkerType::Prefill);
-        let p2 = worker_of("grpc://p2:8000", WorkerType::Prefill);
-        let d1 = worker_of("grpc://d1:8000", WorkerType::Decode);
-        let pool = [Arc::clone(&p1), Arc::clone(&p2), Arc::clone(&d1)];
-        let ledger = AttemptLedger::default();
-
-        let mut first = (StatusCode::GATEWAY_TIMEOUT, "silent").into_response();
-        mark_failed_side(&mut first, p1.as_ref());
-        ledger.settle(&mut first, [&p1, &d1], pool.iter());
-        assert!(!ledger.admits(p1.as_ref()), "the silent prefill is out");
-        assert!(ledger.admits(d1.as_ref()), "its decode partner is not");
-        assert!(ledger.admits(p2.as_ref()));
-        assert!(
-            is_retryable_response(&first),
-            "another prefill worker can take the request"
-        );
-
-        let mut second = (StatusCode::GATEWAY_TIMEOUT, "silent").into_response();
-        mark_failed_side(&mut second, p2.as_ref());
-        ledger.settle(&mut second, [&p2, &d1], pool.iter());
-        assert!(!ledger.admits(p2.as_ref()));
-        assert!(ledger.admits(d1.as_ref()));
-        assert!(
-            !is_retryable_response(&second),
-            "no prefill worker is left: the answer is terminal, whatever the decode pool holds"
-        );
-    }
-}
+#[path = "../../../tests/unit/routers/common/attempt_ledger/tests.rs"]
+mod tests;

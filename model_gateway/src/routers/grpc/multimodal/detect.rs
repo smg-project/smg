@@ -4,18 +4,22 @@
 //! pipeline (`InputMessage`) funnel into the shared processing core; only the
 //! detection and extraction differ, because the input message types differ.
 
+use std::sync::Arc;
+
 use llm_multimodal::{ImageDetail, MediaContentPart};
 use openai_protocol::{
     chat::{ChatMessage, MessageContent},
     common::ContentPart,
     messages::{ImageBlock, ImageSource, InputContent, InputContentBlock, InputMessage, Role},
 };
+use serde_json::{Map, Value};
 
 use super::plan::MediaPlan;
 use crate::routers::grpc::utils::message_utils::tool_result_image_blocks;
 
-/// Extract media parts from OpenAI chat messages,
-/// converting protocol `ContentPart` to multimodal crate `MediaContentPart`.
+/// Extract media parts from OpenAI chat messages, converting protocol
+/// `ContentPart` to multimodal crate `MediaContentPart`; a part's text (a URL,
+/// a data URL, base64 audio) is shared with the request, not copied.
 fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
     let mut parts = Vec::new();
 
@@ -35,7 +39,7 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
                     ContentPart::ImageUrl { image_url } => {
                         let detail = image_url.detail.as_deref().and_then(parse_detail);
                         parts.push(MediaContentPart::ImageUrl {
-                            url: image_url.url.clone(),
+                            url: Arc::clone(&image_url.url),
                             detail,
                             uuid: None,
                             max_long_side_pixel: image_url.max_long_side_pixel,
@@ -43,22 +47,31 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
                     }
                     ContentPart::AudioUrl { audio_url } => {
                         parts.push(MediaContentPart::AudioUrl {
-                            url: audio_url.url.clone(),
+                            url: Arc::clone(&audio_url.url),
+                            uuid: None,
+                        });
+                    }
+                    ContentPart::InputAudio { input_audio }
+                        if media_type_is_plain(&input_audio.format) =>
+                    {
+                        parts.push(MediaContentPart::AudioBase64 {
+                            media_type: format!("audio/{}", input_audio.format),
+                            data: Arc::clone(&input_audio.data),
                             uuid: None,
                         });
                     }
                     ContentPart::InputAudio { input_audio } => {
                         parts.push(MediaContentPart::AudioUrl {
-                            url: format!(
+                            url: Arc::new(format!(
                                 "data:audio/{};base64,{}",
                                 input_audio.format, input_audio.data
-                            ),
+                            )),
                             uuid: None,
                         });
                     }
                     ContentPart::VideoUrl { video_url } => {
                         parts.push(MediaContentPart::VideoUrl {
-                            url: video_url.url.clone(),
+                            url: Arc::clone(&video_url.url),
                             uuid: None,
                             fps: video_url.fps,
                             max_long_side_pixel: video_url.max_long_side_pixel,
@@ -75,9 +88,27 @@ fn extract_media_parts(messages: &[ChatMessage]) -> Vec<MediaContentPart> {
     parts
 }
 
-/// Build the canonical ordered media plan for Chat Completions input.
-pub(crate) fn media_plan_chat(messages: &[ChatMessage]) -> MediaPlan {
+/// The rate a chat request states for sampling its video clips, in frames per
+/// second: `media_io_kwargs.video.fps`, an engine extension carried in the
+/// request's passthrough fields. A value that is no number inside the range a
+/// part's own rate is held to is no rate: the clips are sampled as if the key
+/// were absent, and the request is not refused for it.
+fn request_video_sample_fps(other: &Map<String, Value>) -> Option<f64> {
+    other
+        .get("media_io_kwargs")?
+        .get("video")?
+        .get("fps")?
+        .as_f64()
+        .filter(|fps| llm_multimodal::sample_fps_in_range(*fps))
+}
+
+/// Build the canonical ordered media plan for Chat Completions input, from
+/// the request's messages and its passthrough fields: a plan that holds a
+/// video part carries the rate the request states for its clips
+/// ([`request_video_sample_fps`]), and no other plan reads the key.
+pub(crate) fn media_plan_chat(messages: &[ChatMessage], other: &Map<String, Value>) -> MediaPlan {
     MediaPlan::new(extract_media_parts(messages))
+        .with_request_video_fps(|| request_video_sample_fps(other))
 }
 
 /// Parse OpenAI detail string to multimodal ImageDetail enum.
@@ -110,12 +141,15 @@ fn extract_media_parts_messages(messages: &[InputMessage]) -> Vec<MediaContentPa
 
         for block in blocks {
             match block {
-                InputContentBlock::Image(image_block) => parts.push(image_media_part(image_block)),
+                InputContentBlock::Image(image_block) => {
+                    parts.extend(image_media_part(image_block));
+                }
                 // Images inside a tool result enter the plan where the tool
                 // result stands, in block order: `convert_user_message` renders
                 // them into the user content at that same position.
                 InputContentBlock::ToolResult(tool_result) => {
-                    parts.extend(tool_result_image_blocks(tool_result).map(image_media_part));
+                    parts
+                        .extend(tool_result_image_blocks(tool_result).filter_map(image_media_part));
                 }
                 InputContentBlock::Text(_) => {}
                 _ => {}
@@ -126,19 +160,43 @@ fn extract_media_parts_messages(messages: &[InputMessage]) -> Vec<MediaContentPa
     parts
 }
 
-/// Convert a Messages API image block to a media part for the connector,
-/// turning a base64 source into a data URL.
-fn image_media_part(image_block: &ImageBlock) -> MediaContentPart {
-    let url = match &image_block.source {
-        ImageSource::Base64 { media_type, data } => format!("data:{media_type};base64,{data}"),
-        ImageSource::Url { url } => url.clone(),
-    };
-    MediaContentPart::ImageUrl {
-        url,
-        detail: None,
-        uuid: None,
-        max_long_side_pixel: None,
-    }
+/// Whether a base64 part may stand for the data URL `data:<media_type>;base64,<data>`:
+/// a `,` in the media type would move the delimiter a data URL parser splits
+/// on, so such a type keeps the data URL form and its parsing.
+fn media_type_is_plain(media_type: &str) -> bool {
+    !media_type.contains(',')
+}
+
+/// Convert a Messages API image block to a media part for the connector: a
+/// base64 source travels as its media type and its text, shared with the
+/// request; a URL is shared the same way. A file source names a file of the
+/// public API's Files API, which this gateway cannot fetch, so it makes no
+/// part: the message conversion refuses the block by name.
+fn image_media_part(image_block: &ImageBlock) -> Option<MediaContentPart> {
+    Some(match &image_block.source {
+        ImageSource::Base64 { media_type, data } if media_type_is_plain(media_type) => {
+            MediaContentPart::ImageBase64 {
+                media_type: media_type.clone(),
+                data: Arc::clone(data),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            }
+        }
+        ImageSource::Base64 { media_type, data } => MediaContentPart::ImageUrl {
+            url: Arc::new(format!("data:{media_type};base64,{data}")),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        },
+        ImageSource::Url { url } => MediaContentPart::ImageUrl {
+            url: Arc::clone(url),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        },
+        ImageSource::File { .. } => return None,
+    })
 }
 
 /// Build the canonical ordered media plan for Messages API input.
@@ -147,273 +205,5 @@ pub(crate) fn media_plan_messages(messages: &[InputMessage]) -> MediaPlan {
 }
 
 #[cfg(test)]
-mod tests {
-    use llm_multimodal::Modality;
-    use openai_protocol::common::{AudioUrl, ImageUrl, InputAudio, VideoUrl};
-
-    use super::*;
-
-    #[test]
-    fn media_plan_detects_image() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "What is this?".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "https://example.com/cat.jpg".to_string(),
-                        detail: None,
-                        max_long_side_pixel: None,
-                    },
-                },
-            ]),
-            name: None,
-        }];
-
-        assert_eq!(media_plan_chat(&messages).modalities(), &[Modality::Image]);
-    }
-
-    #[test]
-    fn media_plan_detects_video() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![ContentPart::VideoUrl {
-                video_url: VideoUrl {
-                    url: "https://example.com/clip.mp4".to_string(),
-                    fps: None,
-                    max_long_side_pixel: None,
-                },
-            }]),
-            name: None,
-        }];
-
-        assert_eq!(media_plan_chat(&messages).modalities(), &[Modality::Video]);
-    }
-
-    #[test]
-    fn media_plan_detects_audio() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![ContentPart::AudioUrl {
-                audio_url: AudioUrl {
-                    url: "https://example.com/clip.wav".to_string(),
-                },
-            }]),
-            name: None,
-        }];
-
-        assert_eq!(media_plan_chat(&messages).modalities(), &[Modality::Audio]);
-    }
-
-    #[test]
-    fn media_plan_is_empty_for_string_text() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Text("Hello".to_string()),
-            name: None,
-        }];
-
-        assert!(media_plan_chat(&messages).is_empty());
-    }
-
-    #[test]
-    fn media_plan_is_empty_for_text_parts() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![ContentPart::Text {
-                text: "Just text".to_string(),
-            }]),
-            name: None,
-        }];
-
-        assert!(media_plan_chat(&messages).is_empty());
-    }
-
-    #[test]
-    fn extracts_image_media_part() {
-        let messages = vec![
-            ChatMessage::System {
-                ext: Default::default(),
-                content: MessageContent::Text("You are helpful".to_string()),
-                name: None,
-            },
-            ChatMessage::User {
-                ext: Default::default(),
-                content: MessageContent::Parts(vec![
-                    ContentPart::Text {
-                        text: "Describe this:".to_string(),
-                    },
-                    ContentPart::ImageUrl {
-                        image_url: ImageUrl {
-                            url: "https://example.com/image.jpg".to_string(),
-                            detail: Some("high".to_string()),
-                            max_long_side_pixel: None,
-                        },
-                    },
-                ]),
-                name: None,
-            },
-        ];
-
-        let parts = extract_media_parts(&messages);
-        assert_eq!(parts.len(), 1);
-
-        match &parts[0] {
-            MediaContentPart::ImageUrl { url, detail, .. } => {
-                assert_eq!(url, "https://example.com/image.jpg");
-                assert_eq!(*detail, Some(ImageDetail::High));
-            }
-            _ => panic!("Expected ImageUrl part"),
-        }
-    }
-
-    #[test]
-    fn extracts_video_media_part() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![ContentPart::VideoUrl {
-                video_url: VideoUrl {
-                    url: "https://example.com/video.mp4".to_string(),
-                    fps: None,
-                    max_long_side_pixel: None,
-                },
-            }]),
-            name: None,
-        }];
-
-        let parts = extract_media_parts(&messages);
-        assert_eq!(parts.len(), 1);
-        match &parts[0] {
-            MediaContentPart::VideoUrl { url, .. } => {
-                assert_eq!(url, "https://example.com/video.mp4");
-            }
-            _ => panic!("Expected VideoUrl part"),
-        }
-    }
-
-    #[test]
-    fn extracts_audio_url_media_part() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![ContentPart::AudioUrl {
-                audio_url: AudioUrl {
-                    url: "https://example.com/audio.wav".to_string(),
-                },
-            }]),
-            name: None,
-        }];
-
-        let parts = extract_media_parts(&messages);
-        assert_eq!(parts.len(), 1);
-        match &parts[0] {
-            MediaContentPart::AudioUrl { url, .. } => {
-                assert_eq!(url, "https://example.com/audio.wav");
-            }
-            _ => panic!("Expected AudioUrl part"),
-        }
-    }
-
-    #[test]
-    fn extracts_inline_audio_as_data_url() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![ContentPart::InputAudio {
-                input_audio: InputAudio {
-                    data: "UklGRg==".to_string(),
-                    format: "wav".to_string(),
-                },
-            }]),
-            name: None,
-        }];
-
-        assert_eq!(media_plan_chat(&messages).modalities(), &[Modality::Audio]);
-
-        let parts = extract_media_parts(&messages);
-        assert_eq!(parts.len(), 1);
-        match &parts[0] {
-            MediaContentPart::AudioUrl { url, .. } => {
-                assert_eq!(url, "data:audio/wav;base64,UklGRg==");
-            }
-            _ => panic!("Expected AudioUrl part"),
-        }
-    }
-
-    #[test]
-    fn test_parse_detail() {
-        assert_eq!(parse_detail("auto"), Some(ImageDetail::Auto));
-        assert_eq!(parse_detail("Auto"), Some(ImageDetail::Auto));
-        assert_eq!(parse_detail("LOW"), Some(ImageDetail::Low));
-        assert_eq!(parse_detail("high"), Some(ImageDetail::High));
-        assert_eq!(parse_detail("unknown"), None);
-    }
-
-    #[test]
-    fn media_plan_messages_counts_images_inside_tool_results() {
-        use openai_protocol::messages::{
-            TextBlock, ToolResultBlock, ToolResultContent, ToolResultContentBlock,
-        };
-
-        let image = |data: &str| ImageBlock {
-            source: ImageSource::Base64 {
-                media_type: "image/png".to_string(),
-                data: data.to_string(),
-            },
-            cache_control: None,
-        };
-        let messages = vec![InputMessage {
-            role: Role::User,
-            content: InputContent::Blocks(vec![
-                InputContentBlock::ToolResult(ToolResultBlock {
-                    tool_use_id: "tu_1".to_string(),
-                    content: Some(ToolResultContent::Blocks(vec![
-                        ToolResultContentBlock::Text(TextBlock {
-                            text: "screenshot taken".to_string(),
-                            cache_control: None,
-                            citations: None,
-                        }),
-                        ToolResultContentBlock::Image(image("AAAA")),
-                    ])),
-                    is_error: None,
-                    cache_control: None,
-                }),
-                InputContentBlock::Image(image("BBBB")),
-            ]),
-        }];
-
-        let plan = media_plan_messages(&messages);
-        assert_eq!(plan.modalities(), &[Modality::Image]);
-        assert_eq!(plan.count(Modality::Image), 2);
-        // Block order: the tool result's image comes before the top-level one.
-        let urls: Vec<&str> = plan
-            .parts()
-            .iter()
-            .map(|part| match part {
-                MediaContentPart::ImageUrl { url, .. } => url.as_str(),
-                _ => panic!("tool result images are image parts"),
-            })
-            .collect();
-        assert_eq!(
-            urls,
-            ["data:image/png;base64,AAAA", "data:image/png;base64,BBBB"]
-        );
-    }
-
-    #[test]
-    fn media_plan_messages_ignores_text_only_tool_results() {
-        use openai_protocol::messages::{ToolResultBlock, ToolResultContent};
-
-        let messages = vec![InputMessage {
-            role: Role::User,
-            content: InputContent::Blocks(vec![InputContentBlock::ToolResult(ToolResultBlock {
-                tool_use_id: "tu_1".to_string(),
-                content: Some(ToolResultContent::String("4".to_string())),
-                is_error: None,
-                cache_control: None,
-            })]),
-        }];
-
-        assert!(media_plan_messages(&messages).is_empty());
-    }
-}
+#[path = "../../../../tests/unit/routers/grpc/multimodal/detect/tests.rs"]
+mod tests;

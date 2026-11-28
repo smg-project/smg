@@ -36,6 +36,9 @@ pub struct MockTokenizer {
     native_reasoning_effort_off_values: &'static [&'static str],
     renderer_capabilities: RendererCapabilities,
     content_format: ChatTemplateContentFormat,
+    /// Reported for a request that declares tools; `None` reports
+    /// `content_format`, as a tokenizer with one template does.
+    tool_content_format: Option<ChatTemplateContentFormat>,
     /// Reported from `think_in_prefill`: the generation prompt opens the
     /// think block.
     think_in_prefill: bool,
@@ -111,6 +114,7 @@ impl MockTokenizer {
             prefill_opens_think_block: None,
             renderer_capabilities: RendererCapabilities::default(),
             content_format: ChatTemplateContentFormat::default(),
+            tool_content_format: None,
             json_chat_template: false,
             response_template: None,
             chat_template: None,
@@ -187,6 +191,13 @@ impl MockTokenizer {
     /// Report `format` from `chat_template_content_format()`.
     pub fn with_content_format(mut self, format: ChatTemplateContentFormat) -> Self {
         self.content_format = format;
+        self
+    }
+
+    /// Report `format` for a request that declares tools, as a checkpoint
+    /// whose tools template differs from its default one does.
+    pub fn with_tool_content_format(mut self, format: ChatTemplateContentFormat) -> Self {
+        self.tool_content_format = Some(format);
         self
     }
 
@@ -323,6 +334,15 @@ impl TokenizerTrait for MockTokenizer {
 
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
         self.content_format
+    }
+
+    fn chat_template_content_format_for_request(
+        &self,
+        has_tools: bool,
+    ) -> ChatTemplateContentFormat {
+        self.tool_content_format
+            .filter(|_| has_tools)
+            .unwrap_or(self.content_format)
     }
 
     /// One `role: content` line per message, plus an `assistant:` tail when a

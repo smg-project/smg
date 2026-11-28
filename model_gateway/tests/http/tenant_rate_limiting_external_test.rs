@@ -17,12 +17,10 @@ use axum::http::{header::RETRY_AFTER, StatusCode};
 use common::test_app::{register_external_worker, register_external_worker_with_card};
 use openai_protocol::{
     chat::ChatCompletionRequest, interactions::InteractionsRequest, messages::CreateMessageRequest,
+    model_card::ModelCard,
 };
 use serde_json::{json, Value};
-use smg::{
-    routers::{external::ExternalRouterAdapter, RouterTrait},
-    worker::ModelCard,
-};
+use smg::routers::{external::ExternalRouterAdapter, RouterTrait};
 use smg_external_router::{known, ExternalRouterSpec};
 
 use super::{
@@ -68,7 +66,9 @@ async fn chat_as(router: &dyn RouterTrait, model: &str) -> axum::response::Respo
         "model": model,
         "messages": [{"role": "user", "content": PROMPT_TEXT}],
     }));
-    router.route_chat(None, &tenant(), body, model).await
+    router
+        .route_chat(None, &tenant(), Arc::new(body), model)
+        .await
 }
 
 // ---------------------------------------------------------------------------
@@ -129,7 +129,7 @@ async fn an_impossible_request_is_denied_on_every_provider_route() {
             (
                 "messages",
                 anthropic
-                    .route_messages(None, &tenant, messages, MODEL)
+                    .route_messages(None, &tenant, Arc::new(messages), MODEL)
                     .await,
             ),
             (

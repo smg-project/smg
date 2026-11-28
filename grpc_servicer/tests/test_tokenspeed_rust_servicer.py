@@ -486,6 +486,58 @@ def test_server_facts_carry_the_grammar_backend_the_scheduler_runs(monkeypatch):
     assert json.loads(rust.server_facts(unset)["server_args_json"])["grammar_backend"] == "xgrammar"
 
 
+def test_server_facts_ask_the_engine_for_a_checkpoint_it_has_not_read(monkeypatch, caplog):
+    # An unset flag on a checkpoint the engine had not read when it parsed its
+    # arguments (a hub id its cache did not hold): the facts ask the engine's
+    # own method again, bare and on a deep copy, so the launch still finds its
+    # arguments unread and settles them itself.
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    monkeypatch.setattr(
+        "smg_grpc_servicer.constrained_decoding.installed_xgrammar_version", lambda: "0.1.32"
+    )
+    calls = []
+
+    class UnreadCheckpoint(_GrammarServerArgs):
+        def resolve_model_defaults(self, download=False):
+            calls.append(download)
+            self.nested.append("read")
+            if isinstance(self.outcome, Exception):
+                raise self.outcome
+            self._beam_checkpoint = self.outcome
+            if self.outcome:
+                self.grammar_backend = "xgrammar"
+
+    def facts_of(outcome, backend="none", unset=True, checkpoint=None):
+        calls.clear()
+        args = UnreadCheckpoint(grammar_backend=backend)
+        args._grammar_backend_unset, args._beam_checkpoint = unset, checkpoint
+        args.outcome, args.nested = outcome, []
+        facts = json.loads(rust.server_facts(args)["server_args_json"])
+        # The arguments handed in are as they were, down to a nested object.
+        assert (args.grammar_backend, args._beam_checkpoint, args.nested) == (
+            backend,
+            checkpoint,
+            [],
+        )
+        return facts.get("grammar_backend"), facts.get("structural_tag_vocabulary"), list(calls)
+
+    # The engine settles its default: the key and the vocabulary label of an
+    # older xgrammar follow what it settled.
+    assert facts_of(True) == ("xgrammar", "older", [False])
+    assert facts_of(False) == ("none", None, [False])
+    # A checkpoint the cache still does not hold (the method returns with its
+    # mark unset) and a refusal the method raises: nothing is written and
+    # nothing is logged, as before; the launch raises the refusal again.
+    with caplog.at_level("DEBUG"):
+        assert facts_of(None) == (None, "older", [False])
+        assert facts_of(ValueError("a flag this checkpoint refuses")) == (None, "older", [False])
+    assert not caplog.records
+    # A flag that was given and a checkpoint already read are not asked again.
+    assert facts_of(True, backend="xgrammar", unset=False) == ("xgrammar", "older", [])
+    assert facts_of(True, checkpoint=False) == ("none", None, [])
+
+
 def test_server_facts_never_carry_credentials(monkeypatch):
     """The Rust server reports the same server args as the Python one, so the
     in-engine RL control key and tokens must not leave the engine here either.
@@ -751,6 +803,39 @@ def test_the_launcher_builds_the_model_config_once_for_the_default_and_the_facts
     assert (
         launcher.facts(args)["kv_events_endpoint"] == json.loads(args.kv_events_config)["endpoint"]
     )
+
+
+def test_the_facts_say_why_the_default_left_the_publisher_off(monkeypatch, caplog):
+    """A launcher whose engine cannot serve the publisher for the model writes
+    the line it logged into the server args (``kv_events_left_off``), where
+    the Rust servicer reads what it refuses ``SubscribeKvEvents`` with. A
+    publisher that is on, or off by an explicit configuration or the opt-out,
+    writes none."""
+    _install_cache_vocabulary(monkeypatch)
+    _stub_servicer_module(monkeypatch)
+    hybrid = _model_config_of("linear_attention", "full_attention")
+    monkeypatch.setattr(rust, "_model_config", lambda args: hybrid)
+
+    def server_args_of(args):
+        launcher = rust.TokenSpeedLauncher()
+        launcher.kv_events_default(args)
+        return json.loads(launcher.facts(args)["server_args_json"])
+
+    with caplog.at_level(logging.INFO, logger=rust_lifecycle.logger.name):
+        left_off = server_args_of(FakeServerArgs())["kv_events_left_off"]
+    assert left_off.startswith(
+        "KV event publishing left off: org/m keeps recurrent state in 1 of its 2 layers "
+    )
+    assert left_off.endswith("; pass --kv-events-config to turn the publisher on anyway")
+    assert left_off in caplog.text
+
+    given = '{"enable_kv_cache_events": true, "publisher": "zmq", "endpoint": "tcp://*:5600"}'
+    assert "kv_events_left_off" not in server_args_of(FakeServerArgs(kv_events_config=given))
+    monkeypatch.setenv(rust.KV_EVENTS_ENV, "0")
+    assert "kv_events_left_off" not in server_args_of(FakeServerArgs())
+    monkeypatch.delenv(rust.KV_EVENTS_ENV)
+    monkeypatch.setattr(rust, "_model_config", lambda args: _model_config_of("full_attention"))
+    assert "kv_events_left_off" not in server_args_of(FakeServerArgs())
 
 
 @pytest.fixture
@@ -1070,7 +1155,7 @@ def test_serve_rust_starts_the_scheduler_ranks_from_this_process(
         rust, "server_facts", lambda args: {"server_args_json": "{}", "data_parallel_size": 1}
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
     supervised: dict = {}
@@ -1122,7 +1207,7 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
         lambda args: {"server_args_json": "{}", "data_parallel_size": 2},
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
 
     def fake_launch(headless):
@@ -1205,7 +1290,7 @@ def _run_serve_rust(monkeypatch, tmp_path) -> dict:
     )
     monkeypatch.setattr(rust, "_model_config", lambda args: model_config)
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.setattr(rust, "launch_scheduler_ranks", lambda headless, **_: "engine-handle")
 
@@ -1294,7 +1379,7 @@ def _serve_rust_role(monkeypatch, tmp_path, caplog, mode: str, *, in_process: bo
         rust, "server_facts", lambda args: {"server_args_json": "{}", "data_parallel_size": 1}
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
 
@@ -1522,7 +1607,8 @@ def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_pat
     _run_serve_rust(monkeypatch, tmp_path)
     recorded = _run_serve_rust.recorded
     assert recorded["server"].ready == [] and recorded["server"].serving == []
-    assert recorded["supervise_kwargs"] == {}
+    assert "warmup" not in recorded["supervise_kwargs"]
+    assert recorded["supervise_kwargs"]["linger_secs"] == rust_lifecycle.DRAIN_LINGER_SECS
 
 
 def test_serve_rust_refuses_a_warm_up_knob_it_cannot_read_before_the_server_binds(
@@ -1543,6 +1629,71 @@ def test_serve_rust_refuses_a_warm_up_knob_it_cannot_read_before_the_server_bind
     ):
         asyncio.run(rust.serve_rust(FakeServerArgs(port=50123)))
     assert created == {}
+
+
+def test_the_remainders_knob_is_a_named_configuration_error_where_the_launchers_read_it():
+    assert rust.read_remainders_setting({}) == "auto"
+    assert rust.read_remainders_setting({rust.REMAINDERS_ENV: " Off "}) == "off"
+    assert rust.read_remainders_setting({rust.REMAINDERS_ENV: "1"}) == "on"
+    with pytest.raises(
+        rust_lifecycle.ServicerConfigError,
+        match="SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS='sometimes'",
+    ):
+        rust.read_remainders_setting({rust.REMAINDERS_ENV: "sometimes"})
+
+
+@pytest.mark.parametrize(
+    ("warmup", "role"),
+    [(None, "null"), ("off", "null"), (None, "decode")],
+    ids=["warm-up on", "warm-up off", "decode role"],
+)
+def test_serve_rust_refuses_a_remainders_knob_it_cannot_read_before_any_engine_work(
+    monkeypatch, tmp_path, warmup, role
+):
+    """The chunk-remainders knob is read with the launcher's other knobs, so a
+    value it does not take refuses the start before the model config is read
+    and the server binds, whether or not the warm-up runs and on a
+    disaggregation role, which plans none."""
+    created: dict = {}
+    configs_read: list = []
+
+    class FakeServer:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+    _install_fake_servicer(monkeypatch, FakeServer)
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.setattr(rust, "_model_config", lambda args: configs_read.append(args))
+    monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
+    if warmup is not None:
+        monkeypatch.setenv(rust.WARMUP_ENV, warmup)
+    monkeypatch.setenv(rust.REMAINDERS_ENV, "sometimes")
+    with pytest.raises(
+        rust_lifecycle.ServicerConfigError,
+        match="SMG_TOKENSPEED_SERVICER_WARMUP_REMAINDERS='sometimes'",
+    ):
+        asyncio.run(rust.serve_rust(FakeServerArgs(port=50123, disaggregation_mode=role)))
+    assert created == {} and configs_read == []
+
+
+def test_serve_rust_plans_the_chunk_remainders_the_knob_asks_for(monkeypatch, tmp_path, caplog):
+    """The setting read with the launcher's knobs reaches the plan: on the
+    fake engine's unstated layout, auto keeps the chunk remainders, and off
+    plans the rest without them and says the hazard is open."""
+    _run_serve_rust(monkeypatch, tmp_path)
+    plan = _run_serve_rust.recorded["supervise_kwargs"]["warmup"].args[0]
+    assert any(step.kind == "remainder" for step in plan.steps)
+
+    monkeypatch.setenv(rust.REMAINDERS_ENV, "off")
+    caplog.set_level(logging.WARNING, logger="smg_grpc_servicer")
+    _run_serve_rust(monkeypatch, tmp_path)
+    plan = _run_serve_rust.recorded["supervise_kwargs"]["warmup"].args[0]
+    assert plan.steps and not any(step.kind == "remainder" for step in plan.steps)
+    assert any(
+        "no chunk remainders" in r.getMessage()
+        and "an unknown number of processes" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_serve_rust_defaults_both_startup_bounds(monkeypatch, tmp_path):
@@ -1764,7 +1915,7 @@ def test_a_launch_that_fails_stops_the_already_bound_server(monkeypatch, tmp_pat
         rust, "server_facts", lambda args: {"server_args_json": "{}", "data_parallel_size": 1}
     )
     monkeypatch.setattr(rust, "tokenizer_dir_for", lambda args: str(tmp_path))
-    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda exclude=(): 24321)
     monkeypatch.setattr(rust_lifecycle, "default_socket_dir", lambda: str(tmp_path / "sockets"))
     monkeypatch.delenv("SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT", raising=False)
 

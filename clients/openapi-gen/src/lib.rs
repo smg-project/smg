@@ -128,6 +128,26 @@ struct Parameter {
 struct ParameterSchema {
     #[serde(rename = "type")]
     schema_type: String,
+    /// The item schema of an `array` parameter: a query key the route reads repeated, one
+    /// value per occurrence (OpenAPI's default `form` style with `explode`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    items: Option<Box<ParameterSchema>>,
+}
+
+impl ParameterSchema {
+    fn of(schema_type: &str) -> Self {
+        Self {
+            schema_type: schema_type.to_string(),
+            items: None,
+        }
+    }
+
+    fn array_of(item_type: &str) -> Self {
+        Self {
+            schema_type: "array".to_string(),
+            items: Some(Box::new(Self::of(item_type))),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -316,20 +336,21 @@ fn path_param(name: &str) -> Parameter {
         name: name.to_string(),
         location: "path".to_string(),
         required: true,
-        schema: ParameterSchema {
-            schema_type: "string".to_string(),
-        },
+        schema: ParameterSchema::of("string"),
     }
 }
 
 fn optional_query_param(name: &str) -> Parameter {
+    typed_query_param(name, ParameterSchema::of("string"))
+}
+
+/// An optional query parameter with the schema the route parses it by.
+fn typed_query_param(name: &str, schema: ParameterSchema) -> Parameter {
     Parameter {
         name: name.to_string(),
         location: "query".to_string(),
         required: false,
-        schema: ParameterSchema {
-            schema_type: "string".to_string(),
-        },
+        schema,
     }
 }
 
@@ -389,6 +410,8 @@ pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/inflight"),
     ("GET", "/config"),
     ("POST", "/secrets/reload"),
+    ("GET", "/rate-limits/tenants"),
+    ("PUT", "/rate-limits/tenants"),
     ("POST", "/flush_cache"),
     ("POST", "/start_profile"),
     ("POST", "/stop_profile"),
@@ -396,6 +419,7 @@ pub const CONTROL_PLANE_ROUTES: &[(&str, &str)] = &[
     ("GET", "/get_loads"),
     ("POST", "/parse/function_call"),
     ("POST", "/parse/reasoning"),
+    ("GET", "/policy/explain/{request_id}"),
     ("POST", "/wasm"),
     ("GET", "/wasm"),
     ("DELETE", "/wasm/{module_uuid}"),
@@ -579,7 +603,17 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
             get: Some(operation(
                 "listResponseInputItems",
                 "List input items for a response",
-                Some(response_id_param),
+                Some(
+                    response_id_param
+                        .into_iter()
+                        .chain([
+                            typed_query_param("limit", ParameterSchema::of("integer")),
+                            optional_query_param("order"),
+                            optional_query_param("after"),
+                            typed_query_param("include", ParameterSchema::array_of("string")),
+                        ])
+                        .collect(),
+                ),
                 None,
                 input_items_responses,
             )),
@@ -965,6 +999,187 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         },
     );
 
+    // ---- The tenant rate-limit document (control plane) ----
+    // The policy types are the gateway's own; their shape is written here as
+    // the start's YAML file has it and the route answers it.
+    let tenant_policy = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "One tenant's limits: the default policy carries no tenant_key, every other entry one",
+        "properties": {
+            "tenant_key": {"type": "string", "description": "auth:<id>, header:<id>, ip:<address> or anonymous"},
+            "tokens_per_minute": {"type": "integer", "minimum": 1},
+            "requests_per_minute": {"type": "integer", "minimum": 1},
+            "model_rules": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "rule_id": {"type": "string"},
+                        "matcher": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "type": {"type": "string", "enum": ["exact", "prefix"]},
+                                "value": {"type": "string"}
+                            },
+                            "required": ["type", "value"]
+                        },
+                        "tokens_per_minute": {"type": "integer", "minimum": 1},
+                        "requests_per_minute": {"type": "integer", "minimum": 1}
+                    },
+                    "required": ["rule_id", "matcher", "tokens_per_minute", "requests_per_minute"]
+                }
+            }
+        },
+        "required": ["tokens_per_minute", "requests_per_minute"]
+    });
+    let rate_limit_document = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "The tenant rate-limit policy: the shape of the start's YAML file",
+        "properties": {
+            "default_policy": tenant_policy.clone(),
+            "tenants": {"type": "array", "items": tenant_policy}
+        },
+        "required": ["default_policy"]
+    });
+    let revision_fields = serde_json::json!({
+        "revision": {"type": "integer", "description": "1 for the start's file, one more per applied write"},
+        "etag": {"type": "string", "description": "The quoted SHA-256 of the document as JSON; the ETag header and the If-Match of a write"},
+        "applied_at": {"type": "string", "format": "date-time"},
+        "principal": {"type": "string", "description": "The control-plane principal that applied the revision, or startup"}
+    });
+    let mut revision_record = serde_json::json!({
+        "type": "object",
+        "description": "The document in force and the record of its application",
+        "properties": {"document": rate_limit_document.clone()},
+        "required": ["document", "revision", "etag", "applied_at", "principal"]
+    });
+    let mut write_answer = serde_json::json!({
+        "type": "object",
+        "description": "The revision in force after the write and what the document given means against the one it was checked against",
+        "properties": {
+            "applied": {"type": "boolean", "description": "false for a dry run: nothing was swapped and the revision stands"},
+            "summary": {
+                "type": "object",
+                "properties": {
+                    "tenants": {"type": "integer"},
+                    "model_rules": {"type": "integer"},
+                    "default_tokens_per_minute": {"type": "integer"},
+                    "default_requests_per_minute": {"type": "integer"}
+                },
+                "required": ["tenants", "model_rules", "default_tokens_per_minute", "default_requests_per_minute"]
+            },
+            "changes": {
+                "type": "object",
+                "properties": {
+                    "tenants_added": {"type": "array", "items": {"type": "string"}},
+                    "tenants_removed": {"type": "array", "items": {"type": "string"}},
+                    "tenants_changed": {"type": "array", "items": {"type": "string"}},
+                    "default_changed": {"type": "boolean"}
+                },
+                "required": ["tenants_added", "tenants_removed", "tenants_changed", "default_changed"]
+            },
+            "buckets": {
+                "type": "object",
+                "description": "What the application did to the live buckets; absent on a dry run",
+                "properties": {
+                    "kept": {"type": "integer", "description": "Buckets whose limits stand, kept with their fill"},
+                    "replaced": {"type": "integer", "description": "Buckets at new limits, their spending carried"},
+                    "dropped": {"type": "integer", "description": "Buckets of a scope the document no longer names"}
+                },
+                "required": ["kept", "replaced", "dropped"]
+            }
+        },
+        "required": ["applied", "revision", "etag", "applied_at", "principal", "summary", "changes"]
+    });
+    for (record, fields) in [
+        (&mut revision_record, &revision_fields),
+        (&mut write_answer, &revision_fields),
+    ] {
+        if let (Some(properties), Some(fields)) =
+            (record["properties"].as_object_mut(), fields.as_object())
+        {
+            properties.extend(fields.clone());
+        }
+    }
+    let refused = |description: &str| Response {
+        description: description.to_string(),
+        content: Some(json_content(&worker_error_name)),
+    };
+    paths.insert(
+        "/rate-limits/tenants".to_string(),
+        PathItem {
+            get: Some(operation(
+                "getTenantRateLimits",
+                "The tenant rate-limit document in force with its revision and ETag: the admin role alone, mounted only with control-plane authentication",
+                None,
+                None,
+                {
+                    let mut responses = inline_response(
+                        "The document, its revision, ETag, application time and principal; the same ETag and x-smg-config-revision in the headers",
+                        revision_record,
+                    );
+                    responses.insert(
+                        "409".to_string(),
+                        refused("No tenant rate limiter is configured, or the backend in use holds no document"),
+                    );
+                    responses
+                },
+            )),
+            put: Some(operation(
+                "putTenantRateLimits",
+                "Replace the tenant rate-limit document against the ETag read: checked as the start checks its file, applied as the next revision with the live buckets' fill kept where their limits stand; dry_run=true answers the changes and applies nothing",
+                Some(vec![
+                    // The precondition of every write and dry run: the ETag read;
+                    // without it the route answers 428.
+                    Parameter {
+                        name: "If-Match".to_string(),
+                        location: "header".to_string(),
+                        required: true,
+                        schema: ParameterSchema::of("string"),
+                    },
+                    Parameter {
+                        name: "dry_run".to_string(),
+                        location: "query".to_string(),
+                        required: false,
+                        schema: ParameterSchema::of("boolean"),
+                    },
+                ]),
+                Some(RequestBody {
+                    required: true,
+                    content: inline_content(rate_limit_document),
+                }),
+                {
+                    let mut responses = inline_response(
+                        "The revision in force after the write (the new one, or the live one on a dry run), the document's summary and its changes against the revision checked",
+                        write_answer,
+                    );
+                    responses.insert(
+                        "400".to_string(),
+                        refused("The body is not the document, or the document fails the checks the start applies to its file (INVALID_DOCUMENT); the error names the field"),
+                    );
+                    responses.insert(
+                        "409".to_string(),
+                        refused("No tenant rate limiter is configured, or the backend in use takes no new policy while running"),
+                    );
+                    responses.insert(
+                        "412".to_string(),
+                        refused("If-Match names another revision; the live ETag and revision are in the headers"),
+                    );
+                    responses.insert(
+                        "428".to_string(),
+                        refused("If-Match is missing or `*`; read the document first"),
+                    );
+                    responses
+                },
+            )),
+            ..PathItem::default()
+        },
+    );
+
     // ---- WASM modules (control plane) ----
     // The module types live in the WASM runtime crate, which this generator
     // does not build; their shape is written here as the gateway answers it.
@@ -1201,9 +1416,7 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
             name: "selector".to_string(),
             location: "query".to_string(),
             required: true,
-            schema: ParameterSchema {
-                schema_type: "string".to_string(),
-            },
+            schema: ParameterSchema::of("string"),
         };
         operation(
             op_id,
@@ -1333,6 +1546,31 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
         },
     );
 
+    // ---- A kept routing decision ----
+    paths.insert(
+        "/policy/explain/{request_id}".to_string(),
+        PathItem {
+            get: Some(operation(
+                "explainRoutingDecision",
+                "The newest routing decision Grand Central kept of one request, where the policy spec sets explain.sample",
+                Some(vec![path_param("request_id")]),
+                None,
+                refused_with(
+                    inline_response(
+                        "The kept decision, each worker with its address",
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {"decision": {"type": "object"}},
+                            "required": ["decision"]
+                        }),
+                    ),
+                    &worker_error_name,
+                ),
+            )),
+            ..PathItem::default()
+        },
+    );
+
     // ---- Models ----
     use openai_protocol::models::ListModelsResponse as OpenAIListModelsResponse;
     let resp_name = collect_schema(schema_for!(OpenAIListModelsResponse), &mut schemas)?;
@@ -1371,122 +1609,5 @@ pub fn document() -> anyhow::Result<OpenApiDoc> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use serde_json::json;
-
-    use super::*;
-
-    fn document_value() -> Value {
-        serde_json::to_value(document().expect("the document builds")).expect("it serializes")
-    }
-
-    fn listed_routes() -> BTreeSet<(String, String)> {
-        CONTROL_PLANE_ROUTES
-            .iter()
-            .chain(RL_CONTROL_PLANE_ROUTES)
-            .map(|(method, path)| (method.to_lowercase(), path.to_string()))
-            .collect()
-    }
-
-    #[test]
-    fn every_control_plane_route_has_an_operation_that_takes_the_bearer() {
-        let doc = document_value();
-
-        for (method, path) in listed_routes() {
-            let operation = &doc["paths"][&path][&method];
-            assert!(operation.is_object(), "{method} {path} has no operation");
-            assert_eq!(
-                operation["security"],
-                json!([{ BEARER_SCHEME: [] }]),
-                "{method} {path} does not take the bearer"
-            );
-        }
-        assert_eq!(
-            doc["components"]["securitySchemes"][BEARER_SCHEME]["scheme"],
-            json!("bearer")
-        );
-    }
-
-    #[test]
-    fn only_the_listed_routes_take_the_bearer() {
-        let doc = document_value();
-        let listed = listed_routes();
-
-        for (path, item) in doc["paths"].as_object().expect("the paths") {
-            for (method, operation) in item.as_object().expect("a path item") {
-                let takes_bearer = operation.get("security").is_some();
-                assert_eq!(
-                    takes_bearer,
-                    listed.contains(&(method.clone(), path.clone())),
-                    "{method} {path}: takes the bearer {takes_bearer}, listed otherwise"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn the_worker_routes_take_the_types_the_gateway_reads() {
-        let doc = document_value();
-        let item = &doc["paths"]["/workers/{worker_id}"];
-        let body_schema = |method: &str| {
-            item[method]["requestBody"]["content"]["application/json"]["schema"]["$ref"].clone()
-        };
-
-        assert_eq!(body_schema("put"), json!("#/components/schemas/WorkerSpec"));
-        assert_eq!(
-            body_schema("patch"),
-            json!("#/components/schemas/WorkerUpdateRequest")
-        );
-        assert_eq!(
-            item["delete"]["responses"]["4XX"]["content"]["application/json"]["schema"]["$ref"],
-            json!("#/components/schemas/WorkerErrorResponse")
-        );
-        assert_eq!(
-            doc["paths"]["/workers"]["get"]["parameters"][0]["name"],
-            json!("model")
-        );
-    }
-
-    #[test]
-    fn the_module_and_tokenizer_routes_refuse_in_the_worker_envelope() {
-        let doc = document_value();
-        let envelope = json!("#/components/schemas/WorkerErrorResponse");
-        for (path, method, status) in [
-            ("/v1/tokenizers", "post", "409"),
-            ("/v1/tokenizers", "post", "4XX"),
-            ("/v1/tokenizers/{tokenizer_id}", "get", "4XX"),
-            ("/v1/tokenizers/{tokenizer_id}", "delete", "4XX"),
-            ("/v1/tokenizers/{tokenizer_id}/status", "get", "4XX"),
-            ("/wasm", "post", "4XX"),
-            ("/wasm/{module_uuid}", "delete", "4XX"),
-        ] {
-            assert_eq!(
-                doc["paths"][path][method]["responses"][status]["content"]["application/json"]
-                    ["schema"]["$ref"],
-                envelope,
-                "{method} {path} {status}"
-            );
-        }
-    }
-
-    /// The WASM load's explicit 400 carries two bodies, the per-module results
-    /// and, for a refused body, the envelope; the explicit status hides the
-    /// 4XX range, so the document declares both under it.
-    #[test]
-    fn the_wasm_load_400_declares_the_per_module_shape_and_the_envelope() {
-        let doc = document_value();
-        let schema = &doc["paths"]["/wasm"]["post"]["responses"]["400"]["content"]
-            ["application/json"]["schema"];
-        let shapes = schema["oneOf"]
-            .as_array()
-            .unwrap_or_else(|| panic!("the 400 carries no oneOf: {schema}"));
-        assert_eq!(shapes.len(), 2, "{schema}");
-        assert_eq!(shapes[0]["required"], json!(["modules"]));
-        assert_eq!(
-            shapes[1]["$ref"],
-            json!("#/components/schemas/WorkerErrorResponse")
-        );
-    }
-}
+#[path = "../tests/unit/tests.rs"]
+mod tests;

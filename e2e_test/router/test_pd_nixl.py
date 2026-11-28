@@ -15,7 +15,7 @@ Requirements:
     - 2 GPUs (1 prefill + 1 decode)
 
 Usage:
-    E2E_RUNTIME=vllm pytest e2e_test/router/test_pd_nixl.py -v
+    E2E_RUNTIME=vllm E2E_ENGINE=vllm pytest e2e_test/router/test_pd_nixl.py -v
 """
 
 from __future__ import annotations

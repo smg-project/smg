@@ -468,7 +468,7 @@ class TestKindEPDDisaggregation:
     Registration only; no request is served through the EPD pipeline. The
     gRPC router tokenizes every request itself and mock-worker has no
     tokenizer to offer (GetTokenizer is unimplemented; its tokenizer path is
-    the model id), and the one leg that is EPD's own, the encode worker's
+    the model id), and the one call that is EPD's own, the encode worker's
     TokenSpeedEncoder.Encode call, is not a service mock-worker hosts. A text
     request would not reach the encode pool anyway: only image items are
     assigned to encode workers, so it would prove the PD path, not EPD.

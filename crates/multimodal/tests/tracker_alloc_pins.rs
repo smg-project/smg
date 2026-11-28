@@ -67,7 +67,7 @@ fn the_tracker_keys_a_repeated_part_without_allocating_for_its_settings() {
     let connector = Arc::new(connector());
     let parts: Vec<MediaContentPart> = (0..REPEATED_PARTS)
         .map(|_| MediaContentPart::ImageUrl {
-            url: TINY_PNG_URL.to_string(),
+            url: TINY_PNG_URL.to_string().into(),
             detail: None,
             uuid: None,
             max_long_side_pixel: None,

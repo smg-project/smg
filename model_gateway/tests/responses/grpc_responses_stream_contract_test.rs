@@ -4,18 +4,21 @@
 
 use std::{error::Error, sync::Arc, time::Duration};
 
-use axum::{body::to_bytes, http::StatusCode};
+use axum::{
+    body::to_bytes,
+    http::{HeaderMap, HeaderValue, StatusCode},
+};
 use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
 use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
 use serde_json::{json, Value};
 use smg::{
     config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::RouterFactory,
+    routers::{grpc::backend_client::BasicWorkerBuilder, RouterFactory},
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
 use smg_test_harness::scripted_tokenizer;
+use smg_worker::identity::basic::{ConnectionMode, RuntimeType, WorkerType};
 use tokio::{net::TcpListener, time::timeout};
 
 use crate::{common, scripted_worker};
@@ -49,15 +52,14 @@ async fn responses_result_with_final_answer(
         stream,
         final_answer_after.map(|limit| (limit, "Final answer after tools")),
         vec!["stop"],
+        false,
     )
     .await
 }
 
 #[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper: failures should panic; the in-process worker is aborted after the request"
+    clippy::too_many_arguments,
+    reason = "one case: its script, its request and its reader"
 )]
 async fn responses_result_with_finishes(
     tools: Value,
@@ -67,6 +69,43 @@ async fn responses_result_with_finishes(
     stream: bool,
     final_answer_after: Option<(usize, &str)>,
     finish_reasons: Vec<&'static str>,
+    legacy_reader: bool,
+) -> (Value, Vec<Value>) {
+    responses_result_for_input(
+        json!("Hello"),
+        tools,
+        output,
+        max_tool_calls,
+        expected_status,
+        stream,
+        final_answer_after,
+        finish_reasons,
+        legacy_reader,
+    )
+    .await
+}
+
+/// The same case under an `input` of its own: a request may declare tools inside an input item.
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::disallowed_methods,
+    reason = "test helper: failures should panic; the in-process worker is aborted after the request"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one case: its script, its request and its reader"
+)]
+async fn responses_result_for_input(
+    input: Value,
+    tools: Value,
+    output: Option<&str>,
+    max_tool_calls: Option<u32>,
+    expected_status: &str,
+    stream: bool,
+    final_answer_after: Option<(usize, &str)>,
+    finish_reasons: Vec<&'static str>,
+    legacy_reader: bool,
 ) -> (Value, Vec<Value>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -146,12 +185,19 @@ async fn responses_result_with_finishes(
     // storage on all of them, so a stored status that disagrees with the wire
     // (a failed tool loop stored as completed) is caught here.
     let request = serde_json::from_value(json!({
-        "model": MODEL, "input": "Hello", "stream": stream, "store": true,
+        "model": MODEL, "input": input, "stream": stream, "store": true,
         "max_output_tokens": 16, "tools": tools, "max_tool_calls": max_tool_calls,
     }))
     .unwrap();
+    let headers = legacy_reader.then(|| {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-parser", HeaderValue::from_static("legacy"));
+        headers
+    });
     let (status, content_type, parser, bytes) = timeout(Duration::from_secs(30), async {
-        let response = router.route_responses(None, &tenant, request, MODEL).await;
+        let response = router
+            .route_responses(headers.as_ref(), &tenant, request, MODEL)
+            .await;
         let status = response.status();
         let content_type = response.headers().get("content-type").cloned();
         let parser = response.headers().get("x-smg-parser").cloned();
@@ -167,6 +213,10 @@ async fn responses_result_with_finishes(
         assert_eq!(error["error"]["code"], "worker_stream_failed");
         return (error, vec![]);
     }
+    if expected_status == "failed_dependency" {
+        assert_eq!(status, StatusCode::FAILED_DEPENDENCY);
+        return (serde_json::from_slice(&bytes).unwrap(), vec![]);
+    }
     assert_eq!(
         status,
         StatusCode::OK,
@@ -181,9 +231,10 @@ async fn responses_result_with_finishes(
     // it: the `qwen` tool parser is configured exactly when an output is
     // scripted, and under a configured tool parser the Symphony reader is
     // chosen, so every scripted-output case names `symphony` (the scripted
-    // plain answer included) and the two unscripted cases `legacy`.
+    // plain answer included) and the two unscripted cases `legacy`, as does
+    // a case whose request asks for the legacy reader.
     let parser = parser.as_ref().and_then(|value| value.to_str().ok());
-    let expected = if output.is_some() {
+    let expected = if output.is_some() && !legacy_reader {
         "symphony"
     } else {
         "legacy"
@@ -288,6 +339,30 @@ async fn regular_responses_stream_ends_with_json_terminal_event() {
     responses_events(json!([])).await;
 }
 
+/// An `mcp` tool that binds no server is refused before the model is asked,
+/// in both response modes, by the rule the HTTP router applies: here a label
+/// without a `server_url` that names no configured server, the case the
+/// sentence's last clause is for.
+#[tokio::test]
+async fn an_mcp_tool_that_binds_no_server_is_refused_in_the_shared_words() {
+    for stream in [false, true] {
+        let (error, _) = responses_result_with_output(
+            json!([{"type": "mcp", "server_label": "typo"}]),
+            None,
+            None,
+            "failed_dependency",
+            stream,
+        )
+        .await;
+        assert_eq!(error["error"]["code"], "connect_mcp_server_failed");
+        assert_eq!(
+            error["error"]["message"],
+            "Failed to connect to MCP servers. Check server_url and authorization, or that a \
+             server_label without server_url names a configured server."
+        );
+    }
+}
+
 #[tokio::test]
 async fn mcp_responses_stream_ends_with_json_terminal_event() {
     let mut mcp = common::mock_mcp_server::MockMCPServer::start()
@@ -353,6 +428,111 @@ async fn mcp_user_tool_limit_emits_completed_terminal_response() {
         assert_eq!(
             executed_calls, limit as usize,
             "ignore calls exceeding the user cap"
+        );
+    }
+}
+
+/// A server tool call that fails, streamed through the gateway's own tool
+/// loop: the call closes under `response.mcp_call.failed` and then its
+/// `response.output_item.done` with a `failed` item, and no
+/// `response.mcp_call.completed` is sent. The HTTP router's loop closes a
+/// failed call under the same event
+/// (`a_streamed_mcp_call_that_failed_closes_under_the_failed_event` in the
+/// API tests); the two tests hold the two loops to it.
+#[tokio::test]
+async fn a_failed_mcp_call_closes_under_the_failed_event() {
+    let mut mcp = common::mock_mcp_server::MockFailingMCPServer::start("the tool is down")
+        .await
+        .unwrap();
+    let events = responses_events_with_output(
+        json!([{
+            "type": "mcp", "server_label": "test-tools", "server_url": mcp.url(),
+            "require_approval": "never",
+        }]),
+        Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"test\"}}\n</tool_call>"),
+        Some(1),
+        "completed",
+    )
+    .await;
+    mcp.stop().await;
+    // The call's close: its sub-event, and the status of the item behind it.
+    let closes: Vec<(&str, &str)> = events
+        .windows(2)
+        .filter(|pair| {
+            pair[1]["type"] == "response.output_item.done" && pair[1]["item"]["type"] == "mcp_call"
+        })
+        .map(|pair| {
+            (
+                pair[0]["type"].as_str().unwrap_or_default(),
+                pair[1]["item"]["status"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        closes,
+        [("response.mcp_call.failed", "failed")],
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["type"] != "response.mcp_call.completed"),
+        "{events:?}"
+    );
+}
+
+/// The request's cap reached: the loop runs the permitted call, then gives the
+/// model one final turn on its result with the server tools withheld, so the
+/// response ends with the model's answer and `completed`, no error and no
+/// incomplete reason (the public contract at `max_tool_calls`), in both forms.
+#[tokio::test]
+async fn mcp_user_cap_ends_with_the_models_final_turn_in_both_response_modes() {
+    for stream in [false, true] {
+        let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+            .await
+            .unwrap();
+        let (response, events) = responses_result_with_final_answer(
+            json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
+            Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"query-0\"}}\n</tool_call>"),
+            Some(1),
+            "completed",
+            stream,
+            Some(1),
+        )
+        .await;
+        mcp.stop().await;
+        assert!(response["error"].is_null(), "stream={stream}: {response}");
+        assert!(
+            response["incomplete_details"].is_null(),
+            "stream={stream}: {response}"
+        );
+        assert_executed_mcp_queries(&response, &["query-0"]);
+        let kinds: Vec<&str> = response["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["type"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            kinds.first(),
+            Some(&"mcp_list_tools"),
+            "stream={stream}: {response}"
+        );
+        assert_eq!(
+            kinds.last(),
+            Some(&"message"),
+            "the final turn's answer ends the response, stream={stream}: {response}"
+        );
+        let message = response["output"].as_array().unwrap().last().unwrap();
+        assert_eq!(
+            message["content"][0]["text"], "Final answer after tools",
+            "stream={stream}: {response}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["item"]["type"] == "function_call"),
+            "no server call reaches the client as a function: {events:?}"
         );
     }
 }
@@ -564,10 +744,82 @@ async fn mcp_usage_includes_every_model_call_in_both_modes() {
         let response = mcp_cap_response(stream, Some(1), 1, "completed")
             .await
             .unwrap();
-        // Two model requests: one executed call, followed by an ignored call.
-        assert_eq!(response["usage"]["input_tokens"], 2, "{response}");
-        assert_eq!(response["usage"]["output_tokens"], 6, "{response}");
-        assert_eq!(response["usage"]["total_tokens"], 8, "{response}");
+        // Three model requests: one executed call, the call past the cap
+        // (hidden), and the final turn made with the server tools withheld,
+        // whose call is hidden too.
+        assert_eq!(response["usage"]["input_tokens"], 3, "{response}");
+        assert_eq!(response["usage"]["output_tokens"], 9, "{response}");
+        assert_eq!(response["usage"]["total_tokens"], 12, "{response}");
+    }
+}
+
+/// The final turn after the request's cap is scanned for calls as every turn
+/// is, while no server tool is offered: a server call the model repeats on it
+/// is parsed and hidden (not run, not handed to the client as a function),
+/// never left in the message text as the raw call markup, in both forms.
+#[tokio::test]
+async fn mcp_final_turn_hides_a_repeated_server_call_instead_of_leaking_its_markup() {
+    for stream in [false, true] {
+        let response = mcp_cap_response(stream, Some(1), 1, "completed")
+            .await
+            .unwrap();
+        assert!(response["error"].is_null(), "stream={stream}: {response}");
+        assert_executed_mcp_queries(&response, &["query-0"]);
+        assert!(
+            !message_text_holds_call_markup(&response),
+            "the final turn's repeated call is hidden, not text, stream={stream}: {response}"
+        );
+    }
+}
+
+fn message_text_holds_call_markup(response: &Value) -> bool {
+    response["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|item| item["type"] == "message")
+        .flat_map(|item| item["content"].as_array().into_iter().flatten())
+        .any(|part| {
+            part["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("tool_call") || text.contains("brave_web_search"))
+        })
+}
+
+/// The same under the legacy reader, whose streaming parsers read a call only
+/// to a tool of the list the response is read against: the final turn is read
+/// against the server tools as every turn is, so the repeated call is a call
+/// there too, in both forms.
+#[tokio::test]
+async fn mcp_final_turn_hides_a_repeated_server_call_under_the_legacy_reader() {
+    for stream in [false, true] {
+        let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+            .await
+            .unwrap();
+        let (response, events) = responses_result_with_finishes(
+            json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
+            Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"query-0\"}}\n</tool_call>\n"),
+            Some(1),
+            "completed",
+            stream,
+            None,
+            vec!["stop"],
+            true,
+        )
+        .await;
+        mcp.stop().await;
+        assert!(response["error"].is_null(), "stream={stream}: {response}");
+        assert_executed_mcp_queries(&response, &["query-0"]);
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["item"]["type"] == "function_call"),
+            "no server call reaches the client as a function: {events:?}"
+        );
+        assert!(
+            !message_text_holds_call_markup(&response),
+            "the final turn's repeated call is hidden, not text, stream={stream}: {response}"
+        );
     }
 }
 
@@ -582,7 +834,7 @@ async fn mcp_unfinished_generation_never_dispatches_tools() {
                 json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
                 Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"test\"}}\n</tool_call>"),
                 Some(1), if finish == "length" { "incomplete" } else { "failed" },
-                stream, None, vec![finish],
+                stream, None, vec![finish], false,
             ).await;
             mcp.stop().await;
             assert_eq!(
@@ -718,6 +970,7 @@ async fn bare_generation_failure_includes_error_details() {
                 stream,
                 None,
                 vec!["failed"],
+                false,
             )
             .await;
             mcp.stop().await;
@@ -744,7 +997,7 @@ async fn mcp_unfinished_later_generation_preserves_executed_results() {
                 Some(r#"<tool_call>
 {"name":"brave_web_search","arguments":{"query":"first"}}
 </tool_call>"#),
-                Some(2), if finish == "length" { "incomplete" } else { "failed" }, stream, None, vec!["stop", finish],
+                Some(2), if finish == "length" { "incomplete" } else { "failed" }, stream, None, vec!["stop", finish], false,
             ).await;
             mcp.stop().await;
             assert_eq!(mcp.call_count(), 1, "{response}");
@@ -770,7 +1023,7 @@ async fn mcp_client_handoff_preserves_previous_server_results() {
             None, "completed", stream,
             Some((1, r#"<tool_call>
 {"name":"user_tool","arguments":{}}
-</tool_call>"#)), vec!["stop"],
+</tool_call>"#)), vec!["stop"], false,
         ).await;
         mcp.stop().await;
         assert_eq!(mcp.call_count(), 1);
@@ -801,7 +1054,7 @@ async fn mcp_filter_preserves_namespaced_client_function_with_same_member_name()
                     ]}
                 ]),
                 Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{\"query\":\"first\"}}\n</tool_call>\n<tool_call>\n{\"name\":\"client.brave_web_search\",\"arguments\":{}}\n</tool_call>"),
-                None, if finish == "length" { "incomplete" } else { "completed" }, stream, None, vec![finish],
+                None, if finish == "length" { "incomplete" } else { "completed" }, stream, None, vec![finish], false,
             ).await;
             mcp.stop().await;
             assert_executed_mcp_queries(
@@ -830,9 +1083,107 @@ async fn engine_error_never_dispatches_mcp_calls() {
         responses_result_with_finishes(
             json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"never"}]),
             Some("<tool_call>\n{\"name\":\"brave_web_search\",\"arguments\":{}}\n</tool_call>"),
-            Some(1), if stream { "failed" } else { "http_error" }, stream, None, vec!["error"],
+            Some(1), if stream { "failed" } else { "http_error" }, stream, None, vec!["error"], false,
         ).await;
         mcp.stop().await;
         assert_eq!(mcp.call_count(), 0);
+    }
+}
+
+/// A server call under `require_approval: always` is held, streamed or not: the tool does not
+/// run and its call closes as failed with the approval error. The same holds where the request
+/// declares the server inside an `additional_tools` input item and has no top-level `tools`.
+#[tokio::test]
+async fn a_call_that_waits_for_approval_does_not_run() {
+    for (in_input, stream) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+            .await
+            .unwrap();
+        let server = json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":"always"}]);
+        let (input, tools) = if in_input {
+            let declared = json!({"type":"additional_tools","role":"developer","tools":server});
+            (
+                json!([declared, {"role":"user","content":"Hello"}]),
+                Value::Null,
+            )
+        } else {
+            (json!("Hello"), server)
+        };
+        let (response, _) = responses_result_for_input(
+            input,
+            tools,
+            Some("<tool_call>\n{\"name\":\"brave_web_search\"}\n</tool_call>\n"),
+            None,
+            "completed",
+            stream,
+            Some((1, "Final answer after tools")),
+            vec!["stop"],
+            false,
+        )
+        .await;
+        mcp.stop().await;
+
+        let pass = format!("in_input={in_input} stream={stream}: {response}");
+        assert_eq!(mcp.call_count(), 0, "{pass}");
+        let call = response["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|item| item["type"] == "mcp_call")
+            .unwrap_or(&Value::Null);
+        assert_eq!(call["status"], "failed", "{pass}");
+        assert!(
+            call["error"].to_string().contains("requires approval"),
+            "{pass}"
+        );
+    }
+}
+
+/// The object form of `require_approval` holds a call the same way, streamed or not: a tool
+/// its `always` filter names does not run and its call closes as failed with the approval
+/// error; a tool the filter does not name runs as it does with no approval asked.
+#[tokio::test]
+async fn a_call_an_always_filter_names_does_not_run() {
+    for (named, stream) in [(true, false), (true, true), (false, false), (false, true)] {
+        let mut mcp = common::mock_mcp_server::MockMCPServer::start()
+            .await
+            .unwrap();
+        let name = if named {
+            "brave_web_search"
+        } else {
+            "another_tool"
+        };
+        let (response, _) = responses_result_for_input(
+            json!("Hello"),
+            json!([{"type":"mcp","server_label":"test-tools","server_url":mcp.url(),"require_approval":{"always":{"tool_names":[name]}}}]),
+            Some("<tool_call>\n{\"name\":\"brave_web_search\"}\n</tool_call>\n"),
+            None,
+            "completed",
+            stream,
+            Some((1, "Final answer after tools")),
+            vec!["stop"],
+            false,
+        )
+        .await;
+        mcp.stop().await;
+
+        let pass = format!("named={named} stream={stream}: {response}");
+        let call = response["output"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|item| item["type"] == "mcp_call")
+            .unwrap_or(&Value::Null);
+        if named {
+            assert_eq!(mcp.call_count(), 0, "{pass}");
+            assert_eq!(call["status"], "failed", "{pass}");
+            assert!(
+                call["error"].to_string().contains("requires approval"),
+                "{pass}"
+            );
+        } else {
+            assert_eq!(mcp.call_count(), 1, "{pass}");
+            assert_eq!(call["status"], "completed", "{pass}");
+        }
     }
 }

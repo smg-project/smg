@@ -27,21 +27,20 @@
 //! - factor: 28 (patch_size * merge_size)
 //! - min_pixels: 3,136 (4 * 28 * 28)
 //! - max_pixels: 451,584 (576 * 28 * 28) — matches `image_seq_length: 576`
-//! - video max_pixels: 602,112 (768 * 28 * 28), bounding each frame rather than
-//!   the sampled volume, as the reference video processor applies `smart_resize`
-//!   to the frame size. A request that names a `max_long_side_pixel` tier has
-//!   its frames capped to that long side upstream, and the tier's square becomes
-//!   the frame budget instead: shrinking those frames again to the default would
-//!   make the 1008 and 2016 tiers produce the same tokens for 16:9 sources.
+//! - video frames: the model processor's aligned size, by the rule images take
+//!   in `minimax_resize`, from the frame size under the request's
+//!   `max_long_side_pixel` or a long side of 672. Where the config sets
+//!   `max_pixels`, that area bounds each frame instead (not the sampled volume)
+//!   and a request's tier is not read. Where the config sets `min_pixels`,
+//!   turns resizing off, or has a grid (patch_size * merge_size) other than
+//!   28, 602,112 (768 * 28 * 28) bounds each frame, or, under a request's
+//!   tier, the greater of the tier's square and `min_pixels`.
 //! - normalization: CLIP mean/std
 //!
 //! The bounds differ from Qwen2-VL's (200,704 / 1,003,520), so M3 cannot simply
 //! reuse the Qwen2-VL processor's defaults.
 
 use std::{borrow::Cow, ops::Deref};
-
-#[path = "minimax_sglang_video.rs"]
-mod sglang_video;
 
 use image::DynamicImage;
 
@@ -50,36 +49,40 @@ use super::{
     qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode},
 };
 use crate::{
+    minimax_resize::{self, IMAGE_MAX_TOTAL_PIXELS, RESIZED_KEY, SGLANG_RESIZE_KEY},
     types::RgbFrameRef,
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VideoClipOptions, VisionPreProcessor},
-        transforms::TransformError,
+        transforms::{rgb_pixels, TransformError},
     },
     EncoderDtype,
 };
 
+#[path = "minimax_sglang_video.rs"]
+mod sglang_video;
+
 /// Default patch size.
-pub const DEFAULT_PATCH_SIZE: usize = 14;
+pub(crate) const DEFAULT_PATCH_SIZE: usize = 14;
 
 /// Default spatial merge size (2x2 patch merge before the projector).
-pub const DEFAULT_MERGE_SIZE: usize = 2;
+pub(crate) const DEFAULT_MERGE_SIZE: usize = 2;
 
 /// Default temporal patch size (video frames are padded to a multiple of this).
-pub const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
+pub(crate) const DEFAULT_TEMPORAL_PATCH_SIZE: usize = 2;
 
 /// Default minimum pixels (4 * 28 * 28 = 3,136).
-pub const DEFAULT_MIN_PIXELS: usize = 4 * 28 * 28;
+pub(crate) const DEFAULT_MIN_PIXELS: usize = 4 * 28 * 28;
 
 /// Default maximum pixels for images (576 * 28 * 28 = 451,584).
 ///
 /// 576 is the model's `image_seq_length`: at the bound, an image occupies
 /// exactly `image_seq_length` tokens after the 2x2 merge (2,304 patches before
 /// it).
-pub const DEFAULT_MAX_PIXELS: usize = 576 * 28 * 28;
+pub(crate) const DEFAULT_MAX_PIXELS: usize = 576 * 28 * 28;
 
 /// Default maximum pixels per video frame (768 * 28 * 28 = 602,112), not per sampled volume.
-pub const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 28 * 28;
+pub(crate) const DEFAULT_VIDEO_MAX_PIXELS: usize = 768 * 28 * 28;
 
 /// The config block holding M3's merge parameters.
 const COMPRESSION_CONFIG_KEY: &str = "img_token_compression_config";
@@ -89,8 +92,11 @@ const COMPRESSION_CONFIG_KEY: &str = "img_token_compression_config";
 pub struct MiniMaxM3VisionProcessor {
     inner: QwenVLProcessorBase,
     /// Whether the config set `max_pixels`, which then bounds video frames
-    /// in place of a request's `max_long_side_pixel` tier.
+    /// by area in place of their aligned size.
     explicit_max_pixels: bool,
+    /// Whether the config set `min_pixels`, which then raises video frames
+    /// by area in place of their aligned size.
+    explicit_min_pixels: bool,
     /// Opt in to SGLang's day-0 geometry and Pillow byte resize for images and videos.
     sglang_resize: bool,
 }
@@ -103,7 +109,7 @@ impl Default for MiniMaxM3VisionProcessor {
 
 impl MiniMaxM3VisionProcessor {
     /// Create a processor with MiniMax-M3's default parameters.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::build(
             DEFAULT_PATCH_SIZE,
             DEFAULT_MERGE_SIZE,
@@ -111,26 +117,6 @@ impl MiniMaxM3VisionProcessor {
             DEFAULT_MIN_PIXELS,
             DEFAULT_MAX_PIXELS,
             DEFAULT_VIDEO_MAX_PIXELS,
-        )
-    }
-
-    /// Create a processor with custom settings.
-    pub fn with_config(
-        patch_size: usize,
-        merge_size: usize,
-        min_pixels: usize,
-        max_pixels: usize,
-        temporal_patch_size: usize,
-    ) -> Self {
-        // The caller's `max_pixels` governs video too; flooring it at the
-        // video default would ignore a deliberate reduction.
-        Self::build(
-            patch_size,
-            merge_size,
-            temporal_patch_size,
-            min_pixels,
-            max_pixels,
-            max_pixels,
         )
     }
 
@@ -159,6 +145,7 @@ impl MiniMaxM3VisionProcessor {
             .allow_video_dimensions_below_factor()
             .raise_rounded_sides_to_factor(),
             explicit_max_pixels: false,
+            explicit_min_pixels: false,
             sglang_resize: false,
         }
     }
@@ -207,7 +194,9 @@ impl MiniMaxM3VisionProcessor {
     /// unusable block value is the configuration error the construction path
     /// reports, so a prompt's stamps are never paired by a default that the
     /// preprocessing of the same config refuses.
-    pub fn temporal_patch_size_from(config: &PreProcessorConfig) -> Result<usize, TransformError> {
+    pub(crate) fn temporal_patch_size_from(
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         Ok(Self::declared_temporal_patch_size(config)?.unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE))
     }
 
@@ -222,11 +211,6 @@ impl MiniMaxM3VisionProcessor {
     }
 
     /// Layer a config over this processor's settings.
-    ///
-    /// Values the config does not specify keep whatever this processor was
-    /// built with, so settings supplied through [`Self::with_config`] survive
-    /// into `preprocess` and `calculate_num_tokens` instead of being reset to
-    /// the checkpoint defaults.
     fn layered_over(&self, config: &PreProcessorConfig) -> Result<Self, TransformError> {
         let merge_size = config
             .merge_size
@@ -234,9 +218,7 @@ impl MiniMaxM3VisionProcessor {
             .unwrap_or_else(|| self.inner.merge_size());
         let temporal_patch_size = Self::declared_temporal_patch_size(config)?
             .unwrap_or_else(|| self.inner.temporal_patch_size());
-        let source_resized = config
-            .get_extra::<bool>(crate::minimax_resize::RESIZED_KEY)
-            .unwrap_or(false);
+        let source_resized = config.get_extra::<bool>(RESIZED_KEY).unwrap_or(false);
         if source_resized
             && config
                 .get_patch_size(self.inner.patch_size())
@@ -249,7 +231,7 @@ impl MiniMaxM3VisionProcessor {
         }
         // Source planning already aligned and checked the fixed image budget.
         let max_pixels = if source_resized {
-            crate::minimax_resize::IMAGE_MAX_TOTAL_PIXELS as usize
+            IMAGE_MAX_TOTAL_PIXELS as usize
         } else {
             config.max_pixels.unwrap_or_else(|| self.inner.max_pixels())
         };
@@ -273,28 +255,53 @@ impl MiniMaxM3VisionProcessor {
             video_max_pixels,
         );
         layered.inner = layered.inner.with_preprocessor_config(config);
-        layered.sglang_resize = config
-            .get_extra::<bool>(crate::minimax_resize::SGLANG_RESIZE_KEY)
-            .unwrap_or(false);
+        layered.sglang_resize = config.get_extra::<bool>(SGLANG_RESIZE_KEY).unwrap_or(false);
         layered.explicit_max_pixels = self.explicit_max_pixels || config.max_pixels.is_some();
+        layered.explicit_min_pixels = self.explicit_min_pixels || config.min_pixels.is_some();
+        layered.inner.validate()?;
         Ok(layered)
     }
 
-    /// This processor for one clip: a `max_long_side_pixel` tier on the
-    /// request is the caller's frame budget (see the module docs), unless
-    /// `max_pixels` was set explicitly. The budget is the square of the long
-    /// side, so a frame already capped to that side is never shrunk again.
-    fn for_clip(&self, clip: &VideoClipOptions) -> Cow<'_, Self> {
-        match clip.max_long_side_pixel {
-            Some(tier) if !self.explicit_max_pixels => {
+    /// This processor for one clip of `frame`-sized (width, height) frames
+    /// (see the module docs). They take the aligned size under the request's
+    /// `max_long_side_pixel` tier or the default long side, unless
+    /// `max_pixels` was set explicitly. Frames that are not resized, those of
+    /// a config that set `min_pixels`, and those of a config whose grid is not
+    /// 28 pixels, keep as their budget the greater of the tier's square and
+    /// `min_pixels`.
+    fn for_clip(&self, clip: &VideoClipOptions, frame: Option<(u32, u32)>) -> Cow<'_, Self> {
+        if self.explicit_max_pixels {
+            return Cow::Borrowed(self);
+        }
+        let inner = match (frame, clip.max_long_side_pixel) {
+            // A frame with a zero side has no aligned size: the base refuses it.
+            // The aligned size is cut to the 28-pixel grid: a config with
+            // another grid keeps the budget, which rounds to its own.
+            (Some((width, height)), tier)
+                if !self.explicit_min_pixels
+                    && self.inner.resizes()
+                    && self.inner.get_factor() == 28
+                    && width > 0
+                    && height > 0 =>
+            {
+                let (width, height) = minimax_resize::clip_dimensions(width, height, tier);
+                self.inner
+                    .clone()
+                    .with_video_frame_target(height as usize, width as usize)
+            }
+            (_, Some(tier)) => {
                 let tier = tier as usize;
                 let budget = tier.saturating_mul(tier).max(self.inner.min_pixels());
-                let mut processor = self.clone();
-                processor.inner = processor.inner.with_video_max_pixels(budget);
-                Cow::Owned(processor)
+                self.inner.clone().with_video_max_pixels(budget)
             }
-            _ => Cow::Borrowed(self),
-        }
+            _ => return Cow::Borrowed(self),
+        };
+        Cow::Owned(Self {
+            inner,
+            explicit_max_pixels: self.explicit_max_pixels,
+            explicit_min_pixels: self.explicit_min_pixels,
+            sglang_resize: self.sglang_resize,
+        })
     }
 }
 
@@ -356,12 +363,15 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
                 .map(|frame| RgbFrameRef {
                     width: frame.width(),
                     height: frame.height(),
-                    data: frame.as_raw(),
+                    data: rgb_pixels(frame),
                 })
                 .collect();
             return self.preprocess_sglang_video(&borrowed, clip);
         }
-        self.for_clip(clip).inner.preprocess_video(frames, clip)
+        let frame = frames.first().map(|frame| (frame.width(), frame.height()));
+        self.for_clip(clip, frame)
+            .inner
+            .preprocess_video(frames, clip)
     }
 
     fn preprocess_video_rgb(
@@ -372,7 +382,10 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
         if self.sglang_resize {
             return self.preprocess_sglang_video(frames, clip);
         }
-        self.for_clip(clip).inner.preprocess_video_rgb(frames, clip)
+        let frame = frames.first().map(|frame| (frame.width, frame.height));
+        self.for_clip(clip, frame)
+            .inner
+            .preprocess_video_rgb(frames, clip)
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
@@ -396,6 +409,7 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vision::preprocessor_config::PatchSize;
 
     /// The `img_token_compression_config` block as it appears in the
     /// MiniMax-M3 checkpoint's `preprocessor_config.json`.
@@ -431,10 +445,9 @@ mod tests {
             }))
         });
         let mut resized = m3_config();
-        resized.extra.insert(
-            crate::minimax_resize::RESIZED_KEY.to_owned(),
-            serde_json::json!(true),
-        );
+        resized
+            .extra
+            .insert(RESIZED_KEY.to_owned(), serde_json::json!(true));
         let mut unnormalized = m3_config();
         unnormalized.do_normalize = Some(false);
         for config in [
@@ -565,10 +578,10 @@ mod tests {
     }
 
     #[test]
-    fn with_config_settings_survive_request_layering() {
+    fn built_settings_survive_request_layering() {
         // A processor built with explicit settings must keep them when a
         // request config does not override them.
-        let processor = MiniMaxM3VisionProcessor::with_config(14, 2, 3136, 200_704, 2);
+        let processor = MiniMaxM3VisionProcessor::build(14, 2, 2, 3136, 200_704, 200_704);
         let mut config = m3_config();
         // The checkpoint block carries merge/temporal but no pixel bounds.
         config.max_pixels = None;
@@ -593,13 +606,17 @@ mod tests {
 
     #[test]
     fn a_video_tier_sets_the_frame_budget() {
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        // The budget road: frames that are not resized.
+        let mut config = m3_config();
+        config.do_resize = Some(false);
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         let clip = VideoClipOptions {
             sample_fps: 2.0,
             max_long_side_pixel: Some(2016),
         };
+        let frame = Some((2016, 1134));
 
-        let layered = processor.for_clip(&clip);
+        let layered = processor.for_clip(&clip, frame);
         assert_eq!(layered.video_max_pixels(), 2016 * 2016);
         // The tier speaks for video frames only.
         assert_eq!(layered.max_pixels(), DEFAULT_MAX_PIXELS);
@@ -608,19 +625,21 @@ mod tests {
         let mut config = m3_config();
         config.max_pixels = Some(100_352);
         let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
-        let layered = processor.for_clip(&clip);
+        let layered = processor.for_clip(&clip, frame);
         assert_eq!(layered.video_max_pixels(), 100_352);
     }
 
     #[test]
     fn a_tier_budget_never_drops_below_the_frame_minimum() {
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        let mut config = m3_config();
+        config.do_resize = Some(false);
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         let clip = VideoClipOptions {
             sample_fps: 2.0,
             max_long_side_pixel: Some(28),
         };
 
-        let layered = processor.for_clip(&clip);
+        let layered = processor.for_clip(&clip, Some((28, 28)));
         assert_eq!(layered.video_max_pixels(), layered.min_pixels());
     }
 
@@ -650,10 +669,10 @@ mod tests {
             "tiers must order the token count: {low} < {mid} < {high}"
         );
 
-        // Without a tier the reference per-frame budget (768 * 28 * 28) applies,
-        // and a 2016-wide frame is shrunk onto the same grid as a 1008-wide one.
+        // Without a tier the default long side (672) applies, and a 2016-wide
+        // frame is shrunk onto the same grid as a 1008-wide one.
         assert_eq!(tokens(2016, 1134, None), tokens(1008, 567, None));
-        assert_eq!(tokens(1008, 567, None), mid);
+        assert!(tokens(1008, 567, None) < mid);
     }
 
     #[test]
@@ -801,7 +820,13 @@ mod tests {
             "../../../tests/fixtures/golden/minimax_narrow_video.json"
         ))
         .unwrap();
-        let processor = MiniMaxM3VisionProcessor::new();
+        // The fixture holds the sizes of the pixel budget, which frames keep
+        // where the config names `max_pixels`.
+        let config = PreProcessorConfig {
+            max_pixels: Some(DEFAULT_VIDEO_MAX_PIXELS),
+            ..Default::default()
+        };
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         for case in fixture["cases"].as_array().unwrap() {
             let width = case["width"].as_u64().unwrap() as u32;
             let height = case["height"].as_u64().unwrap() as u32;
@@ -1017,9 +1042,12 @@ mod tests {
 
     #[test]
     fn images_and_video_frames_take_the_same_grid_rule() {
-        // One rule for both: a 400x40 image and a clip of 400x40 frames land on
-        // the base's 2x28 grid, 14 tokens per temporal patch.
-        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        // One rule for both under a named pixel budget: a 400x40 image and a
+        // clip of 400x40 frames land on the base's 2x28 grid, 14 tokens per
+        // temporal patch.
+        let mut config = m3_config();
+        config.max_pixels = Some(DEFAULT_MAX_PIXELS);
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         let image = processor
             .preprocess(&[&DynamicImage::new_rgb8(400, 40)])
             .unwrap();
@@ -1054,6 +1082,10 @@ mod tests {
             processor.smart_resize_video(16, 720, 1280).unwrap(),
             (560, 1008)
         );
+        // The budget sizes the frames of a config that names it.
+        let mut config = m3_config();
+        config.max_pixels = Some(DEFAULT_VIDEO_MAX_PIXELS);
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
         let out = processor
             .preprocess_video(
                 &vec![DynamicImage::new_rgb8(1280, 720); 2],
@@ -1071,6 +1103,126 @@ mod tests {
             .unwrap();
         assert_eq!(video_grid_thw(&out), vec![8, 40, 72]);
         assert_eq!(out.feature_token_counts, vec![5760]);
+    }
+
+    #[test]
+    fn video_frames_take_the_model_processors_aligned_size() {
+        // (frame width, height, tier) and the size the model processor resizes
+        // such a frame to: the short side raised to 168, both sides rounded up
+        // to the grid, the long side held to the tier or to 672.
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&m3_config()).unwrap();
+        for ((width, height, tier), (sized_width, sized_height)) in [
+            ((504, 504, None), (504, 504)),
+            ((816, 720, None), (672, 588)),
+            ((400, 300, None), (420, 308)),
+            ((816, 1104, None), (504, 672)),
+            ((1080, 1486, None), (504, 672)),
+            ((1920, 1080, None), (672, 392)),
+            // Narrow and tiny frames are enlarged, not left at a few cells.
+            ((100, 20, None), (672, 168)),
+            ((20, 100, None), (168, 672)),
+            ((1, 1, None), (168, 168)),
+            ((28, 28, None), (168, 168)),
+            ((100, 100, None), (168, 168)),
+            // A tier holds the long side, and the short side rounds up.
+            ((504, 284, Some(504)), (504, 308)),
+            ((1008, 567, Some(1008)), (1008, 588)),
+            ((2016, 1134, Some(2016)), (2016, 1148)),
+            // Past the tiers a request may name, a size can leave 200:1.
+            ((5572, 28, Some(5640)), (5628, 28)),
+        ] {
+            let clip = VideoClipOptions {
+                sample_fps: 2.0,
+                max_long_side_pixel: tier,
+            };
+            let frames = vec![DynamicImage::new_rgb8(width, height); 2];
+            let out = processor.preprocess_video(&frames, &clip).unwrap();
+            assert_eq!(
+                video_grid_thw(&out),
+                vec![1, sized_height / 14, sized_width / 14],
+                "{width}x{height} frames under {tier:?}"
+            );
+            assert_eq!(
+                out.feature_token_counts,
+                vec![(sized_width / 28 * (sized_height / 28)) as usize]
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_minimum_keeps_the_area_budget_of_video_frames() {
+        // A config that sets `min_pixels` alone raises small frames to that
+        // area, with a tier and without one, through both entries: two 28x28
+        // frames under a minimum of 336x336 pixels take that size (144
+        // tokens), not the aligned 168x168 (36).
+        let mut config = m3_config();
+        config.min_pixels = Some(336 * 336);
+        let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config).unwrap();
+        let frames = vec![DynamicImage::new_rgb8(28, 28); 2];
+        let bytes = vec![0; 28 * 28 * 3];
+        let rgb = [0; 2].map(|_| RgbFrameRef {
+            width: 28,
+            height: 28,
+            data: &bytes,
+        });
+        for tier in [None, Some(504)] {
+            let clip = VideoClipOptions {
+                sample_fps: 2.0,
+                max_long_side_pixel: tier,
+            };
+            for out in [
+                processor.preprocess_video(&frames, &clip).unwrap(),
+                processor.preprocess_video_rgb(&rgb, &clip).unwrap(),
+            ] {
+                assert_eq!(video_grid_thw(&out), [1, 24, 24], "under {tier:?}");
+                assert_eq!(out.feature_token_counts, vec![144]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_config_off_the_28_pixel_grid_keeps_the_video_budget() {
+        // The aligned size is cut to 28 pixels. Under a 4x4 merge (a 56-pixel
+        // grid) or patch 16 (32) the frames keep the budget's size, which
+        // rounds to that grid, through both entries: (frame width, height,
+        // tier), grid, tokens.
+        let mut merge_four = m3_config();
+        merge_four.merge_size = Some(4);
+        let mut patch_sixteen = m3_config();
+        patch_sixteen.patch_size = Some(PatchSize {
+            height: Some(16),
+            width: Some(16),
+        });
+        for (config, (width, height, tier), grid, tokens) in [
+            (&merge_four, (400, 300, None), [1, 20, 28], 35),
+            (&merge_four, (1920, 1080, Some(1008)), [1, 52, 96], 312),
+            (&patch_sixteen, (400, 300, None), [1, 18, 24], 108),
+            (&patch_sixteen, (1920, 1080, Some(1008)), [1, 46, 84], 966),
+        ] {
+            let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(config).unwrap();
+            let clip = VideoClipOptions {
+                sample_fps: 2.0,
+                max_long_side_pixel: tier,
+            };
+            let frames = vec![DynamicImage::new_rgb8(width, height); 2];
+            let bytes = vec![0; (width * height * 3) as usize];
+            let rgb = [0; 2].map(|_| RgbFrameRef {
+                width,
+                height,
+                data: &bytes,
+            });
+            for out in [
+                processor.preprocess_video(&frames, &clip).unwrap(),
+                processor.preprocess_video_rgb(&rgb, &clip).unwrap(),
+            ] {
+                assert_eq!(
+                    video_grid_thw(&out),
+                    grid,
+                    "{width}x{height} frames under {tier:?}"
+                );
+                assert_eq!(out.feature_token_counts, vec![tokens]);
+            }
+        }
     }
 
     #[test]

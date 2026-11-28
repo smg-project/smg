@@ -20,7 +20,7 @@ import openai
 import pytest
 import yaml
 from infra import BRAVE_MCP_HOST, BRAVE_MCP_PORT, BRAVE_MCP_URL
-from infra.constants import DEFAULT_ROUTER_TIMEOUT
+from infra.constants import DEFAULT_ROUTER_TIMEOUT, get_gpu_vendor
 from infra.mcp_readiness import wait_for_single_mcp_registration
 from infra.streams import collect_streamed_response
 from infra.web_search import skip_if_web_search_found_nothing
@@ -142,6 +142,8 @@ def gateway_with_mcp_config_grpc(require_brave_server, mcp_config_file):
     try:
         workers = start_workers("openai/gpt-oss-20b", engine, mode=ConnectionMode.GRPC, count=1)
     except Exception as e:
+        if get_gpu_vendor() == "amd":
+            raise
         pytest.skip(f"gRPC worker not available: {e}")
 
     gateway = None

@@ -30,13 +30,14 @@ pub const TOKENIZED_EMBEDDING_REQ_INPUT_TAG: &str = "TokenizedEmbeddingReqInput"
 pub const ENCODER_DISPATCH_ERROR_REQ_TAG: &str = "EncoderDispatchErrorReq";
 
 /// The scheduler's field order of [`TokenizedGenerateReqInput`] this encoder
-/// relies on, through `encoder_urls` (the tag, element 0, is not a field):
+/// relies on, through `cache_salt` (the tag, element 0, is not a field):
 /// the slots the extended forms fill, which the handshake check compares
 /// with the order the engine declares. The form through `require_reasoning`
-/// (34 elements) serves every request but one whose media the encoders
-/// serve; that one reaches `encoder_urls` (42 elements), the slots between
-/// at the scheduler's defaults.
-pub const GENERATE_WIRE_FIELDS: [&str; 41] = [
+/// (34 elements) serves every request but two kinds. One whose media the
+/// encoders serve reaches `encoder_urls` (42 elements). One with a cache
+/// partition reaches `cache_salt` (46 elements). The slots between stay at
+/// the scheduler's defaults.
+pub const GENERATE_WIRE_FIELDS: [&str; 45] = [
     "rid",
     "http_worker_ipc",
     "input_text",
@@ -78,6 +79,10 @@ pub const GENERATE_WIRE_FIELDS: [&str; 41] = [
     "need_wait_for_mm_inputs",
     "num_items_assigned",
     "encoder_urls",
+    "multi_item_delimiter_indices",
+    "token_indices_to_pool",
+    "time_stats",
+    "cache_salt",
 ];
 
 /// The scheduler's field order of [`EncoderDispatchErrorReq`] (the tag not
@@ -136,18 +141,20 @@ impl SglangRequestType {
 
 /// The request SMG sends an SGLang scheduler.
 ///
-/// Models the Python class's prefix through `require_reasoning`: the base
+/// Models the Python class's prefix through `cache_salt`: the base
 /// `rid` / `http_worker_ipc`, the required `input_text`, `input_ids`,
 /// `input_embeds`, `mm_inputs` (the scheduler's own processor output, see
 /// [`SglangWireMmInputs`]), `token_type_ids`, `sampling_params`,
 /// `return_logprob`, `logprob_start_len`, `top_logprobs_num`,
 /// `token_ids_logprob`, `stream`, then the 19 defaulted fields up to
 /// `require_reasoning`, of which this side fills `return_hidden_states`, the
-/// LoRA id, the logit processor, the prefill/decode bootstrap triple and the
-/// routed data-parallel rank (the session and routing-key slots stay at the
-/// scheduler's defaults), so that flag lands in its slot. The encoder emits
-/// the shortest valid prefix: 14 elements (tag + 13 fields) through
-/// `stream`, or 34 when a later field is set; every field after the prefix
+/// LoRA id, the logit processor, the prefill/decode bootstrap triple, the
+/// routed data-parallel rank and the prefill rank a request names (the
+/// session and routing-key slots stay at the scheduler's defaults), so that
+/// flag lands in its slot, then the encode dispatch's slots and the cache
+/// partition's. The encoder emits one of four forms: 14 elements (tag + 13
+/// fields) through `stream`, 34 when a later field is set, 42 with an encode
+/// dispatch, 46 with a cache partition; every field after the form
 /// keeps its `msgspec` default. Token ids go as a plain integer array; the
 /// plugin widens the scheduler's `array('q')` decode hook to accept it.
 #[derive(Debug, Clone, PartialEq)]
@@ -202,6 +209,11 @@ pub struct TokenizedGenerateReqInput {
     /// scheduler's record of the request matches its frontend's. `None`
     /// leaves the placement to the least-loaded selection.
     pub routed_dp_rank: Option<u32>,
+    /// The prefill rank a disaggregated request names, in the scheduler's
+    /// own `disagg_prefill_dp_rank` slot: a prefill scheduler's KV sender
+    /// given one neither tests the placement (its attention-DP rank against
+    /// the room's residue) nor registers a rank for the room.
+    pub disagg_prefill_dp_rank: Option<u32>,
     /// Hybrid-reasoning request: the scheduler tracks the reasoning phase and
     /// accounts its tokens separately.
     pub require_reasoning: bool,
@@ -217,6 +229,12 @@ pub struct TokenizedGenerateReqInput {
     pub need_wait_for_mm_inputs: Option<bool>,
     pub num_items_assigned: Option<BTreeMap<u32, Vec<u32>>>,
     pub encoder_urls: Option<Vec<String>>,
+    /// The request's cache partition, in the scheduler's own two slots. The
+    /// scheduler's radix key reads an empty `extra_key` and an absent one as
+    /// two partitions, so unset is `None`. A value can be a secret: do not
+    /// log it.
+    pub extra_key: Option<String>,
+    pub cache_salt: Option<String>,
     /// The caller's W3C trace context (`traceparent`, `tracestate`) for the
     /// engine's tracer. Not a slot of the scheduler's struct (its own
     /// `time_stats` slot is a pickled object no frontend outside Python can
@@ -277,7 +295,9 @@ impl TokenizedGenerateReqInput {
             || self.bootstrap_port.is_some()
             || self.bootstrap_room.is_some()
             || self.routed_dp_rank.is_some()
+            || self.disagg_prefill_dp_rank.is_some()
             || self.needs_encode_slots()
+            || self.needs_cache_partition_slots()
     }
 
     /// Whether the encode dispatch set its slots (38-40), so the encoder
@@ -286,6 +306,12 @@ impl TokenizedGenerateReqInput {
         self.need_wait_for_mm_inputs.is_some()
             || self.num_items_assigned.is_some()
             || self.encoder_urls.is_some()
+    }
+
+    /// Whether the cache partition set one of its slots (34 and 44), so the
+    /// encoder must emit every slot through 44.
+    fn needs_cache_partition_slots(&self) -> bool {
+        self.extra_key.is_some() || self.cache_salt.is_some()
     }
 }
 
@@ -309,29 +335,40 @@ impl Default for TokenizedGenerateReqInput {
             bootstrap_port: None,
             bootstrap_room: None,
             routed_dp_rank: None,
+            disagg_prefill_dp_rank: None,
             require_reasoning: false,
             need_wait_for_mm_inputs: None,
             num_items_assigned: None,
             encoder_urls: None,
+            extra_key: None,
+            cache_salt: None,
             trace_headers: None,
         }
     }
 }
 
 /// The tag plus the fields through `require_reasoning`: the extended form
-/// every request but an encode-dispatched one stops at.
+/// every request stops at but one with an encode dispatch or a cache
+/// partition.
 const THROUGH_REQUIRE_REASONING: usize = 34;
+
+/// The tag plus the fields through `encoder_urls`: the form of a request with
+/// an encode dispatch and no cache partition.
+const THROUGH_ENCODER_URLS: usize = 42;
 
 impl Serialize for TokenizedGenerateReqInput {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         const NIL: Option<()> = None;
-        // The shortest valid prefix: through `stream` unless a later field
+        // The shortest of the four forms: through `stream` unless a later field
         // (`return_hidden_states`, `lora_id`, `custom_logit_processor`, the bootstrap triple,
-        // `routed_dp_rank`, `require_reasoning`) has to reach its slot past the
-        // defaulted ones; through `encoder_urls` when the encode dispatch set
-        // its slots.
-        let len = if self.needs_encode_slots() {
+        // `routed_dp_rank`, `disagg_prefill_dp_rank`, `require_reasoning`) has to
+        // reach its slot past the defaulted ones; through `encoder_urls` when
+        // the encode dispatch set its slots; through `cache_salt` when the
+        // request has a cache partition.
+        let len = if self.needs_cache_partition_slots() {
             GENERATE_WIRE_FIELDS.len() + 1
+        } else if self.needs_encode_slots() {
+            THROUGH_ENCODER_URLS
         } else if self.needs_extended_form() {
             THROUGH_REQUIRE_REASONING
         } else {
@@ -354,7 +391,7 @@ impl Serialize for TokenizedGenerateReqInput {
         tuple.serialize_element(&self.stream)?;
         if self.needs_extended_form() {
             // The fields between `stream` and `require_reasoning`, at the
-            // scheduler's own defaults except the seven this wire carries:
+            // scheduler's own defaults except the eight this wire carries:
             // return_sampling_mask, return_flat_raw_top_logprobs,
             // return_hidden_states, return_routed_experts,
             // routed_experts_start_len, return_indexer_topk, session_id,
@@ -380,20 +417,29 @@ impl Serialize for TokenizedGenerateReqInput {
             tuple.serialize_element(&NIL)?; // bootstrap_pair_key
             tuple.serialize_element(&NIL)?; // decode_tp_size
             tuple.serialize_element(&self.routed_dp_rank)?;
-            tuple.serialize_element(&NIL)?; // disagg_prefill_dp_rank
+            tuple.serialize_element(&self.disagg_prefill_dp_rank)?;
             tuple.serialize_element(&NIL)?; // routing_key
             tuple.serialize_element(&self.require_reasoning)?;
-            if self.needs_encode_slots() {
-                // priority, extra_key, no_logs, return_bytes, return_entropy
-                // at the scheduler's defaults, then the dispatch's three.
+            if self.needs_encode_slots() || self.needs_cache_partition_slots() {
+                // priority at the scheduler's default, then extra_key, then
+                // no_logs, return_bytes, return_entropy at the scheduler's
+                // defaults, then the dispatch's three.
                 tuple.serialize_element(&NIL)?;
-                tuple.serialize_element(&NIL)?;
+                tuple.serialize_element(&self.extra_key)?;
                 for _ in 0..3 {
                     tuple.serialize_element(&false)?;
                 }
                 tuple.serialize_element(&self.need_wait_for_mm_inputs)?;
                 tuple.serialize_element(&self.num_items_assigned)?;
                 tuple.serialize_element(&self.encoder_urls)?;
+            }
+            if self.needs_cache_partition_slots() {
+                // multi_item_delimiter_indices, token_indices_to_pool,
+                // time_stats at the scheduler's defaults, then cache_salt.
+                for _ in 0..3 {
+                    tuple.serialize_element(&NIL)?;
+                }
+                tuple.serialize_element(&self.cache_salt)?;
             }
         }
         tuple.end()
@@ -466,9 +512,9 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                 // `return_hidden_states`, five more defaulted slots, then
                 // `lora_id` and `custom_logit_processor`,
                 // `positional_embed_overrides`, the bootstrap triple, 2
-                // defaulted ones, `routed_dp_rank`, 2 more defaulted ones, then
-                // `require_reasoning`. A shorter array (a frontend that stopped
-                // at `stream`) leaves them all unset.
+                // defaulted ones, `routed_dp_rank`, `disagg_prefill_dp_rank`, 1
+                // more defaulted one, then `require_reasoning`. A shorter array
+                // (a frontend that stopped at `stream`) leaves them all unset.
                 let mut tail = Tail {
                     seq: &mut seq,
                     ended: false,
@@ -486,14 +532,21 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                 let bootstrap_room = tail.next::<i64>()?;
                 tail.skip(2)?;
                 let routed_dp_rank = tail.next::<u32>()?;
-                tail.skip(2)?;
+                let disagg_prefill_dp_rank = tail.next::<u32>()?;
+                tail.skip(1)?;
                 let require_reasoning = tail.next::<bool>()?.unwrap_or(false);
-                // priority, extra_key, no_logs, return_bytes, return_entropy,
-                // then the encode dispatch's three slots.
-                tail.skip(5)?;
+                // priority, then extra_key, then no_logs, return_bytes,
+                // return_entropy, then the encode dispatch's three slots.
+                tail.skip(1)?;
+                let extra_key = tail.next::<String>()?;
+                tail.skip(3)?;
                 let need_wait_for_mm_inputs = tail.next::<bool>()?;
                 let num_items_assigned = tail.next::<BTreeMap<u32, Vec<u32>>>()?;
                 let encoder_urls = tail.next::<Vec<String>>()?;
+                // multi_item_delimiter_indices, token_indices_to_pool,
+                // time_stats, then cache_salt.
+                tail.skip(3)?;
+                let cache_salt = tail.next::<String>()?;
                 drain_trailing(&mut seq)?;
                 Ok(TokenizedGenerateReqInput {
                     rid,
@@ -513,10 +566,13 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                     bootstrap_port,
                     bootstrap_room,
                     routed_dp_rank,
+                    disagg_prefill_dp_rank,
                     require_reasoning,
                     need_wait_for_mm_inputs,
                     num_items_assigned,
                     encoder_urls,
+                    extra_key,
+                    cache_salt,
                     trace_headers: None,
                 })
             }
@@ -1033,10 +1089,12 @@ mod tests {
         assert_eq!(GENERATE_WIRE_FIELDS[21], "lora_id");
         assert_eq!(GENERATE_WIRE_FIELDS[22], "custom_logit_processor");
         assert_eq!(GENERATE_WIRE_FIELDS[32], "require_reasoning");
+        assert_eq!(GENERATE_WIRE_FIELDS[34], "extra_key");
         assert_eq!(GENERATE_WIRE_FIELDS[38], "need_wait_for_mm_inputs");
         assert_eq!(GENERATE_WIRE_FIELDS[39], "num_items_assigned");
         assert_eq!(GENERATE_WIRE_FIELDS[40], "encoder_urls");
-        assert_eq!(GENERATE_WIRE_FIELDS.len(), 41);
+        assert_eq!(GENERATE_WIRE_FIELDS[44], "cache_salt");
+        assert_eq!(GENERATE_WIRE_FIELDS.len(), 45);
         assert_eq!(EMBEDDING_WIRE_FIELDS[6], "sampling_params");
         assert_eq!(EMBEDDING_WIRE_FIELDS[11], "dimensions");
         for release in [&GENERATE_FIELDS_0_5_21[..], &GENERATE_FIELDS_0_5_22[..]] {
@@ -1342,6 +1400,100 @@ mod tests {
         );
     }
 
+    /// A cache partition takes the form through `cache_salt`, whichever of its
+    /// two values is set: each value in its own slot, the slots between at the
+    /// scheduler's defaults.
+    #[test]
+    fn a_cache_partition_fills_its_two_slots() {
+        let plain = TokenizedGenerateReqInput {
+            rid: "salted".into(),
+            input_ids: vec![1, 2],
+            ..Default::default()
+        };
+        for (extra_key, cache_salt) in [
+            (Some("key"), None),
+            (None, Some("salt")),
+            (Some("key"), Some("salt")),
+        ] {
+            let request = TokenizedGenerateReqInput {
+                extra_key: extra_key.map(String::from),
+                cache_salt: cache_salt.map(String::from),
+                ..plain.clone()
+            };
+            let encoded = encode_msgpack(&request).unwrap();
+            let array: Vec<Value> = decode_msgpack(&encoded).unwrap();
+            assert_eq!(array.len(), 46, "the form through cache_salt");
+            assert!(array[34].is_nil(), "priority at 34");
+            assert_eq!(array[35].as_str(), extra_key, "extra_key at 35");
+            assert!(
+                array[36..39].iter().all(|v| v.as_bool() == Some(false)),
+                "no_logs .. return_entropy false"
+            );
+            assert!(
+                array[39..45].iter().all(Value::is_nil),
+                "need_wait_for_mm_inputs .. time_stats nil"
+            );
+            assert_eq!(array[45].as_str(), cache_salt, "cache_salt at 45");
+            let back: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+            assert_eq!(back, request);
+        }
+        let array: Vec<Value> = decode_msgpack(&encode_msgpack(&plain).unwrap()).unwrap();
+        assert_eq!(array.len(), 14, "no partition: the short form");
+    }
+
+    /// An encode dispatch and a cache partition share one form, each in its own
+    /// slots. The dispatch alone keeps the form through `encoder_urls`.
+    #[test]
+    fn a_cache_partition_composes_with_an_encode_dispatch() {
+        let dispatched = TokenizedGenerateReqInput {
+            rid: "epd".into(),
+            input_ids: vec![1, 2, 3],
+            need_wait_for_mm_inputs: Some(true),
+            num_items_assigned: Some(BTreeMap::from([(1, vec![1, 0])])),
+            encoder_urls: Some(vec!["grpc://10.0.0.8:30001".into()]),
+            ..Default::default()
+        };
+        let request = TokenizedGenerateReqInput {
+            extra_key: Some("key".into()),
+            cache_salt: Some("salt".into()),
+            ..dispatched.clone()
+        };
+        let encoded = encode_msgpack(&request).unwrap();
+        let mut array: Vec<Value> = decode_msgpack(&encoded).unwrap();
+        assert_eq!(array.len(), 46);
+        assert_eq!(array[45].as_str(), Some("salt"), "cache_salt at 45");
+        assert!(
+            array[42..45].iter().all(Value::is_nil),
+            "multi_item_delimiter_indices .. time_stats nil"
+        );
+        array.truncate(42);
+        let extra_key = std::mem::replace(&mut array[35], Value::Nil);
+        assert_eq!(extra_key.as_str(), Some("key"), "extra_key at 35");
+        let short = encode_msgpack(&dispatched).unwrap();
+        assert_eq!(array, decode_msgpack::<Vec<Value>>(&short).unwrap());
+        for (bytes, request) in [(encoded, request), (short, dispatched)] {
+            let back: TokenizedGenerateReqInput = decode_msgpack(&bytes).unwrap();
+            assert_eq!(back, request);
+        }
+    }
+
+    /// The `ADD` payload the plugin's own test decodes through the scheduler's
+    /// real classes (`grpc_servicer/tests/test_sglang_zmq_msgpack.py`,
+    /// `test_the_rust_servicers_cache_partition_decodes_into_the_schedulers_two_fields`).
+    /// The two pins are one constant: a change here is a change there.
+    #[test]
+    fn the_cache_partition_payload_the_plugins_test_decodes_is_pinned() {
+        const PLUGIN_TEST_PAYLOAD: &str = "dc002eb9546f6b656e697a656447656e6572617465526571496e707574a673616c746564c0c093010203c0c0c0dc001acc80c0c0c0cb3ff0000000000000cb3ff0000000000000ffcb0000000000000000cb0000000000000000cb0000000000000000cb3ff00000000000000001c0c0c0c0c0c2c3c3c2c0c0c0c0c2ff00c0c2c2c2c2c200c2c0c0c0c0c0c0c0c0c0c0c0c0c0c2c0a56b65792d61c2c2c2c0c0c0c0c0c0a673616c742d61";
+        let request = TokenizedGenerateReqInput {
+            rid: "salted".into(),
+            input_ids: vec![1, 2, 3],
+            extra_key: Some("key-a".into()),
+            cache_salt: Some("salt-a".into()),
+            ..Default::default()
+        };
+        assert_eq!(encode_msgpack(&request).unwrap(), hex(PLUGIN_TEST_PAYLOAD));
+    }
+
     /// The failure notice is the scheduler's own `EncoderDispatchErrorReq`,
     /// byte for byte what `msgspec` writes for it (the pinned bytes come from
     /// the engine's struct definition: tag, rid, `http_worker_ipc` nil, the
@@ -1421,6 +1573,44 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(SglangProtocol::data_parallel_rank(&embed), None);
+    }
+
+    #[test]
+    fn a_named_prefill_rank_fills_the_disagg_prefill_dp_rank_slot() {
+        let named = TokenizedGenerateReqInput {
+            rid: "pd".into(),
+            input_ids: vec![1, 2],
+            bootstrap_room: Some(7),
+            routed_dp_rank: Some(1),
+            disagg_prefill_dp_rank: Some(1),
+            ..Default::default()
+        };
+        let encoded = encode_msgpack(&named).unwrap();
+        let array: Vec<Value> = decode_msgpack(&encoded).unwrap();
+        assert_eq!(
+            array.len(),
+            34,
+            "the extended form through require_reasoning"
+        );
+        assert_eq!(array[30].as_u64(), Some(1), "routed_dp_rank at 30");
+        assert_eq!(array[31].as_u64(), Some(1), "disagg_prefill_dp_rank at 31");
+        assert!(array[32].is_nil(), "routing_key nil");
+        let back: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(back, named);
+        assert_eq!(GENERATE_WIRE_FIELDS[30], "disagg_prefill_dp_rank");
+        for release in [&GENERATE_FIELDS_0_5_21[..], &GENERATE_FIELDS_0_5_22[..]] {
+            assert_eq!(release[30], "disagg_prefill_dp_rank");
+        }
+
+        let alone = TokenizedGenerateReqInput {
+            rid: "pd".into(),
+            input_ids: vec![1, 2],
+            disagg_prefill_dp_rank: Some(0),
+            ..Default::default()
+        };
+        let array: Vec<Value> = decode_msgpack(&encode_msgpack(&alone).unwrap()).unwrap();
+        assert_eq!(array.len(), 34);
+        assert_eq!(array[31].as_u64(), Some(0));
     }
 
     #[test]

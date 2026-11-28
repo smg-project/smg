@@ -1,4 +1,4 @@
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, ops::Range, sync::Arc};
 
 use aho_corasick::{AhoCorasick, Input};
 use anyhow::Result;
@@ -103,23 +103,31 @@ impl StopSequenceConfig {
 /// more; the automaton's build and the ids' sort are paid once.
 #[derive(Clone, Debug)]
 pub struct StopRules {
-    /// The stop sequences the automaton was built from, hidden then visible; `None` without string
-    /// stops (an empty shared slice would still allocate its header). Shared by every copy of the
-    /// rules, as the automaton's tables are.
-    patterns: Option<Arc<[String]>>,
     /// Index boundary: patterns [0..visible_boundary_idx) are hidden,
     /// patterns [visible_boundary_idx..) are visible
     visible_boundary_idx: usize,
-    /// Aho-Corasick automaton for O(N) stop sequence matching
-    aho_corasick: Option<AhoCorasick>,
-    /// True when there are no string stop sequences (only token-level stops).
-    /// In this mode the jail buffer is bypassed entirely for lower overhead.
-    token_only: bool,
+    /// What the string stops are matched by, `None` without them, behind one
+    /// shared pointer: held inline, the first bytes' bitmap took the
+    /// gateway's per-request context, which holds a decoder, one allocator
+    /// class up.
+    matcher: Option<Arc<Matcher>>,
     /// The config's hidden stop token ids, sorted: every token is checked
     /// against them, and a search of a few sorted ids costs no hashing.
     hidden_stop_ids: StopIds,
     /// The config's visible stop token ids, sorted.
     visible_stop_ids: StopIds,
+}
+
+/// The matcher of the string stop sequences.
+#[derive(Debug)]
+struct Matcher {
+    /// The stop sequences the automaton was built from, hidden then visible.
+    patterns: Vec<String>,
+    /// Aho-Corasick automaton for O(N) stop sequence matching
+    automaton: AhoCorasick,
+    /// The bytes a stop sequence begins with, one bit a byte value: text with
+    /// none of them neither holds a stop sequence nor begins one.
+    starts: [u64; 4],
 }
 
 impl StopRules {
@@ -149,11 +157,22 @@ impl StopRules {
             Some(AhoCorasick::new(&patterns).expect("Failed to build Aho-Corasick automaton"))
         };
 
+        let mut starts = [0; 4];
+        for first in patterns.iter().filter_map(|pattern| pattern.bytes().next()) {
+            starts[usize::from(first >> 6)] |= 1 << (first & 63);
+        }
+
+        let matcher = aho_corasick.map(|automaton| {
+            Arc::new(Matcher {
+                patterns,
+                automaton,
+                starts,
+            })
+        });
+
         Self {
-            token_only: aho_corasick.is_none(),
-            patterns: (!patterns.is_empty()).then(|| patterns.into()),
             visible_boundary_idx,
-            aho_corasick,
+            matcher,
             hidden_stop_ids: StopIds::new(&stop_tokens),
             visible_stop_ids: StopIds::new(&visible_stop_tokens),
         }
@@ -173,6 +192,9 @@ pub struct StopSequenceDecoder {
     /// The string stop sequence that triggered the stop, if any. Set only for
     /// string-sequence matches; token-level stops leave this `None`.
     matched_stop: Option<String>,
+    /// Bytes decoded before string-stop buffering or filtering. Origins observed
+    /// here remain valid when the jail releases their bytes on a later token.
+    decoded_bytes: usize,
 }
 
 impl StopSequenceDecoder {
@@ -217,6 +239,11 @@ impl StopSequenceDecoder {
         self.sequence.skip_special_tokens()
     }
 
+    /// Resolve a vocabulary atom without changing the decoder's state.
+    pub fn token_to_id(&self, text: &str) -> Option<TokenIdType> {
+        self.sequence.tokenizer().token_to_id(text)
+    }
+
     /// How many decode steps of this stream found the decoder had rewritten
     /// text already emitted and streamed a best-effort remainder instead.
     pub fn prefix_mismatches(&self) -> u32 {
@@ -237,6 +264,7 @@ impl StopSequenceDecoder {
             jail_buffer: String::new(),
             stopped: false,
             matched_stop: None,
+            decoded_bytes: 0,
         }
     }
 
@@ -256,9 +284,9 @@ impl StopSequenceDecoder {
         let mut longest = 0;
         for pattern in self
             .rules
-            .patterns
+            .matcher
             .iter()
-            .flat_map(|patterns| patterns.iter())
+            .flat_map(|matcher| matcher.patterns.iter())
         {
             let pat = pattern.as_bytes();
             // Only proper prefixes count, and only ones longer than the best so far.
@@ -285,7 +313,7 @@ impl StopSequenceDecoder {
     /// to a buffer of the caller's instead.
     pub fn process_token(&mut self, token_id: TokenIdType) -> Result<SequenceDecoderOutput> {
         if !self.stopped
-            && self.rules.token_only
+            && self.rules.matcher.is_none()
             && !self.rules.hidden_stop_ids.contains(token_id)
             && !self.rules.visible_stop_ids.contains(token_id)
         {
@@ -294,6 +322,7 @@ impl StopSequenceDecoder {
             // before the appending form existed) rather than an empty string
             // grown by appending into it.
             let text = self.sequence.append_token(token_id)?;
+            self.decoded_bytes += text.len();
             return Ok(if text.is_empty() {
                 SequenceDecoderOutput::Held
             } else {
@@ -318,20 +347,42 @@ impl StopSequenceDecoder {
         token_id: TokenIdType,
         out: &mut String,
     ) -> Result<SequenceDecoderStep> {
+        self.process_token_into_with_origin(token_id, out, None)
+            .map(|(step, _)| step)
+    }
+
+    /// Decode as [`Self::process_token_into`], observing an optional vocabulary
+    /// atom supplied only for its actual token ID. Its range is measured before
+    /// stop filtering, independently of the token-count spans a caller builds.
+    /// A hidden stop never produces an origin. A string stop may hide a range;
+    /// only ranges whose bytes are subsequently released can affect parsing.
+    /// Coordinates describe one prefix through its first stop (or reset).
+    /// `resume` deliberately does not re-emit matched bytes; a consumer that
+    /// resumes must not reuse these as visible-output offsets without rebasing.
+    /// The gateway's Symphony reader never resumes a stopped decoder.
+    pub fn process_token_into_with_origin(
+        &mut self,
+        token_id: TokenIdType,
+        out: &mut String,
+        atom: Option<&str>,
+    ) -> Result<(SequenceDecoderStep, Option<Range<usize>>)> {
         if self.stopped {
-            return Ok(SequenceDecoderStep::Stopped);
+            return Ok((SequenceDecoderStep::Stopped, None));
         }
 
         let hidden_stop = self.rules.hidden_stop_ids.contains(token_id);
         let visible_stop = self.rules.visible_stop_ids.contains(token_id);
-        if self.rules.token_only && !hidden_stop && !visible_stop {
+        if self.rules.matcher.is_none() && !hidden_stop && !visible_stop {
             // The common path: no string stops and not a stop token, so the
             // decoded text goes out as it is, with no jail to run.
-            return Ok(if self.sequence.append_token_into(token_id, out)? {
+            let before = out.len();
+            let step = if self.sequence.append_token_into(token_id, out)? {
                 SequenceDecoderStep::Text
             } else {
                 SequenceDecoderStep::Held
-            });
+            };
+            let origin = observe_atom(&mut self.decoded_bytes, &out[before..], atom);
+            return Ok((step, origin));
         }
         if hidden_stop || visible_stop {
             // A stop token ends the stream for the text held before it, which
@@ -352,28 +403,74 @@ impl StopSequenceDecoder {
             };
             let before = out.len();
             let pending = self.sequence.finish()?;
+            self.decoded_bytes += pending.len();
             self.jail_buffer.push_str(&pending);
             let tail = self.release(out);
             if self.stopped {
-                return Ok(tail);
+                return Ok((tail, None));
             }
             out.push_str(&self.jail_buffer);
             self.jail_buffer.clear();
             self.stopped = true;
-            if let Some(stop_text) = stop_text {
+            let origin = if let Some(stop_text) = stop_text {
+                let origin = observe_atom(&mut self.decoded_bytes, &stop_text, atom);
                 out.push_str(&stop_text);
-            }
-            return Ok(if out.len() == before && hidden_stop {
+                origin
+            } else {
+                None
+            };
+            let step = if out.len() == before && hidden_stop {
                 SequenceDecoderStep::Stopped
             } else {
                 SequenceDecoderStep::StoppedWithText
-            });
+            };
+            return Ok((step, origin));
         }
 
-        // Under string stops the token's text goes through the jail.
-        self.sequence
-            .append_token_into(token_id, &mut self.jail_buffer)?;
-        Ok(self.release(out))
+        // Under string stops the token's text goes through the jail. With
+        // nothing held, text that agrees with no stop sequence at any
+        // position, as far as the text goes, would leave the jail whole: it
+        // is decoded into `out` and stays there. The automaton's entry and
+        // the jail's two copies cost more than the token's own decode.
+        let held = !self.jail_buffer.is_empty();
+        let buffer = if held {
+            &mut self.jail_buffer
+        } else {
+            &mut *out
+        };
+        let before = buffer.len();
+        self.sequence.append_token_into(token_id, buffer)?;
+        let origin = observe_atom(&mut self.decoded_bytes, &buffer[before..], atom);
+        if !held {
+            let text = &out.as_bytes()[before..];
+            let (patterns, bitmap) = match &self.rules.matcher {
+                Some(matcher) => (matcher.patterns.as_slice(), &matcher.starts),
+                None => (&[][..], &[0; 4]),
+            };
+            let starts = |byte: &u8| (bitmap[usize::from(byte >> 6)] >> (byte & 63)) & 1 == 1;
+            let may_stop = text.iter().position(starts).is_some_and(|first| {
+                (first..text.len()).any(|at| {
+                    starts(&text[at])
+                        && patterns.iter().any(|pattern| {
+                            text[at..]
+                                .iter()
+                                .zip(pattern.as_bytes())
+                                .all(|(a, b)| a == b)
+                        })
+                })
+            });
+            if !may_stop {
+                let step = if text.is_empty() {
+                    SequenceDecoderStep::Held
+                } else {
+                    SequenceDecoderStep::Text
+                };
+                return Ok((step, origin));
+            }
+            self.jail_buffer.push_str(&out[before..]);
+            out.truncate(before);
+        }
+        Ok((self.release(out), origin))
     }
 
     /// Appends to `out` what the jail can let go: everything up to a string
@@ -381,34 +478,32 @@ impl StopSequenceDecoder {
     /// longest suffix that is still a partial stop sequence.
     fn release(&mut self, out: &mut String) -> SequenceDecoderStep {
         // Token-only fast path: no string stops means no jail is needed.
-        if self.rules.token_only {
+        let Some(matcher) = &self.rules.matcher else {
             if self.jail_buffer.is_empty() {
                 return SequenceDecoderStep::Held;
             }
             out.push_str(&self.jail_buffer);
             self.jail_buffer.clear();
             return SequenceDecoderStep::Text;
-        }
+        };
 
         // Check for stop sequences using Aho-Corasick. The jail only ever retains a
         // proper prefix of some pattern, so the buffer is bounded by
         // `longest_pattern + one token of text` and scanning it whole is cheap.
-        if let Some(ac) = &self.rules.aho_corasick {
-            if let Some(mat) = ac.find(Input::new(&self.jail_buffer)) {
-                self.stopped = true;
-                self.matched_stop = Some(self.jail_buffer[mat.start()..mat.end()].to_string());
-                let is_visible = mat.pattern().as_usize() >= self.rules.visible_boundary_idx;
-                // A visible stop sequence is included in the output, a hidden
-                // one excluded.
-                let end = if is_visible { mat.end() } else { mat.start() };
-                out.push_str(&self.jail_buffer[..end]);
-                self.jail_buffer.clear();
-                return if end == 0 {
-                    SequenceDecoderStep::Stopped
-                } else {
-                    SequenceDecoderStep::StoppedWithText
-                };
-            }
+        if let Some(mat) = matcher.automaton.find(Input::new(&self.jail_buffer)) {
+            self.stopped = true;
+            self.matched_stop = Some(self.jail_buffer[mat.start()..mat.end()].to_string());
+            let is_visible = mat.pattern().as_usize() >= self.rules.visible_boundary_idx;
+            // A visible stop sequence is included in the output, a hidden
+            // one excluded.
+            let end = if is_visible { mat.end() } else { mat.start() };
+            out.push_str(&self.jail_buffer[..end]);
+            self.jail_buffer.clear();
+            return if end == 0 {
+                SequenceDecoderStep::Stopped
+            } else {
+                SequenceDecoderStep::StoppedWithText
+            };
         }
 
         // Withhold only the longest suffix that is still a *partial* stop sequence.
@@ -475,6 +570,7 @@ impl StopSequenceDecoder {
             return Ok(SequenceDecoderStep::Held);
         }
         let pending = self.sequence.finish()?;
+        self.decoded_bytes += pending.len();
         self.jail_buffer.push_str(&pending);
         Ok(match self.release(out) {
             SequenceDecoderStep::Text => {
@@ -503,6 +599,7 @@ impl StopSequenceDecoder {
         self.sequence.clear();
         self.stopped = false;
         self.matched_stop = None;
+        self.decoded_bytes = 0;
     }
 
     /// Un-stop after a string match the caller does not count (the serving engine checks
@@ -524,6 +621,15 @@ impl StopSequenceDecoder {
             self.jail_buffer.drain(..drain_to);
         }
     }
+}
+
+/// An atomic token's spelling ends the newly decoded bytes. Earlier held UTF-8
+/// bytes may precede it; neither those bytes nor a later jail release inherit
+/// this token's structural identity.
+fn observe_atom(decoded_bytes: &mut usize, text: &str, atom: Option<&str>) -> Option<Range<usize>> {
+    *decoded_bytes += text.len();
+    atom.filter(|atom| !atom.is_empty() && text.ends_with(atom))
+        .map(|atom| (*decoded_bytes - atom.len())..*decoded_bytes)
 }
 
 /// How many stop token ids a decoder keeps inline: the vocabulary's
@@ -570,60 +676,221 @@ impl StopIds {
     }
 }
 
-/// Builder for StopSequenceDecoder
-pub struct StopSequenceDecoderBuilder {
-    tokenizer: Arc<dyn traits::Tokenizer>,
-    config: StopSequenceConfig,
-    skip_special_tokens: bool,
-}
-
-impl StopSequenceDecoderBuilder {
-    pub fn new(tokenizer: Arc<dyn traits::Tokenizer>) -> Self {
-        StopSequenceDecoderBuilder {
-            tokenizer,
-            config: StopSequenceConfig::default(),
-            skip_special_tokens: true,
-        }
-    }
-
-    pub fn stop_token(mut self, token_id: TokenIdType) -> Self {
-        self.config.stop_tokens.insert(token_id);
-        self
-    }
-
-    pub fn stop_sequence(mut self, sequence: impl Into<String>) -> Self {
-        self.config.stop_sequences.push(sequence.into());
-        self
-    }
-
-    pub fn visible_stop_token(mut self, token_id: TokenIdType) -> Self {
-        self.config.visible_stop_tokens.insert(token_id);
-        self
-    }
-
-    pub fn visible_stop_sequence(mut self, sequence: impl Into<String>) -> Self {
-        self.config.visible_stop_sequences.push(sequence.into());
-        self
-    }
-
-    pub fn skip_special_tokens(mut self, skip: bool) -> Self {
-        self.skip_special_tokens = skip;
-        self
-    }
-
-    pub fn build(self) -> StopSequenceDecoder {
-        StopSequenceDecoder::new(self.tokenizer, self.config, self.skip_special_tokens)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, sync::Arc};
 
-    use super::{SequenceDecoderStep, StopIds, StopSequenceDecoderBuilder, INLINE_STOP_IDS};
+    use super::{SequenceDecoderStep, StopIds, INLINE_STOP_IDS};
     use crate::{
         mock::MockTokenizer, SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder,
     };
+
+    fn origin_decoder(config: StopSequenceConfig) -> StopSequenceDecoder {
+        // Two synthetic IDs have the same decoded spelling; only 5000 is the
+        // vocabulary atom the reader binds. No native model IDs are implied.
+        let tokenizer = MockTokenizer::new().with_tokens(&[
+            ("<|close|>", 5001),
+            ("<|close|>", 5000),
+            ("think", 5002),
+            ("<|open|>", 5004),
+            ("�", 5005),
+        ]);
+        StopSequenceDecoder::new(Arc::new(tokenizer), config, false)
+    }
+
+    #[test]
+    fn a_structural_origin_is_retained_before_stop_jail_release() {
+        let mut decoder =
+            origin_decoder(StopSequenceConfig::default().with_stop_sequence("<|close|> message"));
+        let mut text = String::new();
+        let (step, origin) = decoder
+            .process_token_into_with_origin(5000, &mut text, Some("<|close|>"))
+            .unwrap();
+        assert_eq!(step, SequenceDecoderStep::Held);
+        assert_eq!(origin, Some(0..9));
+        assert!(text.is_empty());
+        let (_, later) = decoder
+            .process_token_into_with_origin(5002, &mut text, None)
+            .unwrap();
+        assert_eq!(text, "<|close|> think");
+        assert_eq!(
+            later, None,
+            "the ordinary releasing token gains no structural authority"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_held_lookalike_does_not_borrow_a_later_atoms_identity() {
+        let mut decoder =
+            origin_decoder(StopSequenceConfig::default().with_stop_sequence("<|close|> message"));
+        let mut text = String::new();
+        assert_eq!(
+            decoder
+                .process_token_into_with_origin(5001, &mut text, None)
+                .unwrap()
+                .1,
+            None
+        );
+        let (_, actual) = decoder
+            .process_token_into_with_origin(5000, &mut text, Some("<|close|>"))
+            .unwrap();
+        assert_eq!(actual, Some(10..19));
+        assert_eq!(text, "<|close|> ");
+        decoder
+            .process_token_into_with_origin(5002, &mut text, None)
+            .unwrap();
+        assert_eq!(text, "<|close|> <|close|> think");
+    }
+
+    #[test]
+    fn an_atoms_origin_excludes_released_replacement_character_bytes() {
+        let mut decoder = origin_decoder(StopSequenceConfig::default());
+        let mut text = String::new();
+        decoder.process_token_into(5005, &mut text).unwrap();
+        let (_, origin) = decoder
+            .process_token_into_with_origin(5000, &mut text, Some("<|close|>"))
+            .unwrap();
+        assert_eq!(text, "� <|close|>");
+        assert_eq!(origin, Some(4..13));
+    }
+
+    #[test]
+    fn a_hidden_stop_never_claims_an_old_literal_released_by_its_flush() {
+        let mut decoder = origin_decoder(
+            StopSequenceConfig::default()
+                .with_stop_sequence("<|close|> message")
+                .with_stop_token(5000),
+        );
+        let mut text = String::new();
+        decoder
+            .process_token_into_with_origin(5001, &mut text, None)
+            .unwrap();
+        let (_, origin) = decoder
+            .process_token_into_with_origin(5000, &mut text, Some("<|close|>"))
+            .unwrap();
+        assert_eq!(text, "<|close|>");
+        assert_eq!(origin, None);
+    }
+
+    #[test]
+    fn a_visible_stop_only_claims_its_separately_decoded_spelling() {
+        let mut decoder = origin_decoder(
+            StopSequenceConfig::default()
+                .with_stop_sequence("<|close|> message")
+                .with_visible_stop_token(5000),
+        );
+        let mut text = String::new();
+        decoder
+            .process_token_into_with_origin(5001, &mut text, None)
+            .unwrap();
+        let (_, origin) = decoder
+            .process_token_into_with_origin(5000, &mut text, Some("<|close|>"))
+            .unwrap();
+        assert_eq!(text, "<|close|><|close|>");
+        assert_eq!(origin, Some(9..18));
+    }
+
+    #[test]
+    fn an_earlier_string_stop_prevents_a_visible_stop_origin() {
+        let mut decoder = origin_decoder(
+            StopSequenceConfig::default()
+                .with_stop_sequence("�")
+                .with_visible_stop_token(5000),
+        );
+        let mut text = String::new();
+        decoder
+            .process_token_into_with_origin(5005, &mut text, None)
+            .unwrap();
+        let (_, origin) = decoder
+            .process_token_into_with_origin(5000, &mut text, Some("<|close|>"))
+            .unwrap();
+        assert!(text.is_empty());
+        assert_eq!(origin, None);
+    }
+
+    #[test]
+    fn resetting_the_decoder_resets_origin_coordinates() {
+        let mut decoder = origin_decoder(StopSequenceConfig::default());
+        decoder.process_token(1).unwrap();
+        decoder.reset();
+        let (_, origin) = decoder
+            .process_token_into_with_origin(5000, &mut String::new(), Some("<|close|>"))
+            .unwrap();
+        assert_eq!(origin, Some(0..9));
+    }
+
+    #[test]
+    fn atomic_origins_follow_real_byte_fallback_decoding_without_crediting_utf_prefixes() {
+        use tokenizers::{
+            decoders::{byte_fallback::ByteFallback, fuse::Fuse, sequence::Sequence as Chain},
+            models::bpe::{Merges, Vocab, BPE},
+            AddedToken, DecoderWrapper, Tokenizer as Hf,
+        };
+        let pieces = [
+            "<unk>",
+            "<0xC3>",
+            "<0xA9>",
+            "<0xF0>",
+            "<0x9F>",
+            "<0x8C>",
+            "<0x8D>",
+            "�",
+            "<|close|>",
+        ];
+        let mut vocab = Vocab::default();
+        for (id, text) in pieces.iter().enumerate() {
+            vocab.insert((*text).into(), id as u32);
+        }
+        let model = BPE::builder()
+            .vocab_and_merges(vocab, Merges::new())
+            .byte_fallback(true)
+            .unk_token("<unk>".into())
+            .build()
+            .unwrap();
+        let mut tokenizer = Hf::new(model);
+        let chain: Vec<DecoderWrapper> = vec![ByteFallback::new().into(), Fuse::new().into()];
+        tokenizer.with_decoder(Some(Chain::new(chain)));
+        tokenizer
+            .add_special_tokens([AddedToken::from("<|close|>", true)])
+            .unwrap();
+        let tokenizer = Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(tokenizer));
+        for prefix in [
+            vec![1, 2],
+            vec![3, 4, 5, 6],
+            vec![3, 4],
+            vec![7],
+            vec![7, 1],
+        ] {
+            let mut observed = StopSequenceDecoder::new(
+                tokenizer.clone(),
+                StopSequenceConfig::default().with_stop_sequence("<|close|>message"),
+                false,
+            );
+            let mut raw =
+                StopSequenceDecoder::new(tokenizer.clone(), StopSequenceConfig::default(), false);
+            let mut visible = String::new();
+            let mut decoded = String::new();
+            for id in prefix.into_iter().chain([8]) {
+                raw.process_token_into(id, &mut decoded).unwrap();
+                let (_, origin) = observed
+                    .process_token_into_with_origin(
+                        id,
+                        &mut visible,
+                        (id == 8).then_some("<|close|>"),
+                    )
+                    .unwrap();
+                if id == 8 {
+                    assert!(decoded.ends_with("<|close|>"));
+                    assert_eq!(origin, Some((decoded.len() - 9)..decoded.len()));
+                } else {
+                    assert_eq!(origin, None);
+                }
+            }
+            raw.finish_into(&mut decoded).unwrap();
+            observed.finish_into(&mut visible).unwrap();
+            assert_eq!(visible, decoded);
+        }
+    }
 
     #[test]
     fn test_stop_token_detection() {
@@ -654,20 +921,6 @@ mod tests {
 
         let result = decoder.process_token(999).unwrap();
         assert!(matches!(result, SequenceDecoderOutput::StoppedWithText(_)));
-    }
-
-    #[test]
-    fn test_builder_pattern() {
-        let tokenizer = Arc::new(MockTokenizer::new());
-
-        let decoder = StopSequenceDecoderBuilder::new(tokenizer)
-            .stop_token(999)
-            .stop_sequence("STOP")
-            .visible_stop_token(1000)
-            .skip_special_tokens(true)
-            .build();
-
-        assert!(!decoder.is_stopped());
     }
 
     #[test]
@@ -844,6 +1097,25 @@ mod tests {
         let out = decoder.process_token(3).unwrap();
         assert_eq!(out, SequenceDecoderOutput::Text("Hello test".to_string()));
         assert_eq!(decoder.flush(), SequenceDecoderOutput::Held);
+    }
+
+    #[test]
+    fn a_stop_that_begins_past_the_first_candidate_byte_is_held() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        // In "Hello" the first 'l' ("llo") disagrees with the stop; the second
+        // ("lo") agrees as far as the text goes and must be held.
+        let config = StopSequenceConfig::default().with_stop_sequence("lo world");
+        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
+
+        assert_eq!(
+            decoder.process_token(1).unwrap(),
+            SequenceDecoderOutput::Text("Hel".to_string())
+        );
+        assert_eq!(
+            decoder.process_token(2).unwrap(),
+            SequenceDecoderOutput::Stopped
+        );
+        assert_eq!(decoder.matched_stop(), Some("lo world"));
     }
 
     #[test]
@@ -1078,131 +1350,22 @@ mod tests {
     }
 
     #[test]
-    fn test_utf8_multibyte_character_boundaries() {
-        // This test verifies the fix for the UTF-8 boundary panic
-        // The panic occurred when trying to slice jail_buffer at a byte index
-        // that was in the middle of a multi-byte UTF-8 character (e.g., '×')
-        use crate::mock::MockTokenizer;
-
-        let tokenizer = Arc::new(MockTokenizer::new());
-
-        // Configure stop sequence with a multi-byte character
-        let config = StopSequenceConfig::default().with_stop_sequence(" ×");
-
+    fn a_multibyte_character_that_begins_a_stop_is_held_at_a_tokens_end() {
+        let tokenizer = Arc::new(MockTokenizer::new().with_tokens(&[("aΔ", 5000)]));
+        let config = StopSequenceConfig::default().with_stop_sequence("Δ world");
         let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
 
-        // Simulate the scenario: jail_buffer will contain " ×" (space + multiplication sign)
-        // The '×' character is UTF-8 encoded as bytes [0xC3, 0x97] (2 bytes)
-        // When checking for partial matches, we must not slice in the middle of these bytes
-
-        // This should not panic - the fix ensures we only slice at char boundaries
-        let result = decoder.process_token(1); // Will add some text to jail_buffer
-        assert!(result.is_ok());
-
-        // Even with multi-byte UTF-8 characters in the buffer, processing should work
-        let result = decoder.process_token(2);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_utf8_multibyte_delta_character() {
-        // Test for: byte index 1 is not a char boundary; it is inside 'Δ' (bytes 0..2) of `Δ`
-        // 'Δ' (U+0394 GREEK CAPITAL LETTER DELTA) is encoded as [0xCE, 0x94] (2 bytes)
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let config = StopSequenceConfig::default().with_stop_sequence("Δ");
-
-        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
-
-        // Process tokens - should not panic when checking partial matches
-        let result = decoder.process_token(1);
-        assert!(result.is_ok());
-        let result = decoder.process_token(2);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_utf8_multibyte_degree_character() {
-        // Test for: byte index 1 is not a char boundary; it is inside '°' (bytes 0..2) of `°`
-        // '°' (U+00B0 DEGREE SIGN) is encoded as [0xC2, 0xB0] (2 bytes)
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let config = StopSequenceConfig::default().with_stop_sequence("°");
-
-        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
-
-        // Process tokens - should not panic when checking partial matches
-        let result = decoder.process_token(1);
-        assert!(result.is_ok());
-        let result = decoder.process_token(2);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_utf8_multibyte_triangle_character() {
-        // Test for: byte index 4 is not a char boundary; it is inside '∆' (bytes 2..5) of ` (∆`
-        // '∆' (U+2206 INCREMENT) is encoded as [0xE2, 0x88, 0x86] (3 bytes)
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let config = StopSequenceConfig::default().with_stop_sequence(" (∆");
-
-        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
-
-        // Process tokens - should not panic when checking partial matches
-        let result = decoder.process_token(1);
-        assert!(result.is_ok());
-        let result = decoder.process_token(2);
-        assert!(result.is_ok());
-        let result = decoder.process_token(3);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_utf8_multibyte_en_dash_character() {
-        // Test for: byte index 3 is not a char boundary; it is inside '–' (bytes 1..4) of ` –`
-        // '–' (U+2013 EN DASH) is encoded as [0xE2, 0x80, 0x93] (3 bytes)
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let config = StopSequenceConfig::default().with_stop_sequence(" –");
-
-        let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
-
-        // Process tokens - should not panic when checking partial matches
-        let result = decoder.process_token(1);
-        assert!(result.is_ok());
-        let result = decoder.process_token(2);
-        assert!(result.is_ok());
-        let result = decoder.process_token(3);
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_utf8_multibyte_various_characters() {
-        // Comprehensive test with multiple multi-byte UTF-8 characters
-        // Tests 2-byte, 3-byte, and 4-byte UTF-8 sequences
-        let test_cases = vec![
-            ("×", "multiplication sign - 2 bytes"),
-            ("Δ", "Greek Delta - 2 bytes"),
-            ("°", "degree sign - 2 bytes"),
-            ("∆", "increment - 3 bytes"),
-            ("–", "en dash - 3 bytes"),
-            ("€", "euro sign - 3 bytes"),
-            ("中", "Chinese character - 3 bytes"),
-            ("🚀", "rocket emoji - 4 bytes"),
-            ("💡", "lightbulb emoji - 4 bytes"),
-        ];
-
-        for (stop_char, description) in test_cases {
-            let tokenizer = Arc::new(MockTokenizer::new());
-            let config = StopSequenceConfig::default().with_stop_sequence(stop_char);
-
-            let mut decoder = StopSequenceDecoder::new(tokenizer, config, false);
-
-            // Process multiple tokens - should not panic
-            for token_id in 1..=5 {
-                let result = decoder.process_token(token_id);
-                assert!(
-                    result.is_ok(),
-                    "Failed on {description} with token {token_id}"
-                );
-            }
-        }
+        // "aΔ" ends in the stop's first character: "a" goes out and the two
+        // bytes of "Δ" are held.
+        assert_eq!(
+            decoder.process_token(5000).unwrap(),
+            SequenceDecoderOutput::Text("a".to_string())
+        );
+        assert_eq!(
+            decoder.process_token(2).unwrap(),
+            SequenceDecoderOutput::Stopped
+        );
+        assert_eq!(decoder.matched_stop(), Some("Δ world"));
     }
 
     /// The append form and the owned form of every step agree on the text and on what

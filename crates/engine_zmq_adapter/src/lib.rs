@@ -33,6 +33,7 @@ mod pin_yield;
 mod sglang;
 pub mod sglang_encode;
 mod sglang_mm_hash;
+mod sglang_v41_items;
 mod sockets;
 pub mod stops;
 mod stream;
@@ -42,6 +43,7 @@ mod test_support;
 mod tokenspeed;
 mod trtllm;
 mod vllm;
+mod vllm_cache_salt;
 
 pub use client::{
     connect_for_worker, connect_with_eos, kv_transfer_rejection_params, ZmqDialect,
@@ -56,23 +58,28 @@ pub use engine_zmq_client::{
     EngineCount,
 };
 pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
-pub use sglang::{to_sglang_response, SglangGenerateStream, SglangProfileStart};
+pub use sglang::{
+    cache_partition_fields_arg, to_sglang_response, SglangGenerateStream, SglangProfileStart,
+};
 pub use sglang_encode::{
     EncodeDispatchErrorSink, EncodeDispatchOutcome, EncodeDispatchRequest, EncodeFuture,
     EncodeMediaRefs, EncodeRelease, EncodeTransport, EncoderDispatchErrorReq,
     SglangEncodeDispatcher,
 };
 pub use sglang_mm_hash::SglangCpuMmHasher;
-pub use sockets::{zmq_handshake_address, Handshake};
-pub use stream::ZmqGenerateStream;
+#[cfg(unix)]
+pub use sockets::knock_ipc_socket;
+pub use sockets::{is_leftover_handshake_socket, zmq_handshake_address, Handshake};
+pub use stream::{FrontendFinish, ZmqGenerateStream};
 pub use structured_outputs::{
     refuse_unenforceable_constraint, ConstraintKinds, ConstraintRef,
     StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
 pub use tokenspeed::{
-    qwen35_lineage, to_tokenspeed_response, translate_encode_request, EncodeRendezvous,
-    GridTensors, MropeLayout, OmniLayout, PositionFacts, PositionRule, RuleFamily,
-    TokenSpeedGenerateStream,
+    qwen35_lineage, tensor_dtype_width, to_tokenspeed_response, translate_encode_request,
+    wire_tensor_tokenspeed, EncodeRendezvous, GridTensors, MropeLayout, OmniLayout, PositionFacts,
+    PositionRule, RuleFamily, TokenSpeedGenerateStream,
 };
 pub use trtllm::{to_trtllm_response, TrtllmGenerateStream};
 pub use vllm::{structured_outputs_backend_from_config, ProcessedMedia, VllmGenerateStream};
+pub use vllm_cache_salt::validate_cache_salt;

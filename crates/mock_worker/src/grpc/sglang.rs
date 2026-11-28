@@ -8,9 +8,11 @@
 //! The admin fan-out's flush and profile RPCs are answered by the core, the
 //! same on every wire.
 
-use std::pin::Pin;
+use std::{collections::BTreeMap, pin::Pin};
 
+use engine_zmq_client::protocol::sglang::multimodal::SglangWireTensor;
 use futures::{Stream, StreamExt};
+use prost::Message;
 use sg::{
     generate_response::Response as GenResp,
     sglang_scheduler_server::{SglangScheduler, SglangSchedulerServer},
@@ -18,11 +20,274 @@ use sg::{
 use smg_grpc_client::{common_proto as common, sglang_proto as sg};
 use tonic::{Request, Response, Status};
 
-use super::{Frame, GenerateInput, LogProbs, MockScheduler, Rendezvous, TokenizerStream};
-use crate::{engine::KvEventStream, script::MatchedStop};
+use super::{
+    constraint, media_id, media_identity, Frame, GenerateInput, LogProbs, MediaSpan, MockScheduler,
+    Rendezvous, Shaping, TokenizerStream,
+};
+use crate::{
+    engine::KvEventStream,
+    replay::f32_json,
+    script::{self, MatchedStop},
+};
+
+/// The gRPC paths of this wire's two info calls, as a recorder writes them
+/// beside a record file ([`script::recorded_info`]).
+const MODEL_INFO_CALL: &str = "/sglang.grpc.scheduler.SglangScheduler/GetModelInfo";
+const SERVER_INFO_CALL: &str = "/sglang.grpc.scheduler.SglangScheduler/GetServerInfo";
+
+/// The model of a record file made on this wire ([`super::recorded_model`]).
+pub(super) fn recorded_model() -> Option<super::RecordedModel> {
+    let recorded = script::recorded_info(MODEL_INFO_CALL)?;
+    let info = sg::GetModelInfoResponse::decode(recorded.as_slice()).ok()?;
+    Some(super::RecordedModel {
+        max_context_length: info.max_context_length,
+        max_req_input_len: info.max_req_input_len,
+        vocab_size: info.vocab_size,
+        supports_vision: info.supports_vision,
+        model_type: info.model_type,
+        architectures: info.architectures,
+        eos_token_ids: info.eos_token_ids,
+        pad_token_id: info.pad_token_id,
+        bos_token_id: info.bos_token_id,
+        default_sampling_params_json: info.default_sampling_params_json,
+    })
+}
+
+/// The one identity of a media batch: the feature hash it states, else a
+/// fold of its pixel tensor, as the gateway's request states none. It keys
+/// all the spans of the batch, as this wire's engine pads a request's images
+/// as one item, and it joins the key of a recorded line ([`asked`]). The
+/// tensor is tens of megabytes an image, so the fold takes eight bytes a
+/// step.
+fn batch_identity(batch: &sg::MultimodalInputs) -> u64 {
+    batch.feature_hash.unwrap_or_else(|| {
+        let pixels = batch.pixel_values.as_ref();
+        let pixels = pixels.map_or(&[][..], |tensor| &tensor.data[..]);
+        let (words, rest) = pixels.as_chunks::<8>();
+        words.iter().fold(media_identity(rest), |digest, word| {
+            let word = u64::from_le_bytes(*word);
+            let digest = (digest ^ word).wrapping_mul(0x0100_0000_01b3);
+            digest ^ (digest >> 32)
+        })
+    })
+}
+
+/// What a `Generate` request asks beyond its prompt, under the names every
+/// wire's recorded lines use (`recorded.asked`): the recorder writes it and a
+/// replay keys on it ([`script::ask_fold`]). A media batch reads as the
+/// feature hash it states, else as the fold of its pixel values
+/// ([`batch_identity`]), and each
+/// reference in it as the fold of its modality and URL, in the batch's order
+/// ([`media_id`]): a reference can carry a credential, and a record file
+/// keeps what this returns. This wire carries no seed.
+pub(super) fn asked(request: &sg::GenerateRequest) -> serde_json::Value {
+    use sg::sampling_params::Constraint;
+    let media: Vec<String> = request
+        .mm_inputs
+        .as_deref()
+        .into_iter()
+        .chain(&request.extra_mm_inputs)
+        .flat_map(|batch| {
+            let content = match batch.feature_hash {
+                Some(hash) => format!("{hash:016x}"),
+                None => format!("fold:{:016x}", batch_identity(batch)),
+            };
+            // Pixels that state no hash key under their modality too: the
+            // same bytes read as a video ask another answer. A batch that
+            // names no modality is an image batch.
+            let content = match &batch.pixel_values {
+                Some(_) if batch.feature_hash.is_none() => {
+                    let named = &batch.modalities;
+                    let video = !named.is_empty() && named.iter().all(|name| name == "video");
+                    format!("{}:{content}", if video { "video" } else { "image" })
+                }
+                _ => content,
+            };
+            // A batch of references states no hash and carries no pixels:
+            // each URL joins the key under its modality, in its order.
+            let references = [
+                ("image", &batch.image_urls),
+                ("video", &batch.video_urls),
+                ("audio", &batch.audio_urls),
+            ];
+            let references = references.into_iter().flat_map(|(modality, urls)| {
+                urls.iter()
+                    .map(move |url| media_id("", format!("{modality}\n{url}").as_bytes()))
+            });
+            std::iter::once(content).chain(references)
+        })
+        .collect();
+    let unset = sg::SamplingParams::default();
+    let params = request.sampling_params.as_ref().unwrap_or(&unset);
+    let shaping = Shaping {
+        min_p: params.min_p,
+        frequency_penalty: params.frequency_penalty,
+        presence_penalty: params.presence_penalty,
+        repetition_penalty: params.repetition_penalty,
+        min_new_tokens: params.min_new_tokens,
+        ignore_eos: params.ignore_eos,
+        no_stop_trim: params.no_stop_trim,
+        logit_bias: (params.logit_bias.iter())
+            .map(|(token, bias)| (token.clone(), *bias))
+            .collect(),
+        score_ids: &request.token_ids_logprob,
+    };
+    shaping.join(serde_json::json!({
+        "stream": request.stream,
+        "max_new_tokens": params.max_new_tokens,
+        "n": params.n,
+        "temperature": f32_json(params.temperature),
+        "top_p": f32_json(params.top_p),
+        "top_k": params.top_k,
+        "seed": serde_json::Value::Null,
+        "stop": params.stop,
+        "stop_token_ids": params.stop_token_ids,
+        "logprobs": request.return_logprob.then_some(request.top_logprobs_num),
+        "media": media.len(),
+        "media_ids": media,
+        "constraint": params.constraint.as_ref().map(|c| match c {
+            Constraint::JsonSchema(v) => constraint("json_schema", v.as_str()),
+            Constraint::Regex(v) => constraint("regex", v.as_str()),
+            Constraint::EbnfGrammar(v) => constraint("ebnf_grammar", v.as_str()),
+            Constraint::StructuralTag(v) => constraint("structural_tag", v.as_str()),
+        }),
+    }))
+}
 
 pub(super) type Server = SglangSchedulerServer<MockScheduler>;
 type GenStream = Pin<Box<dyn Stream<Item = Result<sg::GenerateResponse, Status>> + Send>>;
+
+/// A request's media batches (`mm_inputs` and `extra_mm_inputs`, one per
+/// modality) against the shape the engine's adapter requires before it
+/// places their embeddings; the gateway builds them, so a wrong batch is a
+/// gateway regression the canned answer would otherwise hide. The reference
+/// form (media URLs without a pixel tensor: what the gateway hands a worker
+/// that processes media itself, resolved by the worker's processor or an
+/// encoder) is the primary batch's alone and travels with no extra batch; it
+/// is accepted as it stands, as the mock has neither. Each tensor batch: one
+/// modality, image or video (an empty list is an image batch), placed once
+/// across the request, a video's placeholder token id, its pixel tensor read
+/// as the wire reads it (or a feature hash standing in for a validated
+/// identity) and its model-specific tensors read the same way, placeholder
+/// spans inside the prompt and disjoint across the request's batches, and,
+/// when the batch names its placeholder token id, that the prompt's tokens
+/// of that id are exactly the spans'. A batch without spans is left to the
+/// engine, which finds the placeholder tokens itself.
+fn check_mm_inputs(req: &sg::GenerateRequest) -> Result<(), Status> {
+    let Some(primary) = req.mm_inputs.as_deref() else {
+        if req.extra_mm_inputs.is_empty() {
+            return Ok(());
+        }
+        return Err(Status::invalid_argument(format!(
+            "mock-worker: {} extra media batch(es) without a primary mm_inputs batch",
+            req.extra_mm_inputs.len()
+        )));
+    };
+    if names_references(primary) {
+        if !req.extra_mm_inputs.is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: media batch 0 names media references and {} extra tensor \
+                 batch(es) ride beside it; the reference form travels alone",
+                req.extra_mm_inputs.len()
+            )));
+        }
+        return Ok(());
+    }
+    let prompt_ids = req
+        .tokenized
+        .as_ref()
+        .map_or(&[][..], |tokenized| tokenized.input_ids.as_slice());
+    let mut covered: BTreeMap<u32, usize> = BTreeMap::new();
+    let mut claimed = Vec::new();
+    let mut placed: Vec<&str> = Vec::new();
+    let batches = std::iter::once(primary).chain(req.extra_mm_inputs.iter());
+    for (index, mm) in batches.enumerate() {
+        let what = format!("media batch {index}");
+        let modality = if mm.modalities.iter().all(|name| name == "image") {
+            "image"
+        } else if mm.modalities.iter().all(|name| name == "video") {
+            "video"
+        } else {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: {what} names modalities {:?}; a tensor batch is image or video, \
+                 one modality per batch (an empty list is an image batch)",
+                mm.modalities
+            )));
+        };
+        if modality == "video" && mm.im_token_id.is_none() {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: {what} is a video batch without its placeholder token id"
+            )));
+        }
+        if names_references(mm) {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: {what} carries media references but no pixel_values; the \
+                 reference form is the primary batch's alone"
+            )));
+        }
+        match &mm.pixel_values {
+            Some(tensor) => check_tensor(&what, "pixel_values", tensor)?,
+            None if mm.feature_hash.is_some() => {}
+            None => {
+                return Err(Status::invalid_argument(format!(
+                    "mock-worker: {what} carries no pixel_values and no feature hash"
+                )));
+            }
+        }
+        for (key, tensor) in &mm.model_specific_tensors {
+            check_tensor(&what, key, tensor)?;
+        }
+        if !mm.mm_placeholders.is_empty() {
+            let spans = mm
+                .mm_placeholders
+                .iter()
+                .map(|placeholder| (placeholder.offset, placeholder.length));
+            let length = super::check_placeholder_spans(
+                Some(prompt_ids),
+                spans,
+                mm.im_token_id,
+                &mut claimed,
+                &what,
+            )?;
+            if let Some(id) = mm.im_token_id {
+                *covered.entry(id).or_default() += length;
+            }
+        }
+        // The adapter's last check of an extra batch, after the batch itself
+        // translated: a modality placed once across the request.
+        if placed.contains(&modality) {
+            return Err(Status::invalid_argument(format!(
+                "mock-worker: {what} is a second {modality} batch; one batch per modality"
+            )));
+        }
+        placed.push(modality);
+    }
+    for (id, length) in covered {
+        super::check_placeholder_tokens(prompt_ids, id, length)?;
+    }
+    Ok(())
+}
+
+/// Whether a batch takes the reference form: media URLs and no pixel tensor
+/// (the adapter's own test of it; a batch carrying a tensor takes the tensor
+/// path whatever references ride beside it).
+fn names_references(mm: &sg::MultimodalInputs) -> bool {
+    mm.pixel_values.is_none()
+        && !(mm.image_urls.is_empty() && mm.video_urls.is_empty() && mm.audio_urls.is_empty())
+}
+
+/// A batch's tensor read as this wire's reader reads it (a dtype the wire
+/// carries, bytes matching the shape at that width), so the mock refuses the
+/// tensors the engine's adapter refuses; `name` is the field in the refusal.
+fn check_tensor(what: &str, name: &str, tensor: &sg::TensorData) -> Result<(), Status> {
+    SglangWireTensor::new(
+        tensor.dtype.clone(),
+        tensor.shape.iter().map(|&dim| u64::from(dim)).collect(),
+        tensor.data.clone(),
+    )
+    .map_err(|error| Status::invalid_argument(format!("mock-worker: {what}'s {name}: {error}")))?;
+    Ok(())
+}
 
 #[tonic::async_trait]
 impl SglangScheduler for MockScheduler {
@@ -35,6 +300,31 @@ impl SglangScheduler for MockScheduler {
         request: Request<sg::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         let req = request.into_inner();
+        check_mm_inputs(&req)?;
+        let ask = script::recorded().then(|| script::ask_fold(&asked(&req)));
+        // One identity keys all the spans of a batch ([`batch_identity`]).
+        // Where the request states no hash it is a fold of the pixel tensor,
+        // which waits until the cache reads the spans: a prefill-role
+        // request, a request a hand-written script answers and the canned
+        // engine never pay for it, but a gRPC prefill worker under
+        // `--prefill-engine true` does. A worker that holds recorded lines
+        // pays it once a request, above, for the key of the line; the
+        // recorder pays it once as a call ends.
+        let (batch, extra) = (req.mm_inputs, req.extra_mm_inputs);
+        let media = move || -> Vec<MediaSpan> {
+            let batches = batch.as_deref().into_iter().chain(&extra);
+            batches
+                .flat_map(|batch| {
+                    let identity = batch_identity(batch);
+                    batch.mm_placeholders.iter().map(move |span| MediaSpan {
+                        identity,
+                        offset: span.offset,
+                        length: span.length,
+                        slot: batch.im_token_id,
+                    })
+                })
+                .collect()
+        };
         let tokenized = req.tokenized.unwrap_or_default();
         let params = req.sampling_params.unwrap_or_default();
         let rendezvous = req
@@ -59,6 +349,8 @@ impl SglangScheduler for MockScheduler {
                 score_ids: req.token_ids_logprob.clone(),
                 pin: req.data_parallel_rank,
                 rendezvous,
+                media: Box::new(media),
+                ask,
             })
             .await?;
         let request_id = req.request_id;
@@ -67,11 +359,24 @@ impl SglangScheduler for MockScheduler {
         }))))
     }
 
+    /// One vector per request, deterministic from the input's ids
+    /// ([`super::embedding_of`]); the prompt tokens are the ids' count.
     async fn embed(
         &self,
-        _request: Request<sg::EmbedRequest>,
+        request: Request<sg::EmbedRequest>,
     ) -> Result<Response<sg::EmbedResponse>, Status> {
-        Err(Status::unimplemented("mock-worker"))
+        let request = request.into_inner();
+        let input_ids = request
+            .tokenized
+            .as_ref()
+            .map(|tokenized| tokenized.input_ids.as_slice())
+            .unwrap_or(&[]);
+        let embedding = super::embedding_of(input_ids);
+        Ok(Response::new(sg::EmbedResponse {
+            embedding_dim: embedding.len() as u32,
+            embedding,
+            prompt_tokens: input_ids.len() as u32,
+        }))
     }
 
     async fn health_check(
@@ -101,8 +406,19 @@ impl SglangScheduler for MockScheduler {
         _request: Request<sg::GetModelInfoRequest>,
     ) -> Result<Response<sg::GetModelInfoResponse>, Status> {
         self.overrides.model_info().refusal("model info")?;
+        // A replay of a record file made on this wire answers what the
+        // recorded engine did; a tokenizer stated on the command line is the
+        // one of this host, so its path goes in place of the engine's own.
+        if let Some(recorded) = script::recorded_info(MODEL_INFO_CALL) {
+            let mut info = sg::GetModelInfoResponse::decode(recorded.as_slice())
+                .map_err(|e| Status::internal(format!("the recorded model info: {e}")))?;
+            if super::own_tokenizer(&self.cfg) {
+                info.tokenizer_path.clone_from(&self.cfg.tokenizer_path);
+            }
+            return Ok(Response::new(info));
+        }
         let context_length = self.cfg.context_length.min(i32::MAX as u32) as i32;
-        Ok(Response::new(sg::GetModelInfoResponse {
+        let mut info = sg::GetModelInfoResponse {
             model_path: self.cfg.model_id.clone(),
             tokenizer_path: self.cfg.tokenizer_path.clone(),
             is_generation: true,
@@ -121,7 +437,20 @@ impl SglangScheduler for MockScheduler {
             id2label_json: String::new(),
             num_labels: 0,
             default_sampling_params_json: self.cfg.default_sampling_params_json.clone(),
-        }))
+        };
+        if let Some(model) = super::recorded_model() {
+            info.max_context_length = model.max_context_length;
+            info.max_req_input_len = model.max_req_input_len;
+            info.vocab_size = model.vocab_size;
+            info.supports_vision = model.supports_vision;
+            info.model_type = model.model_type;
+            info.architectures = model.architectures;
+            info.eos_token_ids = model.eos_token_ids;
+            info.pad_token_id = model.pad_token_id;
+            info.bos_token_id = model.bos_token_id;
+            info.default_sampling_params_json = model.default_sampling_params_json;
+        }
+        Ok(Response::new(info))
     }
 
     async fn get_server_info(
@@ -129,6 +458,14 @@ impl SglangScheduler for MockScheduler {
         _request: Request<sg::GetServerInfoRequest>,
     ) -> Result<Response<sg::GetServerInfoResponse>, Status> {
         self.overrides.server_info().refusal("server info")?;
+        if let Some(recorded) = script::recorded_info(SERVER_INFO_CALL) {
+            let mut info = sg::GetServerInfoResponse::decode(recorded.as_slice())
+                .map_err(|e| Status::internal(format!("the recorded server info: {e}")))?;
+            // A gateway reads this entry over the tokenizer path of the
+            // model info.
+            super::state_tokenizer(&self.cfg, info.server_args.as_mut(), "tokenizer_path");
+            return Ok(Response::new(info));
+        }
         Ok(Response::new(sg::GetServerInfoResponse {
             server_args: self.server_args(),
             scheduler_info: None,
@@ -148,7 +485,7 @@ impl SglangScheduler for MockScheduler {
         request: Request<sg::GetLoadsRequest>,
     ) -> Result<Response<sg::GetLoadsResponse>, Status> {
         let loads: Vec<sg::SchedulerLoad> = self
-            .load_rows(request.into_inner().dp_rank)
+            .load_rows(request.into_inner().dp_rank)?
             .into_iter()
             .map(|(dp_rank, s)| sg::SchedulerLoad {
                 dp_rank,
@@ -169,6 +506,7 @@ impl SglangScheduler for MockScheduler {
                 lora: None,
                 disaggregation: None,
                 queues: None,
+                values: self.load_values(dp_rank),
             })
             .collect();
         Ok(Response::new(sg::GetLoadsResponse {
@@ -269,6 +607,7 @@ fn response(request_id: &str, frame: Frame) -> sg::GenerateResponse {
     sg::GenerateResponse {
         request_id: request_id.to_string(),
         media_identity: None,
+        prepared_input: Vec::new(),
         response: Some(response),
     }
 }
@@ -304,6 +643,7 @@ mod tests {
     use serde_json::json;
     use sg::sglang_scheduler_client::SglangSchedulerClient;
     use smg_grpc_client::tokenspeed_proto as ts;
+    use tokio::sync::watch;
     use tonic::{transport::Channel, Code};
     use tonic_health::pb::{
         health_check_response::ServingStatus, health_client::HealthClient, HealthCheckRequest,
@@ -670,6 +1010,40 @@ mod tests {
         );
     }
 
+    /// A list and an object an info patch sets reach a client of this wire
+    /// as a list and a struct in the server args, as an engine servicer's do.
+    #[tokio::test]
+    async fn a_patched_list_and_object_reach_the_server_args_in_their_kinds() {
+        use prost_types::value::Kind;
+
+        let (service, _stop) = MockScheduler::for_tests(Config::default(), 65_381);
+        let patch = json!({
+            "weight_version": ["a", "b"],
+            "kv_cache_dtype": {"bits": 8},
+        });
+        service.overrides.patch_info(patch.as_object().unwrap());
+        let info = service
+            .get_server_info(Request::new(sg::GetServerInfoRequest {}))
+            .await
+            .expect("info")
+            .into_inner();
+        let args = info.server_args.expect("server args").fields;
+        let kind = |key: &str| args.get(key).and_then(|value| value.kind.as_ref());
+        assert!(
+            matches!(kind("weight_version"), Some(Kind::ListValue(list)) if list.values.len() == 2),
+            "a list of two members: {:?}",
+            kind("weight_version")
+        );
+        assert!(
+            matches!(
+                kind("kv_cache_dtype"),
+                Some(Kind::StructValue(entry)) if entry.fields.contains_key("bits")
+            ),
+            "a struct with its member: {:?}",
+            kind("kv_cache_dtype")
+        );
+    }
+
     /// The admin fan-out's three RPCs on this wire call the core's answers:
     /// the flush succeeds, a profiling run starts and stops with one trace
     /// file in the requested directory, and a second stop is refused.
@@ -775,5 +1149,465 @@ mod tests {
             .await
             .expect_err("a service the worker does not serve");
         assert_eq!(unknown.code(), Code::NotFound);
+    }
+
+    /// An image batch as the gateway builds it: one span over the placeholder
+    /// token 9, a pixel tensor, the token id named.
+    fn image_batch(offset: u32, length: u32) -> sg::MultimodalInputs {
+        sg::MultimodalInputs {
+            modalities: vec!["image".to_string()],
+            pixel_values: Some(sg::TensorData {
+                data: vec![0; 16].into(),
+                shape: vec![1, 4],
+                dtype: "float32".to_string(),
+            }),
+            im_token_id: Some(9),
+            mm_placeholders: vec![sg::PlaceholderRange { offset, length }],
+            ..Default::default()
+        }
+    }
+
+    fn with_batch(
+        mut req: sg::GenerateRequest,
+        batch: sg::MultimodalInputs,
+    ) -> sg::GenerateRequest {
+        req.mm_inputs = Some(Box::new(batch));
+        req
+    }
+
+    async fn refused_batch(service: &MockScheduler, req: sg::GenerateRequest) -> Status {
+        match service.generate(Request::new(req)).await {
+            Err(status) => status,
+            Ok(_) => panic!("the malformed media batch was accepted"),
+        }
+    }
+
+    fn media_service(port: u16) -> (MockScheduler, watch::Sender<bool>) {
+        MockScheduler::for_tests(
+            Config {
+                grpc_wire: SchedulerWire::Sglang,
+                ..Config::default()
+            },
+            port,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_well_formed_media_batch_is_accepted() {
+        let (service, _stop) = media_service(65_350);
+        let frames = read_frames(
+            &service,
+            with_batch(request("sg-mm-ok", &[1, 9, 9, 2], true), image_batch(1, 2)),
+        )
+        .await;
+        assert!(!frames.is_empty(), "the answer streams");
+    }
+
+    #[tokio::test]
+    async fn a_reference_batch_is_accepted_as_the_worker_processed_form() {
+        // The gateway's media references for a worker that processes media
+        // itself: the URLs alone, no modality, no tensor, no feature hash
+        // and no spans.
+        let (service, _stop) = media_service(65_358);
+        let image = sg::MultimodalInputs {
+            image_urls: vec!["https://example.test/a.png".to_string()],
+            ..Default::default()
+        };
+        let video = sg::MultimodalInputs {
+            video_urls: vec!["https://example.test/a.mp4".to_string()],
+            ..Default::default()
+        };
+        let audio = sg::MultimodalInputs {
+            audio_urls: vec!["https://example.test/a.wav".to_string()],
+            ..Default::default()
+        };
+        for (id, batch) in [
+            ("sg-mm-ref-image", image),
+            ("sg-mm-ref-video", video),
+            ("sg-mm-ref-audio", audio),
+        ] {
+            let frames = read_frames(&service, with_batch(request(id, &[1, 2], true), batch)).await;
+            assert!(!frames.is_empty(), "{id}: the answer streams");
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_placeholders_across_batches_are_refused_on_this_wire() {
+        let (service, _stop) = media_service(65_359);
+        let mut req = with_batch(
+            request("sg-mm-overlap", &[1, 9, 9, 2], true),
+            image_batch(1, 1),
+        );
+        req.extra_mm_inputs.push(image_batch(1, 1));
+        let status = refused_batch(&service, req).await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("media batch 1")
+                && status
+                    .message()
+                    .contains("overlaps an earlier placeholder at token 1"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_media_batch_without_pixels_or_a_feature_hash_is_refused() {
+        let (service, _stop) = media_service(65_351);
+        let mut batch = image_batch(1, 2);
+        batch.pixel_values = None;
+        let status = refused_batch(
+            &service,
+            with_batch(request("sg-mm-px", &[1, 9, 9, 2], true), batch),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("media batch 0") && status.message().contains("pixel_values"),
+            "{status:?}"
+        );
+        let mut identity = image_batch(1, 2);
+        identity.pixel_values = None;
+        identity.feature_hash = Some(42);
+        service
+            .generate(Request::new(with_batch(
+                request("sg-mm-id", &[1, 9, 9, 2], true),
+                identity,
+            )))
+            .await
+            .expect("a feature hash stands in for the tensor");
+    }
+
+    #[tokio::test]
+    async fn a_media_batch_with_an_unknown_modality_is_refused() {
+        let (service, _stop) = media_service(65_352);
+        let mut batch = image_batch(1, 2);
+        batch.modalities = vec!["point_cloud".to_string()];
+        let status = refused_batch(
+            &service,
+            with_batch(request("sg-mm-mod", &[1, 9, 9, 2], true), batch),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().contains("image or video"), "{status:?}");
+    }
+
+    #[tokio::test]
+    async fn a_video_batch_without_its_placeholder_token_id_is_refused() {
+        let (service, _stop) = media_service(65_353);
+        let mut batch = image_batch(1, 2);
+        batch.modalities = vec!["video".to_string()];
+        batch.im_token_id = None;
+        let status = refused_batch(
+            &service,
+            with_batch(request("sg-mm-vid", &[1, 9, 9, 2], true), batch),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("placeholder token id"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_placeholder_outside_the_prompt_is_refused_on_this_wire() {
+        let (service, _stop) = media_service(65_354);
+        let status = refused_batch(
+            &service,
+            with_batch(request("sg-mm-out", &[1, 9, 9, 2], true), image_batch(3, 2)),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("outside the prompt of 4 tokens"),
+            "{status:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_placeholder_that_does_not_cover_its_token_is_refused_on_this_wire() {
+        let (service, _stop) = media_service(65_355);
+        let status = refused_batch(
+            &service,
+            with_batch(
+                request("sg-mm-cover", &[1, 9, 9, 2], true),
+                image_batch(0, 2),
+            ),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("not its placeholder token 9"),
+            "{status:?}"
+        );
+        let status = refused_batch(
+            &service,
+            with_batch(
+                request("sg-mm-stray", &[1, 9, 9, 9], true),
+                image_batch(1, 2),
+            ),
+        )
+        .await;
+        assert!(
+            status.message().contains("holds 3 placeholder token(s) 9")
+                && status.message().contains("cover 2"),
+            "{status:?}"
+        );
+    }
+
+    /// The engine's adapter takes the extra batches beside a primary one.
+    #[tokio::test]
+    async fn extra_batches_without_a_primary_batch_are_refused() {
+        let (service, _stop) = media_service(65_360);
+        let mut req = request("sg-mm-extra", &[1, 9, 9, 2], true);
+        req.extra_mm_inputs.push(image_batch(1, 2));
+        let status = refused_batch(&service, req).await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(status.message().contains("without a primary"), "{status:?}");
+    }
+
+    /// One batch per modality: two image batches over disjoint spans pass
+    /// the overlap rule and the engine still takes one of them; an image
+    /// batch beside a video batch is the engine's shape.
+    #[tokio::test]
+    async fn a_second_batch_of_a_placed_modality_is_refused() {
+        let (service, _stop) = media_service(65_361);
+        let prompt = [1, 9, 9, 2, 9];
+        let mut req = with_batch(request("sg-mm-twice", &prompt, true), image_batch(1, 2));
+        req.extra_mm_inputs.push(image_batch(4, 1));
+        let status = refused_batch(&service, req).await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("media batch 1")
+                && status.message().contains("second image batch"),
+            "{status:?}"
+        );
+        let mut video = image_batch(4, 1);
+        video.modalities = vec!["video".to_string()];
+        let mut req = with_batch(request("sg-mm-pair", &prompt, true), image_batch(1, 2));
+        req.extra_mm_inputs.push(video);
+        let frames = read_frames(&service, req).await;
+        assert!(!frames.is_empty(), "the answer streams");
+    }
+
+    /// The adapter reads an empty `modalities` list as an image batch and
+    /// takes image and video tensors alone, one modality per batch.
+    #[tokio::test]
+    async fn an_unnamed_tensor_batch_is_an_image_batch_and_other_modalities_are_refused() {
+        let (service, _stop) = media_service(65_362);
+        let mut unnamed = image_batch(1, 2);
+        unnamed.modalities.clear();
+        let frames = read_frames(
+            &service,
+            with_batch(request("sg-mm-unnamed", &[1, 9, 9, 2], true), unnamed),
+        )
+        .await;
+        assert!(
+            !frames.is_empty(),
+            "an unnamed tensor batch is an image batch"
+        );
+        for (id, names) in [
+            ("sg-mm-audio", &["audio"][..]),
+            ("sg-mm-mixed", &["image", "video"]),
+        ] {
+            let mut batch = image_batch(1, 2);
+            batch.modalities = names.iter().map(|name| (*name).to_string()).collect();
+            let status = refused_batch(
+                &service,
+                with_batch(request(id, &[1, 9, 9, 2], true), batch),
+            )
+            .await;
+            assert_eq!(status.code(), Code::InvalidArgument, "{id}: {status:?}");
+            assert!(
+                status.message().contains("image or video"),
+                "{id}: {status:?}"
+            );
+        }
+    }
+
+    /// A tensor is read as the wire's reader reads it: the bytes match the
+    /// shape at the dtype's width, the dtype is one the wire carries, the
+    /// model-specific tensors the same.
+    #[tokio::test]
+    async fn a_tensor_is_read_as_the_wire_reads_it() {
+        let (service, _stop) = media_service(65_363);
+        let mut short = image_batch(1, 2);
+        short.pixel_values.as_mut().expect("the tensor").data = vec![0; 15].into();
+        let status = refused_batch(
+            &service,
+            with_batch(request("sg-mm-bytes", &[1, 9, 9, 2], true), short),
+        )
+        .await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("media batch 0's pixel_values")
+                && status.message().contains("expected 16, got 15"),
+            "{status:?}"
+        );
+        let mut wide = image_batch(1, 2);
+        wide.pixel_values.as_mut().expect("the tensor").dtype = "float64".to_string();
+        let status = refused_batch(
+            &service,
+            with_batch(request("sg-mm-dtype", &[1, 9, 9, 2], true), wide),
+        )
+        .await;
+        assert!(
+            status.message().contains("unsupported tensor dtype"),
+            "{status:?}"
+        );
+        let mut grid = image_batch(1, 2);
+        grid.model_specific_tensors.insert(
+            "image_grid_thw".to_string(),
+            sg::TensorData {
+                data: vec![0; 8].into(),
+                shape: vec![1, 3],
+                dtype: "int64".to_string(),
+            },
+        );
+        let status = refused_batch(
+            &service,
+            with_batch(request("sg-mm-grid", &[1, 9, 9, 2], true), grid),
+        )
+        .await;
+        assert!(
+            status.message().contains("image_grid_thw")
+                && status.message().contains("expected 24, got 8"),
+            "{status:?}"
+        );
+    }
+
+    /// The reference form is the primary batch's alone, whichever of its
+    /// three URL kinds names it: the adapter refuses extra batches beside it,
+    /// and a reference batch on the tensor path.
+    #[tokio::test]
+    async fn the_reference_form_travels_alone_as_the_primary_batch() {
+        let (service, _stop) = media_service(65_364);
+        let reference = sg::MultimodalInputs {
+            image_urls: vec!["https://example.test/a.png".to_string()],
+            ..Default::default()
+        };
+        let video = sg::MultimodalInputs {
+            video_urls: vec!["https://example.test/a.mp4".to_string()],
+            ..Default::default()
+        };
+        let audio = sg::MultimodalInputs {
+            audio_urls: vec!["https://example.test/a.wav".to_string()],
+            ..Default::default()
+        };
+        for (id, primary) in [
+            ("sg-mm-ref-extra", reference.clone()),
+            ("sg-mm-ref-video-extra", video),
+            ("sg-mm-ref-audio-extra", audio),
+        ] {
+            let mut req = with_batch(request(id, &[1, 9, 9, 2], true), primary);
+            req.extra_mm_inputs.push(image_batch(1, 2));
+            let status = refused_batch(&service, req).await;
+            assert_eq!(status.code(), Code::InvalidArgument, "{id}: {status:?}");
+            assert!(
+                status.message().contains("media references")
+                    && status.message().contains("1 extra tensor batch"),
+                "{id}: {status:?}"
+            );
+        }
+        let mut req = with_batch(
+            request("sg-mm-extra-ref", &[1, 9, 9, 2], true),
+            image_batch(1, 2),
+        );
+        req.extra_mm_inputs.push(reference);
+        let status = refused_batch(&service, req).await;
+        assert_eq!(status.code(), Code::InvalidArgument, "{status:?}");
+        assert!(
+            status.message().contains("media batch 1")
+                && status.message().contains("references but no pixel_values"),
+            "{status:?}"
+        );
+    }
+
+    /// The realistic engine keys a batch's tokens by the batch: with no
+    /// feature hash on the request the fold of its pixel tensor stands in, so
+    /// the same pixels are served from the cache and other pixels under the
+    /// same placeholder id part the prompt at the batch's first token.
+    #[tokio::test]
+    async fn a_media_batchs_tokens_are_cached_by_the_batch() {
+        let (service, _stop) = MockScheduler::for_tests(
+            Config {
+                grpc_wire: SchedulerWire::Sglang,
+                realistic: true,
+                engine: engine::EngineParams {
+                    timing: engine::TimingModel::linear(),
+                    ..Default::default()
+                },
+                ..Config::default()
+            },
+            65_263,
+        );
+        // A block of text, two blocks under the placeholder id, text again.
+        let ids: Vec<u32> = (100..116).chain([9; 32]).chain(200..219).collect();
+        let mut cached = Vec::new();
+        for (id, pixel) in [("sw-media-a1", 1), ("sw-media-a2", 1), ("sw-media-b", 2)] {
+            let mut batch = image_batch(16, 32);
+            batch.pixel_values = Some(sg::TensorData {
+                data: vec![pixel; 16].into(),
+                shape: vec![1, 4],
+                dtype: "float32".to_string(),
+            });
+            read_frames(&service, with_batch(request(id, &ids, false), batch)).await;
+            cached.push(
+                engine::records_since(0, usize::MAX)
+                    .into_iter()
+                    .find(|record| record.request_id == id)
+                    .map(|record| record.cached_tokens),
+            );
+        }
+        assert_eq!(cached, [Some(0), Some(64), Some(16)]);
+    }
+
+    #[test]
+    fn a_batch_of_media_references_keys_on_each_url() {
+        let asked_with = |images: &[&str], videos: &[&str]| {
+            let mut req = request("r", &[1, 2, 3], false);
+            req.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+                image_urls: images.iter().map(|url| (*url).to_string()).collect(),
+                video_urls: videos.iter().map(|url| (*url).to_string()).collect(),
+                ..Default::default()
+            }));
+            asked(&req)
+        };
+        let pair = asked_with(&["http://a/1.png", "http://a/2.png"], &[]);
+        assert_eq!(pair, asked_with(&["http://a/1.png", "http://a/2.png"], &[]));
+        // Another picture, the same pictures in another order and the same
+        // URL under another modality each ask another answer.
+        assert_ne!(pair, asked_with(&["http://a/1.png", "http://a/3.png"], &[]));
+        assert_ne!(pair, asked_with(&["http://a/2.png", "http://a/1.png"], &[]));
+        assert_ne!(
+            asked_with(&["http://a/1"], &[]),
+            asked_with(&[], &["http://a/1"])
+        );
+        // A record file keeps the fold of a reference, never its URL.
+        assert!(!pair.to_string().contains("http://"), "{pair}");
+        // A batch of pixels that states no hash keys on its bytes, the zero
+        // bytes too: a payload under more leading zero bytes, and an
+        // all-zero payload of another length, each ask another answer.
+        let asked_pixels = |modalities: &[&str], bytes: &[u8]| {
+            let mut req = request("r", &[1, 2, 3], false);
+            req.mm_inputs = Some(Box::new(sg::MultimodalInputs {
+                modalities: modalities.iter().map(|name| (*name).to_string()).collect(),
+                pixel_values: Some(sg::TensorData {
+                    data: bytes.to_vec().into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+            asked(&req)
+        };
+        let float = asked_pixels(&[], &[0, 0, 128, 63]);
+        assert_eq!(float, asked_pixels(&[], &[0, 0, 128, 63]));
+        assert_ne!(float, asked_pixels(&[], &[0, 0, 0, 0, 0, 0, 128, 63]));
+        assert_ne!(asked_pixels(&[], &[0; 4]), asked_pixels(&[], &[0; 8]));
+        // Such a batch keys under its modality too: one that names none is
+        // an image batch, and the same pixels read as a video ask another
+        // answer.
+        assert_eq!(float, asked_pixels(&["image"], &[0, 0, 128, 63]));
+        assert_ne!(float, asked_pixels(&["video"], &[0, 0, 128, 63]));
     }
 }

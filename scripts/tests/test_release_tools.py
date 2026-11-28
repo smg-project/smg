@@ -366,6 +366,7 @@ class Sandbox:
         )
         self.put("model_gateway/Cargo.toml", versioned("smg", "1.13.0"))
         self.put("model_gateway/src/main.rs", 'fn main() {\n    println!("one");\n}\n')
+        self.put("model_gateway/src/cli/mod.rs", 'fn read_args() {\n    println!("one");\n}\n')
         self.put("crates/tool_parser/Cargo.toml", versioned("tool-parser", "0.5.0"))
         self.put("crates/tool_parser/src/lib.rs", "pub fn parse() {}\n")
         # a crate the checker lists that cargo never publishes (the real one is a generator's scaffold)
@@ -1150,20 +1151,21 @@ def test_pick_refusals(repo: Sandbox) -> None:
 
 
 def test_pick_conflict_stops_with_the_steps_and_pick_pr_finishes(repo: Sandbox) -> None:
+    path = "model_gateway/src/cli/mod.rs"
     repo.cut()
     repo.git("switch", "--quiet", "release/1.14")
-    repo.put("model_gateway/src/main.rs", 'fn main() {\n    println!("branch only");\n}\n')
+    repo.put(path, 'fn read_args() {\n    println!("branch only");\n}\n')
     repo.git("commit", "--quiet", "-am", "fix(router): branch only")
     repo.land_on_release()
     four = repo.commit_main(
         "fix(router): four (#125)",
-        "model_gateway/src/main.rs",
-        'fn main() {\n    println!("four");\n}\n',
+        path,
+        'fn read_args() {\n    println!("four");\n}\n',
     )
     done = repo.tool("pick", "1.14", four, check=False)
     assert done.returncode == 1
     assert f"the pick of {four[:7]} (fix(router): four (#125)) conflicts on:" in done.stdout
-    assert "    model_gateway/src/main.rs" in done.stdout
+    assert f"    {path}" in done.stdout
     assert "git cherry-pick --continue" in done.stdout
     topic = f"pick/1.14-{four[:7]}"
     assert f"make release-pick-pr RELEASE=1.14 PICK={topic}" in done.stdout
@@ -1172,8 +1174,8 @@ def test_pick_conflict_stops_with_the_steps_and_pick_pr_finishes(repo: Sandbox) 
     )
     assert repo.git("rev-parse", "--abbrev-ref", "HEAD") == topic
     assert "still in progress" in repo.tool("pick-pr", "1.14", check=False).stderr
-    repo.put("model_gateway/src/main.rs", 'fn main() {\n    println!("four");\n}\n')
-    repo.git("add", "model_gateway/src/main.rs")
+    repo.put(path, 'fn read_args() {\n    println!("four");\n}\n')
+    repo.git("add", path)
     repo.git("cherry-pick", "--continue")
     assert f"(cherry picked from commit {four})" in repo.git("log", "-1", "--format=%B")
     # finished from main, the branch named: the pick branch may lack the release targets
@@ -2163,6 +2165,7 @@ def test_publish_plan_prints_the_dispatches_and_runs_nothing(repo: Sandbox) -> N
     assert "gh workflow run release-engine-docker.yml --ref v1.14.0 -f engine=vllm" in out
     assert "gh workflow run release-go.yml --ref v1.14.0 -f version=1.14.0" in out
     assert "smg==1.14.0," in out and "and latest" in out
+    assert "-ol9 appended = the Oracle Linux 9 router for linux/amd64" in out
     assert "     smg 1.14.0\n" in out and "     tool-parser 0.6.0\n" in out
     assert "openapi-gen" not in out, (
         "a crate with publish = false is never published: not in the plan"
@@ -3592,7 +3595,7 @@ def test_the_grpc_release_selects_a_package_until_pypi_holds_both_its_files(tmp_
 # reached anyway.
 REGISTRY_WORKFLOWS = {
     "release-pypi.yml": ("build", "build-sdist"),
-    "release-crates.yml": ("tier1",),
+    "release-crates.yml": ("tier0",),
     "release-grpc.yml": ("detect",),
 }
 CANDIDATE_IF = "${{ !contains(github.ref_name, '-rc.') }}"
@@ -3883,11 +3886,13 @@ def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sand
     # main's floor quotes an older floor in its comment and has an entry after it
     floor = '    "smg-grpc-proto>=0.4.0",  # up from "smg-grpc-proto>=0.3.0"\n'
     extra = 'mlx = ["smg-grpc-proto>=0.4.0", "mlx>=0.22.0"]\n'
+    # an extra whose first entry is a literal string with a URL fragment: its hash opens no comment
+    frag = "cu = ['wheel @ https://example.org/w.whl#sha256=abc', \"smg-grpc-proto>=0.4.0\"]\n"
     repo.commit_main(
         "chore(servicer): the floors",
         "grpc_servicer/pyproject.toml",
         '[project]\nname = "smg-grpc-servicer"\nversion = "0.14.0"\n'
-        f'dependencies = [\n{floor}    "grpcio>=1.60",\n]\n\n[project.optional-dependencies]\n{extra}',
+        f'dependencies = [\n{floor}    "grpcio>=1.60",\n]\n\n[project.optional-dependencies]\n{extra}{frag}',
     )
     repo.cut()
     # the branch's bump raised the floors with what it published (by hand, as a cut's review does):
@@ -3899,7 +3904,8 @@ def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sand
         "grpc_servicer/pyproject.toml",
         repo.read("grpc_servicer/pyproject.toml")
         .replace(floor + '    "grpcio>=1.60",\n', '    "grpcio>=1.70",\n' + raised)
-        .replace(extra, 'mlx = ["smg-grpc-proto>=0.5.0", "mlx>=0.23.0"]\n'),
+        .replace(extra, 'mlx = ["smg-grpc-proto>=0.5.0", "mlx>=0.23.0"]\n')
+        .replace(frag, frag.replace("0.4.0", "0.5.0")),
     )
     repo.git("add", "-A")
     repo.git("commit", "--quiet", "-m", "chore(release): the servicer's floors")
@@ -3917,15 +3923,16 @@ def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sand
     # the branch's requirement and comment, main's comma (an entry follows on main): one line
     followed = '    "smg-grpc-proto>=0.5.0",  # 0.5.0 adds the fields the servicer reads\n'
     assert followed in text, text
-    assert text.count("smg-grpc-proto>=0.5.0") == 2 and "0.3.0" not in text, text
+    assert text.count("smg-grpc-proto>=0.5.0") == 3 and "0.3.0" not in text, text
     assert 'mlx = ["smg-grpc-proto>=0.5.0", "mlx>=0.22.0"]\n' in text, text
+    assert frag.replace("0.4.0", "0.5.0") in text, text
     assert tomllib.loads(text)["project"]["dependencies"] == [
         "smg-grpc-proto>=0.5.0",
         "grpcio>=1.60",
     ]
     assert '"grpcio>=1.60"' in text, "a floor on a package that is not ours is the maintainer's"
-    assert done.stdout.count("grpc_servicer/pyproject.toml smg-grpc-proto>=: 0.4.0 -> 0.5.0") == 2
-    assert "0.4.0 -> 0.5.0 (requirement 2)" in done.stdout, done.stdout
+    assert done.stdout.count("grpc_servicer/pyproject.toml smg-grpc-proto>=: 0.4.0 -> 0.5.0") == 3
+    assert "0.4.0 -> 0.5.0 (requirement 3)" in done.stdout, done.stdout
     again = subprocess.run(
         [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
         cwd=repo.work,
@@ -3947,6 +3954,86 @@ def test_sync_versions_carries_the_dependency_floors_a_release_raised(repo: Sand
     )
     assert kept.returncode == 0 and "already follows" in kept.stdout, kept.stdout
     assert repo.read("grpc_servicer/pyproject.toml") == higher
+
+
+def test_sync_versions_refuses_a_floor_it_cannot_pair_by_position(repo: Sandbox) -> None:
+    """A name that occurs a different number of times in main's file and the release's (an extra
+    added on one side since the cut, placed before an older one) cannot be paired by position: the
+    sync names the file, the name and the counts, moves nothing for that name and fails, so the
+    release flow stops for a move by hand rather than writing a floor onto the wrong entry."""
+    floor = '    "smg-grpc-proto>=0.4.0",\n'
+    extra = 'mlx = ["smg-grpc-proto>=0.4.0", "mlx>=0.22.0"]\n'
+    repo.commit_main(
+        "chore(servicer): the floors",
+        "grpc_servicer/pyproject.toml",
+        '[project]\nname = "smg-grpc-servicer"\nversion = "0.14.0"\n'
+        f'dependencies = [\n{floor}    "grpcio>=1.60",\n]\n\n[project.optional-dependencies]\n{extra}',
+    )
+    repo.cut()
+    repo.git("switch", "--quiet", "release/1.14")
+    repo.put(
+        "grpc_servicer/pyproject.toml",
+        repo.read("grpc_servicer/pyproject.toml").replace("0.4.0", "0.5.0"),
+    )
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "chore(release): the servicer's floors")
+    repo.land_on_release()
+    repo.git("switch", "--quiet", "main")
+    # main added an extra with its own requirement on the proto package, before the mlx extra
+    repo.put(
+        "grpc_servicer/pyproject.toml",
+        repo.read("grpc_servicer/pyproject.toml").replace(
+            extra, 'tpu = ["smg-grpc-proto>=0.4.0"]\n' + extra
+        ),
+    )
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "feat(servicer): a tpu extra")
+    done = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert done.returncode == 1, done.stdout + done.stderr
+    assert (
+        "sync_versions: grpc_servicer/pyproject.toml: smg-grpc-proto>= occurs 3 time(s) here and 2"
+        " in origin/release/1.14: the pairing is ambiguous, not moved (move it by hand)"
+    ) in done.stderr, done.stderr
+    text = repo.read("grpc_servicer/pyproject.toml")
+    assert "0.5.0" not in text and text.count("smg-grpc-proto>=0.4.0") == 3, text
+    # the move by hand the message asks for: main carries the release's floors, the counts still
+    # differ (the release never takes main's new extra), nothing is pending, and the rerun passes
+    repo.put("grpc_servicer/pyproject.toml", text.replace("0.4.0", "0.5.0"))
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "chore(servicer): the floors by hand")
+    again = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "ambiguous" not in again.stderr and "already follows" in again.stdout, again.stdout
+    # main dropping its extras is the same case the other way (one occurrence against two)
+    repo.put(
+        "grpc_servicer/pyproject.toml",
+        repo.read("grpc_servicer/pyproject.toml")
+        .replace('tpu = ["smg-grpc-proto>=0.5.0"]\n', "")
+        .replace(extra.replace("0.4.0", "0.5.0"), ""),
+    )
+    assert repo.read("grpc_servicer/pyproject.toml").count("smg-grpc-proto>=") == 1
+    repo.git("add", "-A")
+    repo.git("commit", "--quiet", "-m", "chore(servicer): the extras dropped")
+    dropped = subprocess.run(
+        [sys.executable, str(repo.work / SYNC), "origin/release/1.14", "1.14.0"],
+        cwd=repo.work,
+        env=repo.env(),
+        capture_output=True,
+        text=True,
+    )
+    assert dropped.returncode == 0 and "ambiguous" not in dropped.stderr, dropped.stderr
 
 
 def test_sync_versions_usage_and_version_order() -> None:

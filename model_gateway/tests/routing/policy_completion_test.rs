@@ -14,11 +14,14 @@ use axum::{
 };
 use futures_util::{stream, StreamExt};
 use http_body_util::BodyExt;
+use openai_protocol::model_card::ModelCard;
 use smg::{
-    routers::{router::Router as HttpRouter, RouterTrait},
+    routers::{
+        grpc::backend_client::BasicWorkerBuilder, router::Router as HttpRouter, RouterTrait,
+    },
     tenant::{RouteRequestMeta, TenantKey},
-    worker::{BasicWorkerBuilder, ModelCard, RequestCompletionSink, Worker},
 };
+use smg_worker::identity::basic::{RequestCompletionSink, Worker};
 use tokio::{net::TcpListener, time::timeout};
 
 use super::streaming_chat_request;
@@ -87,7 +90,12 @@ async fn http_stream_cancelled_mid_way_reports_one_completion() {
     let (router, spy) = router_with_spy(&upstream_url).await;
     let meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
     let response = router
-        .route_chat(None, &meta, streaming_chat_request(), "mock-model")
+        .route_chat(
+            None,
+            &meta,
+            Arc::new(streaming_chat_request()),
+            "mock-model",
+        )
         .await;
     assert_eq!(response.status(), 200);
     let mut body = response.into_body();

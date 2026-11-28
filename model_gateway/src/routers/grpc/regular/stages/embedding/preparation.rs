@@ -1,15 +1,21 @@
-//! Preparation stage for embedding requests
+//! Preparation stage for embedding and classification requests: the inputs
+//! of the request, one per member of its batch, each tokenized by the gateway
+//! or taken as the token ids the client sent.
 
 use async_trait::async_trait;
 use axum::response::Response;
-use openai_protocol::common::GenerationRequest;
-use tracing::error;
+use llm_tokenizer::traits::Tokenizer;
+use openai_protocol::completion::CompletionPrompt;
+use serde::Deserialize;
+use serde_json::Value;
+use tracing::{error, warn};
 
 use crate::routers::{
     error,
     grpc::{
         common::stages::PipelineStage,
-        context::{PreparationOutput, RequestContext, RequestType},
+        context::{EmbeddingInput, PreparationOutput, RequestContext, RequestType},
+        regular::stages::token_ids::{reject_unknown_token_id, reported_embedding_rows},
         utils,
     },
 };
@@ -25,10 +31,10 @@ impl EmbeddingPreparationStage {
 #[async_trait]
 impl PipelineStage for EmbeddingPreparationStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
-        // Extract text from embedding or classify request (both use same preparation)
-        let text = match &ctx.input.request_type {
-            RequestType::Embedding(req) => req.extract_text_for_routing(),
-            RequestType::Classify(req) => req.extract_text_for_routing(),
+        // The input of an embedding or classify request (both are prepared here).
+        let input = match &ctx.input.request_type {
+            RequestType::Embedding(req) => &req.input,
+            RequestType::Classify(req) => &req.input,
             _ => {
                 error!(
                     function = "EmbeddingPreparationStage::execute",
@@ -40,37 +46,44 @@ impl PipelineStage for EmbeddingPreparationStage {
                 ));
             }
         };
-        if text.is_empty() {
-            return Err(error::bad_request(
-                "empty_input",
-                "Input text cannot be empty",
-            ));
-        }
+        let input = embedding_inputs(input)?;
 
         // Resolve tokenizer from registry (cached for potential reuse)
         let tokenizer =
             utils::resolve_tokenizer(ctx, "EmbeddingPreparationStage::execute").map_err(|e| *e)?;
 
-        // Tokenize with special tokens (BOS/EOS) for embeddings
-        // This matches Python's transformers behavior which reads add_bos_token/add_eos_token from tokenizer_config.json
-        let token_ids = utils::encode_blocking(tokenizer.clone(), &text, true)
-            .await
-            .map_err(|e| {
-                error!(
-                    function = "EmbeddingPreparationStage::execute",
-                    error = %e,
-                    "Tokenization failed"
-                );
-                error::bad_request("tokenization_failed", format!("Tokenization failed: {e}"))
-            })?
-            .token_ids()
-            .to_vec();
+        // The embedding table the model's workers report, read only after an
+        // id the tokenizer does not know (the bound of a token-id input).
+        let worker_registry = &ctx.components.worker_registry;
+        let model_id = ctx.input.model_id.as_str();
+        let embedding_rows = || reported_embedding_rows(worker_registry, model_id);
 
-        // Store preparation output
-        ctx.state.preparation = Some(PreparationOutput::Embedding {
-            original_text: text,
-            token_ids,
-        });
+        let inputs = match input {
+            CompletionPrompt::Text(text) => encode_inputs(&tokenizer, vec![text]).await?,
+            CompletionPrompt::Texts(texts) => encode_inputs(&tokenizer, texts).await?,
+            CompletionPrompt::TokenIds(ids) => {
+                vec![token_input(
+                    tokenizer.as_ref(),
+                    ids,
+                    "input",
+                    embedding_rows,
+                )?]
+            }
+            CompletionPrompt::TokenIdBatches(batches) => batches
+                .into_iter()
+                .enumerate()
+                .map(|(b, ids)| {
+                    token_input(
+                        tokenizer.as_ref(),
+                        ids,
+                        &format!("input[{b}]"),
+                        embedding_rows,
+                    )
+                })
+                .collect::<Result<_, _>>()?,
+        };
+
+        ctx.state.preparation = Some(PreparationOutput::Embedding { inputs });
 
         Ok(())
     }
@@ -79,3 +92,129 @@ impl PipelineStage for EmbeddingPreparationStage {
         "EmbeddingPreparation"
     }
 }
+
+/// The client-visible code of an input of a shape this route has no form
+/// for: an array of structured members (the fifth shape the public validator
+/// admits, for the engine's own server), or, when a request reaches the stage
+/// unvalidated, an object, a mixed array or a negative id.
+pub(crate) const INVALID_INPUT_CODE: &str = "invalid_input";
+/// The client-visible code of an input with nothing to embed: an empty text
+/// or id list, or a batch with an empty member.
+pub(crate) const EMPTY_INPUT_CODE: &str = "empty_input";
+/// The client-visible code of a token-id input with an id the model has no
+/// row for.
+pub(crate) const INVALID_INPUT_TOKEN_CODE: &str = "invalid_input_token";
+
+/// The request's `input` in the four shapes of the public contract, the ones
+/// a completion's `prompt` takes: one text, a batch of texts, one input of
+/// token ids, or a batch of token-id inputs. Any other shape, an empty input
+/// and an empty member of a batch are refused by name, before a tokenizer or
+/// a worker is spoken to.
+fn embedding_inputs(input: &Value) -> Result<CompletionPrompt, Response> {
+    // The public validator admits a fifth shape on the embeddings route, an
+    // array of structured members for the engine's own server; the tokenized
+    // wire has no form for it, so it is refused by name, not as a malformed
+    // request.
+    if matches!(input, Value::Array(members) if members.first().is_some_and(Value::is_object)) {
+        return Err(error::bad_request(
+            INVALID_INPUT_CODE,
+            "input as an array of objects (structured members) is not served by the gRPC router; \
+             send a string, an array of strings, an array of token ids or an array of token-id arrays",
+        ));
+    }
+    let prompt = CompletionPrompt::deserialize(input).map_err(|e| {
+        error::bad_request(
+            INVALID_INPUT_CODE,
+            format!(
+                "input must be a string, an array of strings, an array of token ids or an \
+                 array of token-id arrays: {e}"
+            ),
+        )
+    })?;
+    let empty = match &prompt {
+        CompletionPrompt::Text(text) => text.is_empty().then(|| "input".to_owned()),
+        CompletionPrompt::TokenIds(ids) => ids.is_empty().then(|| "input".to_owned()),
+        CompletionPrompt::Texts(texts) => empty_member(texts.iter().map(String::is_empty)),
+        CompletionPrompt::TokenIdBatches(batches) => {
+            empty_member(batches.iter().map(Vec::is_empty))
+        }
+    };
+    match empty {
+        Some(field) => Err(error::bad_request(
+            EMPTY_INPUT_CODE,
+            format!("{field} cannot be empty"),
+        )),
+        None => Ok(prompt),
+    }
+}
+
+/// The name of the first empty member of a batch, or of the batch itself
+/// when it has none.
+fn empty_member(members: impl ExactSizeIterator<Item = bool>) -> Option<String> {
+    if members.len() == 0 {
+        return Some("input".to_owned());
+    }
+    members
+        .enumerate()
+        .find_map(|(i, empty)| empty.then(|| format!("input[{i}]")))
+}
+
+/// The text inputs encoded with the model's special tokens (as the
+/// transformers tokenizers add them for embeddings), one input per text: one
+/// text takes the single encode, a batch the in-place pass over its texts.
+async fn encode_inputs(
+    tokenizer: &std::sync::Arc<dyn Tokenizer>,
+    texts: Vec<String>,
+) -> Result<Vec<EmbeddingInput>, Response> {
+    let encodings = match texts.as_slice() {
+        [text] => utils::encode_blocking(tokenizer.clone(), text, true)
+            .await
+            .map(|encoding| vec![encoding]),
+        _ => utils::encode_texts_blocking(tokenizer.clone(), &texts, true).await,
+    };
+    let encodings = encodings.map_err(|e| {
+        error!(
+            function = "EmbeddingPreparationStage::execute",
+            error = %e,
+            "Tokenization failed"
+        );
+        error::bad_request("tokenization_failed", format!("Tokenization failed: {e}"))
+    })?;
+    Ok(texts
+        .into_iter()
+        .zip(encodings)
+        .map(|(text, encoding)| EmbeddingInput {
+            text: Some(text),
+            token_ids: encoding.into_token_ids(),
+        })
+        .collect())
+}
+
+/// An input given as token ids: it goes to the engine as given, with no
+/// encode and no text beside it, once every id is bound to a row of the
+/// model's embedding table ([`reject_unknown_token_id`], the rule the
+/// completion and `/generate` prompts apply). `field` names the input in a
+/// refusal: `input`, or `input[b]` for one member of a batch.
+fn token_input(
+    tokenizer: &dyn Tokenizer,
+    ids: Vec<u32>,
+    field: &str,
+    embedding_rows: impl FnOnce() -> Option<usize>,
+) -> Result<EmbeddingInput, Response> {
+    reject_unknown_token_id(tokenizer, &ids, field, embedding_rows).map_err(|message| {
+        warn!(
+            function = "EmbeddingPreparationStage::execute",
+            error = %message,
+            "Input token id outside the model's vocabulary"
+        );
+        error::bad_request(INVALID_INPUT_TOKEN_CODE, message)
+    })?;
+    Ok(EmbeddingInput {
+        text: None,
+        token_ids: ids,
+    })
+}
+
+#[cfg(test)]
+#[path = "../../../../../../tests/unit/routers/grpc/regular/stages/embedding/preparation/tests.rs"]
+mod tests;

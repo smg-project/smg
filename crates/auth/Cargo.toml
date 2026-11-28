@@ -29,6 +29,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 subtle.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 # Only used by auth
 # jsonwebtoken 10 decouples crypto behind a provider trait; `rust_crypto` selects the
@@ -40,7 +41,7 @@ url = "2.5"
 [dev-dependencies]
 base64 = "0.22"
 rsa = "0.9"
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util", "sync"] }
 tower = { version = "0.5", features = ["util"] }
 
 [lints]

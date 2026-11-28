@@ -14,22 +14,37 @@ pub(crate) mod mode;
 pub(crate) mod multimodal;
 pub(crate) mod pipeline;
 pub(crate) mod proto_wrapper;
+/// The dispatch tickets' benchmark seam: what `benches/dispatch_tickets.rs` drives,
+/// compiled for the crate's test targets only.
+#[cfg(any(test, feature = "test-util"))]
+pub use proto_wrapper::dispatch_ticket_life;
 pub(crate) mod regular;
 pub(crate) mod router; // Used by routers/factory
 pub(crate) mod sequential_pd;
 pub(crate) mod spec;
 #[cfg(test)]
+#[path = "../../../tests/unit/routers/grpc/test_engine.rs"]
 pub(crate) mod test_engine;
 #[cfg(test)]
+#[path = "../../../tests/unit/routers/grpc/testing.rs"]
 pub(crate) mod testing;
 #[cfg(any(test, feature = "test-util"))]
 pub mod tokenizer_cache;
 pub mod utils; // Used by routers/http and bindings/golang
-/// The stream state machines' benchmark seams: what `benches/stream_state_machines.rs`
-/// drives, compiled for the crate's test targets only.
+/// The stream state machines' benchmark seams: what `benches/stream_state_machines.rs`,
+/// `benches/forced_call_stream.rs` and `benches/symphony_messages_stream.rs` drive, compiled
+/// for the crate's test targets only.
 #[cfg(any(test, feature = "test-util"))]
-pub use regular::streaming::bench::{EngineScript, StreamBench};
+pub use regular::streaming::bench::{EngineScript, ForcedChat, StreamBench};
 pub(crate) mod wire;
+#[cfg(test)]
+#[path = "../../../tests/unit/routers/grpc/worker_identity_tests/mod.rs"]
+mod worker_identity_tests;
+/// The worker selection stage's benchmark seam: what
+/// `benches/policy_selection.rs` drives for the stage's own placements,
+/// compiled for the crate's test targets only.
+#[cfg(any(test, feature = "test-util"))]
+pub use common::stages::SelectionBench;
 pub mod zmq_client; // ZMQ backend adapter behind the vLLM client surface
 
 // Re-export for convenience
@@ -93,43 +108,5 @@ pub struct ProcessedMessages {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::routers::error::extract_error_code_from_response;
-
-    #[test]
-    fn validates_grpc_text_only_output() {
-        for modalities in [
-            None,
-            Some(vec![]),
-            Some(vec!["text".to_string()]),
-            Some(vec!["text".to_string(), "text".to_string()]),
-        ] {
-            let request = ChatCompletionRequest {
-                modalities,
-                ..Default::default()
-            };
-            assert!(validate_text_only_output(&request).is_ok());
-        }
-
-        let audio_request = ChatCompletionRequest {
-            return_audio: Some(true),
-            ..Default::default()
-        };
-        let response = validate_text_only_output(&audio_request).unwrap_err();
-        assert_eq!(
-            extract_error_code_from_response(&response),
-            "audio_output_not_supported"
-        );
-
-        let modality_request = ChatCompletionRequest {
-            modalities: Some(vec!["text".to_string(), "audio".to_string()]),
-            ..Default::default()
-        };
-        let response = validate_text_only_output(&modality_request).unwrap_err();
-        assert_eq!(
-            extract_error_code_from_response(&response),
-            "unsupported_output_modality"
-        );
-    }
-}
+#[path = "../../../tests/unit/routers/grpc/tests.rs"]
+mod tests;

@@ -14,6 +14,8 @@ use axum::{
 
 #[cfg(feature = "axum")]
 use crate::transcription::{AudioFile, TranscriptionRequest};
+#[cfg(feature = "axum")]
+use crate::validated::rejection;
 
 /// Extractor for `/v1/audio/transcriptions` requests.
 ///
@@ -131,9 +133,18 @@ impl<S: Send + Sync> FromRequest<S> for AudioTranscriptionMultipart {
                         Err(e) => return Err(bad_text_field("stream", e)),
                     }
                 }
-                _ => {
-                    // Unknown field; drain to free resources but otherwise ignore.
+                _ if name.is_empty() || field.file_name().is_some() => {
+                    // A part without a name, or a file under another name:
+                    // drained to free resources, but otherwise ignored.
                     let _ = field.bytes().await;
+                }
+                _ => {
+                    // A text part the type does not model rides to the worker
+                    // under its own name, in order.
+                    match field.text().await {
+                        Ok(t) => request.other.push((name, t)),
+                        Err(e) => return Err(bad_text_field(&name, e)),
+                    }
                 }
             }
         }
@@ -184,7 +195,7 @@ impl<S: Send + Sync> FromRequest<S> for AudioTranscriptionMultipart {
 /// refusal is about when there is one.
 #[cfg(feature = "axum")]
 fn bad_request(code: &str, param: Option<&str>, message: String) -> Response {
-    crate::validated::rejection(
+    rejection(
         StatusCode::BAD_REQUEST,
         code,
         param.map(str::to_owned),
@@ -306,6 +317,63 @@ mod tests {
         assert!(
             message.starts_with("Invalid 'temperature' value:"),
             "{body}"
+        );
+    }
+
+    /// The text parts the type does not model are kept in order, under the
+    /// names they came with, a repeated one each time; a file under another
+    /// name is drained.
+    #[tokio::test]
+    async fn the_text_parts_the_type_does_not_model_are_kept_in_order() {
+        let part = |name: &str, value: &str| {
+            format!("--cut\nContent-Disposition: form-data; name=\"{name}\"\n\n{value}\n")
+        };
+        let form = [
+            "--cut\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\nContent-Type: audio/wav\n\nRIFF\n".to_string(),
+            part("model", "gpt-4o-transcribe-diarize"),
+            part("include[]", "logprobs"),
+            part("chunking_strategy[type]", "server_vad"),
+            part("chunking_strategy[prefix_padding_ms]", "300"),
+            part("known_speaker_names[]", "agent"),
+            part("known_speaker_references[]", "data:audio/wav;base64,UklGRg=="),
+            "--cut\nContent-Disposition: form-data; name=\"attachment\"; filename=\"b.wav\"\n\nRIFF\n".to_string(),
+            part("known_speaker_names[]", "customer"),
+            part("response_format", "diarized_json"),
+            "--cut--\n".to_string(),
+        ]
+        .concat();
+        let request = Request::builder()
+            .method("POST")
+            .header("content-type", "multipart/form-data; boundary=cut")
+            .body(Body::from(form.replace('\n', "\r\n")))
+            .expect("a request");
+        let Ok(taken) = AudioTranscriptionMultipart::from_request(request, &()).await else {
+            panic!("the form is taken");
+        };
+        assert_eq!(taken.request.model, "gpt-4o-transcribe-diarize");
+        assert_eq!(
+            taken.request.response_format.as_deref(),
+            Some("diarized_json")
+        );
+        let other: Vec<(&str, &str)> = taken
+            .request
+            .other
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        assert_eq!(
+            other,
+            [
+                ("include[]", "logprobs"),
+                ("chunking_strategy[type]", "server_vad"),
+                ("chunking_strategy[prefix_padding_ms]", "300"),
+                ("known_speaker_names[]", "agent"),
+                (
+                    "known_speaker_references[]",
+                    "data:audio/wav;base64,UklGRg=="
+                ),
+                ("known_speaker_names[]", "customer"),
+            ]
         );
     }
 }

@@ -146,13 +146,13 @@ ignores --tenant-rate-limit-config and --priority-scheduler-config without
 their enabled flags). Renders nothing.
 */}}
 {{- define "smg.validateAdmission" -}}
-{{- if and .Values.router.tenantRateLimit.enabled (not .Values.router.tenantRateLimit.configMap.name) -}}
+{{- if and (.Values.router.tenantRateLimit).enabled (not ((.Values.router.tenantRateLimit).configMap).name) -}}
 {{- fail "router.tenantRateLimit.enabled needs router.tenantRateLimit.configMap.name: the gateway requires --tenant-rate-limit-config with --tenant-rate-limit-enabled" -}}
 {{- end -}}
-{{- if and .Values.router.priorityScheduler.configMap.name (not .Values.router.priorityScheduler.enabled) -}}
+{{- if and ((.Values.router.priorityScheduler).configMap).name (not .Values.router.priorityScheduler.enabled) -}}
 {{- fail "router.priorityScheduler.configMap.name without router.priorityScheduler.enabled: the gateway ignores --priority-scheduler-config without --priority-scheduler-enabled" -}}
 {{- end -}}
-{{- if and .Values.router.tenantRateLimit.configMap.name (not .Values.router.tenantRateLimit.enabled) -}}
+{{- if and ((.Values.router.tenantRateLimit).configMap).name (not .Values.router.tenantRateLimit.enabled) -}}
 {{- fail "router.tenantRateLimit.configMap.name without router.tenantRateLimit.enabled: the gateway ignores --tenant-rate-limit-config without --tenant-rate-limit-enabled" -}}
 {{- end -}}
 {{- end -}}
@@ -250,8 +250,16 @@ Called from the router Deployment template.
 {{- end -}}
 {{- if .Values.router.adminPort }}
 {{- $admin := int .Values.router.adminPort -}}
-{{- if or (eq $admin (int .Values.router.port)) (eq $admin (int .Values.router.metrics.port)) (and .Values.router.mesh.enabled (eq $admin (int .Values.router.mesh.port))) -}}
-{{- fail (printf "router.adminPort %d is another listener's port (router.port, router.metrics.port or router.mesh.port): the gateway refuses two listeners on one port" $admin) -}}
+{{- $taken := "" -}}
+{{- if eq $admin (int .Values.router.port) -}}
+{{- $taken = "router.port" -}}
+{{- else if eq $admin (int .Values.router.metrics.port) -}}
+{{- $taken = "router.metrics.port" -}}
+{{- else if and .Values.router.mesh.enabled (eq $admin (int .Values.router.mesh.port)) -}}
+{{- $taken = "router.mesh.port" -}}
+{{- end -}}
+{{- if $taken -}}
+{{- fail (printf "router.adminPort %d equals %s: the gateway refuses two listeners on one port" $admin $taken) -}}
 {{- end }}
 - "--admin-port"
 - {{ .Values.router.adminPort | quote }}
@@ -355,8 +363,8 @@ Called from the router Deployment template.
 {{- end }}
 {{- end }}
 {{- end }}
-{{- $disaggregationMode := .Values.router.disaggregation.mode | default "" }}
-{{- $roleWorkers := or .Values.router.disaggregation.prefill .Values.router.disaggregation.decode .Values.router.disaggregation.encode }}
+{{- $disaggregationMode := (.Values.router.disaggregation).mode | default "" }}
+{{- $roleWorkers := or (.Values.router.disaggregation).prefill (.Values.router.disaggregation).decode (.Values.router.disaggregation).encode }}
 {{- $chartWorkersAreRegular := and .Values.workers (not (include "smg.discoveryProvider" .)) (not (include "smg.meshRouterDiscovery" .)) }}
 {{- /* A disaggregated gateway reads only its role workers and drops regular
      worker URLs without a word, so the chart refuses them under a mode and
@@ -413,7 +421,7 @@ Called from the router Deployment template.
 - "--selector"
 - {{ .selector | quote }}
 {{- end }}
-{{- $mode := $.Values.router.disaggregation.mode | default "" }}
+{{- $mode := ($.Values.router.disaggregation).mode | default "" }}
 {{- if and (not $mode) (or .prefillSelector .decodeSelector .encodeSelector) -}}
 {{- fail "router.discovery.kubernetes names a role selector (prefillSelector, decodeSelector or encodeSelector) without router.disaggregation.mode: set mode to pd or epd" -}}
 {{- end }}
@@ -448,7 +456,7 @@ Called from the router Deployment template.
 - {{ include "smg.discoveryFilePath" $ | quote }}
 {{- else if eq .provider "slurm" }}
 {{- with .slurm }}
-{{- $mode := $.Values.router.disaggregation.mode | default "" }}
+{{- $mode := ($.Values.router.disaggregation).mode | default "" }}
 {{- if and (not $mode) (or .prefillJobNames .decodeJobNames .encodeJobNames) -}}
 {{- fail "router.discovery.slurm names a role job (prefillJobNames, decodeJobNames or encodeJobNames) without router.disaggregation.mode: set mode to pd or epd" -}}
 {{- end }}
@@ -545,7 +553,9 @@ Called from the router Deployment template.
 - "--request-timeout-secs"
 - {{ .Values.router.requestTimeoutSecs | quote }}
 - "--mm-turbojpeg"
-- {{ .Values.router.mmTurbojpeg | quote }}
+{{- /* Absent when an upgrade reuses the values of a release from before this
+     value: the chart's default then, where the gateway's own is prefer. */}}
+- {{ .Values.router.mmTurbojpeg | default "require" | quote }}
 {{- if .Values.router.grpcRequestTimeoutSecs }}
 - "--grpc-request-timeout-secs"
 - {{ .Values.router.grpcRequestTimeoutSecs | quote }}
@@ -669,19 +679,21 @@ Called from the router Deployment template.
 - "--control-plane-api-keys-file"
 - {{ printf "/etc/smg/control-plane/%s" (include "smg.controlPlaneSecretKey" .) | quote }}
 {{- end }}
-{{- if .Values.router.tenantRateLimit.enabled }}
+{{- if (.Values.router.tenantRateLimit).enabled }}
 - "--tenant-rate-limit-enabled"
 {{- end }}
-{{- if .Values.router.tenantRateLimit.configMap.name }}
+{{- if ((.Values.router.tenantRateLimit).configMap).name }}
 - "--tenant-rate-limit-config"
-- {{ printf "/etc/smg/rate-limit/%s" .Values.router.tenantRateLimit.configMap.key | quote }}
+{{- /* No key when an upgrade reuses the values of a release from before the
+     block and turns it on, as for the scheduler below: the chart's default. */}}
+- {{ printf "/etc/smg/rate-limit/%s" (.Values.router.tenantRateLimit.configMap.key | default "rate-limit.yaml") | quote }}
 {{- end }}
-{{- if .Values.router.priorityScheduler.enabled }}
+{{- if (.Values.router.priorityScheduler).enabled }}
 - "--priority-scheduler-enabled"
 {{- end }}
-{{- if .Values.router.priorityScheduler.configMap.name }}
+{{- if ((.Values.router.priorityScheduler).configMap).name }}
 - "--priority-scheduler-config"
-- {{ printf "/etc/smg/scheduler/%s" .Values.router.priorityScheduler.configMap.key | quote }}
+- {{ printf "/etc/smg/scheduler/%s" (.Values.router.priorityScheduler.configMap.key | default "scheduler.yaml") | quote }}
 {{- end }}
 {{- range .Values.router.extraArgs }}
 - {{ . | quote }}
@@ -718,9 +730,9 @@ names a Secret the operator manages; otherwise `auth.controlPlane.apiKeys`,
 when set, is written into a chart-managed Secret. Empty when neither is set.
 */}}
 {{- define "smg.controlPlaneSecretName" -}}
-{{- if .Values.auth.controlPlane.existingSecret -}}
+{{- if (.Values.auth.controlPlane).existingSecret -}}
 {{- .Values.auth.controlPlane.existingSecret -}}
-{{- else if .Values.auth.controlPlane.apiKeys -}}
+{{- else if (.Values.auth.controlPlane).apiKeys -}}
 {{- printf "%s-control-plane" (include "smg.fullname" .) -}}
 {{- end -}}
 {{- end }}
@@ -969,4 +981,299 @@ Used by smg.routerArgs when workers are defined but workerUrls is empty.
 {{- end }}
 - "{{ $scheme }}://{{ include "smg.fullname" $ }}-worker-{{ $worker.name }}:{{ $port }}"
 {{- end }}
+{{- end }}
+
+{{/*
+Grand Central name -- its Deployment, its Service, its budget and its
+ServiceMonitor.
+*/}}
+{{- define "smg.grandCentralName" -}}
+{{- printf "%s-grand-central" (include "smg.fullname" .) -}}
+{{- end }}
+
+{{/*
+Grand Central election -- "true" when grandCentral.election.enabled
+is set; empty when it is not, and over values that hold no election block.
+*/}}
+{{- define "smg.grandCentralElection" -}}
+{{- if ((.Values.grandCentral).election).enabled -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Grand Central Lease name -- grandCentral.election.leaseName, or the
+controller's full name when it is empty: two releases in one namespace never
+share a Lease. No revision is in it: a name that moved at an upgrade would
+elect a second leader beside the first.
+*/}}
+{{- define "smg.grandCentralLeaseName" -}}
+{{- default (include "smg.grandCentralName" .) ((.Values.grandCentral).election).leaseName -}}
+{{- end }}
+
+{{/*
+Grand Central replica count -- the count as a reader of the rendered
+manifest takes it, a whole number: a count given as text that reads there
+as a number (2e0, or a 2 after a blank) counts as that number. Zero for a
+null and for a text that reads as no number. Every place that judges the
+count asks here.
+*/}}
+{{- define "smg.grandCentralReplicaCount" -}}
+{{- int (fromYaml (printf "count: %v" .Values.grandCentral.replicas)).count -}}
+{{- end }}
+
+{{/*
+Grand Central replicas -- more than one only with the election on. With
+it off every replica is a controller of its own, and two would each lead
+alone: the render refuses them. The count is compared as a reader of the
+rendered manifest takes it: a text that reads there as a number above one
+(2e0, or a 2 after a blank) is refused as that number is. It is written as
+the values hold it: a null stays the API's default. Beside a spec store the
+refusal says one way out, not two: a store takes no election.
+*/}}
+{{- define "smg.grandCentralReplicas" -}}
+{{- $replicas := .Values.grandCentral.replicas -}}
+{{- $read := include "smg.grandCentralReplicaCount" . -}}
+{{- if and (gt (int $read) 1) (not (include "smg.grandCentralElection" .)) -}}
+{{- if include "smg.grandCentralSpecStore" . -}}
+{{- fail (printf "grandCentral.replicas is %v beside grandCentral.specStoreClaim: each replica would lead alone, and a spec store holds one controller's generations. Keep one replica" $replicas) -}}
+{{- end -}}
+{{- fail (printf "grandCentral.replicas is %v with grandCentral.election.enabled off: each replica would lead alone. Turn the election on, or keep one replica" $replicas) -}}
+{{- end -}}
+{{- $replicas -}}
+{{- end }}
+
+{{/*
+Grand Central selector labels -- the release's selector labels with the
+controller's own component, so no router or worker selector takes its pods.
+*/}}
+{{- define "smg.grandCentralSelectorLabels" -}}
+{{ include "smg.selectorLabels" . }}
+app.kubernetes.io/component: grand-central
+{{- end }}
+
+{{/*
+Grand Central image -- grandCentral.image, each part falling back to
+the router's image: the global registry, the global repository, and the
+router's tag with -grand-central appended, the tag a release publishes
+the controller under. One version names both images: a release publishes one
+controller image, so the router's -slurm or -ol9 variant takes it too, its
+own suffix cut first. The default tag belongs to the router's repository and
+stands on the router's tag, so a repository of the operator's own is refused
+without its tag, and so is a router image named by a digest. No release
+older than the first that publishes a controller image has one, so a tag
+that names such a release is refused too. Only the three numbers a release
+tag starts with are compared, each of nine digits at most, a number the
+comparer can hold: any other tag takes the default.
+*/}}
+{{- define "smg.grandCentralImage" -}}
+{{- $image := .Values.grandCentral.image -}}
+{{- $routerTag := .Values.global.image.tag | default .Chart.AppVersion -}}
+{{- if and $image.repository (not $image.tag) -}}
+{{- fail "grandCentral.image.repository needs grandCentral.image.tag: the default tag is the router's with -grand-central appended, and it belongs to the router's repository" -}}
+{{- end -}}
+{{- if and (not $image.tag) (contains "@" $routerTag) -}}
+{{- fail "grandCentral.image.tag is needed: global.image.tag names the router's image by a digest, and the controller's default tag is the router's tag with -grand-central appended" -}}
+{{- end -}}
+{{- $firstRelease := "1.16.0" -}}
+{{- $release := regexFind "^[0-9]{1,9}\\.[0-9]{1,9}\\.[0-9]{1,9}(-|$)" $routerTag | trimSuffix "-" -}}
+{{- if and (not $image.tag) $release -}}
+{{- if semverCompare (printf "<%s" $firstRelease) $release -}}
+{{- fail (printf "grandCentral.image.tag is needed: global.image.tag %s is older than %s, the first release that publishes a Grand Central image" $routerTag $firstRelease) -}}
+{{- end -}}
+{{- end -}}
+{{- $registry := $image.registry | default .Values.global.image.registry -}}
+{{- $repository := $image.repository | default .Values.global.image.repository -}}
+{{- $tag := $image.tag | default (printf "%s-grand-central" ($routerTag | trimSuffix "-slurm" | trimSuffix "-ol9")) -}}
+{{- printf "%s/%s:%s" $registry $repository $tag -}}
+{{- end }}
+
+{{/*
+Grand Central spec document -- grandCentral.spec as the bytes of the
+file the controller reads. The controller refuses a start that names no
+source of its spec, so values that hold no document are refused here, by
+name: a null, an empty map, or values with no such key. A value that is no
+map is refused as written, also one that reads as empty (false, 0, an empty
+text or list). The schema names each first, and the helper does where the
+schema's check is skipped. The chart reads no line of the document and
+writes none: whether it runs is the controller's word, and a generation
+line is the document's own.
+*/}}
+{{- define "smg.grandCentralSpec" -}}
+{{- $spec := (.Values.grandCentral).spec -}}
+{{- if not (or (kindIs "invalid" $spec) (kindIs "map" $spec)) -}}
+{{- fail (printf "grandCentral.spec is %s: the policy spec document as a map" (toJson $spec)) -}}
+{{- end -}}
+{{- if not $spec -}}
+{{- fail "grandCentral.spec holds no document: the controller refuses a start that names no source of its policy spec" -}}
+{{- end -}}
+{{- toYaml $spec -}}
+{{- end }}
+
+{{/*
+Grand Central spec store -- the claim named in
+grandCentral.specStoreClaim, and empty when none is named: the
+controller then runs the document of grandCentral.spec from its file. A
+store is the other source of the controller's spec. The controller is
+passed --spec-store on the claim's mount: it starts on the newest
+generation on file, and writes each generation an operator applies there.
+What the controller refuses at start beside a store is refused here, in
+its reasons: a document in grandCentral.spec, since a start names one
+source of its spec, and the election, since a standby does not follow an
+applied generation yet and the controller takes no store beside a lease
+another replica can take. More than one replica is refused where the count
+is judged. A value that is no text is refused as written, where the
+schema's check is skipped.
+*/}}
+{{- define "smg.grandCentralSpecStore" -}}
+{{- $claim := (.Values.grandCentral).specStoreClaim -}}
+{{- if not (or (kindIs "invalid" $claim) (kindIs "string" $claim)) -}}
+{{- fail (printf "grandCentral.specStoreClaim is %s: the name of a PersistentVolumeClaim, as text" (toJson $claim)) -}}
+{{- end -}}
+{{- if $claim -}}
+{{- if (.Values.grandCentral).spec -}}
+{{- fail (printf "grandCentral.specStoreClaim names %s and grandCentral.spec holds a document: the controller refuses a start that names two sources of its policy spec. Set grandCentral.spec to null and upgrade with --reset-then-reuse-values or --reset-values, which drops the release's other overrides: give them again (an empty map does not clear a reused document, and under --reuse-values a null does not either), or leave the claim unnamed" $claim) -}}
+{{- end -}}
+{{- if include "smg.grandCentralElection" . -}}
+{{- fail (printf "grandCentral.specStoreClaim names %s with grandCentral.election.enabled on: another replica can take the controller's lease, and a standby does not follow an applied generation in this build. Turn the election off, or keep the spec document" $claim) -}}
+{{- end -}}
+{{- $claim -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Grand Central CLI arguments -- every argument is a flag of
+smg-grand-central, each from a value. The controller's id is not here:
+the flag reads HOSTNAME, the pod's name. What the controller refuses at
+start is refused at render: two listeners on one port, a settle window
+over half the grace period (the controller's own default of 5 seconds when
+shutdownSettleSeconds is null) and a listener named to take identities as
+told that is none of the three: the schema names it first, and the helper
+does where the schema's check is skipped. A value that is no list is
+refused there as written, also one that reads as empty (false, 0, an empty
+text or map): null alone is the value left out. Those listeners are a set,
+said in the listeners' own order however the value was written: a reorder
+rolls no pod. With the election on the Lease is named,
+and the pod's own address, which the kubelet writes in place of $(POD_IP):
+the holder of the Lease is named by an address the others can dial. The
+spec file named is the one the Deployment mounts the document as: the one
+key of the document's ConfigMap, under the mount's directory. Where a spec
+store's claim is named the store's directory is passed in the file's
+place: the claim's mount.
+*/}}
+{{- define "smg.grandCentralArgs" -}}
+{{- $controller := .Values.grandCentral -}}
+{{- $seen := dict -}}
+{{- range $listener := list "gateway" "control" "replication" "admin" -}}
+{{- $port := index $controller.ports $listener | int | toString -}}
+{{- with index $seen $port -}}
+{{- fail (printf "grandCentral.ports.%s %s equals grandCentral.ports.%s: the controller refuses two listeners on one port" $listener $port .) -}}
+{{- end -}}
+{{- $_ := set $seen $port $listener -}}
+{{- end -}}
+{{- $grace := int $controller.shutdownGracePeriodSeconds -}}
+{{- $settle := 5 -}}
+{{- if not (kindIs "invalid" $controller.shutdownSettleSeconds) -}}
+{{- $settle = int $controller.shutdownSettleSeconds -}}
+{{- end -}}
+{{- $elected := include "smg.grandCentralElection" . -}}
+{{- $told := list -}}
+{{- $named := list -}}
+{{- if not (kindIs "invalid" $controller.identityAsTold) -}}
+{{- $named = $controller.identityAsTold -}}
+{{- end -}}
+{{- if not (kindIs "slice" $named) -}}
+{{- fail (printf "grandCentral.identityAsTold is %s: a list of listeners' names (gateway, control, replication)" (toJson $named)) -}}
+{{- end -}}
+{{- range $name := $named -}}
+{{- if not (has $name (list "gateway" "control" "replication")) -}}
+{{- fail (printf "grandCentral.identityAsTold names %v, none of the chart's listeners (gateway, control, replication)" $name) -}}
+{{- end -}}
+{{- end -}}
+{{- range $listener := list "gateway" "control" "replication" -}}
+{{- if has $listener $named -}}
+{{- $told = append $told $listener -}}
+{{- end -}}
+{{- end -}}
+{{- if gt (mul $settle 2) $grace -}}
+{{- fail (printf "grandCentral: a settle window of %d s is over half the grace period of %d s (shutdownSettleSeconds, 5 when null, and shutdownGracePeriodSeconds): the controller refuses it" $settle $grace) -}}
+{{- end -}}
+- "--gateway-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.gateway) | quote }}
+- "--control-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.control) | quote }}
+- "--replication-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.replication) | quote }}
+- "--admin-listen"
+- {{ printf "0.0.0.0:%d" (int $controller.ports.admin) | quote }}
+{{- with $told }}
+- "--identity-as-told"
+- {{ join "," . | quote }}
+{{- end }}
+- "--shutdown-grace-period-secs"
+- {{ $grace | quote }}
+{{- if not (kindIs "invalid" $controller.shutdownSettleSeconds) }}
+- "--shutdown-settle-secs"
+- {{ $settle | quote }}
+{{- end }}
+{{- with $controller.runtimeWorkerThreads }}
+- "--runtime-worker-threads"
+- {{ . | quote }}
+{{- end }}
+- "--log-level"
+- {{ $controller.logging.level | quote }}
+{{- if $controller.logging.json }}
+- "--log-json"
+{{- end }}
+{{- if $elected }}
+- "--lease-name"
+- {{ include "smg.grandCentralLeaseName" . | quote }}
+- "--advertise-address"
+- "$(POD_IP)"
+{{- end }}
+{{- if include "smg.grandCentralSpecStore" . }}
+- "--spec-store"
+- "/var/lib/smg/spec"
+{{- else }}
+- "--spec-file"
+- "/etc/smg/policy-spec/spec.yaml"
+{{- end }}
+{{- range $controller.extraArgs }}
+- {{ . | quote }}
+{{- end }}
+{{- end }}
+
+{{/*
+Grand Central replication as told -- "true" when the controller's
+arguments name the replication listener among those that take identities as
+told; empty when they do not. A replica that does not lead follows its
+leader only where they do. The arguments are read whole, as the controller
+reads them: grandCentral.identityAsTold and an --identity-as-told flag
+of grandCentral.extraArgs name alike. The flag's value is the next
+argument or stands behind an equals sign, one name or several between
+commas.
+*/}}
+{{- define "smg.grandCentralReplicationAsTold" -}}
+{{- $told := list -}}
+{{- $value := false -}}
+{{- range $argument := include "smg.grandCentralArgs" . | fromYamlArray -}}
+{{- if $value -}}
+{{- $told = concat $told (splitList "," $argument) -}}
+{{- else if hasPrefix "--identity-as-told=" $argument -}}
+{{- $told = concat $told (splitList "," (trimPrefix "--identity-as-told=" $argument)) -}}
+{{- end -}}
+{{- $value = eq $argument "--identity-as-told" -}}
+{{- end -}}
+{{- if has "replication" $told -}}true{{- end -}}
+{{- end }}
+
+{{/*
+Grand Central TLS -- "true" when the controller's arguments hand its
+gRPC listeners a server certificate (--tls-cert, its value the next
+argument or behind an equals sign); empty when they do not. A standby's
+dial has no credential yet, so a replica whose replication listener serves
+TLS follows no leader.
+*/}}
+{{- define "smg.grandCentralServesTls" -}}
+{{- range $argument := include "smg.grandCentralArgs" . | fromYamlArray -}}
+{{- if or (eq $argument "--tls-cert") (hasPrefix "--tls-cert=" $argument) -}}true{{- end -}}
+{{- end -}}
 {{- end }}

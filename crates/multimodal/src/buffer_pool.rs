@@ -7,36 +7,51 @@
 //! mapping, or pages the allocator had given back), so every request faulted
 //! them in page by page and the kernel zeroed each page right before the
 //! producer overwrote it: about 5,200 minor faults and 20 MB of page zeroing
-//! per 1024x768 request. The producers write every byte they ask for, so
-//! nothing in those buffers has to be zero: this pool keeps them. A producer
-//! takes a buffer of the length it needs and fills it; the buffer comes back
-//! when the request is done with it: the frame dropped
+//! per 1024x768 request. Most producers write every byte they ask for, so
+//! nothing in their buffers has to be zero: this pool keeps them. A producer
+//! takes a buffer of the length it needs and fills it (one that may leave a
+//! byte unwritten takes its buffer cleared, `take_zeroed`); the buffer
+//! comes back when the request is done with it: the frame dropped
 //! ([`ImageFrame`](crate::types::ImageFrame) returns its pixels), the wire
 //! payload sent ([`recycled_bytes`]), the patches written in another dtype
 //! ([`EncoderInput::into_bytes_as`](crate::encoder_inputs::EncoderInput::into_bytes_as)).
 //!
 //! Geometry: a length between [`SMALLEST`] and [`LARGEST`] is served from the
-//! class of its next power of two (nine classes, 256 KiB to 64 MiB), so one
+//! class of its next power of two (ten classes, 256 KiB to 128 MiB), so one
 //! class serves every length up to its size and the pages past the length
 //! are never touched; a length outside the range is allocated as before. The
-//! pool holds at most [`BOUND`] bytes of capacity in all, process-wide; a
-//! buffer offered beyond that is freed as before. Resident memory grows by
+//! pool holds at most [`BOUND`] bytes of capacity in the classes below the
+//! top one, and one idle buffer of the top class beside them, process-wide;
+//! a buffer offered beyond that is freed as before. Resident memory grows by
 //! at most the bytes requests wrote into the kept buffers, so by at most the
-//! bound: a 1024x768 request writes 2.4 MB into a 4 MiB-class frame and
-//! 18.9 MB into a 32 MiB-class `float32` wire, and the bound holds seven
-//! such pairs; at eight runtime threads the steady state is the in-flight
-//! count's worth of them.
+//! bound and that one buffer: a 1024x768 request writes 2.4 MB into a
+//! 4 MiB-class frame and 18.9 MB into a 32 MiB-class `float32` wire, and the
+//! bound holds seven such pairs; at eight runtime threads the steady state
+//! is the in-flight count's worth of them.
 //!
 //! One pool for the process rather than one per thread: a buffer is taken on
 //! the thread that decodes or preprocesses and comes back from the thread
 //! that finishes the request, so a per-thread pool would never see its
 //! buffers again. The lock is held for one push or pop per buffer.
 //!
-//! In a debug build a buffer is handed out filled with [`SENTINEL`] rather
-//! than a previous request's bytes, so a producer that left a byte unwritten
-//! shows it in every test that compares its output with a reference.
+//! At rest: the pool has no clock and no task of its own. A host calls
+//! [`trim_if_quiet`] on a period, and at the second call in a row with no
+//! take between them the idle buffers are freed, so a process at rest behind
+//! a burst of images gives back what the burst left; the requests after that
+//! take fresh buffers once. A take pays one add under the lock it already
+//! holds. A host that never calls it keeps the idle buffers for the life of
+//! the process.
+//!
+//! In a debug build a plain take is handed out filled with [`SENTINEL`]
+//! rather than a previous request's bytes, so a producer that left a byte
+//! unwritten shows it in every test that compares its output with a
+//! reference; a cleared take reads zero in every build.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::{
+    collections::TryReserveError,
+    convert::Infallible,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
 
 use bytes::Bytes;
 use image::DynamicImage;
@@ -46,9 +61,12 @@ use image::DynamicImage;
 /// tile in bfloat16 (677,376 bytes), sits in the 1 MiB class above this floor.
 pub const SMALLEST: usize = 256 << 10;
 /// The longest buffer the pool serves; a longer one is allocated as before.
-pub const LARGEST: usize = 64 << 20;
-/// The capacity the pool holds in all, the idle buffers of every class
-/// together.
+/// Ten 1024x768 images on `llama4`, 130 tiles of 336x336, write one bfloat16
+/// wire of 88 MB, which sits in this top class; the pool keeps one idle
+/// buffer of it, outside [`BOUND`].
+pub const LARGEST: usize = 128 << 20;
+/// The capacity the pool holds below the top class, the idle buffers of
+/// those classes together.
 pub const BOUND: usize = 256 << 20;
 /// What a buffer holds when handed out in a debug build.
 pub const SENTINEL: u8 = 0xA5;
@@ -64,8 +82,13 @@ pub(crate) struct BufferPool {
 struct Idle {
     /// The idle buffers of each class, each with the class's capacity.
     classes: [Vec<Vec<u8>>; CLASSES],
-    /// The capacity of every idle buffer together.
+    /// The capacity of every idle buffer below the top class together.
     held: usize,
+    /// The takes so far, served or not: what two calls of
+    /// [`BufferPool::trim_if_quiet`] compare.
+    takes: u64,
+    /// `takes` as the last such call read it; `None` before the first.
+    seen: Option<u64>,
 }
 
 /// The process's pool.
@@ -117,12 +140,26 @@ fn class_index(capacity: usize) -> Option<usize> {
         .then(|| (capacity / SMALLEST).trailing_zeros() as usize)
 }
 
+/// A zeroed buffer of `len` bytes, or the allocator's refusal.
+fn zeroed(len: usize) -> Result<Vec<u8>, TryReserveError> {
+    bytemuck::try_zeroed_vec(len).or_else(|()| {
+        // That refusal carries no value: the reserve asks again and gives
+        // the error, or the buffer after all.
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(len)?;
+        buf.resize(len, 0);
+        Ok(buf)
+    })
+}
+
 impl BufferPool {
     pub(crate) const fn new() -> Self {
         Self {
             inner: Mutex::new(Idle {
                 classes: [const { Vec::new() }; CLASSES],
                 held: 0,
+                takes: 0,
+                seen: None,
             }),
         }
     }
@@ -135,43 +172,108 @@ impl BufferPool {
     /// Its bytes are a previous request's (the [`SENTINEL`] in a debug
     /// build), zeros only when it is fresh or outside the pooled range.
     pub(crate) fn take(&self, len: usize) -> Vec<u8> {
+        // A refused allocation ends the process, as before.
+        let Ok(buf) = self.sized(len, |len| Ok::<_, Infallible>(vec![0u8; len]));
+        buf
+    }
+
+    /// [`Self::take`] for a producer that reports a refused allocation.
+    pub(crate) fn try_take(&self, len: usize) -> Result<Vec<u8>, TryReserveError> {
+        self.sized(len, zeroed)
+    }
+
+    /// A buffer of `len` zero bytes, for a producer that may leave some of
+    /// them unwritten. A kept buffer is cleared here; a fresh one is the
+    /// zeroed allocation the producer had without the pool, of the whole
+    /// class as in [`Self::take`].
+    pub(crate) fn take_zeroed(&self, len: usize) -> Vec<u8> {
         let Some(capacity) = class_capacity(len) else {
             return vec![0u8; len];
         };
-        let index = (capacity / SMALLEST).trailing_zeros() as usize;
-        let kept = {
-            let mut idle = self.idle();
-            let kept = idle.classes[index].pop();
-            if kept.is_some() {
-                idle.held -= capacity;
-            }
-            kept
+        let Some(mut buf) = self.kept(capacity) else {
+            let mut buf = vec![0u8; capacity];
+            buf.truncate(len);
+            return buf;
+        };
+        buf.clear();
+        buf.resize(len, 0);
+        buf
+    }
+
+    /// The buffer of both takes; `fresh` allocates a zeroed one.
+    fn sized<E>(
+        &self,
+        len: usize,
+        fresh: impl Fn(usize) -> Result<Vec<u8>, E>,
+    ) -> Result<Vec<u8>, E> {
+        let Some(capacity) = class_capacity(len) else {
+            return fresh(len);
         };
         // A fresh buffer is a zeroed allocation of the whole class: the pages
         // past `len` stay untouched, the ones below it are faulted in by the
         // producer's first write, once in the buffer's life.
-        let mut buf = kept.unwrap_or_else(|| vec![0u8; capacity]);
+        let mut buf = match self.kept(capacity) {
+            Some(buf) => buf,
+            None => fresh(capacity)?,
+        };
         buf.resize(len, 0);
         #[cfg(debug_assertions)]
         buf.fill(SENTINEL);
-        buf
+        Ok(buf)
+    }
+
+    /// An empty buffer with room for `len` bytes, for a producer that appends
+    /// them: nothing is filled here. A fresh one is reserved fallibly, with
+    /// the class's capacity or, outside the pooled range, `len` bytes.
+    pub(crate) fn take_empty(&self, len: usize) -> Result<Vec<u8>, TryReserveError> {
+        let class = class_capacity(len);
+        let mut buf = class
+            .and_then(|capacity| self.kept(capacity))
+            .unwrap_or_default();
+        buf.clear();
+        // Empty, so nothing to zero: the producer writes what it appends.
+        buf.try_reserve_exact(class.unwrap_or(len))?;
+        Ok(buf)
+    }
+
+    /// The idle buffer of the class of `capacity`, when it keeps one.
+    fn kept(&self, capacity: usize) -> Option<Vec<u8>> {
+        let index = (capacity / SMALLEST).trailing_zeros() as usize;
+        let mut idle = self.idle();
+        idle.takes = idle.takes.wrapping_add(1);
+        let kept = idle.classes[index].pop();
+        if kept.is_some() && capacity != LARGEST {
+            idle.held -= capacity;
+        }
+        kept
     }
 
     /// `buf` back for the next request: kept when it is a class's buffer and
-    /// the bound has room, freed as before otherwise. Any buffer may be
-    /// offered.
+    /// the bound has room (in the top class, when none of it is idle), freed
+    /// as before otherwise. Any buffer may be offered.
     pub(crate) fn recycle(&self, buf: Vec<u8>) {
         let capacity = buf.capacity();
         let Some(index) = class_index(capacity) else {
             return;
         };
-        // A buffer the bound turns away is freed after the lock is released.
+        // A buffer turned away is freed after the lock is released.
         let turned_away = {
             let mut idle = self.idle();
-            if idle.held + capacity > BOUND {
+            // The top class stays out of the bound, where one of its buffers
+            // would take the room of many smaller ones, and keeps a single
+            // idle buffer, since the pool frees what it keeps only at rest.
+            let top = capacity == LARGEST;
+            let full = if top {
+                !idle.classes[index].is_empty()
+            } else {
+                idle.held + capacity > BOUND
+            };
+            if full {
                 Some(buf)
             } else {
-                idle.held += capacity;
+                if !top {
+                    idle.held += capacity;
+                }
                 idle.classes[index].push(buf);
                 None
             }
@@ -179,7 +281,24 @@ impl BufferPool {
         drop(turned_away);
     }
 
-    /// The capacity held in all.
+    /// Frees every idle buffer when no take came since the call before this
+    /// one and returns the bytes of capacity freed; otherwise notes the takes
+    /// so far and returns 0, as the first call always does.
+    pub(crate) fn trim_if_quiet(&self) -> usize {
+        // The buffers are freed after the lock is released.
+        let freed = {
+            let mut idle = self.idle();
+            let takes = idle.takes;
+            if idle.seen.replace(takes) != Some(takes) {
+                return 0;
+            }
+            idle.held = 0;
+            std::mem::take(&mut idle.classes)
+        };
+        freed.iter().flatten().map(Vec::capacity).sum()
+    }
+
+    /// The capacity held below the top class.
     #[cfg(test)]
     pub(crate) fn held(&self) -> usize {
         self.idle().held
@@ -191,10 +310,42 @@ pub(crate) fn take(len: usize) -> Vec<u8> {
     shared().take(len)
 }
 
+/// [`BufferPool::try_take`] on the process's pool.
+pub(crate) fn try_take(len: usize) -> Result<Vec<u8>, TryReserveError> {
+    shared().try_take(len)
+}
+
+/// [`BufferPool::take_zeroed`] on the process's pool.
+pub(crate) fn take_zeroed(len: usize) -> Vec<u8> {
+    shared().take_zeroed(len)
+}
+
+/// [`BufferPool::take_empty`] on the process's pool.
+pub(crate) fn take_empty(len: usize) -> Result<Vec<u8>, TryReserveError> {
+    shared().take_empty(len)
+}
+
 /// A buffer back to the process's pool: kept for the next request of its
-/// class, or freed when it is outside the classes or the pool is at its bound.
+/// class, or freed when it is outside the classes or the pool has no room.
 pub fn recycle(buf: Vec<u8>) {
     shared().recycle(buf);
+}
+
+/// Frees what the process's pool holds idle once the pool has been quiet,
+/// for a host to call on a period. At the second call in a row with no take
+/// between them every idle buffer is freed, the top class's one too, and the
+/// bytes of capacity freed are returned; any other call returns 0. A take
+/// of a pooled length reads no clock for this: it counts itself under the
+/// lock it already holds. The requests after a trim take fresh buffers once,
+/// and what the pool keeps under load (up to [`BOUND`] below the top class
+/// and one buffer of it) is unchanged. A host that never calls this keeps
+/// the idle buffers for the life of the process.
+///
+/// Two calls in a row are compared whoever makes them, so a process calls
+/// this from one place: a second caller on a period of its own would cut the
+/// quiet of the first short.
+pub fn trim_if_quiet() -> usize {
+    shared().trim_if_quiet()
 }
 
 /// The pixel buffer of `image` back to the pool: the eight-bit layouts own a
@@ -275,6 +426,17 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_buffer_that_cannot_be_reserved_is_an_error() {
+        let pool = BufferPool::new();
+        // No allocator gives this length: the refusal reaches the caller.
+        assert!(pool.take_empty(usize::MAX).is_err());
+        let outside = pool.take_empty(SMALLEST - 1).unwrap();
+        assert_eq!((outside.len(), outside.capacity()), (0, SMALLEST - 1));
+        let class = pool.take_empty(SMALLEST + 1).unwrap();
+        assert_eq!((class.len(), class.capacity()), (0, 2 * SMALLEST));
+    }
+
+    #[test]
     fn the_smallest_image_wire_is_served_from_the_pool() {
         // A single 336x336 tile on the bfloat16 wire, the smallest image wire
         // a processor emits per request; below the former 1 MiB floor it was
@@ -286,6 +448,20 @@ mod tests {
         let address = first.as_ptr();
         pool.recycle(first);
         let again = pool.take(wire);
+        assert_eq!(again.as_ptr(), address);
+    }
+
+    #[test]
+    fn a_buffer_between_64_and_128_mib_is_kept_and_handed_out_again() {
+        // The first length of the top class: one byte past 64 MiB sits in
+        // the 128 MiB class.
+        let len = (64 << 20) + 1;
+        let pool = BufferPool::new();
+        let first = pool.take(len);
+        let address = first.as_ptr();
+        assert_eq!(first.capacity(), 128 << 20);
+        pool.recycle(first);
+        let again = pool.take(len);
         assert_eq!(again.as_ptr(), address);
     }
 
@@ -306,6 +482,25 @@ mod tests {
         let other = pool.take(SMALLEST);
         assert_ne!(other.as_ptr(), address);
         assert_eq!(pool.held(), 2 * SMALLEST);
+    }
+
+    #[test]
+    fn a_zeroed_take_clears_a_kept_buffer() {
+        let pool = BufferPool::new();
+        let mut buf = pool.take(2 * SMALLEST);
+        buf.fill(0x17);
+        let address = buf.as_ptr();
+        pool.recycle(buf);
+        // A shorter length of the same class: the same buffer, zero in
+        // every byte handed out.
+        let again = pool.take_zeroed(SMALLEST + 1);
+        assert_eq!(again.as_ptr(), address);
+        assert_eq!(again.len(), SMALLEST + 1);
+        assert!(again.iter().all(|&byte| byte == 0));
+        // A fresh buffer of a class and one outside the pooled range are
+        // zeroed allocations.
+        assert!(pool.take_zeroed(SMALLEST).iter().all(|&byte| byte == 0));
+        assert!(pool.take_zeroed(SMALLEST - 1).iter().all(|&byte| byte == 0));
     }
 
     #[test]
@@ -332,18 +527,74 @@ mod tests {
     }
 
     #[test]
+    fn a_length_no_allocation_can_hold_is_refused() {
+        let pool = BufferPool::new();
+        assert!(pool.try_take(usize::MAX).is_err());
+    }
+
+    #[test]
     fn the_bound_turns_a_buffer_away() {
         let pool = BufferPool::new();
-        for _ in 0..BOUND / LARGEST {
-            pool.recycle(Vec::with_capacity(LARGEST));
+        // The largest class the bound counts.
+        let class = LARGEST / 2;
+        for _ in 0..BOUND / class {
+            pool.recycle(Vec::with_capacity(class));
         }
         assert_eq!(pool.held(), BOUND);
         pool.recycle(Vec::with_capacity(SMALLEST));
         assert_eq!(pool.held(), BOUND);
-        drop(pool.take(LARGEST));
-        assert_eq!(pool.held(), BOUND - LARGEST);
+        drop(pool.take(class));
+        assert_eq!(pool.held(), BOUND - class);
         pool.recycle(Vec::with_capacity(SMALLEST));
-        assert_eq!(pool.held(), BOUND - LARGEST + SMALLEST);
+        assert_eq!(pool.held(), BOUND - class + SMALLEST);
+    }
+
+    #[test]
+    fn the_top_class_keeps_one_idle_buffer_outside_the_bound() {
+        let pool = BufferPool::new();
+        pool.recycle(Vec::with_capacity(LARGEST));
+        // A second one that comes back while the first is idle is freed.
+        pool.recycle(Vec::with_capacity(LARGEST));
+        assert_eq!(pool.idle().classes[CLASSES - 1].len(), 1);
+        // The classes below keep their whole bound beside it.
+        for _ in 0..BOUND / SMALLEST {
+            pool.recycle(Vec::with_capacity(SMALLEST));
+        }
+        assert_eq!(pool.idle().classes[0].len(), BOUND / SMALLEST);
+    }
+
+    #[test]
+    fn two_trims_with_no_take_between_them_free_the_idle_buffers() {
+        let pool = BufferPool::new();
+        drop(pool.take(SMALLEST));
+        pool.recycle(Vec::with_capacity(SMALLEST));
+        pool.recycle(Vec::with_capacity(LARGEST));
+        // The first call only notes the takes so far.
+        assert_eq!(pool.trim_if_quiet(), 0);
+        assert_eq!(pool.held(), SMALLEST);
+        assert_eq!(pool.trim_if_quiet(), SMALLEST + LARGEST);
+        assert_eq!(pool.held(), 0);
+        assert!(pool.idle().classes.iter().all(Vec::is_empty));
+        // Nothing is left for a third, and the next take is a fresh buffer.
+        assert_eq!(pool.trim_if_quiet(), 0);
+        assert_eq!(pool.take(SMALLEST).len(), SMALLEST);
+    }
+
+    #[test]
+    fn a_take_between_two_trims_keeps_the_idle_buffers() {
+        let pool = BufferPool::new();
+        pool.recycle(Vec::with_capacity(SMALLEST));
+        pool.recycle(Vec::with_capacity(SMALLEST));
+        assert_eq!(pool.trim_if_quiet(), 0);
+        // One of the two is taken: the other stays for the takes that follow.
+        drop(pool.take(SMALLEST));
+        assert_eq!(pool.trim_if_quiet(), 0);
+        assert_eq!(pool.held(), SMALLEST);
+        // A take the pool could not serve counts as well: it is in use.
+        drop(pool.take(2 * SMALLEST));
+        assert_eq!(pool.trim_if_quiet(), 0);
+        assert_eq!(pool.held(), SMALLEST);
+        assert_eq!(pool.trim_if_quiet(), SMALLEST);
     }
 
     #[test]

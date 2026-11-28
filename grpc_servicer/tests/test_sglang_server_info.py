@@ -88,6 +88,15 @@ class _OlderServerArgs(msgspec.Struct):
     model_path: str = "org/model"
 
 
+class _GrammarServerArgs(msgspec.Struct):
+    """Server arguments with the grammar backend flag and the tokenizer
+    switch its resolution reads."""
+
+    model_path: str = "org/model"
+    grammar_backend: str | None = None
+    skip_tokenizer_init: bool = False
+
+
 class _WindowServerArgs(msgspec.Struct):
     """Server arguments with the running-window flag, None unless set."""
 
@@ -99,8 +108,10 @@ class _WindowServerArgs(msgspec.Struct):
 
 
 def _servicer(servicer_mod, server_args, **request_manager):
+    """Construct the RPC fixture with resolved model precision and scheduler state."""
     servicer = servicer_mod.SGLangSchedulerServicer.__new__(servicer_mod.SGLangSchedulerServicer)
     servicer.server_args = server_args
+    servicer.model_config = SimpleNamespace(dtype="torch.bfloat16")
     servicer.scheduler_info = {}
     servicer.start_time = 0.0
     servicer.request_manager = SimpleNamespace(
@@ -262,3 +273,32 @@ def test_server_info_carries_where_the_engine_starts_a_grammar(servicer_mod, mon
     older = _server_info(servicer_mod, _OlderServerArgs()).server_args
     assert "constrained_decoding_start" not in older and "engine_reasoning_parser" not in older
     assert older["model_path"] == "org/model", "the other server args are reported as before"
+
+
+def test_server_info_carries_the_structural_tag_vocabulary(servicer_mod, monkeypatch):
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    labels = servicer_mod.grammar_backend_entry.__globals__
+    # An xgrammar before 0.1.33 takes the older structural-tag nodes alone, so
+    # the Router spells this worker's tags in the older vocabulary.
+    monkeypatch.setitem(labels, "installed_xgrammar_version", lambda: "0.1.32")
+    xgrammar = _GrammarServerArgs(grammar_backend="xgrammar")
+    assert _server_info(servicer_mod, xgrammar).server_args["structural_tag_vocabulary"] == "older"
+    # The label follows the backend the scheduler runs, as resolved: another
+    # backend, or none without the scheduler's tokenizer, reports nothing.
+    for other in (
+        _GrammarServerArgs(grammar_backend="llguidance"),
+        _GrammarServerArgs(grammar_backend="xgrammar", skip_tokenizer_init=True),
+    ):
+        assert "structural_tag_vocabulary" not in _server_info(servicer_mod, other).server_args
+
+    monkeypatch.setitem(labels, "installed_xgrammar_version", lambda: "0.1.33")
+    assert "structural_tag_vocabulary" not in _server_info(servicer_mod, xgrammar).server_args
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16", "float32", "float8_e4m3fn"])
+def test_server_info_advertises_effective_encoder_dtype(servicer_mod, dtype):
+    """Publish the effective dtype, falling back for unsupported engine types."""
+    servicer = _servicer(servicer_mod, _OlderServerArgs())
+    servicer.model_config.dtype = "torch." + dtype
+    expected = "float32" if dtype == "float8_e4m3fn" else dtype
+    assert _info(servicer).server_args["multimodal_encoder_dtype"] == expected

@@ -4,13 +4,19 @@
 //! and processing responses. These functions are composed by the
 //! streaming and non-streaming processors.
 
-use std::time::{Duration, Instant};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use axum::{
-    http::{HeaderMap, HeaderValue},
+    body::Body,
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue},
     response::{IntoResponse, Response},
 };
 use openai_protocol::messages::{CreateMessageRequest, Message};
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use tracing::{debug, error, info, warn};
 
 use super::utils::should_propagate_header;
@@ -83,6 +89,9 @@ pub(crate) async fn send_request(
             Ok(response)
         }
         Err(e) => {
+            // The client's text ends with the request URL: the line names the
+            // worker masked, and the answer names no address.
+            let e = e.without_url();
             warn!(url = %redacted_url(url), error = %e, "Request to worker failed");
 
             let (kind, reason) = if e.is_timeout() {
@@ -131,7 +140,12 @@ pub(crate) async fn parse_response(
                 message_id = %message.id,
                 "Successfully parsed response"
             );
-            record_success_metrics(model_id, &message, start_time);
+            record_success_metrics(
+                model_id,
+                u64::from(message.usage.input_tokens),
+                u64::from(message.usage.output_tokens),
+                start_time,
+            );
             info!(
                 model = %model_id,
                 message_id = %message.id,
@@ -142,7 +156,7 @@ pub(crate) async fn parse_response(
             Ok(message)
         }
         Err(e) => {
-            error!(model = %model_id, error = %e, "Failed to parse response");
+            error!(model = %model_id, error = %e.without_url(), "Failed to parse response");
             record_failure_metrics(
                 model_id,
                 start_time,
@@ -155,6 +169,101 @@ pub(crate) async fn parse_response(
             ))
         }
     }
+}
+
+/// Relay a successful non-streaming answer as the provider wrote it, for the
+/// plain path, which reads nothing of it. The body must be a JSON object: one
+/// that is not is the 502 `parse_error`, as when the answer was read typed. A
+/// body that stops coming is sorted as a send that fails (`send_request`): the
+/// request's timeout running out mid-body is the 504 under
+/// `timeout`/`deadline`, any other read failure the 502 under
+/// `backend_error`/`transport_disconnect`. The answer's usage counts go to the
+/// token metrics, and its bytes leave under the upstream's status and content
+/// type, so a key or a block this build does not model reaches the client as
+/// sent.
+pub(crate) async fn relay_response(
+    response: reqwest::Response,
+    model_id: &str,
+    start_time: Instant,
+) -> Response {
+    let status = response.status();
+    let content_type = response.headers().get(CONTENT_TYPE).cloned();
+    let body = match response.bytes().await {
+        Ok(body) => body,
+        Err(e) => {
+            // The client's text ends with the request URL; the answers name
+            // no address.
+            let e = e.without_url();
+            warn!(model = %model_id, error = %e, "Reading the response body failed");
+            if e.is_timeout() {
+                record_failure_metrics(
+                    model_id,
+                    start_time,
+                    metrics_labels::ERROR_TIMEOUT,
+                    metrics_labels::REASON_DEADLINE,
+                );
+                return error::gateway_timeout("timeout", format!("Request timeout: {e}"));
+            }
+            record_failure_metrics(
+                model_id,
+                start_time,
+                metrics_labels::ERROR_BACKEND,
+                metrics_labels::REASON_TRANSPORT_DISCONNECT,
+            );
+            return error::bad_gateway("request_failed", format!("Request failed: {e}"));
+        }
+    };
+    // The top-level keys alone, each value left as written: a map refuses an
+    // answer that is no JSON object, and the rest of the document is scanned
+    // past, not built.
+    let answer = match serde_json::from_slice::<HashMap<String, &RawValue>>(&body) {
+        Ok(answer) => answer,
+        Err(e) => {
+            error!(model = %model_id, error = %e, "Failed to parse response");
+            record_failure_metrics(
+                model_id,
+                start_time,
+                "parse_error",
+                metrics_labels::REASON_BAD_RESPONSE,
+            );
+            return error::bad_gateway("parse_error", "Invalid response from backend");
+        }
+    };
+    #[derive(Default, Deserialize)]
+    struct Counts {
+        #[serde(default)]
+        input_tokens: u64,
+        #[serde(default)]
+        output_tokens: u64,
+    }
+    let counts = answer
+        .get("usage")
+        .and_then(|usage| serde_json::from_str::<Counts>(usage.get()).ok())
+        .unwrap_or_default();
+    let message_id = answer
+        .get("id")
+        .and_then(|id| serde_json::from_str::<String>(id.get()).ok())
+        .unwrap_or_default();
+    record_success_metrics(
+        model_id,
+        counts.input_tokens,
+        counts.output_tokens,
+        start_time,
+    );
+    info!(
+        model = %model_id,
+        message_id = %message_id,
+        input_tokens = %counts.input_tokens,
+        output_tokens = %counts.output_tokens,
+        "Completed non-streaming request"
+    );
+    let mut relayed = Response::new(Body::from(body));
+    *relayed.status_mut() = status;
+    relayed.headers_mut().insert(
+        CONTENT_TYPE,
+        content_type.unwrap_or_else(|| HeaderValue::from_static("application/json")),
+    );
+    relayed
 }
 
 /// Handle a non-success response: read body (limited) and record metrics.
@@ -217,7 +326,12 @@ pub(crate) fn record_router_request(model_id: &str, streaming: bool) {
     );
 }
 
-fn record_success_metrics(model_id: &str, message: &Message, start_time: Instant) {
+fn record_success_metrics(
+    model_id: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    start_time: Instant,
+) {
     Metrics::record_router_duration(
         metrics_labels::ROUTER_HTTP,
         metrics_labels::BACKEND_EXTERNAL,
@@ -232,7 +346,7 @@ fn record_success_metrics(model_id: &str, message: &Message, start_time: Instant
         model_id,
         "messages",
         metrics_labels::TOKEN_INPUT,
-        message.usage.input_tokens as u64,
+        input_tokens,
     );
     Metrics::record_router_tokens(
         metrics_labels::ROUTER_HTTP,
@@ -240,7 +354,7 @@ fn record_success_metrics(model_id: &str, message: &Message, start_time: Instant
         model_id,
         "messages",
         metrics_labels::TOKEN_OUTPUT,
-        message.usage.output_tokens as u64,
+        output_tokens,
     );
 }
 
@@ -274,244 +388,9 @@ pub(crate) fn record_failure_metrics(
 /// What a test reads back from a local recorder: the series a failed request
 /// was counted under.
 #[cfg(test)]
-pub(crate) mod probe {
-    use metrics_exporter_prometheus::PrometheusHandle;
-
-    /// The recorder's rendered line of `metric` carrying `model`, if any.
-    pub(crate) fn series_line(
-        handle: &PrometheusHandle,
-        metric: &str,
-        model: &str,
-    ) -> Option<String> {
-        let rendered = handle.render();
-        let model = format!("model=\"{model}\"");
-        rendered
-            .lines()
-            .find(|line| line.starts_with(&format!("{metric}{{")) && line.contains(&model))
-            .map(str::to_string)
-    }
-
-    /// The error series the failed request is counted under for `model`, as
-    /// `(error_type, reason, count)`, with the number of duration samples.
-    pub(crate) fn counted_failure(
-        handle: &PrometheusHandle,
-        model: &str,
-    ) -> (String, String, u64, u64) {
-        let errors = series_line(handle, "smg_router_request_errors_total", model)
-            .expect("the failed request is counted");
-        let label = |name: &str| {
-            let key = format!("{name}=\"");
-            let start = errors.find(&key).expect(name) + key.len();
-            let end = errors[start..].find('"').expect(name) + start;
-            errors[start..end].to_string()
-        };
-        let count = |line: &str| -> u64 {
-            line.rsplit(' ')
-                .next()
-                .expect("a value")
-                .parse()
-                .expect("a count")
-        };
-        let durations = series_line(handle, "smg_router_request_duration_seconds_count", model)
-            .expect("the failed request has a duration");
-        (
-            label("error_type"),
-            label("reason"),
-            count(&errors),
-            count(&durations),
-        )
-    }
-}
+#[path = "../../tests/unit/anthropic/worker/probe.rs"]
+pub(crate) mod probe;
 
 #[cfg(test)]
-mod tests {
-    use axum::http::StatusCode;
-    use metrics_exporter_prometheus::PrometheusBuilder;
-
-    use super::{probe::counted_failure, *};
-    use crate::test_support::{
-        text_of, upstream, RefusedAddress, StubWorker, CREDENTIALED_WORKER_URL, MASKED_WORKER_URL,
-    };
-
-    const UPSTREAM_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for model in organization org-abc123 project proj_xyz789","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
-
-    /// A provider's refusal reaches the Messages caller under its status with
-    /// the operator's organization and project gone.
-    #[tokio::test]
-    async fn an_upstream_errors_body_loses_the_operators_identifiers() {
-        let refusal = upstream(429, None, UPSTREAM_REFUSAL);
-        let response = handle_error_response(refusal, "m", Instant::now()).await;
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        let text = text_of(response).await;
-        assert!(!text.contains("org-abc123"), "{text}");
-        assert!(!text.contains("proj_xyz789"), "{text}");
-        assert!(text.contains("Rate limit reached for model"), "{text}");
-    }
-
-    /// A client whose budget for a call is `timeout`, the process TLS crypto
-    /// provider installed first.
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "a test binary's client factory; the process TLS crypto provider is installed first"
-    )]
-    fn client_with_timeout(timeout: Duration) -> reqwest::Client {
-        use rustls::crypto::ring::default_provider;
-        let _ = default_provider().install_default();
-        reqwest::Client::builder()
-            .timeout(timeout)
-            .build()
-            .expect("a client")
-    }
-
-    fn request() -> CreateMessageRequest {
-        serde_json::from_value(serde_json::json!({
-            "model": "m",
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "q"}],
-        }))
-        .expect("a request")
-    }
-
-    /// Every line the transport writes about a worker names its address
-    /// masked: a worker registered with credentials at a port nobody listens
-    /// on fails its send, and neither the request-built line nor the send
-    /// lines carry the credentials. The capture is the tracing subscriber
-    /// itself, so the rendering is read as a log reader would.
-    #[tracing_test::traced_test]
-    #[tokio::test]
-    async fn the_transports_lines_name_the_worker_masked() {
-        let worker = StubWorker::at(CREDENTIALED_WORKER_URL);
-        let (url, headers) = build_request(worker.as_ref(), None);
-        assert_eq!(url, format!("{CREDENTIALED_WORKER_URL}/v1/messages"));
-
-        let answer = send_request(
-            worker.http_client(),
-            &url,
-            &headers,
-            &request(),
-            Duration::from_secs(5),
-            "m",
-            Instant::now(),
-        )
-        .await;
-
-        let response = answer.expect_err("a failed send");
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert!(!logs_contain("secret"));
-        assert!(!logs_contain("user:"));
-        assert!(logs_contain("Request built"));
-        assert!(logs_contain("Request to worker failed"));
-        assert!(logs_contain(&format!("{MASKED_WORKER_URL}/v1/messages")));
-    }
-
-    /// A send the request timeout cuts is the caller's 504 and one error
-    /// counted against the model under `timeout`/`deadline`, with a duration
-    /// sample; the upstream completes the handshake and never answers.
-    #[tokio::test]
-    async fn a_send_that_times_out_is_counted_as_a_deadline_against_the_model() {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-        let silent = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("a port");
-        let url = format!(
-            "http://{}/v1/messages",
-            silent.local_addr().expect("an address")
-        );
-        let budget = Duration::from_millis(50);
-
-        let answer = send_request(
-            &client_with_timeout(budget),
-            &url,
-            &HeaderMap::new(),
-            &request(),
-            budget,
-            "silent-upstream",
-            Instant::now(),
-        )
-        .await;
-
-        let response = answer.expect_err("a failed send");
-        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-        assert_eq!(
-            counted_failure(&handle, "silent-upstream"),
-            ("timeout".to_string(), "deadline".to_string(), 1, 1)
-        );
-    }
-
-    /// A send nothing answers (the port refuses the connection) is the
-    /// caller's 502 and one error counted against the model under
-    /// `backend_error`/`transport_disconnect`, with a duration sample.
-    #[tokio::test]
-    async fn a_refused_connection_is_counted_as_a_transport_disconnect_against_the_model() {
-        let recorder = PrometheusBuilder::new().build_recorder();
-        let handle = recorder.handle();
-        let _guard = metrics::set_default_local_recorder(&recorder);
-        let refused = RefusedAddress::reserve();
-        let url = format!("http://{}/v1/messages", refused.addr());
-
-        let answer = send_request(
-            &client_with_timeout(Duration::from_secs(5)),
-            &url,
-            &HeaderMap::new(),
-            &request(),
-            Duration::from_secs(5),
-            "closed-port",
-            Instant::now(),
-        )
-        .await;
-
-        let response = answer.expect_err("a failed send");
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert_eq!(
-            counted_failure(&handle, "closed-port"),
-            (
-                "backend_error".to_string(),
-                "transport_disconnect".to_string(),
-                1,
-                1
-            )
-        );
-    }
-
-    fn header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
-        headers.get(name).and_then(|value| value.to_str().ok())
-    }
-
-    /// The configured key goes out as `x-api-key` with the version header when
-    /// the caller sent no credential; a caller's own `x-api-key` or
-    /// `authorization` wins and the configured key stays home; without either
-    /// nothing is added.
-    #[test]
-    fn the_configured_key_goes_out_when_the_caller_sent_none() {
-        let configured = "provider-key".to_string();
-
-        let none = propagated_headers(None, Some(&configured));
-        assert_eq!(header(&none, "x-api-key"), Some("provider-key"));
-        assert_eq!(header(&none, "anthropic-version"), Some("2023-06-01"));
-
-        let mut callers = HeaderMap::new();
-        callers.insert("x-api-key", HeaderValue::from_static("callers-key"));
-        callers.insert("anthropic-version", HeaderValue::from_static("2024-01-01"));
-        callers.insert("x-request-id", HeaderValue::from_static("r-1"));
-        let own = propagated_headers(Some(&callers), Some(&configured));
-        assert_eq!(header(&own, "x-api-key"), Some("callers-key"));
-        assert_eq!(header(&own, "anthropic-version"), Some("2024-01-01"));
-        assert!(own.get("x-request-id").is_none());
-
-        let mut bearer = HeaderMap::new();
-        bearer.insert(
-            "authorization",
-            HeaderValue::from_static("Bearer callers-key"),
-        );
-        let with_bearer = propagated_headers(Some(&bearer), Some(&configured));
-        assert_eq!(
-            header(&with_bearer, "authorization"),
-            Some("Bearer callers-key")
-        );
-        assert!(with_bearer.get("x-api-key").is_none());
-
-        assert!(propagated_headers(None, None).is_empty());
-    }
-}
+#[path = "../../tests/unit/anthropic/worker/tests.rs"]
+mod tests;

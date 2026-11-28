@@ -1,9 +1,11 @@
 //! What the generate path allocates per token on a streamed request without
-//! fan-out, and what an idle subscription to the load records costs per
-//! second, over the crate's mock engine, pinned at today's counts so the next
+//! fan-out, what an idle subscription to the load records costs per second,
+//! both over the crate's mock engine, and what the KV relay's engine-hash
+//! check allocates per verified block, pinned at today's counts so the next
 //! change that adds a copy fails a test rather than moving a bench inside its
 //! noise. A separate executable, so it can declare the counting allocator the
-//! pins need; the bed is the one `benches/generate_path.rs` times.
+//! pins need; the beds are the ones `benches/generate_path.rs` and
+//! `benches/engine_hash.rs` time.
 #![expect(
     clippy::expect_used,
     clippy::unwrap_used,
@@ -21,6 +23,8 @@ use std::{
 
 use common::counting_alloc::{self, Counting};
 use engine_servicer::{
+    engine_hash::{vllm_chain, EngineHash},
+    kv_wire::{BlockHash, EventTail, Normalizer, WireBatch, WireEvent, WireStored, WireTokens},
     ServicerConfig, SglangModelInfo, SglangServicerConfig, SglangServicerServer,
     TokenSpeedModelInfo, TokenSpeedServicerConfig, TokenSpeedServicerServer, VllmModelInfo,
     VllmServicerConfig, VllmServicerServer,
@@ -459,5 +463,98 @@ fn an_idle_loads_only_subscription_on_the_tokenspeed_wire_allocates_this_much_pe
         per_second.iter().all(|&rate| rate <= 1.0),
         "allocation calls per second: {per_second:?} (0 with one rank's entry read alone per tick; \
          the whole answer built per read before)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The KV relay's engine-hash check
+// ---------------------------------------------------------------------------
+
+/// The blocks of the long store; the short one has one block, so the
+/// difference is the per-block cost alone.
+const CHECKED_BLOCKS: usize = 64;
+const CHECKED_BLOCK_SIZE: usize = 16;
+
+/// One admitted store of `blocks` full blocks: a fresh chain whose tokens
+/// start at `first`, published with the hashes the engine would have sent.
+fn stored_chain(blocks: usize, first: u32) -> WireBatch {
+    let tokens: Vec<u32> = (0..(blocks * CHECKED_BLOCK_SIZE) as u32)
+        .map(|i| first + i)
+        .collect();
+    let block_hashes = vllm_chain(&tokens, CHECKED_BLOCK_SIZE, None)
+        .into_iter()
+        .map(|(_, published)| BlockHash(published))
+        .collect();
+    WireBatch {
+        ts: 1_700_000_000.5,
+        dp_rank: Some(0),
+        events: vec![WireEvent::BlockStored(WireStored {
+            block_hashes,
+            parent_block_hash: None,
+            token_ids: WireTokens::Ids(tokens),
+            block_size: CHECKED_BLOCK_SIZE as i64,
+            lora_id: None,
+            lora_name: None,
+            cache_salt: None,
+            extra_keys: None,
+            tail: EventTail {
+                medium: Some("GPU".to_string()),
+                group_idx: Some(0),
+                kv_cache_spec_kind: Some("full_attention".to_string()),
+                ..EventTail::default()
+            },
+        })],
+    }
+}
+
+/// The allocation calls one store makes through `normalizer`; the batch is
+/// built before the window and dropped after it.
+fn store_calls(normalizer: &mut Normalizer, blocks: usize, first: u32) -> usize {
+    let batch = stored_chain(blocks, first);
+    let mut event_id = 0;
+    let before = counting_alloc::total_calls();
+    let forwarded = normalizer.normalize_batch(batch, 1, &mut event_id);
+    let calls = counting_alloc::total_calls() - before;
+    assert_eq!(forwarded.events.len(), 1, "the store was admitted");
+    calls
+}
+
+/// The relay's opt-in engine-hash check rehashes every stored block; its own
+/// cost per block is the difference between a checked and an unchecked
+/// normalizer over the same stores (the record keeping is the same on both).
+#[test]
+fn a_verified_block_under_the_engine_hash_check_allocates_this_much() {
+    let _one_at_a_time = ONE_PIN_AT_A_TIME
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut plain = Normalizer::new();
+    let mut checked = Normalizer::with_hash_check(EngineHash::VllmSha256Cbor);
+    // The rank's state and the block records' first growth are paid first.
+    store_calls(&mut plain, CHECKED_BLOCKS, 0);
+    store_calls(&mut checked, CHECKED_BLOCKS, 0);
+    let next = (CHECKED_BLOCKS * CHECKED_BLOCK_SIZE) as u32;
+    let plain_short = store_calls(&mut plain, 1, next);
+    let plain_long = store_calls(&mut plain, CHECKED_BLOCKS, 2 * next);
+    let checked_short = store_calls(&mut checked, 1, next);
+    let checked_long = store_calls(&mut checked, CHECKED_BLOCKS, 2 * next);
+    let per_block = ((checked_long as f64 - checked_short as f64)
+        - (plain_long as f64 - plain_short as f64))
+        / (CHECKED_BLOCKS - 1) as f64;
+    eprintln!(
+        "allocation calls per store: unchecked {plain_short} for 1 block and {plain_long} for \
+         {CHECKED_BLOCKS}; checked {checked_short} and {checked_long}: the check's own cost is \
+         {per_block:.2} per verified block"
+    );
+    let counts = checked.counts();
+    assert_eq!(
+        (counts.hash_checked, counts.hash_mismatch),
+        ((2 * CHECKED_BLOCKS + 1) as u64, 0),
+        "every block was verified and matched"
+    );
+    assert!(
+        per_block <= 0.5,
+        "allocation calls per verified block: {per_block:.2} (none with the encoding fed to \
+         the hasher; two with a CBOR buffer per block and the chain's none-hash derived for \
+         every block)"
     );
 }

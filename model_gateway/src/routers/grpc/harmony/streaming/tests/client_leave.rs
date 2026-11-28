@@ -99,6 +99,7 @@ async fn a_client_that_leaves_while_the_engine_is_parked_ends_the_iteration_at_o
         None,
         None,
         &[],
+        None,
     );
     let (outcome, saw_text) = tokio::time::timeout(Duration::from_secs(5), async {
         tokio::join!(read, read_then_leave(rx, Duration::from_millis(100)))
@@ -108,7 +109,7 @@ async fn a_client_that_leaves_while_the_engine_is_parked_ends_the_iteration_at_o
     let Err(error) = outcome else {
         panic!("the iteration ends with the client's leaving, not as completed");
     };
-    assert_eq!(error, "Client disconnected");
+    assert_eq!(error.message, "Client disconnected");
     assert!(saw_text, "the answer was under way when the client left");
     assert!(
         started.elapsed() < Duration::from_secs(1),
@@ -139,12 +140,13 @@ async fn a_client_that_left_before_the_first_read_reads_nothing() {
         None,
         None,
         &[],
+        None,
     )
     .await;
     let Err(error) = outcome else {
         panic!("nothing is read for a client that left");
     };
-    assert_eq!(error, "Client disconnected");
+    assert_eq!(error.message, "Client disconnected");
     server.abort();
 }
 
@@ -180,6 +182,7 @@ async fn a_client_that_stays_reads_the_answer_to_its_end() {
             None,
             None,
             &[],
+            None,
         )
         .await;
         drop(tx);

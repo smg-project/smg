@@ -27,6 +27,9 @@ interface middleware-types {
     headers-set: list<header>,
     headers-add: list<header>,
     headers-remove: list<string>,
+    // replaces the body: the gateway frames the replacement (content-length is its length) and drops
+    // the content-encoding declared for the body it replaces; a module whose replacement is encoded
+    // declares it in headers-set
     body-replace: option<list<u8>>,
   }
 

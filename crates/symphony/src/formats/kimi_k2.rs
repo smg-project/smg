@@ -53,9 +53,30 @@
 //! the engine starts its grammar after its reasoning parser has seen `</think>`, the tag is the
 //! block at once there, so a thinking model keeps its thought and the forced call follows it in
 //! the model's own syntax, which the table reads back (the tests below hold the recorded forced
-//! answers of a live cell in that shape, whole and at every cut). Without the tag the gateway
-//! hands such a request to its older path, whose JSON-schema constraint makes the model write the
-//! bare arguments after the thought, which the table reads as content (pinned below too).
+//! answers of a live cell in that shape, whole and at every cut). Without the tag such a request
+//! goes under a JSON-schema constraint, which makes the model write the bare arguments after the
+//! thought: this table reads them as content (pinned below too), and its variant for a forced
+//! call reads them as the call ([`Format::with_forced_call`](crate::Format::with_forced_call)).
+//!
+//! [`kimi()`] is this table with a second pair of markers for the thought, `◁think▷` and
+//! `◁/think▷`: the pair of the gateway's older `kimi` reasoning parser, which the older parsers
+//! paired with this line's calls. A thought `◁think▷` opens is a state of its own, which
+//! `◁/think▷` alone leaves: all between the two is the thought, a `</think>` and the markers of
+//! a call among it, as the older parser read it. A `◁think▷` the prompt writes opens no thought:
+//! the marker is a turn anchor of the table, as the turn's opener is, so the output starts in the
+//! content behind the last one, whatever the prompt holds before it, as the older parser, which
+//! read no prompt, had it. No prompt leaves that state open, then, and the structural tags, which
+//! close a thought the prompt left open with `</think>`, never meet it. Two limits come with the
+//! anchor: a thought between `<think>` and `</think>` that the prompt left open and that quotes
+//! `◁think▷` is read from the content, its `</think>` shown there; and a prompt without the
+//! line's opener is replayed from behind its last `◁think▷`, and not at all where it holds
+//! none. A call's id is minted ([`CallId::Minted`]), not the header's: the older parsers left the
+//! ids of this name to the gateway, which numbers them by the conversation for a model it knows
+//! as Kimi by its name, and still does. No group of the registry reads with it: an operator names
+//! it. Two departures from the older `kimi` parser: text before `◁think▷` is content when the
+//! output is read whole, as the older parser's streamed reading had it (its whole reading put
+//! that text in the thought); and a thought between `<think>` and `</think>` is read as a
+//! thought, where the older parser left it in the content with its markers.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -72,7 +93,27 @@ const HOLD_CAP_BYTES: u32 = 8192;
 
 /// The Kimi K2 table.
 pub fn kimi_k2() -> Format {
-    Format::new("kimi_k2")
+    table("kimi_k2").opens_turn("<|im_assistant|>assistant<|im_middle|>")
+}
+
+/// The Kimi table: [`kimi_k2()`]'s rows, and the thought between `◁think▷` and `◁/think▷` in a
+/// state of its own, which no other marker leaves; a `◁think▷` the prompt writes opens none (the
+/// marker is a turn anchor, as the turn's opener is); a call's id is minted.
+pub fn kimi() -> Format {
+    table("kimi")
+        .terminal("unicode_think_open", "◁think▷")
+        .terminal("unicode_think_close", "◁/think▷")
+        .state("unicode_reasoning", Emits::Reasoning)
+        .transition("content", "unicode_think_open", "unicode_reasoning")
+        .transition("unicode_reasoning", "unicode_think_close", "content")
+        .call_id(CallId::Minted)
+        .turn_anchor("<|im_assistant|>assistant<|im_middle|>")
+        .turn_anchor_starting_in("◁think▷", "content")
+}
+
+/// The Kimi K2 line's rows, under the table's `name`; the table says where its turn starts.
+fn table(name: &str) -> Format {
+    Format::new(name)
         .terminal("think_open", "<think>")
         .terminal("think_close", "</think>")
         .terminal("calls_open", "<|tool_calls_section_begin|>")
@@ -93,7 +134,6 @@ pub fn kimi_k2() -> Format {
         .transition("calls", "calls_close", "content")
         .calls(CallSyntax::Shaped(shape::intern(call_shape())))
         .call_id(CallId::Header)
-        .opens_turn("<|im_assistant|>assistant<|im_middle|>")
         .with_layout(layout())
 }
 
@@ -1037,5 +1077,73 @@ mod tests {
                 reasoning: FORCED_REQUIRED_THOUGHT.to_string(),
             }
         );
+    }
+
+    #[test]
+    fn the_kimi_table_reads_the_older_parsers_thought_to_its_own_close_and_the_calls_behind_it() {
+        // The prompt, the output, its thought, its content and its calls: the unit cases of the
+        // gateway's older `kimi` reasoning parser that hold its pair, a call behind such a
+        // thought, a thought that holds the line's own close and a block, which `◁/think▷` alone
+        // ends, and a forced call after a prompt that ends in `◁think▷`, right behind the turn's
+        // opener and behind prefilled text, which opens no thought.
+        let call = (
+            "get_weather".to_string(),
+            "{\"city\": \"Paris\"}".to_string(),
+        );
+        let held = format!("A</think>{CALL}B");
+        let opened = format!("{PROMPT}◁think▷");
+        let prefilled = format!("{PROMPT}Sure.\n◁think▷");
+        let cases = [
+            (
+                PROMPT,
+                "◁think▷reasoning content◁/think▷answer".to_string(),
+                "reasoning content",
+                "answer",
+                0,
+            ),
+            (
+                PROMPT,
+                "normal ◁think▷thinking◁/think▷answer".to_string(),
+                "thinking",
+                "normal answer",
+                0,
+            ),
+            (PROMPT, "◁think▷reasoning".to_string(), "reasoning", "", 0),
+            (
+                PROMPT,
+                format!("◁think▷Paris.◁/think▷Checking.{CALL}"),
+                "Paris.",
+                "Checking.",
+                1,
+            ),
+            (
+                PROMPT,
+                format!("◁think▷{held}◁/think▷C"),
+                held.as_str(),
+                "C",
+                0,
+            ),
+            (opened.as_str(), CALL.to_string(), "", "", 1),
+            (prefilled.as_str(), CALL.to_string(), "", "", 1),
+        ];
+        for (prompt, output, thought, answer, called) in cases {
+            assert!(!kimi().reasoning_open(prompt), "{prompt}");
+            let said = crate::testing::the_same_at_every_cut(
+                |pieces| {
+                    drive(
+                        &mut Engine::new(kimi(), Declared::default()),
+                        prompt,
+                        pieces,
+                    )
+                },
+                &output,
+            );
+            assert_eq!(
+                (said.reasoning.as_str(), said.content.as_str()),
+                (thought, answer),
+                "{output}"
+            );
+            assert_eq!(said.calls, vec![call.clone(); called], "{output}");
+        }
     }
 }

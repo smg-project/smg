@@ -3,7 +3,11 @@
 //! naming one function takes that function's `parameters` as the schema), the one shape known from
 //! the request rather than from the model. The table ([`formats::forced`]) has one state, an
 //! arguments state the output starts in, and no marker, so this assembler sees every byte of the
-//! output, and the stream's end closes the call.
+//! output, and the stream's end closes the call. The variant a forced call makes of a model's
+//! table ([`Format::with_forced_call`](crate::Format::with_forced_call)) enters the assembler
+//! after the thought too, and keeps the table's markers: one moves the reader only before the
+//! value's first byte, and from that byte to the value's last every marker is the value's text,
+//! one the table ignores included.
 //!
 //! The value reads through [`Arguments`]: the whitespace before it is dropped, its bytes are
 //! fragments, a JSON prefix until a `Malformed { InvalidArguments }` event of no bytes says where
@@ -19,7 +23,7 @@
 //! [`Declared::forced`]: crate::Declared::forced
 
 use crate::{
-    event::{Event, Events, MalformedReason, Text},
+    event::{CallEnd, Event, Events, MalformedReason, Text},
     json::{
         arguments::{Arguments, AsWritten},
         prefix::json_space,
@@ -108,6 +112,7 @@ impl Assembler {
         out.push(Event::ToolCallEnd {
             index: self.index,
             source: Text::default(),
+            ended: CallEnd::Closed,
         });
     }
 }
@@ -125,8 +130,36 @@ impl crate::engine::CallAssembler for Assembler {
         self.feed(text, declared, out)
     }
 
+    /// A terminal with a row out of the state leaves it only before the value's first byte, where
+    /// a table that reads a thought before the call has the thought's opener
+    /// ([`Format::with_forced_call`](crate::Format::with_forced_call)). Once the value began,
+    /// every terminal is its text, as a JSON string may hold any, or text after it.
+    fn closes(&mut self, _terminal: &str) -> bool {
+        !self.started && !self.unnamed
+    }
+
+    /// A terminal the table ignores is the value's text from the value's first byte to its
+    /// last, as any other terminal is there; before the value and after it the terminal is the
+    /// template's wrapping, which the engine drops.
+    fn markers_are_text(&self) -> bool {
+        self.started && !self.ended
+    }
+
+    /// The call has no delimiter of its own, so the output's end is its end where the value
+    /// is whole there: a number or a literal the bytes end on. A literal is whole at a cut
+    /// too, since no byte continues it; a number is whole only at the model's own stop, since
+    /// the cut may have taken its next digit. A value the end finds unfinished is a call left
+    /// open.
+    fn ends_with_the_output(&self, cut: bool) -> bool {
+        self.started
+            && !self.ended
+            && self.arguments.whole_at_the_end()
+            && !(cut && self.arguments.is_a_number())
+    }
+
     fn close(self: Box<Self>, _terminal: &str, out: &mut Events) -> bool {
-        // The table has no terminal that closes the region; the end of the stream does.
+        // No terminal closes the call; the end of the stream does. A terminal that leaves the
+        // state before the value began ([`Self::closes`]) finds nothing to end.
         (*self).finish(out);
         false
     }

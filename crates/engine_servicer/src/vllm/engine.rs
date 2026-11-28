@@ -3,7 +3,6 @@
 
 use std::sync::Arc;
 
-use engine_zmq_adapter::structured_outputs_backend_from_config;
 use openai_protocol::worker::RuntimeType;
 
 use super::State;
@@ -30,9 +29,24 @@ pub(super) async fn connect_engine(state: Arc<State>, inputs: ConnectInputs) {
         inputs,
         |client| {
             client.adopt_tokenizer_eos(state.tokenizer());
-            client.set_structured_outputs_support(
-                structured_outputs_backend_from_config(&state.model.structured_outputs_backend)
-                    .into(),
+            client.set_structured_outputs_support(super::structured_outputs_support(&state.model));
+            // The model's vocabulary, widened where vLLM's frontend widens
+            // it by the tokenizer's largest id (a multimodal placeholder can
+            // lie past the model's).
+            client.set_vocab_size(
+                state.model.vocab_size,
+                state
+                    .tokenizer()
+                    .and_then(|tokenizer| tokenizer.max_token_id()),
+            );
+            // A PD decode side's prompt KV is pulled only by a consumer of
+            // a connector that acts on the request's handoff claim; elsewhere
+            // the claim is ignored and the engine computes the prompt itself.
+            // Even after a pull it computes the prompt's tail itself.
+            client.note_kv_transfer_config(
+                &state.model.kv_connector,
+                &state.model.kv_role,
+                state.model.pd_local_tail,
             );
             // Known at start: the wire reports every scheduler step while the
             // engine's statistics are on, before its first batch shows it.

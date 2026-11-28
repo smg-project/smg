@@ -14,45 +14,119 @@ use std::{
 };
 
 use http::HeaderMap;
+use serde::{ser::SerializeMap, Serialize, Serializer};
 use serde_json::{json, Value};
-
-use crate::worker::Worker;
+use smg_worker::identity::basic::Worker;
 
 #[derive(Default)]
 struct Capture {
     /// The request asked for its decision record (`x-smg-cache-trace: 1`).
     header_requested: bool,
     prediction: Value,
-    selections: Vec<Value>,
+    selections: Vec<Selection>,
     truncated: bool,
     gates: Vec<Value>,
-    candidates: Vec<Value>,
+    candidates: Vec<Candidate>,
     candidates_complete: bool,
     observation_started_ns: u64,
     observation_finished_ns: u64,
     scores: Vec<Value>,
 }
 
+/// One candidate as a selection observed it: the worker, and the state read
+/// from it where the pick runs, which may be under a caller's lock. Nothing
+/// here is text: the candidate's JSON object is written from these values
+/// when the evidence is (see its [`Serialize`]), after the pick and its lock.
+/// The URL and the advertised epochs are the worker's own and never change,
+/// so they are read at the write; whether those epochs were current is read
+/// here.
+struct Candidate {
+    worker: Arc<dyn Worker>,
+    load: usize,
+    healthy: bool,
+    overloaded: bool,
+    revision: u64,
+    epochs_valid: bool,
+}
+
+impl Serialize for Candidate {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let epochs = if self.epochs_valid {
+            self.worker.advertised_cache_trace_epochs()
+        } else {
+            Vec::new()
+        };
+        let epoch = if epochs.len() == 1 {
+            epochs.first()
+        } else {
+            None
+        };
+        let mut row = serializer.serialize_map(Some(8))?;
+        row.serialize_entry("worker", self.worker.redacted_url())?;
+        row.serialize_entry("load", &self.load)?;
+        row.serialize_entry("healthy", &self.healthy)?;
+        row.serialize_entry("overloaded", &self.overloaded)?;
+        row.serialize_entry("registry_revision", &self.revision)?;
+        row.serialize_entry("backend_cache_epoch", &epoch)?;
+        row.serialize_entry("backend_cache_epochs", &epochs)?;
+        row.serialize_entry("backend_cache_epoch_source", "registration_metadata")?;
+        row.end()
+    }
+}
+
+/// One selection's row as it was observed, kept as values until the evidence
+/// is written.
+struct Selection {
+    /// The policy's name and the seam's: static, so a row copies neither.
+    policy: &'static str,
+    origin: &'static str,
+    worker: Option<Arc<dyn Worker>>,
+    prediction: Value,
+    candidates: Vec<Candidate>,
+    candidates_complete: bool,
+    observation_started_ns: u64,
+    observation_finished_ns: u64,
+    scores: Vec<Value>,
+    gates: Vec<Value>,
+}
+
+impl Serialize for Selection {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let worker = self.worker.as_ref().map(|worker| worker.redacted_url());
+        let mut row = serializer.serialize_map(Some(14))?;
+        row.serialize_entry("policy", &self.policy)?;
+        row.serialize_entry("origin", &self.origin)?;
+        row.serialize_entry("worker", &worker)?;
+        row.serialize_entry("prediction", &self.prediction)?;
+        row.serialize_entry("candidates", &self.candidates)?;
+        row.serialize_entry("candidates_complete", &self.candidates_complete)?;
+        row.serialize_entry("observation_started_ns", &self.observation_started_ns)?;
+        row.serialize_entry("observation_finished_ns", &self.observation_finished_ns)?;
+        row.serialize_entry("snapshot_atomic", &false)?;
+        row.serialize_entry("scores", &self.scores)?;
+        row.serialize_entry("load_source", "router_inflight")?;
+        row.serialize_entry("eligibility_scope", "policy_candidates")?;
+        row.serialize_entry("load_observation_phase", "before_selection")?;
+        row.serialize_entry("gates", &self.gates)?;
+        row.end()
+    }
+}
+
 impl Capture {
+    /// Read the candidates where the pick is about to run: each worker's
+    /// handle and its live state, no text. A caller may hold a lock here.
     fn observe_candidates(&mut self, workers: &[Arc<dyn Worker>]) {
         self.observation_started_ns = timestamp_ns();
         self.candidates = workers
             .iter()
             .take(32)
-            .map(|worker| {
-                let epochs = worker.cache_trace_epochs();
-                let epoch = if epochs.len() == 1 {
-                    epochs.first()
-                } else {
-                    None
-                };
-                json!({
-                    "worker": worker.redacted_url(), "load": worker.load(), "healthy": worker.is_healthy(),
-                    "overloaded": worker.is_overloaded(), "registry_revision": worker.revision(),
-                    "backend_cache_epoch": epoch,
-                    "backend_cache_epochs": epochs,
-                    "backend_cache_epoch_source": "registration_metadata",
-                })
+            .map(|worker| Candidate {
+                epochs_valid: worker.cache_trace_epochs_valid(),
+                load: worker.load(),
+                healthy: worker.is_healthy(),
+                overloaded: worker.is_overloaded(),
+                revision: worker.revision(),
+                worker: Arc::clone(worker),
             })
             .collect();
         self.candidates_complete = workers.len() <= 32;
@@ -74,7 +148,7 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// The process-wide switches: either one captures every request.
-fn configured() -> bool {
+pub(crate) fn configured() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| log_enabled() || header_enabled())
 }
@@ -291,8 +365,8 @@ pub(crate) fn mark_truncated() {
 }
 
 pub(crate) fn selection(
-    policy: &str,
-    origin: &str,
+    policy: &'static str,
+    origin: &'static str,
     workers: &[Arc<dyn Worker>],
     selected: Option<usize>,
 ) {
@@ -301,25 +375,92 @@ pub(crate) fn selection(
     }
     let _ = CAPTURE.try_with(|capture| {
         let mut capture = capture.borrow_mut();
+        let capture = &mut *capture;
         if capture.selections.len() >= 16 {
             capture.truncated = true;
             return;
         }
-        let value = json!({
-            "policy": policy, "origin": origin,
-            "worker": selected.map(|idx| workers[idx].redacted_url()),
-            "prediction": std::mem::take(&mut capture.prediction),
-            "candidates": std::mem::take(&mut capture.candidates),
-            "candidates_complete": capture.candidates_complete,
-            "observation_started_ns": capture.observation_started_ns,
-            "observation_finished_ns": capture.observation_finished_ns,
-            "snapshot_atomic": false,
-            "scores": std::mem::take(&mut capture.scores),
-            "load_source": "router_inflight", "eligibility_scope": "policy_candidates",
-            "load_observation_phase": "before_selection",
-            "gates": std::mem::take(&mut capture.gates),
+        // The row's values, moved: its text is written with the evidence.
+        capture.selections.push(Selection {
+            policy,
+            origin,
+            worker: selected.map(|idx| Arc::clone(&workers[idx])),
+            prediction: std::mem::take(&mut capture.prediction),
+            candidates: std::mem::take(&mut capture.candidates),
+            candidates_complete: capture.candidates_complete,
+            observation_started_ns: capture.observation_started_ns,
+            observation_finished_ns: capture.observation_finished_ns,
+            scores: std::mem::take(&mut capture.scores),
+            gates: std::mem::take(&mut capture.gates),
         });
-        capture.selections.push(value);
+    });
+}
+
+/// The rows a request's capture keeps at most. A row past them is dropped
+/// and marks the record truncated. [`selection`] states the same bound in
+/// place.
+const MAX_SELECTIONS: usize = 16;
+
+/// What a selection observed of its candidates, held by its caller until
+/// the selection's row is written ([`selection_of`]): the candidates,
+/// whether they are all of the list, and the reading's two instants.
+pub(crate) struct Observed {
+    candidates: Vec<Candidate>,
+    candidates_complete: bool,
+    started_ns: u64,
+    finished_ns: u64,
+}
+
+/// A list's candidates as a selection observes them where its pick is about
+/// to run ([`begin_selection`]), handed to the caller and not kept in the
+/// request's capture. It is for a call that may pick from two lists and
+/// answers workers, not places in a list: its caller reads each list ahead
+/// of the call and writes a row for each pick behind it
+/// ([`selection_of`]). `None` where nothing is captured for the request,
+/// which is one lookup.
+pub(crate) fn observe(workers: &[Arc<dyn Worker>]) -> Option<Observed> {
+    CAPTURE
+        .try_with(|_| {
+            let mut read = Capture::default();
+            read.observe_candidates(workers);
+            Observed {
+                candidates: read.candidates,
+                candidates_complete: read.candidates_complete,
+                started_ns: read.observation_started_ns,
+                finished_ns: read.observation_finished_ns,
+            }
+        })
+        .ok()
+}
+
+/// The row of the selection whose candidates `observed` holds: `policy` and
+/// `origin` as [`selection`] takes them, and `worker` the worker picked,
+/// `None` where the call picked nobody. The row holds no prediction, score
+/// or gate: the call that picked wrote none.
+pub(crate) fn selection_of(
+    policy: &'static str,
+    origin: &'static str,
+    observed: Observed,
+    worker: Option<&Arc<dyn Worker>>,
+) {
+    let _ = CAPTURE.try_with(|capture| {
+        let mut capture = capture.borrow_mut();
+        if capture.selections.len() >= MAX_SELECTIONS {
+            capture.truncated = true;
+            return;
+        }
+        capture.selections.push(Selection {
+            policy,
+            origin,
+            worker: worker.map(Arc::clone),
+            prediction: Value::Null,
+            candidates: observed.candidates,
+            candidates_complete: observed.candidates_complete,
+            observation_started_ns: observed.started_ns,
+            observation_finished_ns: observed.finished_ns,
+            scores: Vec::new(),
+            gates: Vec::new(),
+        });
     });
 }
 
@@ -388,224 +529,34 @@ fn gateway_header(value: &Value) -> Option<String> {
 pub(crate) fn failure(root_id: Option<&str>, status: u16) {
     if log_enabled() {
         let _ = CAPTURE.try_with(|capture| {
-            let capture = capture.borrow();
-            let evidence = json!({"root_id": root_id, "status": status,
-                "selections": capture.selections, "gates": capture.gates,
-                "truncated": capture.truncated});
+            let evidence = failure_evidence(&capture.borrow(), root_id, status);
             let evidence = encode_capped(evidence, max_bytes());
             tracing::info!(target: "smg::cache_trace", evidence = %evidence, "Cache routing failure");
         });
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn candidate_observation_survives_dispatch_load_credit() {
-        use crate::worker::BasicWorkerBuilder;
-        let worker: Arc<dyn Worker> =
-            Arc::new(BasicWorkerBuilder::new("http://worker:8000").build());
-        let workers = vec![worker];
-        let mut capture = Capture::default();
-        capture.observe_candidates(&workers);
-        workers[0].increment_load();
-        assert_eq!(capture.candidates[0]["load"], json!(0));
-        assert_eq!(workers[0].load(), 1);
-        assert!(capture.candidates_complete);
-        assert!(capture.observation_started_ns <= capture.observation_finished_ns);
-    }
-
-    #[test]
-    fn candidate_epochs_are_replica_scoped_and_invalidated_after_failure() {
-        use openai_protocol::worker::WorkerStatus;
-
-        use crate::worker::BasicWorkerBuilder;
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://worker:8000")
-                .labels(std::collections::HashMap::from([(
-                    "cache_trace_epochs".to_string(),
-                    r#"["one","two"]"#.to_string(),
-                )]))
-                .build(),
-        );
-        let mut capture = Capture::default();
-        capture.observe_candidates(std::slice::from_ref(&worker));
-        assert_eq!(
-            capture.candidates[0]["backend_cache_epochs"],
-            json!(["one", "two"])
-        );
-        assert!(capture.candidates[0]["backend_cache_epoch"].is_null());
-        worker.set_status(WorkerStatus::NotReady);
-        worker.set_status(WorkerStatus::Ready);
-        capture.observe_candidates(&[worker]);
-        assert_eq!(capture.candidates[0]["backend_cache_epochs"], json!([]));
-        assert!(capture.candidates[0]["backend_cache_epoch"].is_null());
-    }
-
-    #[test]
-    fn gateway_header_keeps_join_fields_without_candidate_state() {
-        let mut evidence = json!({
-            "schema": 1, "root_id": "root", "dispatch_id": "dispatch", "attempt": 1,
-            "engine_ids": ["engine"], "engine_ids_complete": true, "truncated": false,
-            "selections": [{"policy": "cache_aware", "origin": "policy",
-                "prediction": {"source": "approximate_tree"},
-                "worker": "selected-worker", "candidates": [{"worker": "candidate-worker", "load": 99}],
-                "gates": [{"spill": true}]}],
-        });
-        let encoded = gateway_header(&evidence).unwrap();
-        assert!(!encoded.contains("candidate-worker"));
-        assert!(!encoded.contains("gates"));
-        let decoded: Value = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(decoded["engine_ids"], json!(["engine"]));
-        assert_eq!(decoded["attempt"], 1);
-        assert_eq!(
-            decoded["selections"][0]["worker"], "selected-worker",
-            "the chosen worker joins the record"
-        );
-        evidence["root_id"] = Value::String("x".repeat(2049));
-        assert!(gateway_header(&evidence).is_none());
-    }
-
-    fn fleet_evidence(candidates: usize) -> Value {
-        let candidates: Vec<Value> = (0..candidates)
-            .map(|index| {
-                json!({
-                    "worker": format!("http://10.0.0.{index}:8000"), "load": index, "healthy": true,
-                    "overloaded": false, "registry_revision": 7, "backend_cache_epoch": null,
-                })
-            })
-            .collect();
-        json!({
-            "schema": 1, "root_id": "root", "dispatch_id": "dispatch", "attempt": 1,
-            "engine_ids": ["engine"], "engine_ids_complete": true, "truncated": false,
-            "selections": [{"policy": "cache_aware", "origin": "policy", "worker": "http://10.0.0.3:8000",
-                "prediction": {"source": "approximate_tree", "overlap_blocks": 4},
-                "candidates": candidates, "candidates_complete": true,
-                "scores": [{"worker": "http://10.0.0.3:8000", "score": 0.9}],
-                "gates": [{"spill": false}]}],
-            "unattributed_gates": [{"spill": true}],
-        })
-    }
-
-    #[test]
-    fn sample_knob_logs_one_dispatch_in_every_n() {
-        assert_eq!(parse_sample(None), 1);
-        assert_eq!(parse_sample(Some("0")), 1);
-        assert_eq!(parse_sample(Some("many")), 1);
-        assert_eq!(parse_sample(Some(" 100 ")), 100);
-        let every_request = Sampler::new(1);
-        assert!((0..10).all(|_| every_request.admit()));
-        let one_in_hundred = Sampler::new(100);
-        let logged = (0..1000)
-            .filter(|_| log_line(fleet_evidence(32), &one_in_hundred, None).is_some())
-            .count();
-        assert_eq!(logged, 10);
-        assert!(
-            Sampler::new(100).admit(),
-            "the first dispatch is always logged"
-        );
-    }
-
-    #[test]
-    fn byte_cap_keeps_the_decision_record_and_drops_the_candidate_lists() {
-        assert_eq!(parse_max_bytes(None), None);
-        assert_eq!(parse_max_bytes(Some("bytes")), None);
-        assert_eq!(parse_max_bytes(Some("1024")), Some(1024));
-        let full = encode_capped(fleet_evidence(32), None);
-        assert!(
-            full.len() > 3000,
-            "32 candidates make the line {} bytes",
-            full.len()
-        );
-        assert_eq!(encode_capped(fleet_evidence(32), Some(full.len())), full);
-        let capped = encode_capped(fleet_evidence(32), Some(1024));
-        assert!(capped.len() < 1024, "capped line is {} bytes", capped.len());
-        let decoded: Value = serde_json::from_str(&capped).unwrap();
-        assert_eq!(decoded["capped"], json!(true));
-        assert_eq!(decoded["root_id"], "root");
-        assert_eq!(decoded["engine_ids"], json!(["engine"]));
-        let selection = &decoded["selections"][0];
-        assert_eq!(selection["policy"], "cache_aware");
-        assert_eq!(selection["worker"], "http://10.0.0.3:8000");
-        assert_eq!(selection["prediction"]["overlap_blocks"], 4);
-        assert!(selection.get("candidates").is_none());
-        assert!(selection.get("scores").is_none());
-        assert_eq!(
-            selection["elided"],
-            json!({"candidates": 32, "scores": 1, "gates": 1})
-        );
-        assert!(decoded.get("unattributed_gates").is_none());
-        let failure = encode_capped(
-            json!({"root_id": "root", "status": 503, "selections": [], "gates": [{"spill": true}], "truncated": false}),
-            Some(0),
-        );
-        let decoded: Value = serde_json::from_str(&failure).unwrap();
-        assert_eq!(decoded["status"], 503);
-        assert!(decoded.get("gates").is_none());
-    }
-
-    #[test]
-    fn the_header_switch_alone_yields_the_header_and_no_log_line() {
-        let every_dispatch = Sampler::new(1);
-        let (header, line) = emit(fleet_evidence(2), false, true, &every_dispatch, None);
-        let header: Value = serde_json::from_str(&header.unwrap()).unwrap();
-        assert_eq!(header["selections"][0]["prediction"]["overlap_blocks"], 4);
-        assert!(line.is_none(), "the log switch is off");
-        let (header, line) = emit(fleet_evidence(2), true, false, &every_dispatch, None);
-        assert!(header.is_none(), "the header switch is off");
-        assert!(line.is_some());
-        let (header, line) = emit(fleet_evidence(2), true, true, &every_dispatch, None);
-        assert!(header.is_some() && line.is_some());
-        let one_in_hundred = Sampler::new(100);
-        let outcomes: Vec<_> = (0..200)
-            .map(|_| emit(fleet_evidence(2), true, true, &one_in_hundred, None))
-            .collect();
-        assert!(
-            outcomes.iter().all(|(header, _)| header.is_some()),
-            "sampling the log line leaves the header on every dispatch"
-        );
-        assert_eq!(
-            outcomes.iter().filter(|(_, line)| line.is_some()).count(),
-            2
-        );
-    }
-
-    #[test]
-    fn the_request_header_asks_for_this_requests_record() {
-        let mut headers = HeaderMap::new();
-        assert!(!requested(None));
-        assert!(!requested(Some(&headers)));
-        headers.insert(REQUEST_HEADER, http::HeaderValue::from_static("0"));
-        assert!(!requested(Some(&headers)));
-        headers.insert(REQUEST_HEADER, http::HeaderValue::from_static(" 1 "));
-        assert!(requested(Some(&headers)));
-    }
-
-    #[tokio::test]
-    async fn a_requesting_scope_captures_its_request_alone() {
-        use crate::worker::BasicWorkerBuilder;
-        let worker: Arc<dyn Worker> =
-            Arc::new(BasicWorkerBuilder::new("grpc://worker:50051").build());
-        let workers = vec![worker];
-        scope(true, async {
-            assert!(enabled(), "the request asked: its evidence is captured");
-            begin_selection(&workers);
-            selection("random", "policy", &workers, Some(0));
-            let header = dispatch(Some("root"), 0, vec!["engine".into()], true, "regular")
-                .expect("the header for the request that asked");
-            let header: Value = serde_json::from_str(&header).unwrap();
-            assert_eq!(header["root_id"], "root");
-            assert_eq!(header["selections"][0]["worker"], "grpc://worker:50051");
-            assert_eq!(header["selections"][0]["policy"], "random");
-        })
-        .await;
-        assert_eq!(
-            enabled(),
-            configured(),
-            "outside that request only the process switches count"
-        );
-        scope(false, async { assert_eq!(enabled(), configured()) }).await;
-    }
+/// A failed request's evidence: its rows so far, written from the capture
+/// and left in it, where a retry's dispatch still finds them.
+fn failure_evidence(capture: &Capture, root_id: Option<&str>, status: u16) -> Value {
+    json!({"root_id": root_id, "status": status,
+        "selections": capture.selections, "gates": capture.gates,
+        "truncated": capture.truncated})
 }
+
+/// The rows the capture in scope holds, each as the evidence line lists it
+/// (its candidates, scores and gates included), for a test that reads what
+/// a selection observed; empty outside a capture.
+#[cfg(test)]
+pub(crate) fn captured_selections() -> Vec<Value> {
+    CAPTURE
+        .try_with(|capture| {
+            let capture = capture.borrow();
+            capture.selections.iter().map(|row| json!(row)).collect()
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+#[path = "../../tests/unit/observability/cache_trace/tests.rs"]
+mod tests;

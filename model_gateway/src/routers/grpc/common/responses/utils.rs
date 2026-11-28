@@ -5,17 +5,17 @@ use std::sync::Arc;
 use axum::response::Response;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use openai_protocol::{
-    common::Tool,
+    common::{Tool, Usage},
     responses::{
-        CustomTool, IncompleteDetails, IncompleteReason, NamespaceTool, ResponseStatus,
-        ResponseTool, ResponsesRequest, ResponsesResponse,
+        CustomTool, IncompleteDetails, IncompleteReason, InputTokensDetails, NamespaceTool,
+        OutputTokensDetails, ResponseStatus, ResponseTool, ResponseUsage, ResponsesRequest,
+        ResponsesResponse,
     },
 };
 use serde_json::{json, to_value, Value};
 use smg_data_connector::{
-    is_unstored, visible_chain, ConversationItemStorage, ConversationStorage,
-    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, ResponseStorageError,
-    StoredResponse,
+    ConversationItemStorage, ConversationStorage, RequestContext as StorageRequestContext,
+    ResponseId, ResponseStorage, ResponseStorageError, StoredResponse,
 };
 use smg_mcp::{McpOrchestrator, McpServerBinding};
 use tracing::{debug, error, warn};
@@ -25,16 +25,16 @@ use crate::{
     observability::metrics::Metrics,
     routers::{
         common::{
-            mcp_utils::{ensure_request_mcp_client, DEFAULT_MAX_ITERATIONS},
+            mcp_utils::{ensure_request_mcp_routing, DEFAULT_MAX_ITERATIONS},
             openai_bridge,
             persistence_utils::{
-                persist_conversation_items, persist_conversation_items_if_open, PersistError,
+                persist_conversation_items_if_open, persist_conversation_items_owned, PersistError,
                 PersistStep,
             },
+            snapshot::WorkerRegistry,
         },
         error,
     },
-    worker::WorkerRegistry,
 };
 
 /// Supply failure details when an engine reports only a terminal finish reason.
@@ -53,10 +53,10 @@ pub(crate) fn generation_failure_error(finish_reason: Option<&str>) -> Option<Va
 /// whole one: cut by the token limit or an abort, or ended by the model and not read whole (a
 /// tagged syntax that refused bytes inside the call writes no close for it; a JSON syntax carries
 /// the bytes as written from where they stopped being JSON), the turn ending on the call
-/// (`tool_calls`) all the same; a failed generation stays `in_progress`.
+/// (`tool_calls`) all the same; a failed or cancelled generation stays `in_progress`.
 pub(crate) fn function_call_status(finish_reason: Option<&str>, arguments: &str) -> &'static str {
     match finish_reason {
-        Some("failed" | "error") => "in_progress",
+        Some("failed" | "error" | "cancelled") => "in_progress",
         _ if serde_json::from_str::<Value>(arguments).is_err() => "incomplete",
         _ => "completed",
     }
@@ -78,7 +78,8 @@ pub(crate) fn cut_call<'a>(
 /// The response's status for the Chat finish reason, with why it is incomplete: a `length`
 /// finish is the token limit; a call that is no whole call under any other finish (`cut_call`,
 /// read on the calls' function-shaped arguments) leaves the response incomplete with no stated
-/// reason. Every
+/// reason; `cancelled` is the gateway's own finish for a stream stopped before its end (the
+/// client left a stored stream), `cancelled` with no reason. Every
 /// builder of a Responses object reads its status here: the non-streaming conversions,
 /// regular and Harmony, the stored object of a regular streamed turn, and the emitter for its
 /// terminal event and stored object under the finish it holds, whether chat chunks or a
@@ -89,6 +90,7 @@ pub(crate) fn response_status(
 ) -> (ResponseStatus, Option<IncompleteDetails>) {
     match finish_reason {
         Some("failed" | "error") => (ResponseStatus::Failed, None),
+        Some("cancelled") => (ResponseStatus::Cancelled, None),
         Some("length") => (
             ResponseStatus::Incomplete,
             Some(IncompleteDetails {
@@ -106,6 +108,87 @@ pub(crate) fn tool_call_limit(max_tool_calls: Option<usize>) -> usize {
     max_tool_calls.map_or(DEFAULT_MAX_ITERATIONS, |user_max| {
         user_max.min(DEFAULT_MAX_ITERATIONS)
     })
+}
+
+/// The server calls a request may still run once `executed` ran: its cap (see
+/// `tool_call_limit`) less them.
+pub(crate) fn tool_call_allowance(max_tool_calls: Option<usize>, executed: usize) -> usize {
+    tool_call_limit(max_tool_calls).saturating_sub(executed)
+}
+
+/// Whether a Harmony loop generation is past the loop's safety net. The call
+/// limit (see `tool_call_limit`) already bounds the loop, since every turn
+/// that continues it runs at least one server call, so the net allows that
+/// many generations plus the one that answers on the last result; the final
+/// turn after the request's cap is always the last generation and is exempt.
+pub(crate) fn iteration_exceeds_safety_limit(iteration_count: usize, final_turn: bool) -> bool {
+    iteration_count > DEFAULT_MAX_ITERATIONS + 1 && !final_turn
+}
+
+/// Adds one model call's usage to a response's total. Usage is per model
+/// request, so a tool loop reports the sum of its calls; a call that reported
+/// none leaves the total as it is.
+pub(crate) fn add_model_call_usage(total: &mut Option<ResponseUsage>, usage: Option<&Usage>) {
+    let Some(usage) = usage else {
+        return;
+    };
+    let total = total.get_or_insert_with(|| ResponseUsage {
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        input_tokens_details: InputTokensDetails::default(),
+        output_tokens_details: OutputTokensDetails::default(),
+    });
+    total.input_tokens = total.input_tokens.saturating_add(usage.prompt_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(usage.completion_tokens);
+    total.total_tokens = total.total_tokens.saturating_add(usage.total_tokens);
+    if let Some(details) = &usage.prompt_tokens_details {
+        total.input_tokens_details.cached_tokens = total
+            .input_tokens_details
+            .cached_tokens
+            .saturating_add(details.cached_tokens);
+    }
+    if let Some(tokens) = usage
+        .completion_tokens_details
+        .as_ref()
+        .and_then(|details| details.reasoning_tokens)
+    {
+        total.output_tokens_details.reasoning_tokens = total
+            .output_tokens_details
+            .reasoning_tokens
+            .saturating_add(tokens);
+    }
+}
+
+/// Why a generated batch of server calls must stop after its permitted prefix
+/// executes: the request's own `max_tool_calls`, or the loop's internal safety
+/// limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpToolCallLimit {
+    User,
+    Safety,
+}
+
+/// The cap a batch of `batch` server calls overflows once `executed` calls
+/// ran: `None` when the batch fits the remaining allowance, else the cap and
+/// the length of the batch's permitted prefix. The cap is the request's own
+/// when it names one at or under the safety limit (a user cap wins when both
+/// are equal), else the safety limit.
+pub(crate) fn tool_call_overflow(
+    max_tool_calls: Option<usize>,
+    executed: usize,
+    batch: usize,
+) -> Option<(McpToolCallLimit, usize)> {
+    let remaining = tool_call_allowance(max_tool_calls, executed);
+    if batch <= remaining {
+        return None;
+    }
+    let limit = if max_tool_calls.is_some_and(|limit| limit <= DEFAULT_MAX_ITERATIONS) {
+        McpToolCallLimit::User
+    } else {
+        McpToolCallLimit::Safety
+    };
+    Some((limit, remaining))
 }
 
 /// Ensure MCP connection succeeds if MCP tools or builtin tools are declared.
@@ -150,34 +233,53 @@ pub(crate) async fn ensure_mcp_connection(
     if let Some(tools) = tools {
         // TODO: Thread real request headers through the gRPC responses path if/when
         // gRPC MCP flows need the same forwarded-header preservation contract.
-        match ensure_request_mcp_client(mcp_orchestrator, format_registry, tools).await {
-            Some(mcp_servers) => {
-                return Ok((true, mcp_servers));
-            }
-            None => {
-                // No MCP servers available
-                if has_explicit_mcp_tools {
-                    // Explicit MCP tools MUST have working connections
-                    error!(
-                        function = "ensure_mcp_connection",
-                        "Failed to connect to MCP servers"
-                    );
-                    return Err(error::failed_dependency(
-                        "connect_mcp_server_failed",
-                        "Failed to connect to MCP servers. Check server_url and authorization.",
-                    ));
-                }
-                // Builtin tools without MCP routing - pass through to model
-                debug!(
-                    function = "ensure_mcp_connection",
-                    "No MCP routing configured for builtin tools, passing through to model"
-                );
-                return Ok((false, Vec::new()));
-            }
+        if let Some(mcp_servers) =
+            ensure_request_mcp_routing(mcp_orchestrator, format_registry, tools).await?
+        {
+            return Ok((true, mcp_servers));
         }
+        // Builtin tools without MCP routing - pass through to model
+        debug!(
+            function = "ensure_mcp_connection",
+            "No MCP routing configured for builtin tools, passing through to model"
+        );
     }
 
     Ok((false, Vec::new()))
+}
+
+/// Refuse tools that disallow direct calls, including namespace members.
+/// This router can offer tools to the model only for direct calls.
+pub(crate) fn refuse_tools_without_a_direct_caller(
+    tools: Option<&[ResponseTool]>,
+) -> Option<Response> {
+    let refused_at = |idx: usize, tool: &ResponseTool| match tool {
+        ResponseTool::Namespace(namespace) => {
+            namespace
+                .tools
+                .iter()
+                .enumerate()
+                .find_map(|(member_idx, member)| {
+                    let direct = match member {
+                        NamespaceTool::Function(ft) => ft.allows_direct_calls(),
+                        NamespaceTool::Custom(ct) => ct.allows_direct_calls(),
+                    };
+                    (!direct).then(|| format!("tools[{idx}].tools[{member_idx}]"))
+                })
+        }
+        _ => (!tool.allows_direct_calls()).then(|| format!("tools[{idx}]")),
+    };
+    let at = tools
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .find_map(|(idx, tool)| refused_at(idx, tool))?;
+    Some(error::bad_request(
+        "tool_not_supported",
+        format!(
+            "Invalid '{at}.allowed_callers': this backend runs no programmatic tool calls, so a tool must allow the 'direct' caller."
+        ),
+    ))
 }
 
 /// Validate that workers are available for the requested model.
@@ -223,7 +325,7 @@ pub(crate) fn extract_tools_from_response_tools(
         .flat_map(|tool| match tool {
             ResponseTool::Function(ft) => vec![Tool {
                 tool_type: "function".to_string(),
-                function: ft.function.clone(),
+                function: ft.chat_function(),
             }],
             ResponseTool::Custom(ct) => vec![Tool {
                 tool_type: "function".to_string(),
@@ -234,7 +336,7 @@ pub(crate) fn extract_tools_from_response_tools(
                 .iter()
                 .map(|member| {
                     let mut function = match member {
-                        NamespaceTool::Function(ft) => ft.function.clone(),
+                        NamespaceTool::Function(ft) => ft.chat_function(),
                         NamespaceTool::Custom(ct) => custom_tool_as_function(ct),
                     };
                     function.name = format!("{}.{}", namespace.name, function.name);
@@ -272,12 +374,13 @@ pub(crate) fn custom_tool_as_function(ct: &CustomTool) -> openai_protocol::commo
 }
 
 /// Recover a custom tool's raw `input` from the `{"input": "..."}` arguments
-/// of its downgraded function call.
+/// of its downgraded function call, preserving the raw `arguments` string if
+/// the model emitted plain text or another JSON shape instead.
 pub(crate) fn custom_tool_input(arguments: &str) -> String {
     serde_json::from_str::<Value>(arguments)
         .ok()
         .and_then(|v| v.get("input")?.as_str().map(str::to_owned))
-        .unwrap_or_default()
+        .unwrap_or_else(|| arguments.to_owned())
 }
 
 /// Collect the names of all declared custom tools (top-level and namespaced),
@@ -324,6 +427,14 @@ pub(crate) fn decode_reasoning_content(blob: &str) -> Option<String> {
     String::from_utf8(BASE64_STANDARD.decode(payload).ok()?).ok()
 }
 
+/// Whether `name` is `namespace` and `member` joined by a dot, read at the
+/// dot without building the joined text.
+fn is_namespaced(name: &str, namespace: &str, member: &str) -> bool {
+    name.strip_prefix(namespace)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .is_some_and(|rest| rest == member)
+}
+
 /// Recover structured identity only for a declared namespace member.
 /// Literal top-level names (including dots) take precedence over namespace matches.
 pub(crate) fn resolve_function_identity(
@@ -331,17 +442,20 @@ pub(crate) fn resolve_function_identity(
     name: &str,
 ) -> (String, Option<String>) {
     let tools = tools.unwrap_or_default();
-    if !tools
-        .iter()
-        .any(|tool| matches!(tool, ResponseTool::Function(ft) if ft.function.name == name))
-    {
+    if !tools.iter().any(|tool| match tool {
+        ResponseTool::Function(ft) => ft.function.name == name,
+        ResponseTool::Custom(ct) => ct.name == name,
+        _ => false,
+    }) {
         for tool in tools {
             if let ResponseTool::Namespace(namespace) = tool {
                 for member in &namespace.tools {
-                    if let NamespaceTool::Function(ft) = member {
-                        if name == format!("{}.{}", namespace.name, ft.function.name) {
-                            return (ft.function.name.clone(), Some(namespace.name.clone()));
-                        }
+                    let member_name = match member {
+                        NamespaceTool::Function(ft) => &ft.function.name,
+                        NamespaceTool::Custom(ct) => &ct.name,
+                    };
+                    if is_namespaced(name, &namespace.name, member_name) {
+                        return (member_name.clone(), Some(namespace.name.clone()));
                     }
                 }
             }
@@ -371,8 +485,7 @@ pub(crate) fn namespace_test_request() -> ResponsesRequest {
 /// tokens, 3 of them cached and 2 reasoning; `assert_responses_api_usage`
 /// reads it back off the wire.
 #[cfg(test)]
-pub(crate) fn responses_api_test_usage() -> openai_protocol::common::Usage {
-    use openai_protocol::common::Usage;
+pub(crate) fn responses_api_test_usage() -> Usage {
     Usage::from_counts(12, 7)
         .with_cached_tokens(3)
         .with_reasoning_tokens(2)
@@ -462,24 +575,9 @@ pub(crate) async fn previous_response_chain(
     tenant: Option<&str>,
 ) -> Result<Vec<Arc<StoredResponse>>, Response> {
     let prev_id = ResponseId::from(prev_id_str);
-    match storage.get_response_chain(&prev_id, None).await {
-        Ok(chain)
-            if !chain.responses.is_empty()
-                && !chain
-                    .responses
-                    .last()
-                    .is_some_and(|response| is_unstored(response)) =>
-        {
-            let responses = visible_chain(chain.responses, tenant);
-            if responses.is_empty() {
-                return Err(error::bad_request(
-                    "previous_response_not_found",
-                    format!("Previous response with id '{prev_id_str}' not found."),
-                ));
-            }
-            Ok(responses)
-        }
-        Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => Err(error::bad_request(
+    match storage.get_response_chain_for(&prev_id, tenant).await {
+        Ok(chain) if !chain.responses.is_empty() => Ok(chain.responses),
+        Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => Err(error::not_found(
             "previous_response_not_found",
             format!("Previous response with id '{prev_id_str}' not found."),
         )),
@@ -544,8 +642,11 @@ pub(crate) async fn persist_response_if_needed(
     } else {
         "foreground"
     };
-    let response_json = match to_value(response) {
-        Ok(json) => json,
+    let mut response_json = match to_value(response) {
+        Ok(mut json) => {
+            exact_sampling_numbers(&mut json, response);
+            json
+        }
         Err(e) => {
             warn!(response_id = %response.id, error = %e, "Failed to serialize the response for storage");
             Metrics::record_response_not_stored(mode, "record");
@@ -587,11 +688,16 @@ pub(crate) async fn persist_response_if_needed(
             )
             .await
         } else {
-            persist_conversation_items(
+            // Only a background persist comes round again: the store takes the tree.
+            debug_assert!(
+                !response_json.is_null(),
+                "a foreground persist runs once; its tree is taken"
+            );
+            persist_conversation_items_owned(
                 conversation_storage.clone(),
                 conversation_item_storage.clone(),
                 response_storage.clone(),
-                &response_json,
+                std::mem::take(&mut response_json),
                 original_request,
                 tenant,
                 request_context.clone(),
@@ -660,578 +766,38 @@ pub(crate) async fn persist_response_if_needed(
 fn not_stored(error: &PersistError) -> NotStored {
     NotStored::new(error.retryable, error)
 }
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use axum::http::StatusCode;
-    use openai_protocol::{
-        model_card::ModelCard, responses::ResponseStatus, worker::HealthCheckConfig,
+/// `value` as a JSON number the way the `f32` prints (`0.7`), not widened
+/// to 64 bits (`0.699999988079071`); the text is written on the stack.
+pub(crate) fn exact_f32(value: f32) -> Value {
+    let mut text = [0u8; 32];
+    let mut rest = &mut text[..];
+    let exact = match serde_json::to_writer(&mut rest, &value) {
+        Ok(()) => {
+            let left = rest.len();
+            serde_json::from_slice(&text[..text.len() - left]).ok()
+        }
+        Err(_) => None,
     };
-    use serde_json::json;
-    use smg_data_connector::{
-        ConditionalStore, ListParams, MemoryConversationItemStorage, MemoryConversationStorage,
-        MemoryResponseStorage, NewConversation, ResponseId, ResponseStorageError, SortOrder,
-        StoredResponse,
-    };
+    // An f32 prints in at most 16 bytes, so this never falls back in
+    // practice; if it did, the widened number is kept.
+    exact.unwrap_or_else(|| Value::from(value))
+}
 
-    use super::*;
-    use crate::{
-        routers::grpc::common::responses::test_support::{
-            completed_response, response_storage_over,
-        },
-        worker::{BasicWorkerBuilder, UNKNOWN_MODEL_ID},
-    };
-
-    /// A chain ending in a record its client asked not to store is no
-    /// previous response (the loaders of both model families call this; the
-    /// item-reference resolver shares its predicate); a stored chain is
-    /// returned, an unknown id refused the same way.
-    #[tokio::test]
-    async fn an_unstored_record_is_no_previous_response() {
-        let storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
-        for (id, store) in [("resp_unstored", false), ("resp_stored", true)] {
-            let mut response = StoredResponse::new(None);
-            response.id = ResponseId::from(id);
-            response.raw_response =
-                json!({"id": id, "store": store, "status": "completed", "output": []});
-            storage.store_response(response).await.unwrap();
+/// Writes `temperature` and `top_p` into the JSON tree of a response as
+/// the response holds them: the plain conversion widens the two 32-bit
+/// numbers to 64 bits.
+pub(crate) fn exact_sampling_numbers(raw: &mut Value, response: &ResponsesResponse) {
+    for (key, value) in [
+        ("temperature", response.temperature),
+        ("top_p", response.top_p),
+    ] {
+        if let (Some(slot), Some(value)) = (raw.get_mut(key), value) {
+            *slot = exact_f32(value);
         }
-
-        let refused = previous_response_chain(&storage, "resp_unstored", None)
-            .await
-            .expect_err("an unstored record is no previous response");
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
-        let chain = previous_response_chain(&storage, "resp_stored", None)
-            .await
-            .expect("a stored record is a previous response");
-        assert_eq!(chain.len(), 1);
-        let unknown = previous_response_chain(&storage, "resp_unknown", None)
-            .await
-            .expect_err("an unknown id is refused");
-        assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
-    }
-
-    /// `background: true` with `store: false`, the public API's probe: the
-    /// result is written over the record the client polls and nothing is
-    /// linked to the conversation; a foreground `store: false` response
-    /// stores nothing at all.
-    #[tokio::test]
-    async fn an_unstored_background_response_finishes_in_its_record_and_the_history_keeps_nothing()
-    {
-        let conversation_storage: Arc<dyn ConversationStorage> =
-            Arc::new(MemoryConversationStorage::new());
-        let item_storage: Arc<dyn ConversationItemStorage> =
-            Arc::new(MemoryConversationItemStorage::new());
-        let response_storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
-        let conversation = conversation_storage
-            .create_conversation(NewConversation::default())
-            .await
-            .unwrap();
-        let request: ResponsesRequest = serde_json::from_value(json!({
-            "model": "m",
-            "input": "hi",
-            "background": true,
-            "store": false,
-            "conversation": conversation.id.0,
-            "max_output_tokens": 64
-        }))
-        .unwrap();
-        background::store_record(
-            &response_storage,
-            &background::queued_response("resp_u", &request),
-            &request,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-        persist_response_if_needed(
-            conversation_storage.clone(),
-            item_storage.clone(),
-            response_storage.clone(),
-            &completed_response("resp_u", &request),
-            &request,
-            None,
-            None,
-        )
-        .await
-        .expect("nothing is reported to the caller here");
-
-        let stored = response_storage
-            .get_response(&ResponseId::from("resp_u"))
-            .await
-            .unwrap()
-            .expect("the record is polled");
-        assert_eq!(
-            stored.raw_response["status"], "completed",
-            "{}",
-            stored.raw_response
-        );
-        assert_eq!(stored.raw_response["store"], false);
-        assert_eq!(
-            stored.raw_response["output"][0]["content"][0]["text"],
-            "hello"
-        );
-        let items = item_storage
-            .list_items(
-                &conversation.id,
-                ListParams {
-                    limit: 10,
-                    order: SortOrder::Asc,
-                    after: None,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(
-            items.is_empty(),
-            "nothing is linked to the conversation: {items:?}"
-        );
-
-        let mut foreground = request;
-        foreground.background = None;
-        persist_response_if_needed(
-            conversation_storage,
-            item_storage,
-            response_storage.clone(),
-            &completed_response("resp_f", &foreground),
-            &foreground,
-            None,
-            None,
-        )
-        .await
-        .expect("nothing is reported to the caller here");
-        assert!(response_storage
-            .get_response(&ResponseId::from("resp_f"))
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    /// A response store that is down: every call answers a storage error.
-    struct DownResponseStorage;
-
-    #[async_trait::async_trait]
-    impl ResponseStorage for DownResponseStorage {
-        async fn store_response(
-            &self,
-            _response: StoredResponse,
-        ) -> Result<ResponseId, ResponseStorageError> {
-            Err(ResponseStorageError::Unavailable(
-                "connection refused".to_string(),
-            ))
-        }
-
-        async fn get_response(
-            &self,
-            _response_id: &ResponseId,
-        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
-            Err(ResponseStorageError::Unavailable(
-                "connection refused".to_string(),
-            ))
-        }
-
-        async fn delete_response(
-            &self,
-            _response_id: &ResponseId,
-        ) -> Result<(), ResponseStorageError> {
-            Err(ResponseStorageError::Unavailable(
-                "connection refused".to_string(),
-            ))
-        }
-
-        async fn list_identifier_responses(
-            &self,
-            _identifier: &str,
-            _tenant: Option<&str>,
-            _limit: Option<usize>,
-        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
-            Err(ResponseStorageError::Unavailable(
-                "connection refused".to_string(),
-            ))
-        }
-
-        async fn delete_identifier_responses(
-            &self,
-            _identifier: &str,
-            _tenant: Option<&str>,
-        ) -> Result<usize, ResponseStorageError> {
-            Err(ResponseStorageError::Unavailable(
-                "connection refused".to_string(),
-            ))
-        }
-    }
-
-    /// A foreground response the client expects stored whose record could
-    /// not be written is reported to the caller with the store-class code; an
-    /// unstored request has nothing to report.
-    #[tokio::test]
-    async fn a_foreground_stored_response_whose_record_was_not_written_is_reported() {
-        let conversation_storage: Arc<dyn ConversationStorage> =
-            Arc::new(MemoryConversationStorage::new());
-        let item_storage: Arc<dyn ConversationItemStorage> =
-            Arc::new(MemoryConversationItemStorage::new());
-        let down: Arc<dyn ResponseStorage> = Arc::new(DownResponseStorage);
-        let request: ResponsesRequest = serde_json::from_value(json!({
-            "model": "m",
-            "input": "hi",
-            "max_output_tokens": 64
-        }))
-        .unwrap();
-        assert!(stored_foreground(&request));
-
-        let not_stored = persist_response_if_needed(
-            conversation_storage.clone(),
-            item_storage.clone(),
-            down.clone(),
-            &completed_response("resp_s", &request),
-            &request,
-            None,
-            None,
-        )
-        .await
-        .expect_err("the record was not written");
-        assert!(not_stored.retryable, "{not_stored:?}");
-        assert_eq!(not_stored.code(), "storage_unavailable");
-        assert!(
-            not_stored.message.contains("connection refused"),
-            "{}",
-            not_stored.message
-        );
-        let error = not_stored.error_object();
-        assert_eq!(error["code"], "storage_unavailable");
-        let answer = not_stored.into_response();
-        assert_eq!(answer.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        let unstorable = NotStored::new(false, "no output");
-        assert_eq!(unstorable.code(), "store_response_failed");
-        assert_eq!(
-            unstorable.into_response().status(),
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
-
-        let mut unstored = request.clone();
-        unstored.store = Some(false);
-        assert!(!stored_foreground(&unstored));
-        persist_response_if_needed(
-            conversation_storage,
-            item_storage,
-            down,
-            &completed_response("resp_n", &unstored),
-            &unstored,
-            None,
-            None,
-        )
-        .await
-        .expect("nothing to store, nothing to report");
-    }
-
-    /// A background response deleted while its work ran (its record is gone
-    /// when the result arrives): the result is not stored under the id again
-    /// and nothing of it reaches the conversation; the delete holds.
-    #[tokio::test]
-    async fn a_background_result_whose_record_was_deleted_is_not_stored() {
-        let conversation_storage: Arc<dyn ConversationStorage> =
-            Arc::new(MemoryConversationStorage::new());
-        let item_storage: Arc<dyn ConversationItemStorage> =
-            Arc::new(MemoryConversationItemStorage::new());
-        let response_storage: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
-        let conversation = conversation_storage
-            .create_conversation(NewConversation::default())
-            .await
-            .unwrap();
-        let request: ResponsesRequest = serde_json::from_value(json!({
-            "model": "m",
-            "input": "hi",
-            "background": true,
-            "conversation": conversation.id.0,
-            "max_output_tokens": 64
-        }))
-        .unwrap();
-        background::store_record(
-            &response_storage,
-            &background::queued_response("resp_d", &request),
-            &request,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        response_storage
-            .delete_response(&ResponseId::from("resp_d"))
-            .await
-            .unwrap();
-
-        persist_response_if_needed(
-            conversation_storage,
-            item_storage.clone(),
-            response_storage.clone(),
-            &completed_response("resp_d", &request),
-            &request,
-            None,
-            None,
-        )
-        .await
-        .expect("a deleted record is not a store failure");
-
-        assert!(
-            response_storage
-                .get_response(&ResponseId::from("resp_d"))
-                .await
-                .unwrap()
-                .is_none(),
-            "the deleted record is not re-created by the result"
-        );
-        let items = item_storage
-            .list_items(
-                &conversation.id,
-                ListParams {
-                    limit: 10,
-                    order: SortOrder::Asc,
-                    after: None,
-                },
-            )
-            .await
-            .unwrap();
-        assert!(
-            items.is_empty(),
-            "nothing is linked to the conversation: {items:?}"
-        );
-    }
-
-    /// A store that takes the write and then answers a timeout: the call's
-    /// bound ran out after the store had accepted the write.
-    struct TimingOutAfterWriteStorage {
-        inner: MemoryResponseStorage,
-        timeouts_left: AtomicUsize,
-        conditional_stores: AtomicUsize,
-    }
-
-    response_storage_over! {
-        TimingOutAfterWriteStorage.inner;
-        passes store_response, update_response_object_if_open, get_response, delete_response, list_identifier_responses, delete_identifier_responses;
-        async fn store_response_if_open(
-            &self,
-            response: StoredResponse,
-        ) -> Result<ConditionalStore, ResponseStorageError> {
-            let outcome = self.inner.store_response_if_open(response).await?;
-            self.conditional_stores.fetch_add(1, Ordering::SeqCst);
-            let left = self.timeouts_left.load(Ordering::SeqCst);
-            if left > 0 {
-                self.timeouts_left.store(left - 1, Ordering::SeqCst);
-                return Err(ResponseStorageError::Timeout(
-                    "store_response_if_open exceeded its bound".to_string(),
-                ));
-            }
-            Ok(outcome)
-        }
-    }
-
-    /// A background response's terminal persist retried after a timeout
-    /// whose write had landed: the retry finds the record closed with this
-    /// run's own result and links the items into the conversation, as the
-    /// first attempt would have had its answer arrived.
-    #[tokio::test(start_paused = true)]
-    async fn a_retried_terminal_persist_whose_first_write_landed_links_its_items() {
-        let conversation_storage: Arc<dyn ConversationStorage> =
-            Arc::new(MemoryConversationStorage::new());
-        let item_storage: Arc<dyn ConversationItemStorage> =
-            Arc::new(MemoryConversationItemStorage::new());
-        let timing_out = Arc::new(TimingOutAfterWriteStorage {
-            inner: MemoryResponseStorage::new(),
-            timeouts_left: AtomicUsize::new(1),
-            conditional_stores: AtomicUsize::new(0),
-        });
-        let response_storage: Arc<dyn ResponseStorage> = timing_out.clone();
-        let conversation = conversation_storage
-            .create_conversation(NewConversation::default())
-            .await
-            .unwrap();
-        let request: ResponsesRequest = serde_json::from_value(json!({
-            "model": "m",
-            "input": "hi",
-            "background": true,
-            "conversation": conversation.id.0,
-            "max_output_tokens": 64
-        }))
-        .unwrap();
-        background::store_record(
-            &response_storage,
-            &background::queued_response("resp_r", &request),
-            &request,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-
-        persist_response_if_needed(
-            conversation_storage,
-            item_storage.clone(),
-            response_storage.clone(),
-            &completed_response("resp_r", &request),
-            &request,
-            None,
-            None,
-        )
-        .await
-        .expect("nothing is reported to the caller here");
-
-        assert_eq!(
-            timing_out.conditional_stores.load(Ordering::SeqCst),
-            2,
-            "the write whose answer was lost was retried once"
-        );
-        let stored = response_storage
-            .get_response(&ResponseId::from("resp_r"))
-            .await
-            .unwrap()
-            .expect("the record");
-        assert_eq!(stored.raw_response["status"], "completed");
-        let items = item_storage
-            .list_items(
-                &conversation.id,
-                ListParams {
-                    limit: 10,
-                    order: SortOrder::Asc,
-                    after: None,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            items.len(),
-            2,
-            "the input and the output are linked into the conversation: {items:?}"
-        );
-    }
-
-    fn registry_with_aliased_worker() -> Arc<WorkerRegistry> {
-        let registry = Arc::new(WorkerRegistry::new());
-        let worker = BasicWorkerBuilder::new("http://worker:8080")
-            .model(ModelCard::new("canonical-model").with_alias("model-alias"))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        registry.register_or_replace(Arc::new(worker));
-        registry
-    }
-
-    #[test]
-    fn worker_availability_accepts_alias_and_preserves_unknown_rejection() {
-        let registry = registry_with_aliased_worker();
-
-        assert!(validate_worker_availability(&registry, "canonical-model").is_none());
-        assert!(validate_worker_availability(&registry, "model-alias").is_none());
-
-        let response = validate_worker_availability(&registry, UNKNOWN_MODEL_ID)
-            .expect("unknown model should remain rejected for Responses");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[test]
-    fn worker_availability_rejects_alias_once_its_worker_is_gone() {
-        let registry = registry_with_aliased_worker();
-        let worker_id = registry.get_id_by_url("http://worker:8080").unwrap();
-        assert!(registry.remove(&worker_id).is_some());
-
-        let response = validate_worker_availability(&registry, "model-alias")
-            .expect("alias must stop resolving with no workers behind it");
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-    #[test]
-    fn namespace_function_identity_roundtrips_and_preserves_literal_names() {
-        let mut request: ResponsesRequest = namespace_test_request();
-        let tools = extract_tools_from_response_tools(request.tools.as_deref());
-        assert_eq!(
-            tools
-                .iter()
-                .map(|t| t.function.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["weather.lookup", "travel.lookup"]
-        );
-        for namespace in ["weather", "travel"] {
-            assert_eq!(
-                resolve_function_identity(request.tools.as_deref(), &format!("{namespace}.lookup")),
-                ("lookup".into(), Some(namespace.into()))
-            );
-        }
-        for name in ["lookup", "unknown.lookup"] {
-            assert_eq!(
-                resolve_function_identity(request.tools.as_deref(), name),
-                (name.into(), None)
-            );
-        }
-        request.tools.as_mut().unwrap().push(
-            serde_json::from_value(
-                serde_json::json!({"type":"function","name":"weather.lookup","parameters":{}}),
-            )
-            .unwrap(),
-        );
-        assert_eq!(
-            resolve_function_identity(request.tools.as_deref(), "weather.lookup"),
-            ("weather.lookup".into(), None)
-        );
-    }
-
-    #[test]
-    fn a_call_whose_arguments_are_no_json_value_is_incomplete_whatever_the_finish() {
-        for finish in [
-            Some("length"),
-            Some("abort"),
-            Some("stop"),
-            Some("tool_calls"),
-            None,
-        ] {
-            for arguments in ["{\"a\": \"b", "", "weather in Paris"] {
-                assert_eq!(
-                    function_call_status(finish, arguments),
-                    "incomplete",
-                    "{finish:?} {arguments:?}"
-                );
-            }
-            assert_eq!(
-                function_call_status(finish, "{\"a\": 1}"),
-                "completed",
-                "{finish:?}"
-            );
-        }
-        assert_eq!(function_call_status(Some("failed"), "{"), "in_progress");
-        assert_eq!(
-            response_status(Some("abort"), true),
-            (ResponseStatus::Incomplete, None)
-        );
-        assert_eq!(
-            response_status(Some("abort"), false),
-            (ResponseStatus::Completed, None)
-        );
-        assert_eq!(
-            response_status(Some("length"), false),
-            (
-                ResponseStatus::Incomplete,
-                Some(IncompleteDetails {
-                    reason: IncompleteReason::MaxOutputTokens
-                })
-            )
-        );
-        assert_eq!(
-            response_status(Some("error"), true),
-            (ResponseStatus::Failed, None)
-        );
-    }
-
-    #[test]
-    fn the_tool_call_limit_is_the_users_figure_under_the_safety_limit() {
-        assert_eq!(tool_call_limit(None), DEFAULT_MAX_ITERATIONS);
-        assert_eq!(tool_call_limit(Some(3)), 3);
-        assert_eq!(tool_call_limit(Some(0)), 0);
-        assert_eq!(
-            tool_call_limit(Some(DEFAULT_MAX_ITERATIONS + 5)),
-            DEFAULT_MAX_ITERATIONS
-        );
     }
 }
+
+#[cfg(test)]
+#[path = "../../../../../tests/unit/routers/grpc/common/responses/utils/tests.rs"]
+mod tests;

@@ -4,6 +4,9 @@
 //! See: its srt/entrypoints/openai/protocol.py
 
 use serde::{Deserialize, Serialize};
+use validator::Validate;
+
+use super::validated::Normalizable;
 
 // ============================================================================
 // Tokenize API
@@ -11,8 +14,10 @@ use serde::{Deserialize, Serialize};
 
 /// Request schema for the /v1/tokenize endpoint
 ///
-/// Supports both single string and batch tokenization.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+/// Supports both single string and batch tokenization. It declares no
+/// validation rule: the validated extractor reads it for the gateway's error
+/// envelope on a body that does not parse or does not match the type.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 pub struct TokenizeRequest {
     /// Model name for tokenizer selection
     pub model: String,
@@ -20,6 +25,8 @@ pub struct TokenizeRequest {
     /// Text(s) to tokenize - can be a single string or array of strings
     pub prompt: StringOrArray,
 }
+
+impl Normalizable for TokenizeRequest {}
 
 /// Response schema for the /v1/tokenize endpoint
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -56,8 +63,9 @@ pub enum CountResult {
 
 /// Request schema for the /v1/detokenize endpoint
 ///
-/// Supports both single sequence and batch detokenization.
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+/// Supports both single sequence and batch detokenization. It declares no
+/// validation rule, as [`TokenizeRequest`] does not.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 pub struct DetokenizeRequest {
     /// Model name for tokenizer selection
     pub model: String,
@@ -69,6 +77,8 @@ pub struct DetokenizeRequest {
     #[serde(default = "default_true")]
     pub skip_special_tokens: bool,
 }
+
+impl Normalizable for DetokenizeRequest {}
 
 /// Token input - either single sequence or batch
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]

@@ -13,14 +13,18 @@
 //! unchanged: a turn is a [`StoredResponse`] whose `input` holds the turn's
 //! request fields ([`TurnInput`]) and whose `raw_response` holds the answer,
 //! chained by `previous_response_id`, so a thread holds its conversation
-//! once, not once per turn. The store keeps the newest [`MAX_TURNS`] turns
-//! for [`TURN_RETENTION_SECS`] after they were written, the oldest evicted
-//! first, on every write; a thread is read back whole up to that count. A
-//! turn is written under its answer's id. An id that is already a stored
-//! turn's (a repeated `rid`, a backend's repeated id, a guess) would hand
-//! the client an id that continues another conversation, so the answer is
-//! reissued under a fresh id, in the answer the client reads and in the
-//! store.
+//! once, not once per turn. The public API deletes a thread no more than
+//! an hour after its last use, the reference a deployment's bound is read
+//! against. The store keeps the turns the operator's `memory` bounds
+//! allow, the `max_responses` and `retention_secs` of the memory history
+//! backend (unset: 10,000 turns, each for a day after it was written; a
+//! `retention_secs` of 3,600 stays within the API's hour), the oldest
+//! evicted first, on every write; a thread is read back whole up to that
+//! count. A turn is written under its answer's id.
+//! An id that is already a stored turn's (a repeated `rid`, a backend's
+//! repeated id, a guess) would hand the client an id that continues another
+//! conversation, so the answer is reissued under a fresh id, in the answer
+//! the client reads and in the store.
 //!
 //! A thread turn's message id is the gateway's: the request's `rid` is
 //! replaced by a fresh `msg_` id before the route (on the regular gRPC path
@@ -83,16 +87,11 @@ use crate::{
         request_id::{is_acceptable_inbound_id, REQUEST_ID},
     },
     observability::metrics::Metrics,
-    routers::{common::sse_rechunk::find_frame_end, error as route_error},
+    routers::{
+        common::sse_rechunk::{find_frame_end, DELIMITER_OVERLAP},
+        error as route_error,
+    },
 };
-
-/// The turns the store keeps: the newest 10,000, each for an hour after it
-/// was written (the public API deletes a thread no more than an hour after
-/// its last use). Over the count the oldest go first; both bounds are
-/// applied on every write. The count is also the depth a thread is read
-/// back to, so no kept thread is cut short of its create turn.
-const MAX_TURNS: usize = 10_000;
-const TURN_RETENTION_SECS: u64 = 60 * 60;
 
 /// An answer over this cannot be read back for its record: the Messages
 /// route's own answers are far smaller.
@@ -351,28 +350,43 @@ pub(crate) struct MessageThreads {
 }
 
 impl MessageThreads {
+    /// The threads under the default bounds ([`MemoryConfig::default`]).
     pub(crate) fn new() -> Self {
-        Self::bounded(MAX_TURNS)
+        Self::from_config(&MemoryConfig::default())
     }
 
-    /// The threads in a store of `max_turns` turns, each kept for the
-    /// retention period.
+    /// The threads in a store bounded as the operator's `memory` section
+    /// says: at most `max_responses` turns, each kept for `retention_secs`
+    /// after it was written, the oldest evicted first on every write. The
+    /// count is also the depth a thread is read back to, so no kept thread
+    /// is cut short of its create turn.
+    pub(crate) fn from_config(config: &MemoryConfig) -> Self {
+        Self {
+            store: MemoryResponseStorage::with_config(config),
+            max_turns: config.max_responses,
+            answer_limit: ANSWER_LIMIT,
+        }
+    }
+
+    /// The threads in a store of `max_turns` turns under the default
+    /// retention.
+    #[cfg(test)]
     fn bounded(max_turns: usize) -> Self {
-        Self::kept(max_turns, TURN_RETENTION_SECS)
+        Self::from_config(&MemoryConfig {
+            max_responses: max_turns,
+            ..MemoryConfig::default()
+        })
     }
 
     /// The threads in a store of `max_turns` turns, each kept for
     /// `retention_secs` after it was written.
+    #[cfg(test)]
     fn kept(max_turns: usize, retention_secs: u64) -> Self {
-        Self {
-            store: MemoryResponseStorage::with_config(&MemoryConfig {
-                max_responses: max_turns,
-                retention_secs: Some(retention_secs),
-                ..MemoryConfig::default()
-            }),
-            max_turns,
-            answer_limit: ANSWER_LIMIT,
-        }
+        Self::from_config(&MemoryConfig {
+            max_responses: max_turns,
+            retention_secs: Some(retention_secs),
+            ..MemoryConfig::default()
+        })
     }
 
     /// The threads with answers bounded at `answer_limit` bytes.
@@ -659,6 +673,10 @@ struct StreamedTurn {
     held: Vec<u8>,
     /// The bytes of the event not yet complete, parsed when it is.
     carry: Vec<u8>,
+    /// Where the last scan of `held` and of `carry` stopped: the next scan
+    /// resumes there, so an event that arrives in many frames is read once.
+    held_scanned: usize,
+    carry_scanned: usize,
     /// Every byte passes as it comes: `message_start` is through, or the
     /// stream opened with an error.
     passing: bool,
@@ -684,7 +702,8 @@ struct Place {
 
 /// The answer under construction: the `message_start` message, its content
 /// blocks by index, each tool call's input JSON as it streams, and the bytes
-/// of text, thinking, signature and input retained so far.
+/// retained so far: each block's start event, and the text, thinking,
+/// signature and input its deltas add.
 struct Assembled {
     message: Message,
     blocks: Vec<ContentBlock>,
@@ -692,7 +711,8 @@ struct Assembled {
     retained: usize,
 }
 
-/// More content blocks than this in one answer are not followed.
+/// An answer may hold this many content blocks. One with a block past them
+/// is not stored: the record is the answer the client read, or nothing.
 const MAX_BLOCKS: usize = 1024;
 
 /// More bytes than this without an event's end, before the first event or
@@ -715,6 +735,8 @@ impl StreamedTurn {
             turn: Some(turn),
             held: Vec::new(),
             carry: Vec::new(),
+            held_scanned: 0,
+            carry_scanned: 0,
             passing: false,
             place: None,
             answer: None,
@@ -733,7 +755,8 @@ impl StreamedTurn {
         }
         self.held.extend_from_slice(&data);
         let mut out = Vec::new();
-        while let Some(end) = event_end(&self.held) {
+        while let Some(end) = event_end(&self.held, self.held_scanned) {
+            self.held_scanned = 0;
             match parse_event(&self.held[..end]) {
                 Ok(Some(MessageStreamEvent::MessageStart { message })) => {
                     let event: Vec<u8> = self.held.drain(..end).collect();
@@ -754,9 +777,11 @@ impl StreamedTurn {
                 _ => out.extend(self.held.drain(..end)),
             }
         }
+        self.held_scanned = self.held.len();
         if !self.passing && self.held.len() > EVENT_LIMIT {
             self.passing = true;
             out.append(&mut self.held);
+            self.held_scanned = 0;
             self.decline("no event end within the size limit");
         }
         (!out.is_empty()).then(|| Bytes::from(out))
@@ -818,11 +843,12 @@ impl StreamedTurn {
             return;
         }
         self.carry.extend_from_slice(data);
-        while let Some(end) = event_end(&self.carry) {
+        while let Some(end) = event_end(&self.carry, self.carry_scanned) {
+            self.carry_scanned = 0;
             let parsed = parse_event(&self.carry[..end]);
             self.carry.drain(..end);
             match parsed {
-                Ok(Some(event)) => self.apply(event),
+                Ok(Some(event)) => self.apply(event, end),
                 Ok(None) => {}
                 Err(Unreadable) => self.decline("data this gateway cannot read"),
             }
@@ -831,13 +857,16 @@ impl StreamedTurn {
                 break;
             }
         }
+        self.carry_scanned = self.carry.len();
         if self.place.is_some() && self.carry.len() > EVENT_LIMIT {
             self.decline("no event end within the size limit");
             self.carry.clear();
+            self.carry_scanned = 0;
         }
     }
 
-    fn apply(&mut self, event: MessageStreamEvent) {
+    /// `event` folded into the answer; `size` is the bytes it arrived in.
+    fn apply(&mut self, event: MessageStreamEvent, size: usize) {
         let Some(answer) = &mut self.answer else {
             return;
         };
@@ -845,7 +874,11 @@ impl StreamedTurn {
             MessageStreamEvent::ContentBlockStart {
                 index,
                 content_block,
-            } => answer.start_block(index, content_block),
+            } => {
+                if answer.start_block(index, content_block, size).is_err() {
+                    self.decline("a content block past the bound on blocks");
+                }
+            }
             MessageStreamEvent::ContentBlockDelta { index, delta } => answer.delta(index, delta),
             MessageStreamEvent::ContentBlockStop { index } => {
                 if answer.stop_block(index).is_err() {
@@ -960,6 +993,7 @@ impl HttpBody for StreamedTurn {
                     this.ended = true;
                     this.give_up();
                     let held = std::mem::take(&mut this.held);
+                    this.held_scanned = 0;
                     return if held.is_empty() {
                         Poll::Ready(None)
                     } else {
@@ -986,10 +1020,22 @@ impl HttpBody for StreamedTurn {
 }
 
 impl Assembled {
-    fn start_block(&mut self, index: u32, block: ContentBlock) {
+    /// The block at `index`, as its start event of `size` bytes gave it. A
+    /// block may arrive whole in that event (a server tool's result, a block
+    /// this gateway does not read), so the event counts toward the bytes
+    /// retained, as a delta does; one that replaces a block counts too. A
+    /// block past `MAX_BLOCKS` has no place in the record, which would then
+    /// not be the answer the client read.
+    fn start_block(
+        &mut self,
+        index: u32,
+        block: ContentBlock,
+        size: usize,
+    ) -> Result<(), Unreadable> {
         let Some(index) = slot(index) else {
-            return;
+            return Err(Unreadable);
         };
+        self.retained += size;
         while self.blocks.len() < index {
             self.blocks.push(ContentBlock::Text {
                 text: String::new(),
@@ -1004,6 +1050,7 @@ impl Assembled {
             self.blocks[index] = block;
             self.partial_json[index].clear();
         }
+        Ok(())
     }
 
     fn delta(&mut self, index: u32, delta: ContentBlockDelta) {
@@ -1116,9 +1163,19 @@ fn slot(index: u32) -> Option<usize> {
 
 /// The end of the first complete event in `buffer` (the index after its
 /// blank line, in any of the three framings the relay reads), when there is
-/// one.
-fn event_end(buffer: &[u8]) -> Option<usize> {
-    find_frame_end(buffer, 0).map(|(at, len)| at + len)
+/// one. `scanned` is where the last scan of this buffer stopped; the scan
+/// resumes a delimiter's overlap before it, since a four-byte delimiter can
+/// straddle the frame boundary the last scan ended at. An event that
+/// arrives in many frames is read once this way, not once per frame.
+fn event_end(buffer: &[u8], scanned: usize) -> Option<usize> {
+    let from = scanned.saturating_sub(DELIMITER_OVERLAP);
+    let end = find_frame_end(buffer, from);
+    #[cfg(test)]
+    tests::SCAN_POSITIONS.with(|cell| {
+        let visited = end.map_or(buffer.len(), |(at, _)| at + 1);
+        cell.set(cell.get() + visited.saturating_sub(from));
+    });
+    end.map(|(at, len)| at + len)
 }
 
 /// Data this gateway cannot read as a stream event. The answer it is part
@@ -1163,1444 +1220,5 @@ fn start_event(message: &Message) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::time::Duration;
-
-    use axum::{body::Bytes, http::header, response::IntoResponse, Json};
-    use futures::{stream, StreamExt};
-    use tracing_test::traced_test;
-
-    use super::*;
-
-    fn request(body: Value) -> CreateMessageRequest {
-        let mut body = body;
-        let object = body.as_object_mut().expect("an object");
-        object.entry("model").or_insert(json!("m"));
-        object.entry("max_tokens").or_insert(json!(64));
-        serde_json::from_value(body).expect("a well-formed request")
-    }
-
-    fn answer(id: &str, content: Value) -> Response {
-        Json(json!({
-            "id": id, "type": "message", "role": "assistant", "model": "m",
-            "content": content, "stop_reason": "end_turn", "stop_sequence": null,
-            "usage": {"input_tokens": 3, "output_tokens": 2}
-        }))
-        .into_response()
-    }
-
-    async fn body_of(response: Response) -> Value {
-        let bytes = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("a body");
-        serde_json::from_slice(&bytes).expect("a JSON body")
-    }
-
-    type Resolved = (CreateMessageRequest, Option<ThreadTurn>);
-
-    /// The resolution of a request the thread store accepts.
-    fn accepted(outcome: Result<Resolved, Response>) -> Resolved {
-        match outcome {
-            Ok(resolved) => resolved,
-            Err(refused) => panic!("refused with {}", refused.status()),
-        }
-    }
-
-    /// The refusal of a request the thread store refuses.
-    fn refusal(outcome: Result<Resolved, Response>) -> Response {
-        match outcome {
-            Ok(_) => panic!("accepted"),
-            Err(refused) => refused,
-        }
-    }
-
-    /// A thread of `turns` user turns under `tenant`, each answered by a
-    /// text reply under the id `msg_<tag>_<turn>`; answers the last id.
-    async fn thread(
-        threads: &MessageThreads,
-        tenant: Option<&str>,
-        turns: usize,
-        tag: &str,
-    ) -> String {
-        let mut previous: Option<String> = None;
-        for index in 1..=turns {
-            let body = match &previous {
-                None => json!({
-                    "system": "be brief",
-                    "tools": [{"name": "f", "input_schema": {"type": "object"}}],
-                    "messages": [{"role": "user", "content": "turn 1"}],
-                    "thread": {"type": "create"}
-                }),
-                Some(id) => json!({
-                    "messages": [{"role": "user", "content": format!("turn {index}")}],
-                    "thread": {"type": "continue", "previous_message_id": id}
-                }),
-            };
-            let (_, turn) = accepted(
-                threads
-                    .resolve(request(body), tenant.map(str::to_string))
-                    .await,
-            );
-            let id = format!("msg_{tag}_{index}");
-            let reply = answer(
-                &id,
-                json!([{"type": "text", "text": format!("reply {index}")}]),
-            );
-            let response = threads.stored(turn.expect("a thread turn"), reply).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            previous = Some(id);
-        }
-        previous.expect("at least one turn")
-    }
-
-    /// A request without `thread` is routed as it came.
-    #[tokio::test]
-    async fn a_plain_request_is_no_turn() {
-        let threads = MessageThreads::new();
-        let (request, turn) = accepted(
-            threads
-                .resolve(
-                    request(json!({"messages": [{"role": "user", "content": "hi"}]})),
-                    None,
-                )
-                .await,
-        );
-        assert!(turn.is_none());
-        assert_eq!(request.messages.len(), 1);
-    }
-
-    /// A stored answer that carries an MCP exchange (the `mcp_tool_use` and
-    /// `mcp_tool_result` blocks the MCP loop writes beside its text) is read
-    /// back as the assistant's turn, blocks and all, so the thread continues.
-    #[tokio::test]
-    async fn a_stored_mcp_exchange_is_continued() {
-        let threads = MessageThreads::new();
-        let (_, turn) = accepted(
-            threads
-                .resolve(
-                    request(json!({
-                        "messages": [{"role": "user", "content": "look it up"}],
-                        "thread": {"type": "create"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        let answered = threads
-            .stored(
-                turn.expect("a turn"),
-                answer(
-                    "msg_mcp",
-                    json!([
-                        {"type": "mcp_tool_use", "id": "mcptoolu_1", "name": "lookup", "server_name": "s", "input": {"q": "x"}},
-                        {"type": "mcp_tool_result", "tool_use_id": "mcptoolu_1", "content": [{"type": "text", "text": "42"}], "is_error": false},
-                        {"type": "text", "text": "it is 42"}
-                    ]),
-                ),
-            )
-            .await;
-        assert_eq!(answered.status(), StatusCode::OK);
-        let (rebuilt, turn) = accepted(
-            threads
-                .resolve(
-                    request(json!({
-                        "messages": [{"role": "user", "content": "thanks"}],
-                        "thread": {"type": "continue", "previous_message_id": "msg_mcp"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        assert!(turn.is_some());
-        assert_eq!(rebuilt.messages.len(), 3);
-        assert_eq!(rebuilt.messages[1].role, Role::Assistant);
-        let InputContent::Blocks(blocks) = &rebuilt.messages[1].content else {
-            panic!("blocks");
-        };
-        assert!(
-            matches!(
-                &blocks[..],
-                [
-                    InputContentBlock::McpToolUse(mcp_use),
-                    InputContentBlock::McpToolResult(result),
-                    InputContentBlock::Text(text)
-                ] if mcp_use.id == "mcptoolu_1" && result.tool_use_id == "mcptoolu_1" && text.text == "it is 42"
-            ),
-            "{blocks:?}"
-        );
-    }
-
-    /// A continue request becomes the whole conversation: the create turn's
-    /// `system` and `tools`, every turn's messages and answer, then the new
-    /// messages; the answer the client gets is the router's, byte for byte.
-    #[tokio::test]
-    async fn a_continue_rebuilds_the_conversation() {
-        let threads = MessageThreads::new();
-        let last = thread(&threads, None, 3, "c").await;
-        let (rebuilt, turn) = accepted(
-            threads
-                .resolve(
-                    request(json!({
-                        "messages": [{"role": "user", "content": "turn 4"}],
-                        "thread": {"type": "continue", "previous_message_id": last}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        assert!(turn.is_some());
-        assert!(rebuilt.thread.is_none());
-        assert!(rebuilt.system.is_some());
-        assert_eq!(rebuilt.tools.as_ref().map(Vec::len), Some(1));
-        let texts: Vec<String> = rebuilt
-            .messages
-            .iter()
-            .map(|message| match &message.content {
-                InputContent::String(text) => text.clone(),
-                InputContent::Blocks(blocks) => match &blocks[..] {
-                    [InputContentBlock::Text(text)] => text.text.clone(),
-                    other => panic!("one text block, not {other:?}"),
-                },
-            })
-            .collect();
-        assert_eq!(
-            texts,
-            ["turn 1", "reply 1", "turn 2", "reply 2", "turn 3", "reply 3", "turn 4"]
-        );
-        let roles: Vec<&Role> = rebuilt.messages.iter().map(|m| &m.role).collect();
-        assert_eq!(roles.len(), 7);
-        assert!(roles.iter().step_by(2).all(|role| **role == Role::User));
-    }
-
-    /// A continue from an id nobody issued, or whose create turn is gone, is
-    /// the public API's 404 with its code in `error.details`.
-    #[tokio::test]
-    async fn an_unknown_id_is_not_found() {
-        let threads = MessageThreads::new();
-        let refused = refusal(
-            threads
-                .resolve(
-                    request(json!({
-                        "messages": [{"role": "user", "content": "again"}],
-                        "thread": {"type": "continue", "previous_message_id": "msg_none"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            refused
-                .headers()
-                .get(route_error::HEADER_X_SMG_ERROR_CODE)
-                .and_then(|value| value.to_str().ok()),
-            Some("thread_not_found")
-        );
-        let body = body_of(refused).await;
-        assert_eq!(body["type"], "error");
-        assert_eq!(body["error"]["type"], "not_found_error");
-        assert_eq!(body["error"]["details"]["error_code"], "thread_not_found");
-    }
-
-    /// A continue that changes a fixed field names it, as a 400.
-    #[tokio::test]
-    async fn a_changed_fixed_field_is_a_mismatch() {
-        let threads = MessageThreads::new();
-        let last = thread(&threads, None, 1, "f").await;
-        let refused = refusal(
-            threads
-                .resolve(
-                    request(json!({
-                        "model": "other", "thinking": {"type": "enabled", "budget_tokens": 1024},
-                        "messages": [{"role": "user", "content": "again"}],
-                        "thread": {"type": "continue", "previous_message_id": last}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
-        let body = body_of(refused).await;
-        assert_eq!(
-            body["error"]["details"]["error_code"],
-            "thread_fingerprint_mismatch"
-        );
-        let message = body["error"]["message"].as_str().expect("a message");
-        assert!(
-            message.starts_with("thread: the request changes model, thinking:"),
-            "{message}"
-        );
-    }
-
-    /// A turn stored under a tenant is continued by that tenant alone; one
-    /// stored under none by every caller.
-    #[tokio::test]
-    async fn a_thread_stays_with_its_tenant() {
-        let threads = MessageThreads::new();
-        let theirs = thread(&threads, Some("auth:a"), 1, "theirs").await;
-        let anyones = thread(&threads, None, 1, "anyones").await;
-        let cont = |id: &str| {
-            request(json!({
-                "messages": [{"role": "user", "content": "again"}],
-                "thread": {"type": "continue", "previous_message_id": id}
-            }))
-        };
-        for (id, tenant, continued) in [
-            (&theirs, Some("auth:a"), true),
-            (&theirs, Some("auth:b"), false),
-            (&theirs, None, false),
-            (&anyones, Some("auth:b"), true),
-            (&anyones, None, true),
-        ] {
-            let outcome = threads.resolve(cont(id), tenant.map(str::to_string)).await;
-            assert_eq!(outcome.is_ok(), continued, "{id} as {tenant:?}");
-        }
-    }
-
-    /// A streamed answer with no events, an error and an answer with no id
-    /// leave the turn unstored, and the answer as it was; the next continue
-    /// is the 404.
-    #[tokio::test]
-    async fn an_unstored_turn_cannot_be_continued() {
-        let threads = MessageThreads::new();
-        let create = |stream: bool| {
-            request(json!({
-                "stream": stream,
-                "messages": [{"role": "user", "content": "hi"}],
-                "thread": {"type": "create"}
-            }))
-        };
-        let cases: [(bool, Response); 3] = [
-            (true, answer("msg_streamed", json!([]))),
-            (false, route_error::bad_request("some_code", "refused")),
-            (false, answer("", json!([{"type": "text", "text": "x"}]))),
-        ];
-        for (stream, response) in cases {
-            let status = response.status();
-            let (_, turn) = accepted(threads.resolve(create(stream), None).await);
-            let answered = threads.stored(turn.expect("a turn"), response).await;
-            assert_eq!(answered.status(), status);
-        }
-        let refused = refusal(
-            threads
-                .resolve(
-                    request(json!({
-                        "messages": [{"role": "user", "content": "again"}],
-                        "thread": {"type": "continue", "previous_message_id": "msg_streamed"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
-    }
-
-    /// The tool loop: an answer that calls a tool is continued by the
-    /// result alone, paired against the stored call.
-    #[tokio::test]
-    async fn a_tool_result_continues_the_stored_call() {
-        let threads = MessageThreads::new();
-        let (_, turn) = accepted(
-            threads
-                .resolve(
-                    request(json!({
-                        "tools": [{"name": "f", "input_schema": {"type": "object"}}],
-                        "messages": [{"role": "user", "content": "call f"}],
-                        "thread": {"type": "create"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        let call = answer(
-            "msg_call",
-            json!([{"type": "tool_use", "id": "toolu_1", "name": "f", "input": {}}]),
-        );
-        threads.stored(turn.expect("a turn"), call).await;
-        let (rebuilt, _) = accepted(
-            threads
-                .resolve(
-                    request(json!({
-                        "messages": [{"role": "user", "content": [
-                            {"type": "tool_result", "tool_use_id": "toolu_1", "content": "42"}
-                        ]}],
-                        "thread": {"type": "continue", "previous_message_id": "msg_call"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        assert_eq!(rebuilt.messages.len(), 3);
-        let unpaired = refusal(
-            threads
-                .resolve(
-                    request(json!({
-                        "messages": [{"role": "user", "content": [
-                            {"type": "tool_result", "tool_use_id": "toolu_other", "content": "42"}
-                        ]}],
-                        "thread": {"type": "continue", "previous_message_id": "msg_call"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        assert_eq!(unpaired.status(), StatusCode::NOT_FOUND);
-    }
-
-    /// The gateway mints a thread turn's message id: a client's `rid` would
-    /// become the answer's id on the regular gRPC path, so a repeated one
-    /// would name a stored turn. The rid stays a trace id, echoed as the
-    /// answer's `request-id`, on a stored and on a streamed turn; a turn
-    /// without one gets no echo.
-    #[tokio::test]
-    async fn a_thread_turn_takes_a_minted_message_id() {
-        let threads = MessageThreads::new();
-        let (request_sent, turn) = accepted(
-            threads
-                .resolve(
-                    request(json!({
-                        "rid": "trace-1",
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "thread": {"type": "create"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        let minted = request_sent.rid.clone().expect("a minted id");
-        assert!(
-            minted.starts_with("msg_") && minted != "trace-1",
-            "{minted}"
-        );
-        let answered = threads
-            .stored(
-                turn.expect("a turn"),
-                answer(&minted, json!([{"type": "text", "text": "x"}])),
-            )
-            .await;
-        assert_eq!(
-            answered.headers()["request-id"].to_str().unwrap(),
-            "trace-1"
-        );
-        let (streamed, turn) = accepted(
-            threads
-                .resolve(
-                    request(json!({
-                        "rid": "trace-1",
-                        "stream": true,
-                        "messages": [{"role": "user", "content": "more"}],
-                        "thread": {"type": "continue", "previous_message_id": minted}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        let again = streamed.rid.clone().expect("a minted id");
-        assert!(again.starts_with("msg_") && again != minted && again != "trace-1");
-        let answered = threads
-            .stored(turn.expect("a turn"), answer("msg_streamed", json!([])))
-            .await;
-        assert_eq!(
-            answered.headers()["request-id"].to_str().unwrap(),
-            "trace-1"
-        );
-        let (plain, turn) = accepted(
-            threads
-                .resolve(
-                    request(json!({
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "thread": {"type": "create"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        assert!(plain
-            .rid
-            .as_deref()
-            .is_some_and(|id| id.starts_with("msg_")));
-        let answered = threads
-            .stored(turn.expect("a turn"), answer("msg_plain", json!([])))
-            .await;
-        assert!(answered.headers().get("request-id").is_none());
-    }
-
-    /// An evicted root's id written again by another create (a backend's
-    /// repeated id) is another thread's root: an old child's continue onto
-    /// it is refused, never spliced onto the new root's system and tools.
-    /// Retention runs from the write, so the root expires while the child,
-    /// written later, stays.
-    #[tokio::test]
-    async fn a_reused_root_id_is_refused_not_spliced() {
-        let threads = MessageThreads::kept(MAX_TURNS, 4);
-        let create = |content: &str| {
-            request(json!({
-                "system": "be brief",
-                "messages": [{"role": "user", "content": content}],
-                "thread": {"type": "create"}
-            }))
-        };
-        let (_, turn) = accepted(threads.resolve(create("first"), None).await);
-        threads
-            .stored(
-                turn.expect("a turn"),
-                answer("msg_root", json!([{"type": "text", "text": "a"}])),
-            )
-            .await;
-        tokio::time::sleep(Duration::from_millis(2000)).await;
-        let (_, turn) = accepted(
-            threads
-                .resolve(
-                    request(json!({
-                        "messages": [{"role": "user", "content": "second"}],
-                        "thread": {"type": "continue", "previous_message_id": "msg_root"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        threads
-            .stored(
-                turn.expect("a turn"),
-                answer("msg_child", json!([{"type": "text", "text": "b"}])),
-            )
-            .await;
-        tokio::time::sleep(Duration::from_millis(2300)).await;
-        let (_, turn) = accepted(threads.resolve(create("another conversation"), None).await);
-        let answered = threads
-            .stored(
-                turn.expect("a turn"),
-                answer("msg_root", json!([{"type": "text", "text": "c"}])),
-            )
-            .await;
-        assert_eq!(
-            answered.status(),
-            StatusCode::OK,
-            "the new root under the reused id"
-        );
-        let refused = refusal(
-            threads
-                .resolve(
-                    request(json!({
-                        "messages": [{"role": "user", "content": "third"}],
-                        "thread": {"type": "continue", "previous_message_id": "msg_child"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
-        let error = body_of(refused).await;
-        assert_eq!(error["error"]["details"]["error_code"], "thread_not_found");
-    }
-
-    /// A reissued answer is serialized again under its fresh id, so the
-    /// `content-length` of the answer it replaces does not go out with it.
-    #[tokio::test]
-    async fn a_reissued_answer_drops_the_stale_content_length() {
-        let threads = MessageThreads::new();
-        let create = || {
-            request(json!({
-                "messages": [{"role": "user", "content": "hi"}],
-                "thread": {"type": "create"}
-            }))
-        };
-        let content = json!([{"type": "text", "text": "x"}]);
-        let (_, first) = accepted(threads.resolve(create(), None).await);
-        threads
-            .stored(first.expect("a turn"), answer("msg_taken", content.clone()))
-            .await;
-        let (_, second) = accepted(threads.resolve(create(), None).await);
-        let body = serde_json::to_vec(&json!({
-            "id": "msg_taken", "type": "message", "role": "assistant", "model": "m",
-            "content": content, "stop_reason": "end_turn", "stop_sequence": null,
-            "usage": {"input_tokens": 3, "output_tokens": 2}
-        }))
-        .expect("an answer");
-        let sized = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::CONTENT_LENGTH, body.len())
-            .body(Body::from(body))
-            .expect("a response");
-        let reissued = threads.stored(second.expect("a turn"), sized).await;
-        assert_eq!(reissued.status(), StatusCode::OK);
-        assert!(
-            reissued.headers().get(header::CONTENT_LENGTH).is_none(),
-            "the replaced answer's length is gone"
-        );
-        let answer = body_of(reissued).await;
-        assert_ne!(answer["id"], json!("msg_taken"));
-    }
-
-    /// A thread whose create turn the store let go (the count bound reached
-    /// under its continues) cannot be continued: the client replays. The
-    /// store itself let the turn go, not only the walk's depth.
-    #[tokio::test]
-    async fn an_evicted_create_turn_ends_the_thread() {
-        let threads = MessageThreads::bounded(2);
-        let last = thread(&threads, None, 3, "bounded").await;
-        assert!(
-            threads
-                .store
-                .get_response(&ResponseId::from("msg_bounded_1"))
-                .await
-                .expect("a store read")
-                .is_none(),
-            "the create turn's record is gone from the store"
-        );
-        let refused = refusal(
-            threads
-                .resolve(
-                    request(json!({
-                        "messages": [{"role": "user", "content": "turn 4"}],
-                        "thread": {"type": "continue", "previous_message_id": last}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
-        let error = body_of(refused).await;
-        assert_eq!(error["error"]["details"]["error_code"], "thread_not_found");
-    }
-
-    /// A second answer under an id that is already a stored turn (another
-    /// caller's guess) leaves the first turn as it was and is reissued under
-    /// a fresh id: the owner continues the first, the second caller
-    /// continues their own under the fresh id and gets the 404 under the
-    /// guessed one.
-    #[tokio::test]
-    async fn an_answer_under_a_stored_id_leaves_the_first_turn() {
-        let threads = MessageThreads::new();
-        let create = |system: &str| {
-            request(json!({
-                "system": system,
-                "messages": [{"role": "user", "content": "hi"}],
-                "thread": {"type": "create"}
-            }))
-        };
-        let reply = |text: &str| answer("msg_taken", json!([{"type": "text", "text": text}]));
-        let mut ids = Vec::new();
-        for (system, tenant) in [("first", "auth:a"), ("second", "auth:b")] {
-            let (_, turn) = accepted(
-                threads
-                    .resolve(create(system), Some(tenant.to_string()))
-                    .await,
-            );
-            let answered = threads.stored(turn.expect("a turn"), reply(system)).await;
-            assert_eq!(answered.status(), StatusCode::OK);
-            ids.push(
-                body_of(answered).await["id"]
-                    .as_str()
-                    .expect("an id")
-                    .to_string(),
-            );
-        }
-        assert_eq!(ids[0], "msg_taken");
-        assert_ne!(ids[1], "msg_taken", "the second answer is reissued");
-        assert!(ids[1].starts_with("msg_"), "{}", ids[1]);
-        let cont = |id: &str, tenant: &str| {
-            threads.resolve(
-                request(json!({
-                    "messages": [{"role": "user", "content": "again"}],
-                    "thread": {"type": "continue", "previous_message_id": id}
-                })),
-                Some(tenant.to_string()),
-            )
-        };
-        let (rebuilt, _) = accepted(cont("msg_taken", "auth:a").await);
-        assert!(
-            matches!(rebuilt.system, Some(SystemContent::String(ref text)) if text == "first"),
-            "the first turn's system, not {:?}",
-            json_of(&rebuilt.system)
-        );
-        assert_eq!(rebuilt.messages.len(), 3);
-        let (theirs, _) = accepted(cont(&ids[1], "auth:b").await);
-        assert!(
-            matches!(theirs.system, Some(SystemContent::String(ref text)) if text == "second"),
-            "the second caller's own turn under the fresh id"
-        );
-        assert_eq!(
-            refusal(cont("msg_taken", "auth:b").await).status(),
-            StatusCode::NOT_FOUND
-        );
-    }
-
-    /// A client that sends one `rid` on every turn: the second answer comes
-    /// back under a fresh id, the turn is stored under it, and the third
-    /// turn's conversation is whole. Before the reissue the second turn was
-    /// unstored and the third turn silently lost it.
-    #[tokio::test]
-    async fn a_repeated_rid_keeps_the_thread_whole() {
-        let threads = MessageThreads::new();
-        let turn = |text: &str, previous: Option<&str>| match previous {
-            None => request(json!({
-                "messages": [{"role": "user", "content": text}],
-                "thread": {"type": "create"}
-            })),
-            Some(id) => request(json!({
-                "messages": [{"role": "user", "content": text}],
-                "thread": {"type": "continue", "previous_message_id": id}
-            })),
-        };
-        let (_, created) = accepted(threads.resolve(turn("m1", None), None).await);
-        let first = threads
-            .stored(
-                created.expect("a turn"),
-                answer("R", json!([{"type": "text", "text": "a1"}])),
-            )
-            .await;
-        assert_eq!(body_of(first).await["id"], "R");
-        let (_, continued) = accepted(threads.resolve(turn("m2", Some("R")), None).await);
-        let second = threads
-            .stored(
-                continued.expect("a turn"),
-                answer("R", json!([{"type": "text", "text": "a2"}])),
-            )
-            .await;
-        assert_eq!(second.status(), StatusCode::OK);
-        let second = body_of(second).await;
-        let reissued = second["id"].as_str().expect("an id");
-        assert_ne!(reissued, "R", "the colliding id is reissued");
-        assert_eq!(
-            second["content"][0]["text"], "a2",
-            "the answer itself is unchanged"
-        );
-        let (rebuilt, _) = accepted(threads.resolve(turn("m3", Some(reissued)), None).await);
-        let texts: Vec<String> = rebuilt
-            .messages
-            .iter()
-            .map(|message| match &message.content {
-                InputContent::String(text) => text.clone(),
-                InputContent::Blocks(blocks) => match &blocks[..] {
-                    [InputContentBlock::Text(text)] => text.text.clone(),
-                    other => panic!("one text block, not {other:?}"),
-                },
-            })
-            .collect();
-        assert_eq!(texts, ["m1", "a1", "m2", "a2", "m3"]);
-    }
-
-    /// A streamed answer as the router writes it: `events` as `event:` and
-    /// `data:` lines, then cut into frames at the byte offsets `cuts`.
-    fn sse(events: &[(&str, Value)]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (name, data) in events {
-            out.extend_from_slice(format!("event: {name}\ndata: {data}\n\n").as_bytes());
-        }
-        out
-    }
-
-    fn streamed(bytes: &[u8], cuts: &[usize]) -> Response {
-        let mut frames = Vec::new();
-        let mut at = 0;
-        for &cut in cuts {
-            frames.push(Bytes::copy_from_slice(&bytes[at..cut]));
-            at = cut;
-        }
-        frames.push(Bytes::copy_from_slice(&bytes[at..]));
-        let body = Body::from_stream(stream::iter(
-            frames.into_iter().map(Ok::<_, std::io::Error>),
-        ));
-        Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
-            .body(body)
-            .expect("a response")
-    }
-
-    fn message_start(id: &str) -> (&'static str, Value) {
-        (
-            "message_start",
-            json!({"type": "message_start", "message": {
-                "id": id, "type": "message", "role": "assistant", "model": "m", "content": [],
-                "stop_reason": null, "stop_sequence": null,
-                "usage": {"input_tokens": 7, "output_tokens": 0}
-            }}),
-        )
-    }
-
-    fn text_events(id: &str, text: &str) -> Vec<(&'static str, Value)> {
-        vec![
-            message_start(id),
-            (
-                "content_block_start",
-                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
-            ),
-            (
-                "content_block_delta",
-                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
-            ),
-            (
-                "content_block_stop",
-                json!({"type": "content_block_stop", "index": 0}),
-            ),
-            (
-                "message_delta",
-                json!({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": null}, "usage": {"output_tokens": 3}}),
-            ),
-            ("message_stop", json!({"type": "message_stop"})),
-        ]
-    }
-
-    fn create(text: &str, streamed: bool) -> CreateMessageRequest {
-        request(json!({
-            "stream": streamed,
-            "messages": [{"role": "user", "content": text}],
-            "thread": {"type": "create"}
-        }))
-    }
-
-    fn continue_from(id: &str, text: &str) -> CreateMessageRequest {
-        request(json!({
-            "messages": [{"role": "user", "content": text}],
-            "thread": {"type": "continue", "previous_message_id": id}
-        }))
-    }
-
-    /// The texts of a rebuilt conversation, one per message.
-    fn texts(request: &CreateMessageRequest) -> Vec<String> {
-        request
-            .messages
-            .iter()
-            .map(|message| match &message.content {
-                InputContent::String(text) => text.clone(),
-                InputContent::Blocks(blocks) => match &blocks[..] {
-                    [InputContentBlock::Text(text)] => text.text.clone(),
-                    other => panic!("one text block, not {other:?}"),
-                },
-            })
-            .collect()
-    }
-
-    /// A streamed create is stored from its events, cut across frames as
-    /// they come: the client reads the router's bytes unchanged, and the
-    /// continue from the `message_start` id carries the streamed text, the
-    /// stop reason and the usage of the final `message_delta`.
-    #[tokio::test]
-    async fn a_streamed_answer_is_stored_from_its_events() {
-        let threads = MessageThreads::new();
-        let bytes = sse(&text_events("msg_s1", "Hello, world"));
-        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
-        let cuts = [17, 230, 231, bytes.len() - 5];
-        let answered = threads
-            .stored(turn.expect("a turn"), streamed(&bytes, &cuts))
-            .await;
-        assert_eq!(answered.status(), StatusCode::OK);
-        let read = to_bytes(answered.into_body(), usize::MAX)
-            .await
-            .expect("the stream");
-        assert_eq!(
-            read.as_ref(),
-            bytes.as_slice(),
-            "the client's bytes are the router's"
-        );
-        let (rebuilt, _) = accepted(
-            threads
-                .resolve(continue_from("msg_s1", "again"), None)
-                .await,
-        );
-        assert_eq!(texts(&rebuilt), ["hi", "Hello, world", "again"]);
-        let (_, turns) = threads
-            .turns("msg_s1", None)
-            .await
-            .ok()
-            .expect("the thread");
-        let stored = &turns[0].raw_response;
-        assert_eq!(stored["stop_reason"], "end_turn");
-        assert_eq!(stored["usage"]["input_tokens"], 7);
-        assert_eq!(stored["usage"]["output_tokens"], 3);
-        assert_eq!(turns[0].input["messages"][0]["content"], "hi");
-    }
-
-    /// A streamed tool call's input is the JSON its deltas spell, parsed when
-    /// the block closes.
-    #[tokio::test]
-    async fn a_streamed_tool_call_is_stored_whole() {
-        let threads = MessageThreads::new();
-        let bytes = sse(&[
-            message_start("msg_t1"),
-            (
-                "content_block_start",
-                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "tu_1", "name": "f", "input": {}}}),
-            ),
-            (
-                "content_block_delta",
-                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"a\":"}}),
-            ),
-            (
-                "content_block_delta",
-                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": " [1, 2]}"}}),
-            ),
-            (
-                "content_block_stop",
-                json!({"type": "content_block_stop", "index": 0}),
-            ),
-            (
-                "message_delta",
-                json!({"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null}, "usage": {"output_tokens": 9}}),
-            ),
-            ("message_stop", json!({"type": "message_stop"})),
-        ]);
-        let (_, turn) = accepted(threads.resolve(create("call f", true), None).await);
-        let answered = threads
-            .stored(turn.expect("a turn"), streamed(&bytes, &[]))
-            .await;
-        to_bytes(answered.into_body(), usize::MAX)
-            .await
-            .expect("the stream");
-        let (_, turns) = threads
-            .turns("msg_t1", None)
-            .await
-            .ok()
-            .expect("the thread");
-        let stored = &turns[0].raw_response;
-        assert_eq!(stored["content"][0]["type"], "tool_use");
-        assert_eq!(stored["content"][0]["input"], json!({"a": [1, 2]}));
-        assert_eq!(stored["stop_reason"], "tool_use");
-    }
-
-    /// A streamed answer whose `message_start` id is a stored turn's is
-    /// reissued in that event: the client continues under the fresh id, the
-    /// first turn keeps its own.
-    #[tokio::test]
-    async fn a_streamed_answer_under_a_stored_id_is_reissued() {
-        let threads = MessageThreads::new();
-        let (_, first) = accepted(threads.resolve(create("one", false), None).await);
-        let kept = threads
-            .stored(
-                first.expect("a turn"),
-                answer("msg_dup", json!([{"type": "text", "text": "first answer"}])),
-            )
-            .await;
-        assert_eq!(body_of(kept).await["id"], "msg_dup");
-        let bytes = sse(&text_events("msg_dup", "second answer"));
-        let (_, second) = accepted(threads.resolve(create("two", true), None).await);
-        let answered = threads
-            .stored(second.expect("a turn"), streamed(&bytes, &[40]))
-            .await;
-        let read = to_bytes(answered.into_body(), usize::MAX)
-            .await
-            .expect("the stream");
-        let text = std::str::from_utf8(&read).expect("utf-8");
-        let first_event = text.split("\n\n").next().expect("an event");
-        let data = first_event
-            .lines()
-            .find_map(|line| line.strip_prefix("data: "))
-            .expect("the message_start data");
-        let start: Value = serde_json::from_str(data).expect("json");
-        let fresh = start["message"]["id"].as_str().expect("an id").to_string();
-        assert_ne!(
-            fresh, "msg_dup",
-            "the colliding id is reissued in message_start"
-        );
-        assert!(text.ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"));
-        let (rebuilt, _) = accepted(threads.resolve(continue_from(&fresh, "three"), None).await);
-        assert_eq!(texts(&rebuilt), ["two", "second answer", "three"]);
-        let (rebuilt, _) = accepted(
-            threads
-                .resolve(continue_from("msg_dup", "more"), None)
-                .await,
-        );
-        assert_eq!(texts(&rebuilt), ["one", "first answer", "more"]);
-    }
-
-    /// A stream that ends before its `message_stop`, or that carries an error
-    /// event (here one a `message_stop` still follows), leaves no turn: the
-    /// continue from its id is the 404.
-    #[tokio::test]
-    async fn a_cut_or_failed_stream_leaves_no_turn() {
-        let threads = MessageThreads::new();
-        let mut cut = text_events("msg_cut", "half");
-        cut.truncate(3);
-        let mut failed = text_events("msg_failed", "half");
-        failed.truncate(3);
-        failed.push((
-            "error",
-            json!({"type": "error", "error": {"type": "overloaded_error", "message": "later"}}),
-        ));
-        failed.extend(text_events("msg_failed", "half").into_iter().skip(4));
-        for (id, events) in [("msg_cut", cut), ("msg_failed", failed)] {
-            let bytes = sse(&events);
-            let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
-            let answered = threads
-                .stored(turn.expect("a turn"), streamed(&bytes, &[]))
-                .await;
-            let read = to_bytes(answered.into_body(), usize::MAX)
-                .await
-                .expect("the stream");
-            assert_eq!(read.as_ref(), bytes.as_slice());
-            let refused = refusal(threads.resolve(continue_from(id, "again"), None).await);
-            assert_eq!(refused.status(), StatusCode::NOT_FOUND, "{id}");
-        }
-    }
-
-    /// A stream with data this gateway cannot read (a content block of a
-    /// kind it does not know, a tool call whose input deltas are no JSON
-    /// document) reaches the client as it came and leaves no turn: the
-    /// record is the answer the client read or nothing, so the continue
-    /// from its id is the 404.
-    #[tokio::test]
-    async fn an_unreadable_stream_leaves_no_turn() {
-        let threads = MessageThreads::new();
-        let mut unknown_block = text_events("msg_unknown", "known");
-        unknown_block.splice(
-            4..4,
-            [
-                (
-                    "content_block_start",
-                    json!({"type": "content_block_start", "index": 1, "content_block": {"type": "bash_code_execution_tool_result", "tool_use_id": "srvtoolu_1", "content": []}}),
-                ),
-                (
-                    "content_block_stop",
-                    json!({"type": "content_block_stop", "index": 1}),
-                ),
-                (
-                    "content_block_start",
-                    json!({"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}}),
-                ),
-                (
-                    "content_block_delta",
-                    json!({"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "after"}}),
-                ),
-                (
-                    "content_block_stop",
-                    json!({"type": "content_block_stop", "index": 2}),
-                ),
-            ],
-        );
-        let no_json = vec![
-            message_start("msg_nojson"),
-            (
-                "content_block_start",
-                json!({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "tu_1", "name": "f", "input": {}}}),
-            ),
-            (
-                "content_block_delta",
-                json!({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"a\":"}}),
-            ),
-            (
-                "content_block_stop",
-                json!({"type": "content_block_stop", "index": 0}),
-            ),
-            (
-                "message_delta",
-                json!({"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": null}, "usage": {"output_tokens": 9}}),
-            ),
-            ("message_stop", json!({"type": "message_stop"})),
-        ];
-        for (id, events) in [("msg_unknown", unknown_block), ("msg_nojson", no_json)] {
-            let bytes = sse(&events);
-            let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
-            let answered = threads
-                .stored(turn.expect("a turn"), streamed(&bytes, &[]))
-                .await;
-            let read = to_bytes(answered.into_body(), usize::MAX)
-                .await
-                .expect("the stream");
-            assert_eq!(read.as_ref(), bytes.as_slice(), "{id}");
-            let kept = threads
-                .store
-                .get_response(&ResponseId::from(id))
-                .await
-                .expect("the store");
-            assert!(kept.is_none(), "{id}: the place is given back");
-            let refused = refusal(threads.resolve(continue_from(id, "again"), None).await);
-            assert_eq!(refused.status(), StatusCode::NOT_FOUND, "{id}");
-        }
-    }
-
-    /// A stream framed with CRLF blank lines (one of the relay's three
-    /// framings) reaches the client event by event as it comes, and is
-    /// stored whole.
-    #[tokio::test]
-    async fn a_crlf_framed_stream_passes_as_it_comes_and_is_stored() {
-        let threads = MessageThreads::new();
-        let mut bytes = Vec::new();
-        let mut cuts = Vec::new();
-        for (name, data) in &text_events("msg_crlf", "carriage") {
-            bytes.extend_from_slice(format!("event: {name}\r\ndata: {data}\r\n\r\n").as_bytes());
-            cuts.push(bytes.len());
-        }
-        cuts.pop();
-        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
-        let answered = threads
-            .stored(turn.expect("a turn"), streamed(&bytes, &cuts))
-            .await;
-        let mut data = answered.into_body().into_data_stream();
-        let first = data
-            .next()
-            .await
-            .expect("a frame")
-            .expect("the start event");
-        assert_eq!(
-            first.as_ref(),
-            &bytes[..cuts[0]],
-            "the first event is through on its own"
-        );
-        let mut read = first.to_vec();
-        while let Some(frame) = data.next().await {
-            read.extend_from_slice(&frame.expect("a frame"));
-        }
-        assert_eq!(read, bytes, "the client's bytes are the router's");
-        let (rebuilt, _) = accepted(
-            threads
-                .resolve(continue_from("msg_crlf", "again"), None)
-                .await,
-        );
-        assert_eq!(texts(&rebuilt), ["hi", "carriage", "again"]);
-    }
-
-    /// A body dropped before its `message_stop` (the client went away) gives
-    /// its place back: no record stays under the dropped id and the thread
-    /// cannot be continued from it.
-    #[tokio::test]
-    async fn a_dropped_stream_leaves_no_turn() {
-        let threads = MessageThreads::new();
-        let events = text_events("msg_dropped", "half");
-        let start = sse(&events[..1]).len();
-        let bytes = sse(&events);
-        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
-        let answered = threads
-            .stored(turn.expect("a turn"), streamed(&bytes, &[start]))
-            .await;
-        let mut data = answered.into_body().into_data_stream();
-        let first = data
-            .next()
-            .await
-            .expect("a frame")
-            .expect("the start event");
-        assert!(first.starts_with(b"event: message_start"), "{first:?}");
-        let reserved = threads
-            .store
-            .get_response(&ResponseId::from("msg_dropped"))
-            .await
-            .expect("the store");
-        assert!(reserved.is_some(), "the place is taken at message_start");
-        drop(data);
-        let kept = threads
-            .store
-            .get_response(&ResponseId::from("msg_dropped"))
-            .await
-            .expect("the store");
-        assert!(kept.is_none(), "the dropped place is given back");
-        let refused = refusal(
-            threads
-                .resolve(continue_from("msg_dropped", "again"), None)
-                .await,
-        );
-        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
-    }
-
-    /// A streamed turn whose place the store's count bound dropped before
-    /// its `message_stop`, and whose id another turn took meanwhile, leaves
-    /// that turn alone: the streamed answer is not written over it, and the
-    /// continue from the id is the other turn's.
-    #[tokio::test]
-    async fn an_evicted_place_is_left_to_the_turn_that_took_its_id() {
-        let threads = MessageThreads::bounded(1);
-        let events = text_events("msg_evicted", "streamed");
-        let bytes = sse(&events);
-        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
-        let answered = threads
-            .stored(
-                turn.expect("a turn"),
-                streamed(&bytes, &[sse(&events[..1]).len()]),
-            )
-            .await;
-        let mut data = answered.into_body().into_data_stream();
-        let first = data
-            .next()
-            .await
-            .expect("a frame")
-            .expect("the start event");
-        assert!(first.starts_with(b"event: message_start"), "{first:?}");
-        let (_, other) = accepted(threads.resolve(create("other", false), None).await);
-        threads
-            .stored(
-                other.expect("a turn"),
-                answer("msg_other", json!([{"type": "text", "text": "pushes"}])),
-            )
-            .await;
-        let (_, taker) = accepted(threads.resolve(create("taker", false), None).await);
-        threads
-            .stored(
-                taker.expect("a turn"),
-                answer(
-                    "msg_evicted",
-                    json!([{"type": "text", "text": "took the id"}]),
-                ),
-            )
-            .await;
-        let mut read = first.to_vec();
-        while let Some(frame) = data.next().await {
-            read.extend_from_slice(&frame.expect("a frame"));
-        }
-        assert_eq!(read, bytes, "the client's bytes are the router's");
-        let (rebuilt, _) = accepted(
-            threads
-                .resolve(continue_from("msg_evicted", "again"), None)
-                .await,
-        );
-        assert_eq!(texts(&rebuilt), ["taker", "took the id", "again"]);
-    }
-
-    /// A stream cut after the store's count bound dropped its place, and
-    /// after another turn took the id, removes nothing: the other turn stays
-    /// and the continue from the id is its own.
-    #[tokio::test]
-    async fn a_cut_stream_leaves_an_evicted_place_to_the_turn_that_took_its_id() {
-        let threads = MessageThreads::bounded(1);
-        let events = text_events("msg_cut_evicted", "streamed");
-        let bytes = sse(&events);
-        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
-        let answered = threads
-            .stored(
-                turn.expect("a turn"),
-                streamed(&bytes, &[sse(&events[..1]).len()]),
-            )
-            .await;
-        let mut data = answered.into_body().into_data_stream();
-        let first = data
-            .next()
-            .await
-            .expect("a frame")
-            .expect("the start event");
-        assert!(first.starts_with(b"event: message_start"), "{first:?}");
-        let (_, other) = accepted(threads.resolve(create("other", false), None).await);
-        threads
-            .stored(
-                other.expect("a turn"),
-                answer("msg_other", json!([{"type": "text", "text": "pushes"}])),
-            )
-            .await;
-        let (_, taker) = accepted(threads.resolve(create("taker", false), None).await);
-        threads
-            .stored(
-                taker.expect("a turn"),
-                answer(
-                    "msg_cut_evicted",
-                    json!([{"type": "text", "text": "took the id"}]),
-                ),
-            )
-            .await;
-        drop(data);
-        let (rebuilt, _) = accepted(
-            threads
-                .resolve(continue_from("msg_cut_evicted", "again"), None)
-                .await,
-        );
-        assert_eq!(texts(&rebuilt), ["taker", "took the id", "again"]);
-    }
-
-    /// An answer with more content than the limit is not stored: the place
-    /// is given back as the deltas pass the bound, the client reads the
-    /// stream as it came, and the continue from its id is the 404.
-    #[tokio::test]
-    async fn an_answer_over_the_limit_leaves_no_turn() {
-        let threads = MessageThreads::new().limited(16);
-        let bytes = sse(&text_events("msg_big", "more than sixteen bytes of text"));
-        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
-        let answered = threads
-            .stored(turn.expect("a turn"), streamed(&bytes, &[]))
-            .await;
-        let read = to_bytes(answered.into_body(), usize::MAX)
-            .await
-            .expect("the stream");
-        assert_eq!(read.as_ref(), bytes.as_slice());
-        let refused = refusal(
-            threads
-                .resolve(continue_from("msg_big", "again"), None)
-                .await,
-        );
-        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
-    }
-
-    /// A body with no event end within the limit is not a stream this
-    /// gateway reads. Before `message_start`, the bytes pass to the client
-    /// once they are over it, not at the body's end. After it, the place is
-    /// given back and the bytes keep passing; the continue is the 404.
-    #[tokio::test]
-    async fn a_body_without_an_event_end_passes_once_over_the_limit() {
-        let threads = MessageThreads::new();
-        let big = vec![b'x'; EVENT_LIMIT + 1];
-        let mut bytes = big.clone();
-        bytes.extend_from_slice(b"tail");
-        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
-        let answered = threads
-            .stored(turn.expect("a turn"), streamed(&bytes, &[big.len()]))
-            .await;
-        let mut data = answered.into_body().into_data_stream();
-        let first = data.next().await.expect("a frame").expect("the held bytes");
-        assert_eq!(
-            first.len(),
-            big.len(),
-            "the held bytes pass before the body ends"
-        );
-        let mut read = first.to_vec();
-        while let Some(frame) = data.next().await {
-            read.extend_from_slice(&frame.expect("a frame"));
-        }
-        assert_eq!(read, bytes);
-
-        let start = sse(&text_events("msg_noend", "")[..1]);
-        let mut bytes = start.clone();
-        bytes.extend_from_slice(b"data: ");
-        bytes.extend_from_slice(&vec![b'y'; EVENT_LIMIT + 1]);
-        let (_, turn) = accepted(threads.resolve(create("hi", true), None).await);
-        let answered = threads
-            .stored(turn.expect("a turn"), streamed(&bytes, &[start.len()]))
-            .await;
-        let mut data = answered.into_body().into_data_stream();
-        let first = data
-            .next()
-            .await
-            .expect("a frame")
-            .expect("the start event");
-        assert_eq!(first.as_ref(), start.as_slice());
-        let reserved = threads
-            .store
-            .get_response(&ResponseId::from("msg_noend"))
-            .await
-            .expect("the store");
-        assert!(reserved.is_some(), "the place is taken at message_start");
-        let second = data
-            .next()
-            .await
-            .expect("a frame")
-            .expect("the unending event");
-        assert_eq!(second.len(), bytes.len() - start.len());
-        let kept = threads
-            .store
-            .get_response(&ResponseId::from("msg_noend"))
-            .await
-            .expect("the store");
-        assert!(kept.is_none(), "the place is given back over the limit");
-        assert!(data.next().await.is_none());
-        let refused = refusal(
-            threads
-                .resolve(continue_from("msg_noend", "again"), None)
-                .await,
-        );
-        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
-    }
-
-    /// A thread longer than the history store's default chain depth of 100
-    /// is read back whole: the walk goes as deep as the store keeps turns.
-    #[tokio::test]
-    async fn a_long_thread_is_read_back_whole() {
-        let threads = MessageThreads::new();
-        let last = thread(&threads, None, 120, "long").await;
-        let (rebuilt, _) = accepted(
-            threads
-                .resolve(
-                    request(json!({
-                        "messages": [{"role": "user", "content": "turn 121"}],
-                        "thread": {"type": "continue", "previous_message_id": last}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        assert_eq!(rebuilt.messages.len(), 241);
-    }
-
-    /// The echoed `request-id` keeps the request-id layer's rules: a `rid`
-    /// over 128 characters or with a space in it is not echoed (a client
-    /// cannot size the header), and a `request-id` the route set stays (a
-    /// relayed upstream id is the one its support asks for).
-    #[tokio::test]
-    async fn the_echoed_request_id_keeps_the_layers_rules() {
-        let threads = MessageThreads::new();
-        for (rid, id) in [
-            ("x".repeat(129), "msg_long"),
-            ("trace 1".to_string(), "msg_space"),
-        ] {
-            let (_, turn) = accepted(
-                threads
-                    .resolve(
-                        request(json!({
-                            "rid": rid,
-                            "messages": [{"role": "user", "content": "hi"}],
-                            "thread": {"type": "create"}
-                        })),
-                        None,
-                    )
-                    .await,
-            );
-            let answered = threads
-                .stored(turn.expect("a turn"), answer(id, json!([])))
-                .await;
-            assert_eq!(answered.status(), StatusCode::OK);
-            assert!(answered.headers().get("request-id").is_none(), "{rid:?}");
-        }
-        let (_, turn) = accepted(
-            threads
-                .resolve(
-                    request(json!({
-                        "rid": "trace-1",
-                        "messages": [{"role": "user", "content": "hi"}],
-                        "thread": {"type": "create"}
-                    })),
-                    None,
-                )
-                .await,
-        );
-        let mut relayed = answer("msg_relayed", json!([]));
-        relayed
-            .headers_mut()
-            .insert(&REQUEST_ID, HeaderValue::from_static("upstream-1"));
-        let answered = threads.stored(turn.expect("a turn"), relayed).await;
-        assert_eq!(
-            answered.headers()["request-id"].to_str().unwrap(),
-            "upstream-1"
-        );
-    }
-
-    fn create_turn() -> CreateMessageRequest {
-        request(json!({
-            "messages": [{"role": "user", "content": "hi"}],
-            "thread": {"type": "create"}
-        }))
-    }
-
-    /// A 200 answer that is not JSON goes to the client as it came; the turn
-    /// is left unstored and the log says why.
-    #[tokio::test]
-    #[traced_test]
-    async fn a_non_json_answer_is_left_unstored_with_a_warning() {
-        let threads = MessageThreads::new();
-        let (_, turn) = accepted(threads.resolve(create_turn(), None).await);
-        let plain = Response::builder()
-            .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/plain")
-            .body(Body::from("not json"))
-            .expect("a response");
-        let answered = threads.stored(turn.expect("a turn"), plain).await;
-        assert_eq!(answered.status(), StatusCode::OK);
-        let bytes = to_bytes(answered.into_body(), usize::MAX)
-            .await
-            .expect("a body");
-        assert_eq!(bytes.as_ref(), b"not json");
-        assert!(logs_contain("the answer is not JSON"));
-    }
-
-    /// A JSON answer without an id goes to the client as it came; the turn
-    /// is left unstored and the log says why.
-    #[tokio::test]
-    #[traced_test]
-    async fn an_answer_without_an_id_is_left_unstored_with_a_warning() {
-        let threads = MessageThreads::new();
-        let (_, turn) = accepted(threads.resolve(create_turn(), None).await);
-        let answered = threads
-            .stored(
-                turn.expect("a turn"),
-                answer("", json!([{"type": "text", "text": "x"}])),
-            )
-            .await;
-        assert_eq!(answered.status(), StatusCode::OK);
-        assert_eq!(body_of(answered).await["id"], "");
-        assert!(logs_contain("the answer has no id"));
-    }
-}
+#[path = "../../tests/unit/routers/message_threads/tests.rs"]
+mod tests;

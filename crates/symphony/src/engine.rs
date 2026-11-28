@@ -12,7 +12,8 @@
 //! `Dropped { Whitespace }` when no text follows it in the stay (the template's spacing after a
 //! thought's close, between two calls, or after a thought nothing follows, held until what
 //! follows says whose it is) unless the table keeps the state's text as written, and the rest as
-//! content, reasoning, or the call's events.
+//! content, reasoning, or the call's events. Under a JSON answer ([`Engine::reads_json_answer`])
+//! a terminal inside one of the answer's strings is the answer's text, not a marker.
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/engine.md`.
 
@@ -20,7 +21,8 @@ use std::{borrow::Cow, collections::VecDeque, ops::Range, sync::Arc};
 
 use crate::{
     event::{
-        release_between, runs_at, DropReason, Event, Events, FinishReason, MalformedReason, Text,
+        release_between, runs_at, CallEnd, DropReason, Event, Events, FinishReason,
+        MalformedReason, Text,
     },
     format::{CallId, CallSyntax, Emits, Format, Replay},
     gemma,
@@ -85,6 +87,12 @@ pub struct Engine {
     /// placed ([`Self::push_call_events`]): kept between pieces with its room, as a stream's
     /// caller keeps its event buffer, so a piece inside a call costs no list of its own.
     scratch: Events<'static>,
+    /// Whether the answer is JSON ([`Self::reads_json_answer`]): the quote state of a content
+    /// stay, and of a JSON call's arguments, is read, and a terminal inside one of the answer's
+    /// strings is the state's text.
+    json_answer: bool,
+    /// Where the stay stands in the answer's JSON, read while `json_answer` is set.
+    quoted: Quoted,
 }
 
 /// The bytes of the call region being assembled: how many the assembler took, how many its events
@@ -139,6 +147,36 @@ enum Held {
     Ignored(String),
 }
 
+/// Where a stay in a JSON answer's text (a content state's, a JSON call's arguments) stands
+/// ([`Engine::reads_json_answer`]): inside a string,
+/// and right after the backslash that escapes the next character. A stay starts outside a
+/// string. The two bytes that move it are ASCII, so stepping over UTF-8 bytes never misreads part
+/// of a multibyte character.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Quoted {
+    in_string: bool,
+    escaped: bool,
+}
+
+impl Quoted {
+    /// Steps over `text`, the next bytes of the stay.
+    pub(crate) fn advance(&mut self, text: &str) {
+        for byte in text.bytes() {
+            if self.in_string {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == b'"' {
+                    self.in_string = false;
+                }
+            } else if byte == b'"' {
+                self.in_string = true;
+            }
+        }
+    }
+}
+
 /// A text event of `like`'s kind carrying `text`, uncounted: the piece of a split text event.
 fn text_event_like<'d>(like: &Event<'_>, text: Cow<'d, str>) -> Event<'d> {
     let text = Text::uncounted(text);
@@ -181,6 +219,8 @@ pub(crate) fn is_strip_space(c: char) -> bool {
 /// What the engine asks of a call syntax's assembler, whichever the syntax: the region's bytes as
 /// they arrive, the table's ignored terminal inside the region, and the two endings. Each syntax
 /// implements it over its own assembler, so the policy of what ends a call lives with the syntax.
+/// An assembler ends every call as [`CallEnd::Closed`]: how the region ended is the engine's to
+/// know, and the engine writes the word on the ends an ending pushes ([`Engine::close_call`]).
 /// An engine moves between threads with its request, so the assembler does too.
 pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// Takes the next bytes of the region and pushes the events they complete; the number of bytes
@@ -190,6 +230,31 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// within the bytes is a slice of them, as a text event is a slice of its delta.
     fn feed<'d>(&mut self, text: &'d str, declared: &Declared, out: &mut Events<'d>) -> usize;
 
+    /// Steps `quoted`, the JSON-answer option's quote state ([`Engine::reads_json_answer`]), over
+    /// the runs of the `taken` bytes of `piece`, the last piece fed, that were the call's JSON
+    /// value, in order: all of them for a syntax whose region is its value; for a call named
+    /// before its marker, those after the marker alone, since the tool's name is no JSON; for a
+    /// list, its objects' bytes and its close, since text between calls, a malformed list's bytes
+    /// and the text after the `]` are none either. The state steps over these and no others, so
+    /// a quote in a malformed header or around a list moves nothing.
+    fn quote_value(&self, taken: usize, piece: &str, quoted: &mut Quoted) {
+        quoted.advance(&piece[..taken]);
+    }
+
+    /// The JSON-answer option is on for this call ([`Engine::reads_json_answer`]): record, piece
+    /// by piece, which of the fed bytes are the call's JSON value, for [`Self::quote_value`]. Off
+    /// by default: an assembler whose `quote_value` reads the value from what it keeps anyway
+    /// ignores it, and the list assembler records its runs under it alone, so a request without
+    /// the option pays nothing per piece for them.
+    fn track_value(&mut self) {}
+
+    /// The engine starts its JSON calls at the name ([`Engine::starts_calls_at_name`]): said
+    /// once, when the call is made, so a request without the option pays one test per call for
+    /// it. Off by default: a syntax whose call is no JSON object that carries the name starts
+    /// as before, and a shaped call's envelope reads the word from the declared record it is
+    /// fed with, its reader being made where none stands.
+    fn start_at_name(&mut self) {}
+
     /// The table's ignored terminal arrived inside the call. Its bytes are the engine's to place
     /// ([`Region`]): dropped where it stands when the assembler holds nothing, else placed where
     /// it arrived once the bytes around it leave, spliced into a call event's source or split out
@@ -197,6 +262,16 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// own separator does what it must here (MiniMax M3's XML releases a tag it holds at it) and
     /// pushes nothing for its bytes.
     fn ignored(&mut self, _text: &str, _declared: &Declared, _out: &mut Events) {}
+
+    /// Whether a marker the engine would take from the call without asking it is the call's text
+    /// where it arrives: a terminal the table ignores, which the engine drops ([`Self::ignored`]),
+    /// and the beginning of a terminal the end of the output cut short, which it drops as the
+    /// whole terminal. True inside the JSON a request's schema forces, whose string may hold any
+    /// marker ([`Format::with_forced_call`](crate::Format::with_forced_call)), and for no other
+    /// syntax. A terminal with a row out of the state is asked through [`Self::closes`].
+    fn markers_are_text(&self) -> bool {
+        false
+    }
 
     /// The call the engine entered through a matched header starts: the events of its start, and
     /// the bytes that followed the header, for the engine to read again inside the call. Every
@@ -225,6 +300,18 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// the answer says whether the terminal's bytes were taken as the call's end (`ToolCallEnd`'s
     /// source); otherwise the engine drops them as the region's.
     fn close(self: Box<Self>, terminal: &str, out: &mut Events) -> bool;
+
+    /// Whether the end of the output is the call's own end: for a syntax whose call has no
+    /// delimiter to close it (the forced arguments, which are the whole output), a value that
+    /// is whole where the bytes end, as a number or a literal the bytes end on is. Asked before
+    /// the stop or the cut ends the call, for the word its end carries ([`CallEnd`]): such a
+    /// call was not left open, and its end says `Closed`. `cut` says the output's end is a cut
+    /// and not the model's own stop: a value that more bytes could have continued (a number)
+    /// is whole at the stop alone. Every other syntax closes a call with bytes of its own, and
+    /// one the output's end reaches before them is open.
+    fn ends_with_the_output(&self, _cut: bool) -> bool {
+        false
+    }
 
     /// The stream was cut inside the region: nothing is closed for the client, so arguments cut
     /// short never look complete.
@@ -316,7 +403,9 @@ fn assembler(
         // The list reader takes what frames the calls as one value: the list between markers
         // (Llama Nemotron) takes text in place of it as malformed; the bare list the output starts
         // in (xLAM) takes it for prose; the `json` table's output is one object, several with `;`
-        // or whitespace between them, or a list, behind the family's call marker or not.
+        // or whitespace between them, or a list, behind the family's call marker or not, and
+        // between the markers of a table with no call marker (Command) the same with text in
+        // place of it malformed.
         Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(
             index,
             ids,
@@ -329,7 +418,11 @@ fn assembler(
         Some(CallSyntax::JsonAlone(opener)) => Box::new(json::list::Assembler::new(
             index,
             ids,
-            json::list::Framing::ObjectOrList { opener },
+            if framed && opener.is_none() {
+                json::list::Framing::FramedObjectOrList
+            } else {
+                json::list::Framing::ObjectOrList { opener }
+            },
         )),
         Some(CallSyntax::Xml) => Box::new(tagged::xml::Assembler::new(index, id())),
         Some(CallSyntax::Attributed(tags)) => {
@@ -349,6 +442,12 @@ fn assembler(
             json::named::After::Arguments,
         )),
         Some(CallSyntax::ForcedArguments) => Box::new(json::forced::Assembler::new(index, id())),
+        // The required call's list under the schema: the list reader, with an open list no prose.
+        Some(CallSyntax::ForcedList) => Box::new(json::list::Assembler::new(
+            index,
+            ids,
+            json::list::Framing::Forced,
+        )),
         Some(CallSyntax::Gemma(spelling)) => Box::new(gemma::Assembler::new(index, id(), spelling)),
         // A shaped call opens through its terminal's header, which the engine reads before it
         // enters the call's state with that assembler (`Engine::open_shaped`); a table that
@@ -432,6 +531,8 @@ impl Engine {
             pending: None,
             region: Region::default(),
             scratch: Events::new(),
+            json_answer: false,
+            quoted: Quoted::default(),
         };
         // A table whose output starts inside a call (a bare list of calls, with no marker before
         // it) opens the call here, since no terminal will.
@@ -439,6 +540,108 @@ impl Engine {
             engine.open_call();
         }
         engine
+    }
+
+    /// The engine for a request whose answer is JSON (a `json_object` or `json_schema` response
+    /// format): inside one of the answer's strings the table's markers are the answer's text. A
+    /// JSON answer may spell a marker in a key or a value, which the table would otherwise read
+    /// as the marker: a row taken and the bytes dropped (the answer's own kind said again, the
+    /// message closed early, a call ended inside its arguments), or a marker out of place
+    /// counted. With the option the engine reads the quote state over the text of a content state
+    /// and over the arguments of a call whose syntax is JSON (the object is the call, as the
+    /// family's parsers read it under their JSON mode), fresh from the row that enters the state
+    /// (a stay starts outside a string), and a terminal that arrives inside a string takes no
+    /// row, counts nothing and is the state's text, the terminals the table ignores included; the
+    /// scanner still holds back a half-arrived terminal and releases it as text at the next piece
+    /// or at the end of the stream, where a tail inside a string is never a tag the end cut short.
+    /// Reasoning and wrapper states read as before (a thought is not JSON, a thought the request
+    /// keeps in the content included: its state is remade by [`Format::without_reasoning`], and no quote in
+    /// it moves the state), and so do the arguments of a tagged, keyed, XML, pythonic, Gemma or
+    /// shaped call, whose text is not one JSON value; in a JSON call's arguments the state follows
+    /// the bytes the call's object took, not the surplus after it. Without the option a request
+    /// pays one branch per text piece. Set per request, from the request's response format, as
+    /// the gateway does.
+    #[must_use]
+    pub fn reads_json_answer(mut self) -> Self {
+        self.json_answer = true;
+        // A table whose output starts inside a call opened it in `new`: told now.
+        if self.json_syntax() {
+            if let Some(call) = &mut self.call {
+                call.track_value();
+            }
+        }
+        self
+    }
+
+    /// The engine that starts a JSON call at its name: `ToolCallStart` is said once the closing
+    /// quote of the name has arrived, so a client that streams learns which function is called
+    /// before the arguments' key comes, and every cut of the output starts the same call. The
+    /// bytes between the name and the arguments value (a comma, the key, the colon) then leave
+    /// with the value's first fragment, and an output that ends behind the name ends a call
+    /// that started, with a `Malformed` event of no bytes for the arguments that never came.
+    /// Without the option a call starts where its arguments value begins (or where its object
+    /// closes without one), and an output that ends before that holds no call: its bytes are
+    /// malformed text, as a reader of a whole output expects. A call whose syntax is not a
+    /// JSON object that carries the name starts as before. Without the option a request pays
+    /// one test per call and one per piece of a JSON call's arguments. Set per request, by a
+    /// host that streams.
+    #[must_use]
+    pub fn starts_calls_at_name(mut self) -> Self {
+        self.declared.start_calls_at_name();
+        // A table whose output starts inside a call opened it in `new`: told now.
+        if let Some(call) = &mut self.call {
+            call.start_at_name();
+        }
+        self
+    }
+
+    /// Whether a terminal arriving now stands inside a string of the JSON answer: the state's
+    /// text, not the table's marker ([`Self::reads_json_answer`]).
+    fn quoted(&self) -> bool {
+        self.json_answer && self.quoted.in_string && self.in_json()
+    }
+
+    /// Whether the state's text is the JSON answer's: a content state the request's variant did
+    /// not remake (a thought kept in the content is still a thought, a call read as content still
+    /// a call: [`Format::is_remade`]) and the template does not discard (a quote in framing text
+    /// moves no state: [`Format::framing`]), or the arguments of a call whose syntax is JSON
+    /// ([`Self::json_syntax`]). Read under the option alone.
+    fn in_json(&self) -> bool {
+        match self.emits() {
+            Emits::Content => {
+                !self.format.is_remade(self.state) && !self.format.is_framing(self.state)
+            }
+            Emits::Arguments => self.json_syntax(),
+            Emits::Reasoning | Emits::Wrapper => false,
+        }
+    }
+
+    /// Whether the table's calls are one JSON value each (the object is the call), so that a
+    /// quoted spelling inside their arguments is a string's text under the JSON-answer option;
+    /// the tagged, keyed, XML, pythonic, Gemma and shaped syntaxes carry their values otherwise.
+    /// Every syntax is classed by name: a new one does not compile until it is.
+    fn json_syntax(&self) -> bool {
+        match self.format.call_syntax() {
+            None
+            | Some(
+                CallSyntax::Json
+                | CallSyntax::NamedJson(_)
+                | CallSyntax::NamedArguments { .. }
+                | CallSyntax::JsonList
+                | CallSyntax::JsonAlone(_)
+                | CallSyntax::ForcedArguments
+                | CallSyntax::ForcedList,
+            ) => true,
+            Some(
+                CallSyntax::Tagged(..)
+                | CallSyntax::Keyed(_)
+                | CallSyntax::Pythonic(_)
+                | CallSyntax::Xml
+                | CallSyntax::Attributed(_)
+                | CallSyntax::Gemma(_)
+                | CallSyntax::Shaped(_),
+            ) => false,
+        }
     }
 
     fn emits(&self) -> Emits {
@@ -540,6 +743,12 @@ impl Engine {
                 }
             };
         }
+        if matches!(piece, Piece::Marker(_)) && self.quoted() {
+            // Inside a string of the JSON answer the marker is the answer's text, whatever row
+            // or header it would take outside one ([`Self::reads_json_answer`]).
+            self.place(piece, out);
+            return None;
+        }
         if let Piece::Marker(index) = piece {
             let leaves = self.format.next(self.state, index).is_some();
             if leaves && self.emits() == Emits::Arguments {
@@ -598,6 +807,17 @@ impl Engine {
     /// a shaped call's trailer must end right before the terminal.
     fn call_closes(&mut self, terminal: &str) -> bool {
         self.call.as_mut().is_none_or(|call| call.closes(terminal))
+    }
+
+    /// Whether the call open in this state holds as its text a marker the engine would take
+    /// without asking it: one the table ignores, and the beginning of one the output's end cut
+    /// short ([`CallAssembler::markers_are_text`]).
+    fn call_holds_markers(&self) -> bool {
+        self.emits() == Emits::Arguments
+            && self
+                .call
+                .as_ref()
+                .is_some_and(|call| call.markers_are_text())
     }
 
     /// A shaped call pending its header, when terminal `index` has a row into the call's state from
@@ -707,6 +927,9 @@ impl Engine {
     /// Text of the state the engine is in: borrowed from the delta when it came whole or the scan
     /// cut it from the delta alone, owned when the engine held, joined or re-scanned it.
     fn text<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
+        if self.json_answer && self.emits() == Emits::Content && self.in_json() {
+            self.quoted.advance(&text);
+        }
         if self.format.is_framing(self.state) {
             self.end_stay(out);
             out.push(Event::Dropped {
@@ -733,6 +956,11 @@ impl Engine {
                 self.show(text, out);
             }
             Emits::Arguments => {
+                // The quote state follows the bytes of the call's JSON value alone, as the assembler
+                // names them: neither a named call's header before its marker, nor a list's text
+                // between calls or after its close, nor the surplus after an object is a JSON value,
+                // and a quote in any of them moves nothing.
+                let in_json = self.json_answer && self.json_syntax();
                 let Some(call) = &mut self.call else {
                     // An arguments state always has a call open; kept as content, not lost.
                     out.push_content(self.tokens.text(text));
@@ -746,6 +974,9 @@ impl Engine {
                     Cow::Borrowed(piece) => {
                         let mut assembled: Events<'d> = std::mem::take(&mut self.scratch);
                         let taken = call.feed(piece, &self.declared, &mut assembled);
+                        if in_json {
+                            call.quote_value(taken, piece, &mut self.quoted);
+                        }
                         self.push_call_events(assembled.consume(), out);
                         self.scratch = assembled.recycle();
                         taken
@@ -753,6 +984,9 @@ impl Engine {
                     Cow::Owned(piece) => {
                         let mut assembled: Events<'_> = std::mem::take(&mut self.scratch);
                         let taken = call.feed(piece, &self.declared, &mut assembled);
+                        if in_json {
+                            call.quote_value(taken, piece, &mut self.quoted);
+                        }
                         let owned = assembled
                             .consume()
                             .map(|event| -> Event<'d> { event.into_owned() });
@@ -952,10 +1186,23 @@ impl Engine {
     /// A terminal the table ignores is dropped where it stands, and moves nothing: inside a call
     /// whose assembler holds bytes it is placed where it arrived once the bytes around it leave
     /// ([`Region`]), and in a stay's held run (a trimmed stay's tail, a content stay's lead, the
-    /// run a wrapping stay holds after its text) it keeps its place among them.
+    /// run a wrapping stay holds after its text) it keeps its place among them. Inside the JSON
+    /// a request's schema forces it is the value's text
+    /// ([`CallAssembler::markers_are_text`]).
     fn terminal(&mut self, index: usize, out: &mut Events) {
+        if self.quoted() {
+            // Inside a string of the JSON answer: the answer's text, no row and no count, a
+            // terminal the table ignores included ([`Self::reads_json_answer`]).
+            let text = self.format.terminal_text(index).to_string();
+            self.text(Cow::Owned(text), out);
+            return;
+        }
         if self.format.ignored(index) {
             let text = self.format.terminal_text(index).to_string();
+            if self.call_holds_markers() {
+                self.text(Cow::Owned(text), out);
+                return;
+            }
             if self.emits() == Emits::Arguments {
                 if let Some(call) = &mut self.call {
                     let mut events: Events<'static> = std::mem::take(&mut self.scratch);
@@ -1081,6 +1328,9 @@ impl Engine {
             self.region = Region::default();
             self.call = Some(call.unwrap_or_else(|| self.new_call()));
         }
+        if to == Emits::Content || (to == Emits::Arguments && self.json_syntax()) {
+            self.quoted = Quoted::default();
+        }
         self.state = next;
         self.stay = Stay::default();
     }
@@ -1099,14 +1349,21 @@ impl Engine {
             .format
             .transitions()
             .any(|(_, _, to)| self.format.emits(to) == Emits::Arguments);
-        assembler(
+        let mut call = assembler(
             self.format.call_syntax().copied(),
             self.calls,
             self.ids,
             framed,
             self.format.value_reader(),
             &self.declared,
-        )
+        );
+        if self.json_answer && self.json_syntax() {
+            call.track_value();
+        }
+        if self.declared.calls_start_at_name() {
+            call.start_at_name();
+        }
+        call
     }
 
     /// Ends the call region: the assembler closes what arrived, and the result says whether it took
@@ -1130,6 +1387,8 @@ impl Engine {
         }
         let mut finished: Events<'static> = std::mem::take(&mut self.scratch);
         let mut as_marker = closed == Closed::Marker;
+        // Asked before the ending takes the call: whether the output's end is the call's own.
+        let own_end = closed != Closed::Marker && call.ends_with_the_output(closed == Closed::Cut);
         let taken = match closed {
             Closed::Marker => call.close(terminal, &mut finished),
             Closed::Stop => {
@@ -1148,13 +1407,27 @@ impl Engine {
         if taken {
             self.region.fed += terminal.len();
         }
+        // How a call this ending closes ended ([`CallEnd`]): the model's own doing where its
+        // marker closed the region, the stop stands for the marker, or the output's end is the
+        // end of a call whose syntax has no delimiter and whose value is whole there; else the
+        // stop or the cut that found it open. A call that ended inside the region ended before
+        // this, closed.
+        let ended = match closed {
+            Closed::Marker => CallEnd::Closed,
+            Closed::Stop | Closed::Cut if own_end => CallEnd::Closed,
+            Closed::Stop if as_marker => CallEnd::Closed,
+            Closed::Stop => CallEnd::Stop,
+            Closed::Cut => CallEnd::Cut,
+        };
         let closed_by_marker = |mut event: Event<'static>| {
-            if as_marker {
-                if let Event::Malformed { why, .. } = &mut event {
-                    if *why == MalformedReason::UnterminatedRegion {
-                        *why = MalformedReason::BlockWithoutACompleteCall;
-                    }
+            match &mut event {
+                Event::Malformed { why, .. }
+                    if as_marker && *why == MalformedReason::UnterminatedRegion =>
+                {
+                    *why = MalformedReason::BlockWithoutACompleteCall;
                 }
+                Event::ToolCallEnd { ended: how, .. } => *how = ended,
+                _ => {}
             }
             event
         };
@@ -1307,7 +1580,7 @@ impl Engine {
     }
 
     /// Where the prompt leaves the engine: the table's replay of it ([`Format::replayed`], which
-    /// [`Format::reasoning_open`] reads too), from the last turn opener the table names or after
+    /// [`Format::reasoning_open`] reads too), from the turn opener the table names or after
     /// its last turn anchor, the turn's first piece deciding its start where the table has a start
     /// row. An arguments state is not entered from the prompt: the engine rests where the turn
     /// started.
@@ -1327,9 +1600,15 @@ impl Engine {
     /// Whether `text`, a piece at the end of the output, is a tag the end cut short: one that
     /// begins with a whole structural token and is the beginning of a terminal the state has a
     /// row for (`<|close|>message` with no `<|sep|>` after it), which the model cannot have
-    /// written as text. A shaped call's header still being read takes every byte.
+    /// written as text. A shaped call's header still being read takes every byte, and so does a
+    /// call that holds every marker as its text ([`Self::call_holds_markers`]): the bytes the
+    /// output ended on are the value's, as the whole marker would be; and a tail inside a string
+    /// of a JSON answer is the answer's text ([`Self::reads_json_answer`]).
     fn cut_tag(&self, text: &str) -> bool {
-        self.pending.is_none() && self.format.is_cut_tag(self.state, text, self.stay.begun)
+        self.pending.is_none()
+            && !self.call_holds_markers()
+            && !self.quoted()
+            && self.format.is_cut_tag(self.state, text, self.stay.begun)
     }
 
     /// A tag the end cut short is dropped as the whole tag would have been. Inside a call the
@@ -1461,7 +1740,7 @@ mod tests {
         formats::{glm, inkling, llama4, mistral, qwen3, xlam},
         input::TokenSpan,
         tagged::{Placement, Spelling},
-        testing::{arguments_of, bytes, malformed, weather_declared},
+        testing::{arguments_of, bytes, endings, malformed, weather_declared},
     };
 
     /// GLM's last call, its closing marker not written: the stop token that would end it is
@@ -1847,6 +2126,44 @@ mod tests {
         }
     }
 
+    /// Every call's end says who ended it. The model's own closing marker closes it, and so
+    /// does the stop where the table's stop row stands for the marker the stop decoder hides;
+    /// without the row the stop found the call open, whatever the syntax closed for the model;
+    /// the token limit and an abort cut it. Only the call the output's end found open ends as
+    /// stopped or cut: the call before it closed at its own marker.
+    #[test]
+    fn a_calls_end_says_who_ended_it() {
+        let whole = format!("{LAST_CALL}</tool_call>");
+        for finish in [EngineFinish::Stop, EngineFinish::Length] {
+            let events = run(glm(), &whole, finish);
+            assert_eq!(endings(&events), [(0, CallEnd::Closed)]);
+        }
+        let with_row = run(glm().closes_at_stop("call"), LAST_CALL, EngineFinish::Stop);
+        assert_eq!(endings(&with_row), [(0, CallEnd::Closed)]);
+        let stopped = run(glm(), LAST_CALL, EngineFinish::Stop);
+        assert_eq!(endings(&stopped), [(0, CallEnd::Stop)]);
+        // The syntax closed the object for the model and said so.
+        assert_eq!(
+            malformed(&stopped),
+            [(String::new(), MalformedReason::OpenAtTheStop)]
+        );
+        for finish in [
+            EngineFinish::Length,
+            EngineFinish::Abort,
+            EngineFinish::Other("content_filter".to_string()),
+        ] {
+            for format in [glm(), glm().closes_at_stop("call")] {
+                let events = run(format, LAST_CALL, finish.clone());
+                assert_eq!(endings(&events), [(0, CallEnd::Cut)], "{finish:?}");
+            }
+        }
+        let two = format!("{whole}{LAST_CALL}");
+        let events = run(glm(), &two, EngineFinish::Length);
+        assert_eq!(endings(&events), [(0, CallEnd::Closed), (1, CallEnd::Cut)]);
+        let events = run(glm(), &two, EngineFinish::Stop);
+        assert_eq!(endings(&events), [(0, CallEnd::Closed), (1, CallEnd::Stop)]);
+    }
+
     #[test]
     fn a_closing_marker_the_model_wrote_ends_the_call_with_or_without_the_row() {
         let output = format!("{LAST_CALL}</tool_call><tool_call>get_weather</tool_call>");
@@ -1885,6 +2202,7 @@ mod tests {
                         Event::ToolCallEnd { index, .. } => Event::ToolCallEnd {
                             index: *index,
                             source: Text::uncounted(""),
+                            ended: CallEnd::Closed,
                         },
                         event => event.clone(),
                     })
@@ -2019,6 +2337,50 @@ mod tests {
                 content, " junk <|eom|><|start|>assistant It is sunny. after",
                 "{finish:?}"
             );
+        }
+    }
+
+    #[test]
+    fn a_quote_in_framing_text_moves_no_json_answer_state() {
+        // The template discards the text outside the message: a quote there is not the answer's,
+        // so the opener after it takes its row and the answer stands, whole and at every cut.
+        let output = "junk \"to=user<|message|>{\"ok\":true}<|eot|>";
+        for cut in 0..=output.len() {
+            let mut engine = Engine::new(muse(true), weather_declared()).reads_json_answer();
+            let mut out = Events::new();
+            for piece in [&output[..cut], &output[cut..]] {
+                if piece.is_empty() {
+                    continue;
+                }
+                engine
+                    .feed(
+                        Input::Delta {
+                            token_ids: &[],
+                            text: piece,
+                            spans: &[],
+                        },
+                        &mut out,
+                    )
+                    .expect("delta");
+            }
+            engine
+                .feed(
+                    Input::End {
+                        finish: EngineFinish::Stop,
+                    },
+                    &mut out,
+                )
+                .expect("end");
+            let events = out.into_owned().drain();
+            let [content, reasoning, dropped, malformed] = kinds(&events);
+            assert_eq!(content, "{\"ok\":true}", "cut at {cut}");
+            assert_eq!(dropped, "junk \"to=user<|message|><|eot|>", "cut at {cut}");
+            assert_eq!(
+                [reasoning.as_str(), malformed.as_str()],
+                ["", ""],
+                "cut at {cut}"
+            );
+            assert_eq!(bytes(&events), output, "cut at {cut}");
         }
     }
 
@@ -3272,5 +3634,48 @@ mod tests {
             .map(|(at, c)| &TWO_CALLS[at..at + c.len_utf8()])
             .collect();
         assert_eq!(replay(characters), whole);
+    }
+
+    /// [`Engine::starts_calls_at_name`]: the start comes with the name, and without the option
+    /// it waits for the arguments. A call the engine opened when it was made, the output of its
+    /// table starting inside one, is told as a call a marker opens.
+    #[test]
+    fn an_engine_that_starts_calls_at_the_name_says_the_start_before_the_arguments_come() {
+        let started = |mut engine: Engine, text: &str| {
+            let mut out = Events::new();
+            engine
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("in order");
+            out.as_slice().iter().any(
+                |event| matches!(event, Event::ToolCallStart { name, .. } if name == "get_weather"),
+            )
+        };
+        let after_a_marker = "<tool_call>\n{\"name\": \"get_weather\"";
+        let engine = || Engine::new(qwen3(CallSyntax::Json), weather_declared());
+        assert!(
+            started(engine().starts_calls_at_name(), after_a_marker),
+            "the name is whole"
+        );
+        assert!(
+            !started(engine(), after_a_marker),
+            "by default the start waits for the arguments"
+        );
+        let in_a_bare_list = "[{\"name\": \"get_weather\"";
+        let engine = || Engine::new(xlam(), weather_declared());
+        assert!(
+            started(engine().starts_calls_at_name(), in_a_bare_list),
+            "the call that stood open when the option was set is told"
+        );
+        assert!(
+            !started(engine(), in_a_bare_list),
+            "by default the start waits for the arguments"
+        );
     }
 }

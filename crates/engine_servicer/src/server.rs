@@ -26,7 +26,7 @@ use crate::ServicerError;
 const BIND_TIMEOUT: Duration = Duration::from_secs(5);
 /// Part of a `stop` timeout kept back for the thread to wind down after the
 /// server future resolves.
-const STOP_MARGIN: Duration = Duration::from_secs(1);
+pub(crate) const STOP_MARGIN: Duration = Duration::from_secs(1);
 /// Least drain grace a server gets, however short the `stop` timeout.
 const MIN_GRACE: Duration = Duration::from_millis(100);
 
@@ -299,23 +299,5 @@ pub fn init_tracing(level: Option<&str>) -> Result<(), ServicerError> {
 }
 
 #[cfg(test)]
-mod worker_threads_tests {
-    use super::{parse_worker_threads, DEFAULT_WORKER_THREADS};
-
-    /// One worker by default: every stream's per-token send then takes the
-    /// connection's lock from the same core, and no engine output batch
-    /// wakes tasks across threads.
-    #[test]
-    fn one_worker_by_default() {
-        assert_eq!(parse_worker_threads(None), 1);
-    }
-
-    #[test]
-    fn worker_threads_default_and_override() {
-        assert_eq!(parse_worker_threads(None), DEFAULT_WORKER_THREADS);
-        assert_eq!(parse_worker_threads(Some(" 8 ")), 8);
-        // Zero and garbage fall back to the default rather than panicking.
-        assert_eq!(parse_worker_threads(Some("0")), DEFAULT_WORKER_THREADS);
-        assert_eq!(parse_worker_threads(Some("many")), DEFAULT_WORKER_THREADS);
-    }
-}
+#[path = "../tests/unit/server/worker_threads_tests.rs"]
+mod worker_threads_tests;

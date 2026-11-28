@@ -6,26 +6,24 @@ use openai_protocol::{
     common::{ToolChoice, ToolChoiceValue},
     profile::ProviderProfile,
 };
-use tracing::error;
+use tracing::{error, warn};
 
-use crate::{
-    routers::{
-        error,
-        grpc::{
-            context::{PreparationOutput, RequestContext},
-            multimodal,
-            regular::{
-                stages::{
-                    reading,
-                    rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
-                    token_ids,
-                },
-                symphony,
+use crate::routers::{
+    common::snapshot::RoutingPool,
+    error,
+    grpc::{
+        context::{PreparationOutput, RequestContext},
+        multimodal,
+        regular::{
+            stages::{
+                reading,
+                rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
+                token_ids,
             },
-            utils, ProcessedMessages,
+            symphony,
         },
+        utils, ProcessedMessages,
     },
-    worker::RoutingPool,
 };
 
 /// Chat preparation stage
@@ -92,7 +90,9 @@ pub(crate) async fn prepare_chat_like(
     request: &ChatCompletionRequest,
     wire_pools: &'static [RoutingPool],
 ) -> Result<(Vec<u32>, ProcessedMessages, symphony::PreparedConstraint), Response> {
-    utils::validate_chat_content_parts(&request.messages)
+    // Validate against the rendered tool set, which allowed_tools may narrow.
+    let body_ref = utils::request_as_rendered(request);
+    utils::validate_chat_template_content_parts(&body_ref)
         .map_err(|e| error::bad_request("unsupported_content_part", e))?;
     {
         // Step 0: Resolve tokenizer from registry (cached for reuse in response processing)
@@ -110,23 +110,18 @@ pub(crate) async fn prepare_chat_like(
         )
         .map_err(|e| error::bad_request("logit_bias_invalid_key", e))?;
 
-        // Step 1: the request whose tools the template renders (every tool
-        // for a named tool_choice; the constraint built below forces the call;
-        // under `none` the tools stay declared, as the engine's own server
-        // renders them, and the reader delivers no call)
-        let body_ref = utils::request_as_rendered(request);
-
         // The media-part order and, for a request with media, the plan and
         // the placeholder tokens, resolved from the registries as the
-        // Messages stage resolves them (`utils::resolve_media`).
+        // Messages stage resolves them (`multimodal::resolve_media`).
         let model_id = ctx.input.model_id.as_str();
-        let media = utils::resolve_media(
+        let media = multimodal::resolve_media(
             &ctx.components,
             model_id,
             &*tokenizer,
             "ChatPreparationStage::execute",
-            || multimodal::media_plan_chat(&request.messages),
+            || multimodal::media_plan_chat(&request.messages, &request.other),
             true,
+            body_ref.tools.is_some(),
         )
         .await?;
         let media_order = media.media_order;
@@ -138,7 +133,7 @@ pub(crate) async fn prepare_chat_like(
         let provider = ProviderProfile::for_model(&request.model);
         ctx.state.provider = Some(provider);
 
-        // Step 2: Process messages and apply chat template
+        // Step 1: Process messages and apply chat template
         let (processed_messages, prompt_encoding) =
             match utils::process_chat_messages_with_placeholders(
                 &body_ref,
@@ -149,12 +144,30 @@ pub(crate) async fn prepare_chat_like(
             ) {
                 Ok(msgs) => msgs,
                 Err(e) => {
-                    error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
-                    return Err(error::bad_request("process_messages_failed", e));
+                    // Only a refusal typed as the request's own is the
+                    // client's to fix: one WARN with the cause, the answer
+                    // marked reported. Every other failure (a tokenizer with
+                    // no chat template, a render the template did not refuse
+                    // itself) keeps ERROR and stays unmarked; among them the
+                    // failure that is the template's own whatever the request
+                    // holds is answered in the server's class
+                    // (`PromptError::answer`).
+                    let refused = e.is_refusal();
+                    if refused {
+                        warn!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                    } else {
+                        error!(function = "ChatPreparationStage::execute", error = %e, "Failed to process chat messages");
+                    }
+                    let answer = e.answer();
+                    return Err(if refused {
+                        utils::reported(answer)
+                    } else {
+                        answer
+                    });
                 }
             };
 
-        // Steps 3 and 4: the prompt tokenized the way its renderer said to,
+        // Steps 2 and 3: the prompt tokenized the way its renderer said to,
         // the media anchors checked, the media processed or kept as
         // references (shared with the Messages stage).
         let RenderedPrompt {
@@ -180,7 +193,7 @@ pub(crate) async fn prepare_chat_like(
         // reasoning instead of preempting it. The constraint covers every tool
         // the choice lets the model call, dynamic tools declared on messages
         // included (see `ChatCompletionRequest::callable_tools`).
-        let constraint_tools = request.callable_tools();
+        let constraint_tools = request.callable_tools_for(provider);
         // All of it, and whether the decoder keeps the special tokens the
         // reader needs, is decided as for a Messages request
         // (`reading::prepare`). Only the chat stage chooses a parser:
@@ -209,11 +222,12 @@ pub(crate) async fn prepare_chat_like(
             "ChatPreparationStage::execute",
         )?;
         ctx.state.parser_names = Some(parser_names);
-        ctx.state.prompt_thought = prompt_thought;
+        ctx.state.prompt_thought = Some(prompt_thought);
         ctx.state.reading = reading;
 
         let skip_special_tokens = skips_special_tokens(
             request,
+            provider,
             json_schema_constraint,
             preserve_reasoning_special_tokens,
         );
@@ -247,9 +261,11 @@ pub(crate) async fn prepare_chat_like(
 /// offers tools the model may call (declared at the request level or on a
 /// message, see `ChatCompletionRequest::declares_tools`, the calls not switched
 /// off by `tool_choice: none`) keeps them for the tool parser's markers; any
-/// other request keeps its own setting.
+/// other request keeps its own setting. `provider` is the model's profile as
+/// preparation derived it once.
 fn skips_special_tokens(
     request: &ChatCompletionRequest,
+    provider: ProviderProfile,
     json_schema_constraint: bool,
     preserve_reasoning_special_tokens: bool,
 ) -> bool {
@@ -263,7 +279,7 @@ fn skips_special_tokens(
         request.tool_choice,
         Some(ToolChoice::Value(ToolChoiceValue::None))
     );
-    if request.declares_tools() && !calls_off {
+    if request.declares_tools_for(provider) && !calls_off {
         false
     } else {
         request.skip_special_tokens
@@ -271,109 +287,5 @@ fn skips_special_tokens(
 }
 
 #[cfg(test)]
-mod tests {
-    use openai_protocol::validated::Normalizable;
-    use serde_json::{json, Value};
-
-    use super::*;
-    use crate::routers::grpc::testing::tool;
-
-    /// A system message declaring `tools`, as the profiles that read such
-    /// declarations take it.
-    fn declaring(tools: &[Value]) -> Value {
-        json!({"role": "system", "content": "", "tools": tools})
-    }
-
-    fn user() -> Value {
-        json!({"role": "user", "content": "weather?"})
-    }
-
-    /// A request as the HTTP layer hands it on: normalized, so an empty `tools`
-    /// list has become `tool_choice: none`.
-    fn request(value: Value) -> ChatCompletionRequest {
-        let mut request: ChatCompletionRequest =
-            serde_json::from_value(value).expect("request deserializes");
-        request.normalize();
-        request
-    }
-
-    fn message_level_only() -> ChatCompletionRequest {
-        request(json!({
-            "model": "kimi-k3",
-            "messages": [declaring(&[tool("get_weather")]), user()]
-        }))
-    }
-
-    #[test]
-    fn tools_keep_the_special_tokens_wherever_they_are_declared() {
-        let request_level_only = request(json!({
-            "model": "kimi-k3",
-            "messages": [user()],
-            "tools": [tool("get_time")]
-        }));
-        assert!(!skips_special_tokens(&request_level_only, false, false));
-
-        assert!(!skips_special_tokens(&message_level_only(), false, false));
-
-        let both = request(json!({
-            "model": "kimi-k3",
-            "messages": [declaring(&[tool("get_weather")]), user()],
-            "tools": [tool("get_time")]
-        }));
-        assert!(!skips_special_tokens(&both, false, false));
-
-        // No tools anywhere: the request's own setting, whichever way it goes.
-        let none = request(json!({"model": "kimi-k3", "messages": [user()]}));
-        assert!(skips_special_tokens(&none, false, false));
-        let kept = request(json!({
-            "model": "kimi-k3",
-            "messages": [user()],
-            "skip_special_tokens": false
-        }));
-        assert!(!skips_special_tokens(&kept, false, false));
-    }
-
-    #[test]
-    fn conflicting_declarations_resolve_as_the_other_gates_resolve_them() {
-        // An empty request-level list beside a message's declaration: the
-        // normalizer's `tool_choice: none` switches the calls off, as it does
-        // without the message, so the parser is off too and nothing is kept.
-        let empty_list = request(json!({
-            "model": "kimi-k3",
-            "messages": [declaring(&[tool("get_weather")]), user()],
-            "tools": []
-        }));
-        assert!(matches!(
-            empty_list.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::None))
-        ));
-        assert!(skips_special_tokens(&empty_list, false, false));
-
-        // `tool_choice: none` written by the client, over a message's declaration.
-        let switched_off = request(json!({
-            "model": "kimi-k3",
-            "messages": [declaring(&[tool("get_weather")]), user()],
-            "tool_choice": "none"
-        }));
-        assert!(skips_special_tokens(&switched_off, false, false));
-
-        // A message's declaration under a profile that reads none widens nothing.
-        let unread = request(json!({
-            "model": "self-hosted-model",
-            "messages": [declaring(&[tool("get_weather")]), user()]
-        }));
-        assert!(skips_special_tokens(&unread, false, false));
-    }
-
-    #[test]
-    fn the_constraint_and_the_reasoning_markers_decide_before_the_tools() {
-        // A JSON-schema constraint forces the call's JSON: nothing to keep, the
-        // request's setting stands even with a message-declared tool.
-        assert!(skips_special_tokens(&message_level_only(), true, false));
-
-        // Reasoning markers the decoder would drop are kept whatever the request says.
-        let none = request(json!({"model": "kimi-k3", "messages": [user()]}));
-        assert!(!skips_special_tokens(&none, false, true));
-        assert!(!skips_special_tokens(&none, true, true));
-    }
-}
+#[path = "../../../../../../tests/unit/routers/grpc/regular/stages/chat/preparation/tests.rs"]
+mod tests;

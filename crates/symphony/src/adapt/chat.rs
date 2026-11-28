@@ -300,7 +300,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        event::{DropReason, MalformedReason, Text},
+        event::{CallEnd, DropReason, MalformedReason, Text},
         formats::qwen3,
         ids::is_minted,
         testing::events::{arguments, call, end, finish},
@@ -338,6 +338,7 @@ mod tests {
             Event::ToolCallEnd {
                 index: 1,
                 source: Text::uncounted("</tool_call>"),
+                ended: CallEnd::Closed,
             },
             Event::Dropped {
                 text: Text::uncounted("\n"),
@@ -556,6 +557,7 @@ mod tests {
                 Event::ToolCallEnd {
                     index: 0,
                     source: Text::uncounted(""),
+                    ended: CallEnd::Closed,
                 },
                 finish(FinishReason::Stop, 1),
             ]

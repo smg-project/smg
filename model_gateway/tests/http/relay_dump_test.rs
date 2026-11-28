@@ -4,6 +4,11 @@
 //! same scripted upstream bodies, compared with the dumps recorded under
 //! `tests/fixtures/relay_dumps`. `RELAY_DUMP_RECORD=1` rewrites the dumps.
 //!
+//! The workers' ports are names the harness keys its stream scripts by, and
+//! the tests of this binary run in one process: a port another file names
+//! would have that file's worker clear these scripts mid-run (the mock then
+//! serves its default answer), so these ports are this file's alone.
+//!
 //! The script splits frames mid-line and mid-frame, carries an empty chunk
 //! and a CRLF frame, and sends a frame after the `[DONE]` sentinel in a chunk
 //! of its own: the regular relay forwards everything, the decode relay ends
@@ -154,7 +159,7 @@ fn chat(model: &str) -> Value {
 
 #[tokio::test]
 async fn the_regular_router_relays_the_scripted_streams_byte_for_byte() {
-    let ctx = regular_app(18901).await;
+    let ctx = regular_app(18981).await;
     check(
         "regular_chat",
         &dump(&ctx, "/v1/chat/completions", chat("mock-model")).await,
@@ -185,7 +190,7 @@ async fn the_regular_router_relays_the_scripted_streams_byte_for_byte() {
 
 #[tokio::test]
 async fn the_disaggregated_router_relays_the_decode_streams_byte_for_byte() {
-    let ctx = pd_app(18902, 18903).await;
+    let ctx = pd_app(18982, 18983).await;
     check(
         "pd_chat",
         &dump(&ctx, "/v1/chat/completions", chat("mock-model")).await,

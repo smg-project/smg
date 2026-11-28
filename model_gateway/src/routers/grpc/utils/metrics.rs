@@ -11,9 +11,11 @@ use crate::{
     rate_limit::RATE_LIMIT_ERROR_CODE,
     routers::{
         common::{
+            attempt_ledger::WORKER_BODY_TOO_LARGE,
             overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
             placement::{
                 MODEL_NOT_FOUND_CODE, NO_AVAILABLE_WORKERS_CODE, NO_MEDIA_REF_CAPABLE_WORKER_CODE,
+                NO_PLAN_BOUND_CODE,
             },
         },
         error::extract_error_code_from_response,
@@ -62,7 +64,9 @@ pub(crate) fn error_type_from_status(status: StatusCode) -> &'static str {
 /// are left out on purpose: they are configuration and capability
 /// mismatches that no wait clears (no `Retry-After`), not the capacity
 /// refusals this label names, and they keep their class by status until
-/// one of their own is decided.
+/// one of their own is decided. So does the 501 for a request of a kind the
+/// policy spec in force binds no plan for (`no_policy_plan_for_model`): a
+/// verdict on the spec that no wait clears either.
 const GATEWAY_REFUSAL_CODES: &[&str] = &[
     NO_AVAILABLE_WORKERS_CODE,
     WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
@@ -129,7 +133,8 @@ pub(crate) fn mark_error_reason(response: &mut Response, reason: &'static str) {
 /// for it), the overload shed and a prefill admission queue that is full,
 /// the bound of the selection queue or of the prefill admission queue, a
 /// model nobody serves, the tenant limit, a constraint the engine could not
-/// continue under, a pool with no capable worker, an upstream call that
+/// continue under, a pool with no capable worker or a policy spec with no
+/// plan of the request's kind, an upstream call that
 /// timed out or whose connection failed before or under the call, a worker's
 /// answer that could not be read or decoded. A response with no gateway code
 /// is a worker's answer relayed as it came, classed by its status; one with
@@ -158,8 +163,13 @@ pub(crate) fn error_reason_for_response(response: &Response) -> &'static str {
         MODEL_NOT_FOUND_CODE => REASON_MODEL_NOT_FOUND,
         RATE_LIMIT_ERROR_CODE => REASON_RATE_LIMITED,
         CONSTRAINT_FAILED_CODE => REASON_CONSTRAINT_FAILED,
-        // The disaggregated routers' pair verdict (`no_compatible_pd_pair`).
-        NO_MEDIA_REF_CAPABLE_WORKER_CODE | "no_compatible_pd_pair" => REASON_NO_CAPABLE_WORKER,
+        // The disaggregated routers' pair verdict (`no_compatible_pd_pair`),
+        // and a policy spec that binds no plan of the request's kind: a
+        // configuration verdict like the two before it, and no failure of
+        // the gateway's own processing.
+        NO_MEDIA_REF_CAPABLE_WORKER_CODE | "no_compatible_pd_pair" | NO_PLAN_BOUND_CODE => {
+            REASON_NO_CAPABLE_WORKER
+        }
         REQUEST_TIMEOUT_CODE => REASON_DEADLINE,
         // The HTTP router's codes for a worker connection that failed before
         // the call (a connect fault), under it (a reset or a close before the
@@ -173,9 +183,9 @@ pub(crate) fn error_reason_for_response(response: &Response) -> &'static str {
         // The decisions route's code for an answer it could not read, the
         // HTTP router's for one it could not decode or one over the payload
         // limit.
-        "invalid_decisions_response"
-        | "call_upstream_decode_error"
-        | "upstream_response_too_large" => REASON_BAD_RESPONSE,
+        "invalid_decisions_response" | "call_upstream_decode_error" | WORKER_BODY_TOO_LARGE => {
+            REASON_BAD_RESPONSE
+        }
         "" => error_reason_from_status(status),
         // Another code of the gateway's own: a 429 under it is a shed of the
         // gateway's (a budget or a cap it holds), never a worker's pushback.
@@ -294,11 +304,14 @@ mod tests {
         use metrics_labels::*;
         use smg_grpc_client::constraint_failed_status;
 
-        use crate::routers::{
-            common::{overload, placement},
-            error,
-            grpc::{common::responses::background, utils::tonic_ext::TonicStatusExt},
-            prefill_queue_full, prefill_queue_timeout,
+        use crate::{
+            rate_limit::rejection_response,
+            routers::{
+                common::{overload, placement},
+                error,
+                grpc::{common::responses::background, utils::tonic_ext::TonicStatusExt},
+                prefill_queue_full, prefill_queue_timeout,
+            },
         };
 
         // A worker's status, whatever code the answer is minted under.
@@ -369,10 +382,7 @@ mod tests {
             ),
             (background::limit_reached(4), REASON_OVERLOAD_SHED),
             (error::model_not_found("m"), REASON_MODEL_NOT_FOUND),
-            (
-                crate::rate_limit::rejection_response(3),
-                REASON_RATE_LIMITED,
-            ),
+            (rejection_response(3), REASON_RATE_LIMITED),
             (
                 placement::no_media_ref_capable_worker("no vision worker"),
                 REASON_NO_CAPABLE_WORKER,
@@ -381,19 +391,26 @@ mod tests {
                 error::service_unavailable("no_compatible_pd_pair", "no pair"),
                 REASON_NO_CAPABLE_WORKER,
             ),
+            // A spec that binds no plan of the request's kind is a
+            // configuration verdict too: its 501 alone would read as the
+            // gateway's own processing.
+            (
+                placement::no_plan_bound("m", "pair"),
+                REASON_NO_CAPABLE_WORKER,
+            ),
             (
                 smg_external_router::retry::request_timeout_response("upstream timed out"),
                 REASON_DEADLINE,
             ),
             (
-                error::internal_error("call_upstream_connection_failed", "refused"),
+                error::bad_gateway("call_upstream_connection_failed", "refused"),
                 REASON_TRANSPORT_DISCONNECT,
             ),
             // The client files a reset or a close before the head as a
             // request fault, and a body cut short as a body fault: both are
             // the worker's connection failing under the call.
             (
-                error::internal_error("call_upstream_request_error", "reset"),
+                error::bad_gateway("call_upstream_request_error", "reset"),
                 REASON_TRANSPORT_DISCONNECT,
             ),
             (
@@ -404,7 +421,7 @@ mod tests {
             // it was whole is the connection's fault, one over the limit the
             // answer's.
             (
-                error::internal_error("read_response_body_failed", "cut"),
+                error::bad_gateway("read_response_body_failed", "cut"),
                 REASON_TRANSPORT_DISCONNECT,
             ),
             (
@@ -437,6 +454,9 @@ mod tests {
                 error::internal_error("no_response_produced", "none"),
                 REASON_INTERNAL,
             ),
+            // A decision Grand Central itself failed is the gateway's own
+            // processing: its code has no arm, and its 500 says so.
+            (placement::decision_failed("m"), REASON_INTERNAL),
             (
                 error::service_unavailable("tokenizer_not_ready", "loading"),
                 REASON_INTERNAL,
@@ -513,6 +533,21 @@ mod tests {
             assert_eq!(
                 error_type_for_response(&response),
                 error_type,
+                "{}",
+                extract_error_code_from_response(&response)
+            );
+        }
+        // Two refusals of the gateway's own are no capacity refusal: a spec
+        // that binds no plan of the request's kind, and a decision Grand
+        // Central itself failed. No wait clears either, and each keeps its
+        // class by status.
+        for response in [
+            placement::no_plan_bound("m", "single-request"),
+            placement::decision_failed("m"),
+        ] {
+            assert_eq!(
+                error_type_for_response(&response),
+                "backend_error",
                 "{}",
                 extract_error_code_from_response(&response)
             );

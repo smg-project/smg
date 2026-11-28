@@ -271,31 +271,15 @@ pub(crate) mod avx2 {
         halves[0]
     }
 
-    /// Sixteen pixels per step, then eight, then the rest one by one.
+    #[inline]
     #[target_feature(enable = "avx2")]
-    fn split_avx2(pixels: &[u8], r: &mut [u8], g: &mut [u8], b: &mut [u8]) {
-        let (wide, rest) = pixels.as_chunks::<48>();
-        let (r_wide, r_rest) = r.as_chunks_mut::<16>();
-        let (g_wide, g_rest) = g.as_chunks_mut::<16>();
-        let (b_wide, b_rest) = b.as_chunks_mut::<16>();
-        for (((pixels, r), g), b) in wide
-            .iter()
-            .zip(r_wide.iter_mut())
-            .zip(g_wide.iter_mut())
-            .zip(b_wide.iter_mut())
-        {
-            [*r, *g, *b] = deinterleave16(*pixels);
-        }
-        let (half, rest) = rest.as_chunks::<24>();
-        let (r_half, r_rest) = r_rest.as_chunks_mut::<8>();
-        let (g_half, g_rest) = g_rest.as_chunks_mut::<8>();
-        let (b_half, b_rest) = b_rest.as_chunks_mut::<8>();
-        for (((pixels, r), g), b) in half
-            .iter()
-            .zip(r_half.iter_mut())
-            .zip(g_half.iter_mut())
-            .zip(b_half.iter_mut())
-        {
+    fn split8_at(pixels: &[u8], r: &mut [u8], g: &mut [u8], b: &mut [u8], at: usize) {
+        if let (Some(pixels), Some(r), Some(g), Some(b)) = (
+            pixels[3 * at..].first_chunk::<24>(),
+            r[at..].first_chunk_mut::<8>(),
+            g[at..].first_chunk_mut::<8>(),
+            b[at..].first_chunk_mut::<8>(),
+        ) {
             let thirds: [[u8; 8]; 3] = bytemuck::must_cast(*pixels);
             let words: [__m128i; 2] =
                 bytemuck::must_cast([thirds[0], thirds[1], thirds[2], [0u8; 8]]);
@@ -303,7 +287,46 @@ pub(crate) mod avx2 {
             *g = plane8(words, &GREEN8);
             *b = plane8(words, &BLUE8);
         }
-        super::split_scalar(rest, r_rest, g_rest, b_rest);
+    }
+
+    /// Sixteen pixels per step, or eight for a run under sixteen. A tail
+    /// shorter than the step is one more step over the run's last pixels,
+    /// which rewrites the pixels the two steps share with the same bytes.
+    /// Only a run under eight pixels goes one by one.
+    #[target_feature(enable = "avx2")]
+    fn split_avx2(pixels: &[u8], r: &mut [u8], g: &mut [u8], b: &mut [u8]) {
+        let run = r.len();
+        if run < 8 {
+            return super::split_scalar(pixels, r, g, b);
+        }
+        if run < 16 {
+            split8_at(pixels, r, g, b, 0);
+            if run > 8 {
+                split8_at(pixels, r, g, b, run - 8);
+            }
+            return;
+        }
+        for (((pixels, r), g), b) in pixels
+            .as_chunks::<48>()
+            .0
+            .iter()
+            .zip(r.as_chunks_mut::<16>().0)
+            .zip(g.as_chunks_mut::<16>().0)
+            .zip(b.as_chunks_mut::<16>().0)
+        {
+            [*r, *g, *b] = deinterleave16(*pixels);
+        }
+        if run.is_multiple_of(16) {
+            return;
+        }
+        if let (Some(pixels), Some(r), Some(g), Some(b)) = (
+            pixels.last_chunk::<48>(),
+            r.last_chunk_mut::<16>(),
+            g.last_chunk_mut::<16>(),
+            b.last_chunk_mut::<16>(),
+        ) {
+            [*r, *g, *b] = deinterleave16(*pixels);
+        }
     }
 }
 

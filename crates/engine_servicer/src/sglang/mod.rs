@@ -18,7 +18,8 @@
 //! room's residue instead (`bootstrap_room % dp_size`: where SGLang's prefill
 //! side requires it and the decode side looks for the KV), the pin yielding
 //! to it (a warning on the connection's first such request, a debug line on
-//! each later one); the decode side keeps the pin.
+//! each later one); the decode side keeps the pin. A prefill side of plain
+//! data-parallel replicas also names that rank to the engine.
 //!
 //! The language side of encode/prefill disaggregation (`--language-only`)
 //! works as behind the engine's own frontend: a request's media references
@@ -31,12 +32,16 @@
 //! ([`engine_zmq_adapter::sglang_encode`]).
 
 mod embed;
+pub mod encoder;
 mod engine;
 mod generate;
 mod info;
+mod lora;
 mod media_identity;
+pub mod native;
 mod service;
 #[cfg(test)]
+#[path = "../../tests/unit/sglang/tests/mod.rs"]
 mod tests;
 
 use std::{sync::Arc, time::Duration};
@@ -45,13 +50,17 @@ use engine_zmq_adapter::{
     ConstraintKinds, SglangEncodeDispatcher, StructuredOutputBackend,
     StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
-use smg_grpc_client::sglang_proto::sglang_scheduler_server::SglangSchedulerServer;
+pub use native::ManagedConfig;
+use native::ManagedNativeRuntime;
+use smg_grpc_client::{
+    sglang_managed::Limits, sglang_proto::sglang_scheduler_server::SglangSchedulerServer,
+};
 use tonic::service::Routes;
 
 use crate::{
     engine_link::EngineLink,
     health_probe,
-    kv_events::KvEventRelay,
+    kv_events::{record_with_queue, KvEventRelay, RankLoads},
     metrics::{Identity, ServicerMetrics},
     proto_json,
     servicer::{self, Shared, WireState},
@@ -201,6 +210,21 @@ pub(super) fn places_by_rendezvous_room(model: &SglangModelInfo) -> bool {
         == Some("prefill")
 }
 
+/// Whether the scheduler ranks are plain data-parallel replicas (`--dp-size`
+/// above one without attention DP), read off the launcher's `server_args` in
+/// either release's spelling of attention DP: `attn_dp_size` above one beside
+/// a `dp_size` of 1, or `enable_dp_attention` beside the `dp_size`.
+pub(super) fn ranks_are_replicas(model: &SglangModelInfo) -> bool {
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    let width = |name: &str| args.get(name).and_then(serde_json::Value::as_u64);
+    let attention_dp = width("attn_dp_size").is_some_and(|ranks| ranks > 1)
+        || args
+            .get("enable_dp_attention")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+    width("dp_size").is_some_and(|replicas| replicas > 1) && !attention_dp
+}
+
 /// SGLang's `CaptureHiddenMode`: how much of the hidden states the scheduler
 /// was launched to return.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,16 +306,13 @@ impl std::fmt::Debug for SglangServicerConfig {
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
 /// attaches to every batch it streams.
-impl crate::kv_events::RankLoads for State {
+impl RankLoads for State {
     fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
         // A connected rank reads its own entry (zero-filled until its first
         // load tail), never another rank's figures; a rank past the
         // connected ones gets no record.
         let load = info::rank_load(self, dp_rank)?;
-        Some(crate::kv_events::record_with_queue(
-            &load,
-            load.num_waiting_uncached_tokens,
-        ))
+        Some(record_with_queue(&load, load.num_waiting_uncached_tokens))
     }
 
     fn engine_link(&self) -> &EngineLink {
@@ -304,7 +325,10 @@ impl crate::kv_events::RankLoads for State {
 }
 
 pub(super) struct State {
+    pub(super) prepared: std::sync::OnceLock<Arc<ManagedNativeRuntime>>,
+    pub(super) managed_config: Option<ManagedConfig>,
     pub(super) model: SglangModelInfo,
+    loras: lora::PreloadedLoras,
     /// What every servicer's state shares: the engine link, the admitted
     /// requests, the KV-event relay, the metrics and the serving switch.
     pub(super) shared: Shared,
@@ -335,6 +359,22 @@ pub struct SglangServicerServer {
 }
 
 impl SglangServicerServer {
+    /// Start a dedicated managed P/D pool. Legacy media preprocessing and dispatch are refused.
+    pub fn start_managed(
+        config: SglangServicerConfig,
+        managed: ManagedConfig,
+    ) -> Result<Self, ServicerError> {
+        managed
+            .validate()
+            .map_err(|e| ServicerError::InvalidConfig(e.to_string()))?;
+        if config.encode_dispatcher.is_some() || config.media_processor.is_some() {
+            return Err(ServicerError::InvalidConfig(
+                "managed workers cannot install legacy media dispatch or processing".into(),
+            ));
+        }
+        Self::start_inner(config, None, false, Some(managed))
+    }
+
     /// Validate, bind, and serve on a dedicated runtime thread.
     pub fn start(config: SglangServicerConfig) -> Result<Self, ServicerError> {
         // Only processors with an engine-tested identity contract auto-enable
@@ -356,6 +396,16 @@ impl SglangServicerServer {
         config: SglangServicerConfig,
         mm_hasher: Option<engine_zmq_adapter::SglangCpuMmHasher>,
         media_identity_enabled: bool,
+    ) -> Result<Self, ServicerError> {
+        Self::start_inner(config, mm_hasher, media_identity_enabled, None)
+    }
+
+    /// Validate configuration and start either a normal or managed SGLang servicer.
+    fn start_inner(
+        config: SglangServicerConfig,
+        mm_hasher: Option<engine_zmq_adapter::SglangCpuMmHasher>,
+        media_identity_enabled: bool,
+        managed_config: Option<ManagedConfig>,
     ) -> Result<Self, ServicerError> {
         let invalid = |message: &str| ServicerError::InvalidConfig(message.to_string());
         config.servicer.validate()?;
@@ -412,6 +462,9 @@ impl SglangServicerServer {
                         .map(str::to_owned)
                 });
         let state = Arc::new(State {
+            prepared: std::sync::OnceLock::new(),
+            managed_config: managed_config.clone(),
+            loras: lora::PreloadedLoras::from_server_args(&config.model.server_args_json)?,
             media_identity_key,
             media_disaggregation_mode,
             model: config.model,
@@ -434,6 +487,25 @@ impl SglangServicerServer {
             .max_decoding_message_size(usize::MAX)
             .max_encoding_message_size(usize::MAX),
         );
+        let mut metadata = None;
+        if let Some(config) = managed_config {
+            let native_state = Arc::downgrade(&state);
+            let runtime = Arc::new(
+                ManagedNativeRuntime::new(
+                    Arc::new(move || native_state.upgrade()?.shared.engine().ok().cloned()),
+                    &config,
+                    Limits::default(),
+                )
+                .map_err(|e| ServicerError::InvalidConfig(e.to_string()))?,
+            );
+            if let Some(endpoint) = config.metadata_endpoint {
+                metadata = Some((Arc::clone(&runtime), endpoint));
+            }
+            state
+                .prepared
+                .set(runtime)
+                .map_err(|_| ServicerError::InvalidConfig("duplicate prepared runtime".into()))?;
+        }
         let connect_state = Arc::clone(&state);
         let server = servicer::Server::start(
             "smg-sglang-servicer",
@@ -442,7 +514,25 @@ impl SglangServicerServer {
             "SGLang",
             &state,
             routes,
-            move |inputs| engine::connect_engine(connect_state, inputs),
+            move |inputs| async move {
+                if let Some((runtime, endpoint)) = metadata {
+                    match ManagedNativeRuntime::bind_metadata(&endpoint).await {
+                        Ok(socket) => {
+                            let errors = Arc::clone(&inputs.last_error);
+                            let ((), result) = tokio::join!(
+                                engine::connect_engine(connect_state, inputs),
+                                runtime.read_metadata(socket)
+                            );
+                            if let Err(error) = result {
+                                crate::record_error(&errors, error.to_string());
+                            }
+                        }
+                        Err(error) => crate::record_error(&inputs.last_error, error.to_string()),
+                    }
+                } else {
+                    engine::connect_engine(connect_state, inputs).await;
+                }
+            },
         )?;
         Ok(Self { server, state })
     }

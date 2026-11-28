@@ -192,10 +192,7 @@ impl ModelProcessorSpec for Step3VLVisionSpec {
     ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
         match modality {
             Modality::Image => Ok(Box::new(Step3VLProcessor::from_model_config(model_config))),
-            _ => Err(ModelRegistryError::UnsupportedModality {
-                spec: self.name(),
-                modality,
-            }),
+            _ => Err(ModelRegistryError::unsupported(self.name(), modality)),
         }
     }
 

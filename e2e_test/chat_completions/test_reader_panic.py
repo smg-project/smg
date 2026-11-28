@@ -16,7 +16,7 @@ requests ask for Symphony by header, so the reader runs whatever parser the
 lane starts the gateway with.
 
 Usage:
-    E2E_RUNTIME=mock pytest e2e_test/chat_completions/test_reader_panic.py -v
+    E2E_RUNTIME=mock E2E_ENGINE=mock pytest e2e_test/chat_completions/test_reader_panic.py -v
 """
 
 from __future__ import annotations

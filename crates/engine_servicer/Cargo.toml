@@ -64,5 +64,9 @@ harness = false
 name = "generate_path"
 harness = false
 
+[[bench]]
+name = "engine_hash"
+harness = false
+
 [lints]
 workspace = true

@@ -86,6 +86,12 @@ impl Params {
                 "Gemma 4 max_soft_tokens must be one of {SUPPORTED_SOFT_TOKENS:?}, got {max_soft_tokens}"
             )));
         }
+        // One image's patch output in float bytes is the largest size of the
+        // geometry: once it fits `usize`, each of its products does.
+        [pool, pool, CHANNELS, patch, patch, size_of::<f32>()]
+            .into_iter()
+            .try_fold(max_soft_tokens, usize::checked_mul)
+            .ok_or_else(|| shape("Gemma 4 patch output size overflow"))?;
         Ok(Self {
             patch,
             pool,
@@ -414,14 +420,18 @@ fn encode<F: RgbSource>(
     let (source_w, source_h) = frame.dimensions();
     let (source_w, source_h) = (source_w as usize, source_h as usize);
     let layout = Layout::new(source_w, source_h, params, pixels)?;
-    let data = layout.pixels(frame.rgb()?, source_w, source_h, pixels.filter)?;
-    let lut = &pixels.lut;
     let patch_pixels = params.patch_pixels();
     // The patches in reading order, then the zero padding, each element
     // written once into a plain allocation: a zeroed allocation of this size
     // costs the allocator's page faults per image, and the patches overwrite
-    // all of it but the padding.
-    let mut values = Vec::with_capacity(params.max_patches() * patch_pixels);
+    // all of it but the padding. Reserved before the resize, so a refusal is
+    // the request's error before that work.
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(params.max_patches() * patch_pixels)
+        .map_err(refused)?;
+    let data = layout.pixels(frame.rgb()?, source_w, source_h, pixels.filter)?;
+    let lut = &pixels.lut;
     let row_bytes = layout.width * CHANNELS;
     for patch_y in 0..layout.grid_h {
         for patch_x in 0..layout.grid_w {
@@ -498,7 +508,7 @@ fn stack(
     let mut values = Vec::new();
     values
         .try_reserve_exact(count * max_patches * patch_pixels)
-        .map_err(|error| shape(format!("cannot reserve Gemma 4 patch output: {error}")))?;
+        .map_err(refused)?;
     let mut positions = Vec::with_capacity(count * max_patches * 2);
     let mut tokens = Vec::with_capacity(count);
     for item in encoded {
@@ -561,6 +571,11 @@ fn extra_usize(
 
 fn shape(message: impl Into<String>) -> TransformError {
     TransformError::ShapeError(message.into())
+}
+
+/// The request's error for a patch output the allocator refuses.
+fn refused(error: std::collections::TryReserveError) -> TransformError {
+    TransformError::ReserveRefused(format!("cannot reserve Gemma 4 patch output: {error}"))
 }
 
 /// Gemma 4 image and video preprocessor.
@@ -638,18 +653,16 @@ impl Gemma4Processor {
         dtype: EncoderDtype,
         writer: &WireWriter,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let params = self.params_for(Modality::Image)?;
         let (max_patches, patch_pixels) = (params.max_patches(), params.patch_pixels());
         let band_bytes = max_patches * patch_pixels * writer.element_size();
         let wire_len = band_bytes
             .checked_mul(images.len())
-            .ok_or_else(|| shape("Gemma 4 wire size overflow"))?;
+            .ok_or_else(|| TransformError::ReserveRefused("Gemma 4 wire size overflow".into()))?;
         // A pooled buffer: its bytes are a previous request's until the bands
         // below, padding included, are written.
-        let mut wire = buffer_pool::take(wire_len);
+        let mut wire = buffer_pool::try_take(wire_len).map_err(refused)?;
         let mut positions = vec![0_i64; images.len() * max_patches * 2];
         let mut tokens = Vec::with_capacity(images.len());
         for ((image, band), positions) in images
@@ -719,9 +732,7 @@ impl VisionPreProcessor for Gemma4Processor {
         &self,
         images: &[&DynamicImage],
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        if images.is_empty() {
-            return Err(TransformError::EmptyBatch);
-        }
+        TransformError::if_empty(images)?;
         let params = self.params_for(Modality::Image)?;
         let encoded = images
             .iter()
@@ -793,6 +804,7 @@ mod tests {
     use image::{Rgb, RgbImage};
 
     use super::*;
+    use crate::test_support::gradient_rgb;
 
     const IMAGE_CONFIG: &str = r#"{
         "do_convert_rgb": true, "do_normalize": false, "do_rescale": true, "do_resize": true,
@@ -925,7 +937,7 @@ mod tests {
         let params = params();
         let side = params.side_mult();
         let (width, height) = (2 * side, side);
-        let pixels = crate::test_support::gradient_rgb(width, height, 7);
+        let pixels = gradient_rgb(width, height, 7);
         let frame = DynamicImage::ImageRgb8(
             RgbImage::from_raw(width as u32, height as u32, pixels.clone()).unwrap(),
         );
@@ -941,14 +953,14 @@ mod tests {
             for patch_x in 0..grid_w {
                 for dy in 0..patch {
                     for dx in 0..patch {
-                        for channel in 0..CHANNELS {
+                        for (channel, lut) in pipeline.lut.iter().enumerate() {
                             let source = ((patch_y * patch + dy) * width + patch_x * patch + dx)
                                 * CHANNELS
                                 + channel;
                             let index = (patch_y * grid_w + patch_x) * patch_pixels
                                 + (dy * patch + dx) * CHANNELS
                                 + channel;
-                            expected[index] = pipeline.lut[channel][pixels[source] as usize];
+                            expected[index] = lut[pixels[source] as usize];
                         }
                     }
                 }
@@ -1088,7 +1100,7 @@ mod tests {
     }
 
     fn gradient(width: u32, height: u32, seed: usize) -> DynamicImage {
-        let pixels = crate::test_support::gradient_rgb(width as usize, height as usize, seed);
+        let pixels = gradient_rgb(width as usize, height as usize, seed);
         DynamicImage::ImageRgb8(RgbImage::from_raw(width, height, pixels).unwrap())
     }
 
@@ -1182,5 +1194,48 @@ mod tests {
             .preprocess_wire(&[&image], EncoderDtype::BFloat16)
             .unwrap()
             .is_err());
+    }
+
+    /// A patch too large for any allocation, and a batch of them too large
+    /// for any layout: the request reads an error in both forms of the
+    /// output, under the same variant when the batch's size passes `usize`.
+    /// A geometry too large to count is refused when the processor is built.
+    #[test]
+    fn a_patch_output_that_cannot_be_reserved_is_an_error() {
+        let built = |patch: u32| {
+            let config: PreProcessorConfig =
+                serde_json::from_value(serde_json::json!({ "patch_size": patch })).unwrap();
+            Gemma4Processor::from_config_for(&config, Modality::Image)
+        };
+        let processor = built(1 << 24).unwrap();
+        let image = solid(1, 1, [0; 3]);
+        let wire = |images: &[&DynamicImage]| {
+            processor
+                .preprocess_wire(images, EncoderDtype::BFloat16)
+                .expect("a narrow wire")
+        };
+
+        for result in [
+            wire(&[&image]),
+            wire(&[&image; 3]),
+            processor.preprocess(&[&image]),
+        ] {
+            assert!(
+                matches!(&result, Err(TransformError::ReserveRefused(message))
+                    if message
+                        .strip_prefix("cannot reserve Gemma 4 patch output: ")
+                        .is_some_and(|cause| !cause.is_empty())),
+                "{result:?}"
+            );
+        }
+        assert!(matches!(
+            wire(&[&image; 5]),
+            Err(TransformError::ReserveRefused(message)) if message == "Gemma 4 wire size overflow"
+        ));
+        assert!(matches!(
+            built(1 << 25),
+            Err(TransformError::ShapeError(message))
+                if message == "Gemma 4 patch output size overflow"
+        ));
     }
 }

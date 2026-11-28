@@ -4,11 +4,12 @@
 
 use std::{
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::Arc,
     time::{Duration, Instant},
 };
 
+use anyhow::Context as _;
 use engine_zmq_client::{
     connect_handshake,
     protocol::vllm::{
@@ -21,8 +22,8 @@ use engine_zmq_client::{
 };
 use futures::StreamExt;
 use mock_worker::{
-    admin,
-    config::{Config, ReplayConfig},
+    config::{Config, ReplayConfig, Role},
+    engine::{EngineParams, TimingModel},
     grpc, http, script, zmq,
 };
 use serde_json::{json, Value};
@@ -50,22 +51,22 @@ fn config(script: Option<PathBuf>) -> Config {
 }
 
 /// Write `answers` as a script file, one per line.
-fn script_file(dir: &Path, name: &str, answers: &[Value]) -> PathBuf {
+fn script_file(dir: &Path, name: &str, answers: &[Value]) -> anyhow::Result<PathBuf> {
     let path = dir.join(name);
     let text: String = answers.iter().map(|a| format!("{a}\n")).collect();
-    std::fs::write(&path, text).expect("write the script");
-    path
+    std::fs::write(&path, text).context("write the script")?;
+    Ok(path)
 }
 
 // ── gRPC ────────────────────────────────────────────────────────────────────
 
 /// Serve `cfg` as a gRPC worker on a free port: the gateway's client and the
 /// worker's name.
-async fn start_grpc(cfg: Config) -> (TokenSpeedSchedulerClient, String) {
+async fn start_grpc(cfg: Config) -> anyhow::Result<(TokenSpeedSchedulerClient, String)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind a free port");
-    let port = listener.local_addr().expect("listener address").port();
+        .context("bind a free port")?;
+    let port = listener.local_addr().context("listener address")?.port();
     #[expect(
         clippy::disallowed_methods,
         reason = "the server serves until the test process exits"
@@ -73,8 +74,9 @@ async fn start_grpc(cfg: Config) -> (TokenSpeedSchedulerClient, String) {
     let _server = tokio::spawn(grpc::serve_with_listener(Arc::new(cfg), listener));
     let client = TokenSpeedSchedulerClient::connect(&format!("http://127.0.0.1:{port}"))
         .await
-        .expect("connect to the mock worker");
-    (client, format!("grpc:{port}"))
+        .map_err(anyhow::Error::from_boxed)
+        .context("connect to the mock worker")?;
+    Ok((client, format!("grpc:{port}")))
 }
 
 fn grpc_request(id: &str, input_ids: &[u32], stream: bool, logprobs: bool) -> ts::GenerateRequest {
@@ -113,12 +115,12 @@ fn chunk(
     }
 }
 
-fn logprobs(token_ids: &[u32], values: &[f32]) -> Option<ts::OutputLogProbs> {
-    Some(ts::OutputLogProbs {
+fn logprobs(token_ids: &[u32], values: &[f32]) -> ts::OutputLogProbs {
+    ts::OutputLogProbs {
         token_logprobs: values.to_vec(),
         token_ids: token_ids.to_vec(),
         top_logprobs: Vec::new(),
-    })
+    }
 }
 
 #[tokio::test]
@@ -136,10 +138,15 @@ async fn grpc_streams_the_scripted_answer_frame_for_frame() {
             "prompt_tokens": 7,
             "logprobs": [-0.5, -1.0, -1.5],
         })],
-    );
-    let (client, _) = start_grpc(config(Some(script))).await;
+    )
+    .expect("the script file");
+    let (client, _) = start_grpc(config(Some(script)))
+        .await
+        .expect("the worker starts");
 
-    let streamed = generate(&client, grpc_request("s", &[1, 2, 3], true, true)).await;
+    let streamed = generate(&client, grpc_request("s", &[1, 2, 3], true, true))
+        .await
+        .expect("the worker answers");
     let complete = ts::GenerateResponse {
         request_id: "s".to_string(),
         response: Some(GenResp::Complete(ts::GenerateComplete {
@@ -148,7 +155,7 @@ async fn grpc_streams_the_scripted_answer_frame_for_frame() {
             prompt_tokens: 7,
             completion_tokens: 3,
             cached_tokens: 2,
-            output_logprobs: logprobs(&[10, 11, 12], &[-0.5, -1.0, -1.5]),
+            output_logprobs: Some(logprobs(&[10, 11, 12], &[-0.5, -1.0, -1.5])),
             matched_stop: Some(ts::generate_complete::MatchedStop::MatchedStopStr(
                 "</s>".to_string(),
             )),
@@ -160,15 +167,17 @@ async fn grpc_streams_the_scripted_answer_frame_for_frame() {
     assert_eq!(
         streamed,
         vec![
-            chunk("s", vec![10], 7, 1, 2, logprobs(&[10], &[-0.5])),
-            chunk("s", vec![11], 7, 2, 2, logprobs(&[11], &[-1.0])),
-            chunk("s", vec![12], 7, 3, 2, logprobs(&[12], &[-1.5])),
+            chunk("s", vec![10], 7, 1, 2, Some(logprobs(&[10], &[-0.5]))),
+            chunk("s", vec![11], 7, 2, 2, Some(logprobs(&[11], &[-1.0]))),
+            chunk("s", vec![12], 7, 3, 2, Some(logprobs(&[12], &[-1.5]))),
             complete.clone(),
         ]
     );
 
     // Not streamed, no logprobs asked: the completion alone, without them.
-    let whole = generate(&client, grpc_request("w", &[1, 2, 3], false, false)).await;
+    let whole = generate(&client, grpc_request("w", &[1, 2, 3], false, false))
+        .await
+        .expect("the worker answers");
     let mut expected = complete;
     expected.request_id = "w".to_string();
     if let Some(GenResp::Complete(complete)) = &mut expected.response {
@@ -184,10 +193,15 @@ async fn grpc_answers_a_prompt_the_script_misses_as_before_and_counts_the_miss()
         dir.path(),
         "miss.jsonl",
         &[json!({"input_ids": [4, 4], "output_ids": [40]})],
-    );
-    let (client, worker) = start_grpc(config(Some(script))).await;
+    )
+    .expect("the script file");
+    let (client, worker) = start_grpc(config(Some(script)))
+        .await
+        .expect("the worker starts");
 
-    let frames = generate(&client, grpc_request("m", &[5, 5], true, false)).await;
+    let frames = generate(&client, grpc_request("m", &[5, 5], true, false))
+        .await
+        .expect("the worker answers");
     let ids: Vec<u32> = frames
         .iter()
         .filter_map(|f| match &f.response {
@@ -201,7 +215,9 @@ async fn grpc_answers_a_prompt_the_script_misses_as_before_and_counts_the_miss()
         frames.last().and_then(|f| f.response.as_ref()),
         Some(GenResp::Complete(c)) if c.finish_reason == "stop" && c.output_ids == vec![100, 101, 102]
     ));
-    generate(&client, grpc_request("h", &[4, 4], false, false)).await;
+    generate(&client, grpc_request("h", &[4, 4], false, false))
+        .await
+        .expect("the worker answers");
     let state = script::status(&worker).expect("a started worker");
     assert_eq!(
         (state["hits"].as_u64(), state["misses"].as_u64()),
@@ -218,10 +234,14 @@ async fn grpc_cuts_frames_by_chunk_tokens_and_pauses_between_them() {
         &[
             json!({"input_ids": [6], "output_ids": [1, 2, 3, 4, 5], "chunk_tokens": 2, "delay_ms": 40}),
         ],
-    );
-    let (client, _) = start_grpc(config(Some(script))).await;
+    ).expect("the script file");
+    let (client, _) = start_grpc(config(Some(script)))
+        .await
+        .expect("the worker starts");
     let started = Instant::now();
-    let frames = generate(&client, grpc_request("c", &[6], true, false)).await;
+    let frames = generate(&client, grpc_request("c", &[6], true, false))
+        .await
+        .expect("the worker answers");
     let elapsed = started.elapsed();
     let cuts: Vec<Vec<u32>> = frames
         .iter()
@@ -250,7 +270,7 @@ async fn grpc_encodes_a_scripted_text_with_the_workers_tokenizer() {
         tokenizer_path: dir.path().display().to_string(),
         ..config(None)
     };
-    let (client, worker) = start_grpc(cfg).await;
+    let (client, worker) = start_grpc(cfg).await.expect("the worker starts");
     let state = script::enqueue(
         &worker,
         vec![script::Answer::parse(
@@ -261,7 +281,9 @@ async fn grpc_encodes_a_scripted_text_with_the_workers_tokenizer() {
     .expect("a started worker");
     assert_eq!(state["queued"], 1);
 
-    let frames = generate(&client, grpc_request("t", &[7, 7], true, false)).await;
+    let frames = generate(&client, grpc_request("t", &[7, 7], true, false))
+        .await
+        .expect("the worker answers");
     let ids: Vec<u32> = frames
         .iter()
         .filter_map(|f| match &f.response {
@@ -277,13 +299,63 @@ async fn grpc_encodes_a_scripted_text_with_the_workers_tokenizer() {
     ));
 }
 
+/// A realistic worker whose `--tokenizer` names local files streams only ids
+/// that tokenizer decodes: 300 words (ids 0 to 299) and a special
+/// end-of-sequence token (300), where the engine draws from 100 up.
+#[tokio::test]
+async fn grpc_streams_engine_output_the_workers_tokenizer_decodes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let vocab: Vec<String> = (0..300).map(|id| format!(r#""w{id}":{id}"#)).collect();
+    let special = r#"{"id":300,"content":"</s>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}"#;
+    let model = format!(
+        r#"{{"type":"WordLevel","vocab":{{{}}},"unk_token":"w0"}}"#,
+        vocab.join(",")
+    );
+    let json = format!(
+        r#"{{"version":"1.0","truncation":null,"padding":null,"added_tokens":[{special}],"normalizer":null,"pre_tokenizer":{{"type":"Whitespace"}},"post_processor":null,"decoder":null,"model":{model}}}"#
+    );
+    std::fs::write(dir.path().join("tokenizer.json"), json).expect("write the tokenizer");
+    let cfg = Config {
+        realistic: true,
+        tokenizer_path: dir.path().display().to_string(),
+        output_tokens: 48,
+        engine: EngineParams {
+            timing: TimingModel::Linear {
+                prefill_tps: 8000.0,
+                decode_base_ms: 1.0,
+                decode_per_req_ms: 0.0,
+            },
+            ..EngineParams::default()
+        },
+        ..config(None)
+    };
+    let (client, _worker) = start_grpc(cfg).await.expect("the worker starts");
+
+    let frames = generate(&client, grpc_request("t", &[7, 7], true, false))
+        .await
+        .expect("the worker answers");
+    let ids: Vec<u32> = frames
+        .iter()
+        .filter_map(|f| match &f.response {
+            Some(GenResp::Chunk(chunk)) => Some(chunk.token_ids.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert_eq!(ids.len(), 48, "the worker's output tokens, streamed");
+    assert!(
+        ids.iter().all(|id| (100..300).contains(id)),
+        "only ids the worker's tokenizer decodes: {ids:?}"
+    );
+}
+
 #[tokio::test]
 async fn grpc_fails_a_text_answer_it_cannot_encode_instead_of_answering_canned() {
     let cfg = Config {
         tokenizer_path: "/nonexistent/tokenizer-dir".to_string(),
         ..config(None)
     };
-    let (client, worker) = start_grpc(cfg).await;
+    let (client, worker) = start_grpc(cfg).await.expect("the worker starts");
     script::enqueue(
         &worker,
         vec![
@@ -312,24 +384,12 @@ async fn grpc_fails_a_text_answer_it_cannot_encode_instead_of_answering_canned()
 
 #[tokio::test]
 async fn the_admin_api_enqueues_answers_in_order_reads_the_counts_and_clears() {
-    let (client, worker) = start_grpc(config(None)).await;
-    let admin_port = free_port();
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "the admin server serves until the test process exits"
-    )]
-    let _admin = tokio::spawn(admin::serve(
-        Arc::new(config(None)),
-        "127.0.0.1".to_string(),
-        admin_port,
-    ));
+    let (client, worker) = start_grpc(config(None)).await.expect("the worker starts");
+    let admin_port = common::start_admin(config(None))
+        .await
+        .expect("the admin API starts");
     let http = common::http_client();
     let url = |worker: &str| format!("http://127.0.0.1:{admin_port}/admin/script/{worker}");
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while http.get(url(&worker)).send().await.is_err() {
-        assert!(Instant::now() < deadline, "the admin API did not come up");
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
 
     // Two in order for this worker, one keyed for every worker. (The shared
     // queue, `all`, is not fed here: the tests of this binary run together
@@ -367,13 +427,21 @@ async fn the_admin_api_enqueues_answers_in_order_reads_the_counts_and_clears() {
             Some(GenResp::Complete(c)) => (c.output_ids.clone(), c.finish_reason.clone()),
             other => panic!("no completion: {other:?}"),
         };
-    let first = generate(&client, grpc_request("1", &[9], false, false)).await;
+    let first = generate(&client, grpc_request("1", &[9], false, false))
+        .await
+        .expect("the worker answers");
     assert_eq!(finish(&first), (vec![1], "stop".to_string()));
-    let second = generate(&client, grpc_request("2", &[9], false, false)).await;
+    let second = generate(&client, grpc_request("2", &[9], false, false))
+        .await
+        .expect("the worker answers");
     assert_eq!(finish(&second), (vec![2], "length".to_string()));
-    let keyed = generate(&client, grpc_request("3", &[8, 8, 8], false, false)).await;
+    let keyed = generate(&client, grpc_request("3", &[8, 8, 8], false, false))
+        .await
+        .expect("the worker answers");
     assert_eq!(finish(&keyed), (vec![88], "stop".to_string()), "the key");
-    let miss = generate(&client, grpc_request("4", &[9], false, false)).await;
+    let miss = generate(&client, grpc_request("4", &[9], false, false))
+        .await
+        .expect("the worker answers");
     assert_eq!(
         finish(&miss).0,
         vec![100, 101, 102],
@@ -438,11 +506,11 @@ async fn the_admin_api_enqueues_answers_in_order_reads_the_counts_and_clears() {
 // ── HTTP ────────────────────────────────────────────────────────────────────
 
 /// Serve `cfg` as an HTTP worker on a free port: its base URL and name.
-async fn start_http(cfg: Config) -> (String, String) {
+async fn start_http(cfg: Config) -> anyhow::Result<(String, String)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
-        .expect("bind a free port");
-    let port = listener.local_addr().expect("listener address").port();
+        .context("bind a free port")?;
+    let port = listener.local_addr().context("listener address")?.port();
     #[expect(
         clippy::disallowed_methods,
         reason = "the server serves until the test process exits"
@@ -455,21 +523,108 @@ async fn start_http(cfg: Config) -> (String, String) {
         .get(format!("{base}/health"))
         .send()
         .await
-        .expect("the worker serves");
-    (base, format!("http:{port}"))
+        .context("the worker serves")?;
+    Ok((base, format!("http:{port}")))
 }
 
 /// The `data:` payloads of an SSE body, in order.
-fn sse_data(body: &str) -> Vec<String> {
+fn sse_data(body: &str) -> anyhow::Result<Vec<String>> {
     body.split("\n\n")
         .filter(|frame| !frame.is_empty())
         .map(|frame| {
             frame
                 .strip_prefix("data: ")
-                .unwrap_or_else(|| panic!("not a data frame: {frame:?}"))
-                .to_string()
+                .map(str::to_string)
+                .with_context(|| format!("not a data frame: {frame:?}"))
         })
         .collect()
+}
+
+/// A canned worker has no engine that counts its requests: the worker counts
+/// the generation requests it received, on either wire, and the admin API
+/// reads the count on its row of the fleet list and in its ops status.
+#[tokio::test]
+async fn the_admin_api_counts_the_requests_a_canned_worker_received() {
+    let (client, grpc_worker) = start_grpc(config(None)).await.expect("the gRPC worker");
+    let (base, http_worker) = start_http(config(None)).await.expect("the HTTP worker");
+    let decode = Config {
+        role: Some(Role::Decode),
+        ..config(None)
+    };
+    let (decode_base, decode_worker) = start_http(decode).await.expect("the decode worker");
+    let admin_port = common::start_admin(config(None))
+        .await
+        .expect("the admin API starts");
+    let http = common::http_client();
+    let admin = format!("http://127.0.0.1:{admin_port}/admin");
+
+    // The counts are read against the list as the workers started: a name
+    // (a port) an earlier worker of this process had keeps that worker's count.
+    let list = || async {
+        http.get(format!("{admin}/fleet"))
+            .send()
+            .await
+            .expect("the fleet list")
+            .json::<Value>()
+            .await
+            .expect("the fleet list is JSON")
+    };
+    let received = |fleet: &Value, worker: &str| {
+        fleet["workers"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["worker"] == worker))
+            .and_then(|row| row["requests"].as_u64())
+    };
+    let before = list().await;
+
+    for id in ["count-1", "count-2"] {
+        generate(&client, grpc_request(id, &[5, 6, 7], false, false))
+            .await
+            .expect("the gRPC worker answers");
+    }
+    // Each of the HTTP wire's two entries, then a request a decode worker
+    // refuses for its missing rendezvous: it was sent to that worker all the
+    // same.
+    let asks =
+        json!({"model": MODEL, "max_tokens": 4, "messages": [{"role": "user", "content": "hi"}]});
+    for (url, status) in [
+        (format!("{base}/v1/chat/completions"), 200),
+        (format!("{base}/v1/messages"), 200),
+        (format!("{decode_base}/v1/chat/completions"), 400),
+    ] {
+        let answer = http
+            .post(&url)
+            .json(&asks)
+            .send()
+            .await
+            .expect("the HTTP worker answers");
+        assert_eq!(answer.status(), status, "{url}");
+    }
+
+    let after = list().await;
+    for (worker, sent) in [(&grpc_worker, 2), (&http_worker, 2), (&decode_worker, 1)] {
+        let counted = received(&after, worker)
+            .zip(received(&before, worker))
+            .map(|(is, was)| is - was);
+        assert_eq!(
+            counted,
+            Some(sent),
+            "{worker} counts the requests it received on its row: {after}"
+        );
+    }
+    let ops: Value = http
+        .get(format!("{admin}/ops/{http_worker}"))
+        .send()
+        .await
+        .expect("the ops status")
+        .json()
+        .await
+        .expect("the ops status is JSON");
+    assert_eq!(
+        ops["requests"].as_u64(),
+        received(&after, &http_worker),
+        "the ops status reads the same count"
+    );
 }
 
 #[tokio::test]
@@ -488,8 +643,11 @@ async fn http_delivers_the_scripted_text_as_frames_and_as_one_body() {
             "cached_tokens": 1,
             "logprobs": [-0.5, -1.0],
         })],
-    );
-    let (base, worker) = start_http(config(Some(script))).await;
+    )
+    .expect("the script file");
+    let (base, worker) = start_http(config(Some(script)))
+        .await
+        .expect("the worker starts");
     let http = common::http_client();
     let chat = |stream: bool| {
         json!({
@@ -512,7 +670,7 @@ async fn http_delivers_the_scripted_text_as_frames_and_as_one_body() {
         .headers()
         .get("content-type")
         .is_some_and(|v| v.to_str().unwrap_or("").starts_with("text/event-stream")));
-    let frames = sse_data(&streamed.text().await.expect("body"));
+    let frames = sse_data(&streamed.text().await.expect("body")).expect("the data frames");
     let chunk = |choice: Value| json!({"id": "chatcmpl-mock", "object": "chat.completion.chunk", "created": 0, "model": MODEL, "choices": [choice]});
     let logprob = |token: &str, value: f64| json!({"content": [{"token": token, "logprob": value, "bytes": null, "top_logprobs": []}]});
     let usage = json!({"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5, "prompt_tokens_details": {"cached_tokens": 1}});
@@ -628,7 +786,8 @@ async fn zmq_pushes_the_scripted_tokens_with_their_stats_finish_and_stop() {
             "cached_tokens": 1,
             "logprobs": [-0.25, -0.75],
         })],
-    );
+    )
+    .expect("the script file");
     // Rank 7 and prompts of this test's own: the store is process-wide.
     let rank = 7;
     #[expect(
@@ -734,8 +893,11 @@ async fn grpc_cuts_a_scripted_answer_at_the_requests_max_new_tokens() {
             "matched_stop": 32,
             "logprobs": [-0.1, -0.2, -0.3],
         })],
-    );
-    let (client, _) = start_grpc(config(Some(script))).await;
+    )
+    .expect("the script file");
+    let (client, _) = start_grpc(config(Some(script)))
+        .await
+        .expect("the worker starts");
     let limited = |limit: u32| {
         let mut request = grpc_request("c", &[7, 8, 9], true, true);
         request.sampling_params = Some(ts::SamplingParams {
@@ -746,12 +908,14 @@ async fn grpc_cuts_a_scripted_answer_at_the_requests_max_new_tokens() {
     };
 
     // Longer than the limit: cut there, the length finish, no matched stop.
-    let streamed = generate(&client, limited(2)).await;
+    let streamed = generate(&client, limited(2))
+        .await
+        .expect("the worker answers");
     assert_eq!(
         streamed,
         vec![
-            chunk("c", vec![30], 3, 1, 0, logprobs(&[30], &[-0.1])),
-            chunk("c", vec![31], 3, 2, 0, logprobs(&[31], &[-0.2])),
+            chunk("c", vec![30], 3, 1, 0, Some(logprobs(&[30], &[-0.1]))),
+            chunk("c", vec![31], 3, 2, 0, Some(logprobs(&[31], &[-0.2]))),
             ts::GenerateResponse {
                 request_id: "c".to_string(),
                 response: Some(GenResp::Complete(ts::GenerateComplete {
@@ -760,7 +924,7 @@ async fn grpc_cuts_a_scripted_answer_at_the_requests_max_new_tokens() {
                     prompt_tokens: 3,
                     completion_tokens: 2,
                     cached_tokens: 0,
-                    output_logprobs: logprobs(&[30, 31], &[-0.1, -0.2]),
+                    output_logprobs: Some(logprobs(&[30, 31], &[-0.1, -0.2])),
                     matched_stop: None,
                     index: 0,
                     weight_version: None,
@@ -771,7 +935,9 @@ async fn grpc_cuts_a_scripted_answer_at_the_requests_max_new_tokens() {
     );
 
     // Within the limit: the answer as scripted, its stop included.
-    let whole = generate(&client, limited(5)).await;
+    let whole = generate(&client, limited(5))
+        .await
+        .expect("the worker answers");
     assert!(matches!(
         whole.last().and_then(|f| f.response.as_ref()),
         Some(GenResp::Complete(c))
@@ -794,7 +960,7 @@ async fn grpc_answers_an_empty_scripted_text_with_the_completion_alone() {
         tokenizer_path: dir.path().display().to_string(),
         ..config(None)
     };
-    let (client, worker) = start_grpc(cfg).await;
+    let (client, worker) = start_grpc(cfg).await.expect("the worker starts");
     script::enqueue(
         &worker,
         vec![
@@ -804,7 +970,9 @@ async fn grpc_answers_an_empty_scripted_text_with_the_completion_alone() {
     )
     .expect("a started worker");
 
-    let frames = generate(&client, grpc_request("z", &[7, 7], true, false)).await;
+    let frames = generate(&client, grpc_request("z", &[7, 7], true, false))
+        .await
+        .expect("the worker answers");
     assert_eq!(
         frames,
         vec![ts::GenerateResponse {
@@ -839,8 +1007,11 @@ async fn http_cuts_a_scripted_text_at_the_requests_max_tokens() {
             "finish_reason": "stop",
             "matched_stop": "\n",
         })],
-    );
-    let (base, _) = start_http(config(Some(script))).await;
+    )
+    .expect("the script file");
+    let (base, _) = start_http(config(Some(script)))
+        .await
+        .expect("the worker starts");
     let http = common::http_client();
     let ask = |max_tokens: u32| {
         json!({
@@ -899,7 +1070,8 @@ async fn zmq_cuts_a_scripted_answer_at_the_requests_max_tokens() {
             "finish_reason": "stop",
             "matched_stop": 42,
         })],
-    );
+    )
+    .expect("the script file");
     // Rank 8 and prompts of this test's own: the store is process-wide.
     let rank = 8;
     #[expect(
@@ -952,7 +1124,8 @@ async fn zmq_cuts_a_scripted_answer_at_the_requests_max_tokens() {
 #[test]
 fn the_binary_refuses_a_script_it_cannot_load_before_any_worker_starts() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let bad = script_file(dir.path(), "bad.jsonl", &[json!({"output_ids": [1]})]);
+    let bad = script_file(dir.path(), "bad.jsonl", &[json!({"output_ids": [1]})])
+        .expect("the script file");
     for (path, reason) in [
         (dir.path().join("missing.jsonl"), "No such file"),
         (bad, "needs key or input_ids"),
@@ -960,7 +1133,7 @@ fn the_binary_refuses_a_script_it_cannot_load_before_any_worker_starts() {
         let output = Command::new(env!("CARGO_BIN_EXE_mock-worker"))
             .args([
                 "--grpc-base-port",
-                &free_port().to_string(),
+                &free_port().expect("a free port").to_string(),
                 "--grpc-count",
                 "1",
             ])
@@ -975,29 +1148,87 @@ fn the_binary_refuses_a_script_it_cannot_load_before_any_worker_starts() {
     }
 }
 
+/// A recorder that cannot start ends the process at its start with one line:
+/// a record path in a directory that does not exist, and an upstream with no
+/// scheme, which parses as a bare host and port and would fail every call
+/// with nothing recorded. The refused address makes no file.
+#[test]
+fn the_binary_refuses_a_recorder_that_cannot_start() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let record = dir.path().join("session.jsonl");
+    for (upstream, path, reason) in [
+        (
+            "grpc://127.0.0.1:9",
+            dir.path().join("missing").join("session.jsonl"),
+            "No such file",
+        ),
+        ("127.0.0.1:9", record.clone(), "needs a scheme"),
+        ("localhost:9", record.clone(), "needs a scheme"),
+    ] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_mock-worker"))
+            .args([
+                "--grpc-base-port",
+                &free_port().expect("a free port").to_string(),
+                "--grpc-count",
+                "1",
+                "--record-upstream",
+                upstream,
+            ])
+            .arg("--record")
+            .arg(&path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run the mock worker");
+        // A start that is not refused runs on: five seconds for the exit.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let code = loop {
+            if let Some(status) = child.try_wait().expect("the exit of the mock worker") {
+                break status.code();
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("stop the mock worker");
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let output = child
+            .wait_with_output()
+            .expect("what the mock worker wrote");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(code, Some(2), "{upstream}: {stderr}");
+        assert!(stderr.contains("cannot start the recorder"), "{stderr}");
+        assert!(stderr.contains(reason), "{stderr}");
+    }
+    assert!(
+        !record.exists() && !record.with_extension("info.jsonl").exists(),
+        "a refused address makes no file"
+    );
+}
+
 // ── load reports ────────────────────────────────────────────────────────────
 
 /// The gRPC load once its running count reads `running` (within two seconds).
 async fn grpc_running_settles_to(
     client: &TokenSpeedSchedulerClient,
     running: i32,
-) -> ts::SchedulerLoad {
+) -> anyhow::Result<ts::SchedulerLoad> {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let load = client
                 .get_loads(vec![])
                 .await
-                .expect("loads")
+                .context("loads")?
                 .loads
                 .remove(0);
             if load.num_running_reqs == running {
-                return load;
+                return anyhow::Ok(load);
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("the running count never read {running}"))
+    .with_context(|| format!("the running count never read {running}"))?
 }
 
 #[tokio::test]
@@ -1012,16 +1243,29 @@ async fn grpc_reports_the_scripted_answers_in_flight_as_running() {
             "chunk_tokens": 1,
             "delay_ms": 40,
         })],
-    );
-    let (client, _) = start_grpc(config(Some(script))).await;
-    let idle = grpc_running_settles_to(&client, 0).await;
+    )
+    .expect("the script file");
+    let (client, _) = start_grpc(config(Some(script)))
+        .await
+        .expect("the worker starts");
+    let idle = grpc_running_settles_to(&client, 0)
+        .await
+        .expect("the running count settles");
     assert_eq!(idle.num_total_reqs, 0, "{idle:?}");
 
     // The answer is paced over four pauses: a poll during them reads the one
     // request as running, and as the whole of the load.
     let (frames, busy) = tokio::join!(
-        generate(&client, grpc_request("r", &[8], true, false)),
-        grpc_running_settles_to(&client, 1)
+        async {
+            generate(&client, grpc_request("r", &[8], true, false))
+                .await
+                .expect("the worker answers")
+        },
+        async {
+            grpc_running_settles_to(&client, 1)
+                .await
+                .expect("the running count settles")
+        }
     );
     assert_eq!(busy.num_total_reqs, 1, "{busy:?}");
     assert_eq!(busy.num_waiting_reqs, 0, "{busy:?}");
@@ -1031,7 +1275,9 @@ async fn grpc_reports_the_scripted_answers_in_flight_as_running() {
         "five chunks and the completion: {frames:?}"
     );
 
-    let idle = grpc_running_settles_to(&client, 0).await;
+    let idle = grpc_running_settles_to(&client, 0)
+        .await
+        .expect("the running count settles");
     assert_eq!(idle.num_total_reqs, 0, "{idle:?}");
 }
 
@@ -1047,18 +1293,29 @@ async fn a_worker_reports_its_own_requests_in_flight_not_the_process_total() {
             "chunk_tokens": 1,
             "delay_ms": 40,
         })],
-    );
-    let (serving, _) = start_grpc(config(Some(script))).await;
-    let (other, _) = start_grpc(config(None)).await;
-    grpc_running_settles_to(&serving, 0).await;
+    )
+    .expect("the script file");
+    let (serving, _) = start_grpc(config(Some(script)))
+        .await
+        .expect("the worker starts");
+    let (other, _) = start_grpc(config(None)).await.expect("the worker starts");
+    grpc_running_settles_to(&serving, 0)
+        .await
+        .expect("the running count settles");
 
     // While the paced answer runs on one worker, the other worker of the same
     // process reports none of it: a gateway that polls both sees where the
     // work is.
     let (frames, (busy, idle)) = tokio::join!(
-        generate(&serving, grpc_request("r", &[8], true, false)),
         async {
-            let busy = grpc_running_settles_to(&serving, 1).await;
+            generate(&serving, grpc_request("r", &[8], true, false))
+                .await
+                .expect("the worker answers")
+        },
+        async {
+            let busy = grpc_running_settles_to(&serving, 1)
+                .await
+                .expect("the running count settles");
             let idle = other
                 .get_loads(vec![])
                 .await
@@ -1078,25 +1335,29 @@ async fn a_worker_reports_its_own_requests_in_flight_not_the_process_total() {
 }
 
 /// The HTTP load once its running count reads `running` (within two seconds).
-async fn http_running_settles_to(http: &reqwest::Client, base: &str, running: u64) -> Value {
+async fn http_running_settles_to(
+    http: &reqwest::Client,
+    base: &str,
+    running: u64,
+) -> anyhow::Result<Value> {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let body: Value = http
                 .get(format!("{base}/v1/loads"))
                 .send()
                 .await
-                .expect("loads")
+                .context("loads")?
                 .json()
                 .await
-                .expect("a JSON body");
+                .context("a JSON body")?;
             if body["loads"][0]["num_running_reqs"].as_u64() == Some(running) {
-                return body["loads"][0].clone();
+                return anyhow::Ok(body["loads"][0].clone());
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("the running count never read {running}"))
+    .with_context(|| format!("the running count never read {running}"))?
 }
 
 #[tokio::test]
@@ -1113,10 +1374,15 @@ async fn http_reports_the_scripted_answers_in_flight_as_running() {
             "chunk_tokens": 1,
             "delay_ms": 40,
         })],
-    );
-    let (base, _) = start_http(config(Some(script))).await;
+    )
+    .expect("the script file");
+    let (base, _) = start_http(config(Some(script)))
+        .await
+        .expect("the worker starts");
     let http = common::http_client();
-    let idle = http_running_settles_to(&http, &base, 0).await;
+    let idle = http_running_settles_to(&http, &base, 0)
+        .await
+        .expect("the running count settles");
     assert_eq!(idle["num_total_reqs"], 0, "{idle}");
 
     // The whole answer is paced before its one body: a poll meanwhile reads
@@ -1134,7 +1400,11 @@ async fn http_reports_the_scripted_answers_in_flight_as_running() {
                 .await
                 .expect("chat")
         },
-        http_running_settles_to(&http, &base, 1)
+        async {
+            http_running_settles_to(&http, &base, 1)
+                .await
+                .expect("the running count settles")
+        }
     );
     assert_eq!(response.status(), 200);
     assert_eq!(busy["num_total_reqs"], 1, "{busy}");
@@ -1145,7 +1415,9 @@ async fn http_reports_the_scripted_answers_in_flight_as_running() {
         "{whole}"
     );
 
-    let idle = http_running_settles_to(&http, &base, 0).await;
+    let idle = http_running_settles_to(&http, &base, 0)
+        .await
+        .expect("the running count settles");
     assert_eq!(idle["num_total_reqs"], 0, "{idle}");
 }
 
@@ -1161,9 +1433,12 @@ async fn grpc_reports_top_alternatives_from_the_answers_own_tokens() {
             "finish_reason": "stop",
             "logprobs": [-0.5, -1.0, -1.5],
         })],
-    );
+    )
+    .expect("the script file");
     // A prompt of this test's own: the store is process-wide.
-    let (client, _) = start_grpc(config(Some(script))).await;
+    let (client, _) = start_grpc(config(Some(script)))
+        .await
+        .expect("the worker starts");
     let top = |values: &[f32], token_ids: &[u32]| ts::TopLogProbs {
         values: values.to_vec(),
         token_ids: token_ids.to_vec(),
@@ -1184,7 +1459,9 @@ async fn grpc_reports_top_alternatives_from_the_answers_own_tokens() {
     // the answer, half a nat less likely; the last position wraps around.
     let mut request = grpc_request("two", &[70, 80, 90], false, true);
     request.top_logprobs_num = 2;
-    let whole = generate(&client, request).await;
+    let whole = generate(&client, request)
+        .await
+        .expect("the worker answers");
     assert_eq!(
         top_of(&whole),
         vec![vec![
@@ -1197,7 +1474,9 @@ async fn grpc_reports_top_alternatives_from_the_answers_own_tokens() {
     // More asked than the answer has distinct tokens: as many as it has.
     let mut request = grpc_request("five", &[70, 80, 90], false, true);
     request.top_logprobs_num = 5;
-    let whole = generate(&client, request).await;
+    let whole = generate(&client, request)
+        .await
+        .expect("the worker answers");
     assert_eq!(
         top_of(&whole),
         vec![vec![
@@ -1211,7 +1490,9 @@ async fn grpc_reports_top_alternatives_from_the_answers_own_tokens() {
     // completion all of them; none asked, none sent.
     let mut request = grpc_request("stream", &[70, 80, 90], true, true);
     request.top_logprobs_num = 2;
-    let streamed = generate(&client, request).await;
+    let streamed = generate(&client, request)
+        .await
+        .expect("the worker answers");
     assert_eq!(
         top_of(&streamed),
         vec![
@@ -1225,7 +1506,9 @@ async fn grpc_reports_top_alternatives_from_the_answers_own_tokens() {
             ],
         ]
     );
-    let plain = generate(&client, grpc_request("plain", &[70, 80, 90], false, true)).await;
+    let plain = generate(&client, grpc_request("plain", &[70, 80, 90], false, true))
+        .await
+        .expect("the worker answers");
     assert_eq!(top_of(&plain), vec![Vec::<ts::TopLogProbs>::new()]);
 }
 
@@ -1243,8 +1526,11 @@ async fn http_reports_top_alternatives_from_the_answers_own_pieces() {
             "finish_reason": "stop",
             "logprobs": [-0.5, -1.0, -1.5],
         })],
-    );
-    let (base, _worker) = start_http(config(Some(script))).await;
+    )
+    .expect("the script file");
+    let (base, _worker) = start_http(config(Some(script)))
+        .await
+        .expect("the worker starts");
     let http = common::http_client();
 
     // Chat: `top_logprobs` entries per content item, the piece itself first.
@@ -1307,7 +1593,7 @@ async fn http_reports_top_alternatives_from_the_answers_own_pieces() {
         .send()
         .await
         .expect("stream");
-    let frames = sse_data(&streamed.text().await.expect("body"));
+    let frames = sse_data(&streamed.text().await.expect("body")).expect("the data frames");
     let second: Value = serde_json::from_str(&frames[1]).expect("a JSON frame");
     assert_eq!(
         second["choices"][0]["logprobs"]["content"][0]["top_logprobs"],
@@ -1337,9 +1623,12 @@ async fn zmq_reports_top_alternatives_with_their_ranks() {
             "finish_reason": "stop",
             "logprobs": [-0.25, -0.75],
         })],
-    );
-    // Rank 8 and prompts of this test's own: the store is process-wide.
-    let rank = 8;
+    )
+    .expect("the script file");
+    // Rank 9 and prompts of this test's own: the store is process-wide and a
+    // rank's entry is keyed by its index, so two live ranks of one index would
+    // share it and the second one's start would wipe the first's.
+    let rank = 9;
     #[expect(
         clippy::disallowed_methods,
         reason = "serve loops until the test drops its handles"
@@ -1463,16 +1752,16 @@ fn complete_at(
     }
 }
 
-fn answers(values: &[Value]) -> Vec<script::Scripted> {
+fn answers(values: &[Value]) -> anyhow::Result<Vec<script::Scripted>> {
     values
         .iter()
-        .map(|value| script::Answer::parse(value).expect("a scripted answer"))
+        .map(|value| script::Answer::parse(value).map_err(anyhow::Error::msg))
         .collect()
 }
 
 #[tokio::test]
 async fn grpc_plays_one_scripted_answer_per_choice_in_order() {
-    let (client, worker) = start_grpc(config(None)).await;
+    let (client, worker) = start_grpc(config(None)).await.expect("the worker starts");
     // The worker's own queue (the store is shared by the binary's tests): the
     // choices read the enqueued answers in order.
     let sampled = |stream: bool| {
@@ -1486,10 +1775,13 @@ async fn grpc_plays_one_scripted_answer_per_choice_in_order() {
 
     script::enqueue(
         &worker,
-        answers(&[json!({"output_ids": [30, 31]}), json!({"output_ids": [32]})]),
+        answers(&[json!({"output_ids": [30, 31]}), json!({"output_ids": [32]})])
+            .expect("the scripted answers"),
     )
     .expect("the worker is known");
-    let streamed = generate(&client, sampled(true)).await;
+    let streamed = generate(&client, sampled(true))
+        .await
+        .expect("the worker answers");
     assert_eq!(
         streamed,
         vec![
@@ -1504,10 +1796,13 @@ async fn grpc_plays_one_scripted_answer_per_choice_in_order() {
     // Without streaming: the choices' `Complete`s alone, in order.
     script::enqueue(
         &worker,
-        answers(&[json!({"output_ids": [40]}), json!({"output_ids": [41, 42]})]),
+        answers(&[json!({"output_ids": [40]}), json!({"output_ids": [41, 42]})])
+            .expect("the scripted answers"),
     )
     .expect("the worker is known");
-    let whole = generate(&client, sampled(false)).await;
+    let whole = generate(&client, sampled(false))
+        .await
+        .expect("the worker answers");
     assert_eq!(
         whole,
         vec![
@@ -1519,8 +1814,12 @@ async fn grpc_plays_one_scripted_answer_per_choice_in_order() {
 
 #[tokio::test]
 async fn grpc_fails_a_request_whose_choices_the_script_does_not_cover() {
-    let (client, worker) = start_grpc(config(None)).await;
-    script::enqueue(&worker, answers(&[json!({"output_ids": [60]})])).expect("the worker is known");
+    let (client, worker) = start_grpc(config(None)).await.expect("the worker starts");
+    script::enqueue(
+        &worker,
+        answers(&[json!({"output_ids": [60]})]).expect("the scripted answers"),
+    )
+    .expect("the worker is known");
     let mut request = grpc_request("short", &[61, 62, 63], false, false);
     request.sampling_params = Some(ts::SamplingParams {
         n: 3,
@@ -1568,7 +1867,9 @@ async fn grpc_fails_a_request_whose_choices_the_script_does_not_cover() {
     assert_eq!(state["queued"], 1, "{state}");
 
     // The one answer still serves a request for one choice...
-    let one = generate(&client, grpc_request("one", &[61, 62, 63], false, false)).await;
+    let one = generate(&client, grpc_request("one", &[61, 62, 63], false, false))
+        .await
+        .expect("the worker answers");
     assert_eq!(one, vec![complete_at("one", vec![60], 3, 0)]);
     // ...and a worker with nothing scripted answers any number of choices in
     // its other mode: the limit binds only a request the script serves.
@@ -1577,7 +1878,9 @@ async fn grpc_fails_a_request_whose_choices_the_script_does_not_cover() {
         n: 129,
         ..Default::default()
     });
-    let canned = generate(&client, request).await;
+    let canned = generate(&client, request)
+        .await
+        .expect("the worker answers");
     assert!(!canned.is_empty(), "the worker's other mode answered");
     let state = script::status(&worker).expect("the worker is known");
     assert_eq!(state["queued"], 0, "{state}");
@@ -1585,7 +1888,7 @@ async fn grpc_fails_a_request_whose_choices_the_script_does_not_cover() {
 
 #[tokio::test]
 async fn http_fails_a_request_whose_choices_the_script_does_not_cover_without_a_retry() {
-    let (base, worker) = start_http(config(None)).await;
+    let (base, worker) = start_http(config(None)).await.expect("the worker starts");
     let http = common::http_client();
     let deadline = Instant::now() + Duration::from_secs(5);
     while script::status(&worker).is_none() {
@@ -1595,8 +1898,11 @@ async fn http_fails_a_request_whose_choices_the_script_does_not_cover_without_a_
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    script::enqueue(&worker, answers(&[json!({"output_text": "one"})]))
-        .expect("the worker is known");
+    script::enqueue(
+        &worker,
+        answers(&[json!({"output_text": "one"})]).expect("the scripted answers"),
+    )
+    .expect("the worker is known");
 
     let response = http
         .post(format!("{base}/v1/chat/completions"))
@@ -1622,7 +1928,7 @@ async fn http_fails_a_request_whose_choices_the_script_does_not_cover_without_a_
 
 #[tokio::test]
 async fn http_plays_one_scripted_answer_per_choice() {
-    let (base, worker) = start_http(config(None)).await;
+    let (base, worker) = start_http(config(None)).await.expect("the worker starts");
     let http = common::http_client();
     // The worker registers with the script store as its server task starts.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -1648,7 +1954,8 @@ async fn http_plays_one_scripted_answer_per_choice() {
         answers(&[
             json!({"output_text": "one"}),
             json!({"output_text": ["two", " more"]}),
-        ]),
+        ])
+        .expect("the scripted answers"),
     )
     .expect("the worker is known");
     let whole: Value = http
@@ -1679,7 +1986,8 @@ async fn http_plays_one_scripted_answer_per_choice() {
         answers(&[
             json!({"output_text": "one"}),
             json!({"output_text": ["two", " more"]}),
-        ]),
+        ])
+        .expect("the scripted answers"),
     )
     .expect("the worker is known");
     let body = http
@@ -1692,6 +2000,7 @@ async fn http_plays_one_scripted_answer_per_choice() {
         .await
         .expect("the stream");
     let frames: Vec<Value> = sse_data(&body)
+        .expect("the data frames")
         .iter()
         .filter(|data| data.as_str() != "[DONE]")
         .map(|data| serde_json::from_str(data).expect("a JSON frame"))
@@ -1745,13 +2054,14 @@ async fn grpc_serves_an_answer_filed_under_a_text_to_the_prompt_that_holds_it() 
         tokenizer_path: dir.path().display().to_string(),
         ..config(None)
     };
-    let (client, worker) = start_grpc(cfg).await;
+    let (client, worker) = start_grpc(cfg).await.expect("the worker starts");
     let state = script::enqueue(
         &worker,
         answers(&[
             json!({"prompt_contains": "apricot", "output_ids": [20]}),
             json!({"prompt_contains": "bramble", "output_ids": [30]}),
-        ]),
+        ])
+        .expect("the scripted answers"),
     )
     .expect("a started worker");
     assert_eq!(state["queued"], 0, "{state}");
@@ -1765,16 +2075,28 @@ async fn grpc_serves_an_answer_filed_under_a_text_to_the_prompt_that_holds_it() 
     // "say bramble" first: the answers match by the prompt's text, not by
     // the order they were filed in.
     assert_eq!(
-        output(generate(&client, grpc_request("b", &[1, 3], false, false)).await),
+        output(
+            generate(&client, grpc_request("b", &[1, 3], false, false))
+                .await
+                .expect("the worker answers")
+        ),
         vec![30]
     );
     assert_eq!(
-        output(generate(&client, grpc_request("a", &[1, 2], false, false)).await),
+        output(
+            generate(&client, grpc_request("a", &[1, 2], false, false))
+                .await
+                .expect("the worker answers")
+        ),
         vec![20]
     );
     // A prompt that holds neither text is a miss, answered canned.
     assert_eq!(
-        output(generate(&client, grpc_request("n", &[1, 1], false, false)).await),
+        output(
+            generate(&client, grpc_request("n", &[1, 1], false, false))
+                .await
+                .expect("the worker answers")
+        ),
         vec![100, 101, 102]
     );
     let state = script::status(&worker).expect("a started worker");
@@ -1782,16 +2104,20 @@ async fn grpc_serves_an_answer_filed_under_a_text_to_the_prompt_that_holds_it() 
         state["marked"], 0,
         "each filed answer was served once: {state}"
     );
-    assert_eq!(state["hits"], 2, "{state}");
+    assert_eq!(
+        state["hits"], 2,
+        "the two prompts that hold a filed text, not the miss: {state}"
+    );
     assert_eq!(state["misses"], 1, "{state}");
 }
 
 #[tokio::test]
 async fn http_serves_an_answer_filed_under_a_text_by_the_requests_own_text() {
-    let (base, worker) = start_http(config(None)).await;
+    let (base, worker) = start_http(config(None)).await.expect("the worker starts");
     script::enqueue(
         &worker,
-        answers(&[json!({"prompt_contains": "apricot", "output_text": "apricot it is"})]),
+        answers(&[json!({"prompt_contains": "apricot", "output_text": "apricot it is"})])
+            .expect("the scripted answers"),
     )
     .expect("a started worker");
     let http = common::http_client();
@@ -1841,10 +2167,11 @@ async fn http_serves_an_answer_filed_under_a_text_by_the_requests_own_text() {
 async fn grpc_reads_the_rendered_prompt_beside_the_ids_and_fails_a_prompt_it_cannot_read() {
     // No tokenizer this worker can load: the rendered text the gateway sends
     // beside the ids is what it reads for the answers filed under a text.
-    let (client, worker) = start_grpc(config(None)).await;
+    let (client, worker) = start_grpc(config(None)).await.expect("the worker starts");
     script::enqueue(
         &worker,
-        answers(&[json!({"prompt_contains": "apricot", "output_ids": [20]})]),
+        answers(&[json!({"prompt_contains": "apricot", "output_ids": [20]})])
+            .expect("the scripted answers"),
     )
     .expect("a started worker");
     let mut rendered = grpc_request("r", &[1, 2], false, false);
@@ -1853,7 +2180,9 @@ async fn grpc_reads_the_rendered_prompt_beside_the_ids_and_fails_a_prompt_it_can
         .as_mut()
         .expect("tokenized input")
         .original_text = "say apricot".to_string();
-    let frames = generate(&client, rendered).await;
+    let frames = generate(&client, rendered)
+        .await
+        .expect("the worker answers");
     match frames.last().and_then(|f| f.response.as_ref()) {
         Some(GenResp::Complete(complete)) => assert_eq!(complete.output_ids, vec![20]),
         other => panic!("a Complete at the end, not {other:?}"),
@@ -1863,7 +2192,8 @@ async fn grpc_reads_the_rendered_prompt_beside_the_ids_and_fails_a_prompt_it_can
     // fails with the reason instead of reading canned; the answer stays.
     script::enqueue(
         &worker,
-        answers(&[json!({"prompt_contains": "bramble", "output_ids": [30]})]),
+        answers(&[json!({"prompt_contains": "bramble", "output_ids": [30]})])
+            .expect("the scripted answers"),
     )
     .expect("a started worker");
     let refused = client

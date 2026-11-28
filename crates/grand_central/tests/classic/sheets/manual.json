@@ -1,0 +1,737 @@
+{
+  "recorded_from": "1b141d03b5ca9097f54f0ebc4b95d72e810a62c3",
+  "policy": "manual",
+  "rows": [
+    {
+      "name": "manual-min-load-a-key-takes-the-fewest-in-flight-and-stays-past-the-load",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 3,
+          "keys": 0
+        },
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        },
+        {
+          "pick": {
+            "key": "k2",
+            "role": "single"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        },
+        {
+          "pick": {
+            "key": "k2",
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          0,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "manual-min-group-a-key-takes-the-fewest-keys-whatever-the-load",
+      "assignment": "min_group",
+      "workers": [
+        {
+          "in_flight": 0,
+          "keys": 3
+        },
+        {
+          "in_flight": 5,
+          "keys": 0
+        },
+        {
+          "in_flight": 0,
+          "keys": 2
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        },
+        {
+          "keys": [
+            3,
+            1,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": "k2",
+            "role": "single"
+          }
+        },
+        {
+          "keys": [
+            3,
+            3,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": "k3",
+            "role": "single"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1,
+          2,
+          1
+        ]
+      }
+    },
+    {
+      "name": "manual-delegate-with-no-policy-under-it-takes-the-fewest-in-flight",
+      "assignment": "delegate",
+      "workers": [
+        {
+          "in_flight": 4,
+          "keys": 0
+        },
+        {
+          "in_flight": 0,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        },
+        {
+          "pick": {
+            "key": null,
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          1
+        ]
+      }
+    },
+    {
+      "name": "manual-random-a-new-key-is-drawn-over-every-worker",
+      "assignment": "random",
+      "workers": [
+        {
+          "in_flight": 9,
+          "keys": 0
+        },
+        {
+          "in_flight": 0,
+          "keys": 0
+        },
+        {
+          "in_flight": 3,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            1990,
+            1996,
+            2014
+          ]
+        }
+      }
+    },
+    {
+      "name": "manual-random-a-request-with-no-key-is-drawn-over-every-worker",
+      "assignment": "random",
+      "workers": [
+        {
+          "in_flight": 9,
+          "keys": 0
+        },
+        {
+          "in_flight": 0,
+          "keys": 0
+        },
+        {
+          "in_flight": 3,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            1982,
+            2032,
+            1986
+          ]
+        }
+      }
+    },
+    {
+      "name": "manual-min-load-equal-loads-are-drawn",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 2,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        },
+        {
+          "in_flight": 5,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            3042,
+            2958,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "manual-min-group-equal-key-counts-are-drawn",
+      "assignment": "min_group",
+      "workers": [
+        {
+          "in_flight": 0,
+          "keys": 1
+        },
+        {
+          "in_flight": 9,
+          "keys": 1
+        },
+        {
+          "in_flight": 0,
+          "keys": 4
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            2978,
+            3022,
+            0
+          ]
+        }
+      }
+    },
+    {
+      "name": "manual-min-load-a-request-with-no-key-follows-the-load-and-pins-nothing",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 3,
+          "keys": 0
+        },
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": null,
+            "role": "single"
+          }
+        },
+        {
+          "loads": [
+            0,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "role": "single"
+          }
+        },
+        {
+          "loads": [
+            4,
+            5,
+            2
+          ]
+        },
+        {
+          "pick": {
+            "key": null,
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          1,
+          0,
+          2
+        ]
+      }
+    },
+    {
+      "name": "manual-min-load-a-request-with-no-key-passes-over-a-worker-that-is-down",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 0,
+          "keys": 0
+        },
+        {
+          "in_flight": 3,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "down": 0
+        },
+        {
+          "pick": {
+            "key": null,
+            "role": "single"
+          }
+        },
+        {
+          "up": 0
+        },
+        {
+          "pick": {
+            "key": null,
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          2,
+          0
+        ]
+      }
+    },
+    {
+      "name": "manual-random-a-request-with-no-key-is-never-drawn-on-a-worker-that-is-down",
+      "assignment": "random",
+      "workers": [
+        {
+          "in_flight": 9,
+          "keys": 0
+        },
+        {
+          "in_flight": 0,
+          "keys": 0
+        },
+        {
+          "in_flight": 3,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "down": 1
+        },
+        {
+          "pick": {
+            "key": null,
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "counts": {
+          "draws": 6000,
+          "counts": [
+            3003,
+            0,
+            2997
+          ]
+        }
+      }
+    },
+    {
+      "name": "manual-a-key-moves-off-a-worker-that-is-down-and-the-first-owner-leads-again",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        },
+        {
+          "in_flight": 3,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        },
+        {
+          "down": 0
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        },
+        {
+          "up": 0
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          1,
+          0
+        ]
+      }
+    },
+    {
+      "name": "manual-a-key-keeps-two-workers-and-drops-the-oldest-at-the-third",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        },
+        {
+          "in_flight": 3,
+          "keys": 0
+        },
+        {
+          "in_flight": 4,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        },
+        {
+          "down": 0
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        },
+        {
+          "down": 1
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        },
+        {
+          "up": 0
+        },
+        {
+          "up": 1
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        },
+        {
+          "down": 1
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          2,
+          1,
+          2
+        ]
+      }
+    },
+    {
+      "name": "manual-two-keys-pin-apart",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        },
+        {
+          "in_flight": 3,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "ka",
+            "role": "single"
+          }
+        },
+        {
+          "loads": [
+            5,
+            2,
+            3
+          ]
+        },
+        {
+          "pick": {
+            "key": "kb",
+            "role": "single"
+          }
+        },
+        {
+          "loads": [
+            9,
+            9,
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": "ka",
+            "role": "single"
+          }
+        },
+        {
+          "pick": {
+            "key": "kb",
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          0,
+          1
+        ]
+      }
+    },
+    {
+      "name": "manual-one-key-pins-apart-under-the-prefill-and-the-decode-role",
+      "assignment": "min_load",
+      "workers": [
+        {
+          "in_flight": 1,
+          "keys": 0
+        },
+        {
+          "in_flight": 2,
+          "keys": 0
+        },
+        {
+          "in_flight": 3,
+          "keys": 0
+        }
+      ],
+      "steps": [
+        {
+          "pick": {
+            "key": "k1",
+            "role": "prefill"
+          }
+        },
+        {
+          "loads": [
+            5,
+            2,
+            3
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "decode"
+          }
+        },
+        {
+          "loads": [
+            9,
+            9,
+            0
+          ]
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "prefill"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "decode"
+          }
+        },
+        {
+          "pick": {
+            "key": "k1",
+            "role": "single"
+          }
+        }
+      ],
+      "outcome": {
+        "sequence": [
+          0,
+          1,
+          0,
+          1,
+          2
+        ]
+      }
+    }
+  ]
+}

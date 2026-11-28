@@ -88,3 +88,7 @@ fn transform_payload(payload: &mut Value, ctx: &RequestContext) {
         obj.insert("store".to_string(), Value::Bool(false));
     }
 }
+
+#[cfg(test)]
+#[path = "../../../tests/unit/gemini/steps/request_building/tests.rs"]
+mod tests;

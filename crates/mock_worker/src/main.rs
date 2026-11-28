@@ -7,9 +7,17 @@
 //! token ids).
 //! All responses are canned — there is no real model.
 
+#![expect(
+    clippy::print_stdout,
+    clippy::print_stderr,
+    reason = "a command-line tool reports on its standard streams"
+)]
+
 use std::{io::IsTerminal, pin::pin, process::ExitCode, sync::Arc};
 
 use mock_worker::{admin, config::Config, drain, grpc, http, replay::Capture, zmq};
+#[cfg(unix)]
+use tokio::signal::unix::Signal;
 use tokio::sync::watch;
 
 #[tokio::main]
@@ -237,8 +245,8 @@ async fn stop_requested(mut stopped: watch::Receiver<bool>) {
 /// as it arrives, so a second one can cut the drain short.
 #[cfg(unix)]
 struct Signals {
-    terminate: Option<tokio::signal::unix::Signal>,
-    interrupt: Option<tokio::signal::unix::Signal>,
+    terminate: Option<Signal>,
+    interrupt: Option<Signal>,
 }
 
 #[cfg(unix)]

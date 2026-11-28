@@ -54,6 +54,21 @@ impl Transport {
         self.send_with_retry(req, None::<()>).await
     }
 
+    /// Send a GET request with a query string with retry; a repeated key sends
+    /// one pair per value, and an empty query sends the bare path.
+    pub(crate) async fn get_with_query(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+    ) -> Result<Response, SmgError> {
+        let req = if query.is_empty() {
+            self.client.get(self.url(path))
+        } else {
+            self.client.get(query_url(&self.url(path), query)?)
+        };
+        self.send_with_retry(req, None::<()>).await
+    }
+
     /// Send a POST request with a JSON body with retry.
     pub(crate) async fn post<T: Serialize>(
         &self,
@@ -180,3 +195,14 @@ fn backoff_delay(attempt: u32) -> std::time::Duration {
 fn is_retryable_error(err: &reqwest::Error) -> bool {
     err.is_connect() || err.is_timeout()
 }
+
+/// The URL of a GET with a query: the pairs form-encoded in the order given
+/// (the url crate's encoder, which the HTTP client re-exports).
+fn query_url(url: &str, query: &[(&str, String)]) -> Result<reqwest::Url, SmgError> {
+    reqwest::Url::parse_with_params(url, query)
+        .map_err(|e| SmgError::Stream(format!("invalid request url: {e}")))
+}
+
+#[cfg(test)]
+#[path = "../tests/unit/transport/tests.rs"]
+mod tests;

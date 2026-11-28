@@ -26,7 +26,11 @@ use tokenizers::{
     Tokenizer as HfTokenizer,
 };
 
-use crate::traits::TokenIdType;
+use crate::{
+    byte_level::max_token_id,
+    traits::TokenIdType,
+    word_cache::{token_of, Listing},
+};
 
 /// What an id contributes to a decode.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -153,13 +157,13 @@ impl TokenTextTable {
     pub(crate) fn build_with_max_id(
         tokenizer: &HfTokenizer,
         model_max_id: Option<u32>,
-        listing: Option<&crate::word_cache::Listing>,
+        listing: Option<&Listing>,
     ) -> Option<Arc<Self>> {
         let rule = Rule::of(tokenizer.get_decoder()?)?;
         // Each id through the lookups the decode uses: `id_to_token` (an added
         // token before a model piece that shares its id) and the added
         // vocabulary's own notion of special, as the other tables do.
-        let max_id = crate::byte_level::max_token_id(tokenizer, model_max_id)?;
+        let max_id = max_token_id(tokenizer, model_max_id)?;
         let added = tokenizer.get_added_vocabulary();
         let ids = usize::try_from(max_id).ok()? + 1;
         let mut table = Self {
@@ -169,7 +173,7 @@ impl TokenTextTable {
             text: String::with_capacity(ids * 6),
         };
         for id in 0..=max_id {
-            match crate::word_cache::token_of(tokenizer, listing, id) {
+            match token_of(tokenizer, listing, id) {
                 None => table.push(Token::Absent, "", "")?,
                 Some(token) => {
                     let (first, later) = rule.texts(&token);
@@ -284,7 +288,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::{huggingface::HuggingFaceTokenizer, sequence::Sequence};
+    use crate::{
+        huggingface::HuggingFaceTokenizer,
+        sequence::Sequence,
+        traits::{Encoder, Tokenizer},
+    };
 
     /// A small WordPiece vocabulary: words and continuations, the
     /// punctuation and clitics the cleanup reads, tokens with spaces in them
@@ -486,7 +494,7 @@ mod tests {
     fn a_stream_steps_as_the_crate_steps() {
         for (name, tokenizer) in every_tokenizer() {
             let vocabulary = tokenizer.get_vocab_size(true) as u32;
-            let smg: Arc<dyn crate::traits::Tokenizer> =
+            let smg: Arc<dyn Tokenizer> =
                 Arc::new(HuggingFaceTokenizer::from_tokenizer(tokenizer.clone()));
             let mut state = 0x1234_5678_9ABC_DEF1u64;
             for round in 0..1_500 {
@@ -541,14 +549,13 @@ mod tests {
             for text in texts {
                 for specials in [false, true] {
                     let want = tokenizer.encode(text, specials).expect("encode");
-                    let got = crate::traits::Encoder::encode(&smg, text, specials).expect("encode");
+                    let got = Encoder::encode(&smg, text, specials).expect("encode");
                     assert_eq!(
                         got.token_ids(),
                         want.get_ids(),
                         "{name}: {text:?} {specials}"
                     );
-                    let got = crate::traits::Encoder::encode_batch(&smg, &[text, "do"], specials)
-                        .expect("batch");
+                    let got = Encoder::encode_batch(&smg, &[text, "do"], specials).expect("batch");
                     assert_eq!(got[0].token_ids(), want.get_ids(), "{name}: batch {text:?}");
                 }
             }

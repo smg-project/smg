@@ -8,10 +8,12 @@ use tracing::{debug, warn};
 
 use crate::{
     channel::Channel,
+    framed::{call_with_frames, sglang_frames},
     request_fields::{
         body_format, completion_constraint, logit_bias_by_token_text, plain_constraint,
         stop_strings, ConstraintKind, FormatSetAside, OutputConstraint, PlainSampling,
     },
+    sglang_encoder_proto::sglang_encoder_client::SglangEncoderClient,
     BoxedTraceInjector,
 };
 
@@ -28,13 +30,19 @@ pub mod proto {
 /// Streaming `generate()` response that auto-aborts on drop. Concrete
 /// alias for the generic `crate::AbortOnDropStream`.
 pub type AbortOnDropStream =
-    crate::AbortOnDropStream<proto::GenerateResponse, SglangSchedulerClient>;
+    crate::AbortOnDropStream<Box<proto::GenerateResponse>, SglangSchedulerClient>;
+
+/// Managed EPD manifests (up to 32 MiB per `sglang_managed::Limits`) ride on
+/// `GenerateResponse.prepared_input` and can exceed tonic's 4 MiB default limit.
+const GENERATE_MAX_DECODING_MESSAGE_SIZE: usize = 36 * 1024 * 1024;
 
 /// gRPC client for SGLang scheduler
 #[derive(Clone)]
 pub struct SglangSchedulerClient {
     client: proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
     trace_injector: BoxedTraceInjector,
+    /// The client's own channel, the one its generated stub rides.
+    channel: Channel,
 }
 
 /// Optional request data used when building SGLang generation requests.
@@ -50,14 +58,47 @@ pub struct SglangGenerateRequestOptions {
 
 crate::impl_abort_for_drop_with_reason!(SglangSchedulerClient);
 
+/// The worker resolves a preloaded adapter's name or internal ID. Never turn
+/// an explicitly empty or conflicting selection into base-model inference.
+fn lora_selector(path: Option<&str>, id: Option<&str>) -> Result<String, String> {
+    if path.is_some_and(|value| value.trim().is_empty())
+        || id.is_some_and(|value| value.trim().is_empty())
+    {
+        return Err("lora_path and lora_id must be non-empty when provided".to_string());
+    }
+    if matches!((path, id), (Some(path), Some(id)) if path != id) {
+        return Err("Specify only one of lora_path or lora_id".to_string());
+    }
+    Ok(path.or(id).unwrap_or_default().to_string())
+}
+
 impl SglangSchedulerClient {
     crate::impl_engine_client_basics!(
         proto,
         proto::sglang_scheduler_client::SglangSchedulerClient<Channel>,
-        "SGLang scheduler"
+        "SGLang scheduler",
+        "sglang.grpc.scheduler.SglangScheduler",
+        proto::sglang_scheduler_server::SERVICE_NAME,
+        Some(GENERATE_MAX_DECODING_MESSAGE_SIZE)
     );
 
     crate::impl_embed!(proto);
+
+    /// Reuse the registered encoder's connection for native SGLang control.
+    pub async fn encode_native(
+        &self,
+        request: crate::sglang_encoder_proto::EncodeRequest,
+        timeout: std::time::Duration,
+    ) -> Result<(), tonic::Status> {
+        let mut request = Request::new(request);
+        request.set_timeout(timeout);
+        let mut client =
+            SglangEncoderClient::new(self.channel.clone()).max_encoding_message_size(usize::MAX);
+        tokio::time::timeout(timeout, client.encode(request))
+            .await
+            .map_err(|_| tonic::Status::deadline_exceeded("encoder deadline expired"))??;
+        Ok(())
+    }
 
     /// Abort a request
     pub async fn abort_request(
@@ -211,6 +252,7 @@ impl SglangSchedulerClient {
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
             require_reasoning: options.require_reasoning,
+            lora_id: lora_selector(body.lora_path.as_deref(), None)?,
             ..Default::default()
         };
 
@@ -262,6 +304,7 @@ impl SglangSchedulerClient {
             stream: body.stream,
             log_metrics: body.log_metrics,
             require_reasoning,
+            lora_id: lora_selector(body.lora_path.as_deref(), body.lora_id.as_deref())?,
             ..Default::default()
         };
 
@@ -348,6 +391,7 @@ impl SglangSchedulerClient {
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
             max_new_tokens,
+            min_new_tokens: request.min_tokens.unwrap_or(0),
             stop: stop_sequences,
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             skip_special_tokens,
@@ -596,6 +640,7 @@ impl SglangSchedulerClient {
             return_hidden_states: body.return_hidden_states,
             stream: body.stream,
             require_reasoning: false,
+            lora_id: lora_selector(body.lora_path.as_deref(), None)?,
             ..Default::default()
         };
 
@@ -738,6 +783,13 @@ impl From<proto::SchedulerLoad> for openai_protocol::worker::SchedulerLoadSnapsh
                     .saturating_add(d.decode_retracted_queue_reqs)
             }),
             disagg_mode: disagg.map(|d| d.mode),
+            values: crate::stated_values(&load.values),
+            // A polled answer states its own figures: none is kept from an
+            // older record.
+            kept: Default::default(),
+            kept_used_tokens_age_ms: None,
+            kept_total_tokens_age_ms: None,
+            sampled_at: None,
         }
     }
 }
@@ -765,12 +817,55 @@ impl From<proto::GetLoadsResponse> for openai_protocol::worker::WorkerLoadRespon
     }
 }
 
+impl SglangSchedulerClient {
+    /// `generate` with the request's large inline tensors as body frames of
+    /// their own (the crate's private `framed` module): no encode buffer of
+    /// the message's size, the same message on the wire. A plain fn like
+    /// `generate`, for the same reason: the request becomes its frames before
+    /// the future exists, so the boxed future holds the frame list and the
+    /// request id, not the request; the trace context is injected at the
+    /// first poll, as there.
+    pub fn generate_framed(
+        &self,
+        req: proto::GenerateRequest,
+    ) -> impl std::future::Future<Output = Result<AbortOnDropStream, tonic::Status>> + '_ {
+        let request_id = req.request_id.clone();
+        let frames = sglang_frames(req);
+        async move {
+            let frames = frames?;
+            let mut carrier = Request::new(());
+            if let Err(e) = self.trace_injector.inject(carrier.metadata_mut()) {
+                warn!("Failed to inject trace context: {}", e);
+            }
+            let (metadata, _extensions, ()) = carrier.into_parts();
+            let stream = call_with_frames::<Box<proto::GenerateResponse>>(
+                self.channel(),
+                "/sglang.grpc.scheduler.SglangScheduler/Generate",
+                metadata.into_headers(),
+                frames,
+                Some(GENERATE_MAX_DECODING_MESSAGE_SIZE),
+            )
+            .await?;
+            Ok(AbortOnDropStream::new(stream, request_id, self.clone()))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
     use crate::channel::testing::refused_endpoint;
+
+    /// The future of each generate call holds a request, inside jemalloc's
+    /// 640-byte size class. A field that needs more room goes in a box (see
+    /// `build.rs`).
+    #[test]
+    fn the_request_stays_in_the_640_byte_allocator_class() {
+        let bytes = size_of::<proto::GenerateRequest>();
+        assert!(bytes <= 640, "an SGLang request is {bytes} bytes");
+    }
 
     #[test]
     fn score_request_uses_unscaled_prefill_only_logprobs() {
@@ -794,6 +889,82 @@ mod tests {
         assert_eq!(params.repetition_penalty, 1.0);
         assert_eq!(params.n, 1);
         assert!(params.constraint.is_none() && params.logit_bias.is_empty());
+    }
+
+    #[test]
+    fn lora_selection_reaches_chat_completion_and_native_generate() {
+        for stream in [false, true] {
+            let chat = serde_json::from_value(json!({
+                "model": "base", "messages": [], "lora_path": "adapter", "stream": stream
+            }))
+            .unwrap();
+            let req = SglangSchedulerClient::build_generate_request_from_chat_parts(
+                "chat".into(),
+                &chat,
+                "hi".into(),
+                vec![1],
+                Default::default(),
+            )
+            .unwrap();
+            assert_eq!(req.lora_id, "adapter");
+            assert_eq!(req.stream, stream);
+
+            let completion = serde_json::from_value(json!({
+                "model": "base", "prompt": "hi", "lora_path": "adapter", "stream": stream
+            }))
+            .unwrap();
+            let req = SglangSchedulerClient::build_generate_request_from_completion_parts(
+                "completion".into(),
+                &completion,
+                "hi".into(),
+                vec![1],
+            )
+            .unwrap();
+            assert_eq!(req.lora_id, "adapter");
+            assert_eq!(req.stream, stream);
+
+            for field in ["lora_path", "lora_id"] {
+                let mut body = json!({"text": "hi", "stream": stream});
+                body[field] = json!("adapter");
+                let req = SglangSchedulerClient::build_plain_generate_request_parts(
+                    "native".into(),
+                    &serde_json::from_value(body).unwrap(),
+                    None,
+                    vec![1],
+                )
+                .unwrap();
+                assert_eq!(req.lora_id, "adapter");
+                assert_eq!(req.stream, stream);
+            }
+        }
+    }
+
+    #[test]
+    fn native_generate_refuses_empty_or_conflicting_lora_selection() {
+        for selection in [
+            json!({"lora_path": ""}),
+            json!({"lora_id": " "}),
+            json!({"lora_path": "adapter", "lora_id": "different"}),
+        ] {
+            let body = serde_json::from_value(selection).unwrap();
+            assert!(SglangSchedulerClient::build_plain_generate_request_parts(
+                "native".into(),
+                &body,
+                None,
+                vec![1],
+            )
+            .is_err());
+        }
+        let body = serde_json::from_value(json!({"text": "hi"})).unwrap();
+        assert!(SglangSchedulerClient::build_plain_generate_request_parts(
+            "base".into(),
+            &body,
+            None,
+            vec![1],
+        )
+        .unwrap()
+        .lora_id
+        .is_empty());
     }
 
     /// A chat or completion request's `logit_bias` reaches the proto keyed by
@@ -826,6 +997,40 @@ mod tests {
         let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&plain)
             .expect("build sampling params");
         assert!(params.logit_bias.is_empty());
+    }
+
+    /// A chat request's `min_tokens` reaches the proto as `min_new_tokens`, as
+    /// a completion request's does; a request without one sends the proto's
+    /// zero, which the engine reads as no minimum.
+    #[test]
+    fn chat_and_completion_sampling_params_carry_min_tokens() {
+        let chat: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "min_tokens": 30
+        }))
+        .expect("a chat request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_chat(
+            &chat,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 30);
+        let completion: CompletionRequest = serde_json::from_value(json!({
+            "model": "m", "prompt": "hi", "min_tokens": 30
+        }))
+        .expect("a completion request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_completion(&completion)
+            .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 30);
+        let unset: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .expect("a chat request");
+        let params = SglangSchedulerClient::build_grpc_sampling_params_from_chat(
+            &unset,
+            OutputConstraint::default(),
+        )
+        .expect("build sampling params");
+        assert_eq!(params.min_new_tokens, 0);
     }
 
     /// A completions `max_tokens` of zero reaches the proto as `Some(0)`, a
@@ -1272,5 +1477,12 @@ mod tests {
             );
         }
         assert_eq!(SglangSchedulerClient::constraint_of(None), None);
+    }
+
+    #[test]
+    fn decode_limit_covers_managed_manifest_budget() {
+        use crate::sglang_managed::Limits;
+
+        assert!(GENERATE_MAX_DECODING_MESSAGE_SIZE > Limits::default().manifest_bytes);
     }
 }

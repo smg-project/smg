@@ -11,21 +11,24 @@
 use image::DynamicImage;
 
 use super::moonvit::{self, MoonVitParams};
-use crate::vision::{
-    preprocessor_config::PreProcessorConfig,
-    processor::{PreprocessedEncoderInputs, VisionPreProcessor},
-    transforms::TransformError,
+use crate::{
+    encoder_inputs::EncoderDtype,
+    vision::{
+        preprocessor_config::PreProcessorConfig,
+        processor::{PreprocessedEncoderInputs, VisionPreProcessor},
+        transforms::TransformError,
+    },
 };
 
-pub const KIMI_K25_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
-pub const KIMI_K25_STD: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const KIMI_K25_MEAN: [f64; 3] = [0.5, 0.5, 0.5];
+pub(crate) const KIMI_K25_STD: [f64; 3] = [0.5, 0.5, 0.5];
 
-pub const DEFAULT_PATCH_SIZE: usize = 14;
-pub const DEFAULT_MERGE_SIZE: usize = 2;
+pub(crate) const DEFAULT_PATCH_SIZE: usize = 14;
+pub(crate) const DEFAULT_MERGE_SIZE: usize = 2;
 /// Maximum total patches before merge (from preprocessor_config.json in_patch_limit)
-pub const DEFAULT_IN_PATCH_LIMIT: usize = 16384;
+pub(crate) const DEFAULT_IN_PATCH_LIMIT: usize = 16384;
 /// Maximum patches along one spatial dimension
-pub const DEFAULT_PATCH_LIMIT_ON_ONE_SIDE: usize = 512;
+pub(crate) const DEFAULT_PATCH_LIMIT_ON_ONE_SIDE: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct KimiK25Processor {
@@ -39,7 +42,7 @@ impl Default for KimiK25Processor {
 }
 
 impl KimiK25Processor {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             params: MoonVitParams {
                 patch_size: DEFAULT_PATCH_SIZE,
@@ -52,18 +55,10 @@ impl KimiK25Processor {
         }
     }
 
-    pub fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
+    pub(crate) fn from_preprocessor_config(config: &PreProcessorConfig) -> Self {
         Self {
             params: Self::new().params.resolved(config),
         }
-    }
-
-    pub fn patch_size(&self) -> usize {
-        self.params.patch_size
-    }
-
-    pub fn merge_size(&self) -> usize {
-        self.params.merge_size
     }
 }
 
@@ -82,6 +77,14 @@ impl VisionPreProcessor for KimiK25Processor {
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         // K2.5 ships no `transparent_bg_config`, so alpha is dropped.
         moonvit::preprocess(self.params, images, None)
+    }
+
+    fn preprocess_wire(
+        &self,
+        images: &[&DynamicImage],
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        moonvit::preprocess_wire(self.params, images, None, dtype)
     }
 
     fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
@@ -113,8 +116,8 @@ mod tests {
     #[test]
     fn test_defaults() {
         let p = KimiK25Processor::new();
-        assert_eq!(p.patch_size(), 14);
-        assert_eq!(p.merge_size(), 2);
+        assert_eq!(p.params.patch_size, 14);
+        assert_eq!(p.params.merge_size, 2);
         assert_eq!(p.params.factor(), 28);
         assert_eq!(p.params.in_patch_limit, DEFAULT_IN_PATCH_LIMIT);
     }
@@ -248,8 +251,8 @@ mod tests {
             ..Default::default()
         };
         let p = KimiK25Processor::from_preprocessor_config(&config);
-        assert_eq!(p.patch_size(), 14);
-        assert_eq!(p.merge_size(), 2);
+        assert_eq!(p.params.patch_size, 14);
+        assert_eq!(p.params.merge_size, 2);
     }
 
     #[test]

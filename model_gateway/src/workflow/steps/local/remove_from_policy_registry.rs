@@ -6,12 +6,17 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::future::join_all;
+use smg_grpc_client::tokenspeed_encoder::TokenSpeedEncoderClient;
 use tokio::sync::Semaphore;
 use tracing::{debug, error};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
+use super::forget_cache_events::forget_cache_events;
 use crate::{
-    policies::PolicyRegistry, worker::WorkerRegistry, workflow::data::WorkerRemovalWorkflowData,
+    policies::PolicyRegistry,
+    routers::common::snapshot::WorkerRegistry,
+    workflow::data::{require_app_context, WorkerRemovalWorkflowData},
 };
 
 /// Bound CPU-heavy radix-tree purges during a fleet-wide scale-down. The
@@ -49,6 +54,16 @@ impl RemoveFromPolicyRegistryStep {
             error!(%error, "Cache-aware worker cleanup task failed");
         }
     }
+
+    /// Closes the encode connections pooled to `url` unless a worker stands
+    /// under it. The pool is keyed by the URL alone: a URL a worker stands
+    /// under again when a removal's close runs keeps its pool, the
+    /// connections dialled before the removal included.
+    pub(crate) fn forget_encode_pool_if_unserved(registry: &WorkerRegistry, url: &str) {
+        if registry.get_by_url(url).is_none() {
+            TokenSpeedEncoderClient::forget_cached(url);
+        }
+    }
 }
 
 #[async_trait]
@@ -57,11 +72,7 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
         &self,
         context: &mut WorkflowContext<WorkerRemovalWorkflowData>,
     ) -> WorkflowResult<StepResult> {
-        let app_context = context
-            .data
-            .app_context
-            .as_ref()
-            .ok_or_else(|| WorkflowError::ContextValueNotFound("app_context".to_string()))?;
+        let app_context = require_app_context(context.data.host.as_ref())?;
         let workers_to_remove = context
             .data
             .actual_workers_to_remove
@@ -73,31 +84,26 @@ impl StepExecutor<WorkerRemovalWorkflowData> for RemoveFromPolicyRegistryStep {
             workers_to_remove.len()
         );
 
-        for worker in workers_to_remove {
-            // Remove from KV event monitor (stops subscription, removes from indexer)
-            if let Some(ref monitor) = app_context.kv_event_monitor {
-                monitor.on_worker_removed(worker.url()).await;
-            }
-        }
+        // The batch's KV cleanups start together: the monitor's own bound on
+        // index purges decides how many run at once.
+        join_all(
+            workers_to_remove
+                .iter()
+                .map(|worker| forget_cache_events(app_context, worker.url())),
+        )
+        .await;
 
-        // Drop the state the policies and the hosted engine keep on the
-        // removed workers (a load-aware policy's dispatch tally by URL, the
-        // engine's rows by handle) so it does not leak under churn. The
-        // workers the registry step removed count as well as the ones found:
-        // a same-URL replacement during the drain is a handle of its own,
-        // and each handle is pruned once.
-        let mut pruned: Vec<usize> = Vec::new();
-        for worker in workers_to_remove
-            .iter()
-            .chain(&context.data.removed_workers)
-        {
-            let handle = Arc::as_ptr(worker).cast::<()>() as usize;
-            if !pruned.contains(&handle) {
-                pruned.push(handle);
-                app_context
-                    .policy_registry
-                    .on_worker_removed(worker.as_ref());
-            }
+        for worker in workers_to_remove {
+            // Drop the state the policies keep on the worker (a load-aware
+            // policy's dispatch tally) so it does not leak under churn.
+            app_context
+                .policy_registry
+                .remove_worker_from_policies(worker.url());
+            // Its pooled encode connections go too: the pool is keyed by
+            // this URL and outlived the worker otherwise. A worker
+            // registered under the URL while the cleanups above ran keeps
+            // the pool.
+            Self::forget_encode_pool_if_unserved(&app_context.worker_registry, worker.url());
         }
 
         // The removed workers' URLs leave their models' trees too, those of

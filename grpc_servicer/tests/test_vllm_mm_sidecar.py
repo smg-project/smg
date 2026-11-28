@@ -357,54 +357,93 @@ class TestNativeAudio:
         assert result.prompt_token_ids == [258881]
 
 
-class TestShortSideFloor:
-    def test_a_fetched_image_below_the_familys_floor_is_raised_before_the_renderer(self):
-        from smg_grpc_servicer.vllm.short_side_floor import FloorRule
+class TestNativeImage:
+    def test_a_fetched_image_reaches_the_sidecar_renderer_as_fetched(self):
+        s = sidecar(FakeRedis())
+        image = object()
+        fetched, rendered = [], []
 
-        M3_RULE = FloorRule(floor=112, factor=28, min_pixels=3136, max_pixels=451584)
+        async def fetch_image(actual_url):
+            fetched.append(actual_url)
+            return image
 
-        class _Image:
-            def __init__(self, width, height):
-                self.size = (width, height)
+        async def render(prompt, **kwargs):
+            rendered.append(prompt)
+            return {
+                "prompt_token_ids": [258881],
+                "mm_kwargs": {},
+                "mm_hashes": {},
+                "mm_placeholders": {},
+            }
 
-            def resize(self, size, resample):
-                assert resample == 3  # bicubic
-                return _Image(*size)
+        s._connector = types.SimpleNamespace(fetch_image_async=fetch_image)
+        s._tokens_prompt = lambda **kwargs: kwargs
+        s._renderer = types.SimpleNamespace(process_for_engine_async=render)
+        s._encoder = None  # The fake renderer produces no tensor payloads.
+        result = run(s.handle(job()))
+        assert result.ok, result
+        assert fetched == ["https://a/1.png"]
+        (prompt,) = rendered
+        (handed,) = prompt["multi_modal_data"]["image"]
+        assert handed is image
 
-        for size, floor, expected in [
-            ((16, 16), M3_RULE, (112, 112)),
-            ((400, 112), M3_RULE, (400, 112)),
-        ]:
-            s = sidecar(FakeRedis())
-            s._short_side_floor = floor
-            fetched = _Image(*size)
-            rendered = []
 
-            async def fetch_image(url, fetched=fetched):
-                return fetched
+class TestConnector:
+    def test_the_connector_reads_the_allow_list_as_the_guard_does(self, monkeypatch):
+        """vLLM's own first-URL check is handed the list the guarded
+        connection checks every hop against: trimmed, lowercased, blanks
+        dropped; a list with nothing left stays as configured, refusing
+        every host."""
+        loaded = {}
 
-            async def render(prompt, **kwargs):
-                rendered.append(prompt)
-                return {
-                    "prompt_token_ids": [1, 2, 3],
-                    "mm_kwargs": {},
-                    "mm_hashes": {},
-                    "mm_placeholders": {},
-                }
+        def module(name, **attrs):
+            mod = types.ModuleType(name)
+            mod.__dict__.update(attrs)
+            monkeypatch.setitem(sys.modules, name, mod)
 
-            s._connector = types.SimpleNamespace(fetch_image_async=fetch_image)
-            s._tokens_prompt = lambda **kwargs: kwargs
-            s._renderer = types.SimpleNamespace(process_for_engine_async=render)
-            s._encoder = None
-            result = run(s.handle(job()))
-            assert result.ok, result
-            (image,) = rendered[0]["multi_modal_data"]["image"]
-            assert image.size == expected
-            if expected == size:
-                assert image is fetched
+        class _Registry:
+            @staticmethod
+            def load(name, **kwargs):
+                loaded.update(kwargs)
+                return object()
 
-    def test_a_sidecar_built_without_init_raises_nothing(self):
-        assert sidecar(FakeRedis())._short_side_floor is None
+        module(
+            "vllm",
+            TokensPrompt=dict,
+            envs=types.SimpleNamespace(VLLM_MEDIA_CONNECTOR="http"),
+        )
+        module("vllm.multimodal")
+        module("vllm.multimodal.media")
+        module("vllm.multimodal.media.connector", MEDIA_CONNECTOR_REGISTRY=_Registry)
+        module("vllm.connections", HTTPConnection=type("HTTPConnection", (), {}))
+        module("vllm.transformers_utils")
+        module("vllm.transformers_utils.processor", get_video_processor_cls_name=lambda cfg: "vp")
+        module("vllm.v1")
+        module("vllm.v1.serial_utils", MsgpackEncoder=lambda **kwargs: object())
+        monkeypatch.setattr(mm_sidecar, "config_fingerprint", lambda cfg: fingerprint())
+
+        def build(domains):
+            mm_config = types.SimpleNamespace(media_io_kwargs=None)
+            model_config = types.SimpleNamespace(
+                get_multimodal_config=lambda: mm_config,
+                allowed_local_media_path="",
+                allowed_media_domains=domains,
+            )
+            mm_sidecar.Sidecar(
+                types.SimpleNamespace(model_config=model_config),
+                renderer=None,
+                client=None,
+                namespace="t",
+                concurrency=1,
+            )
+            return loaded
+
+        loaded = build([" Images.Example.com ", "", "[::1]"])
+        assert type(loaded["connection"]).__name__ == "GuardedHTTPConnection"
+        assert loaded["allowed_media_domains"] == ["[::1]", "images.example.com"]
+        # A list that names no host still refuses every host, as it did.
+        assert build([" "])["allowed_media_domains"] == [" "]
+        assert build(None)["allowed_media_domains"] is None
 
 
 class TestClassification:
@@ -773,6 +812,7 @@ class TestServe:
         assert seen["sidecar_kwargs"]["settings"].sources == {
             "redis_url": "flag",
             "sidecar_namespace": "flag",
+            "allow_private_media_hosts": "default",
         }
 
     def test_the_startup_log_hides_redis_credentials(self, monkeypatch, caplog):

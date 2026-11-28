@@ -13,13 +13,18 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::Context;
 use llm_multimodal::{
     configure_parallelism, data_url::data_url_payload_bytes, jpeg_turbo::TurboJpegPolicy,
-    registry::modality_limit_override, vision::PreProcessorConfig, FrameSampling, MediaConnector,
-    MediaConnectorConfig, MediaConnectorError, MediaContentPart, MediaErrorCode, MediaFault,
-    Modality, ModelMetadata, ModelRegistry, MultiModalError, Parallelism, POOL_THREADS_ENV,
+    registry::modality_limit_override, vision::PreProcessorConfig, EncoderDtype, FrameSampling,
+    ImageDetail, MediaConnector, MediaConnectorConfig, MediaConnectorError, MediaContentPart,
+    MediaErrorCode, MediaFault, Modality, ModelMetadata, ModelRegistry, MultiModalError,
+    Parallelism, POOL_THREADS_ENV,
 };
 use llm_tokenizer::TokenizerTrait;
 use openai_protocol::worker::MmProcessingMode;
 use smg_grpc_client::{sglang_proto as sglang, vllm_proto as vllm, WorkerMediaFault};
+use smg_worker::{
+    connection::http_client::build_with,
+    identity::basic::{RuntimeType, WorkerType},
+};
 use tracing::{info, warn};
 
 use super::{
@@ -36,10 +41,7 @@ use super::{
     process::process_multimodal_plan,
     RegistryTokenizer,
 };
-use crate::{
-    routers::grpc::proto_wrapper::vllm_mm_identity,
-    worker::{http_client::build_with, RuntimeType},
-};
+use crate::routers::grpc::proto_wrapper::vllm_mm_identity;
 
 /// A worker serves one model: the config registry's one key.
 const CONFIG_KEY: &str = "worker";
@@ -109,7 +111,8 @@ pub struct WorkerMediaSettings {
     /// loader the engine registers for its processor class, none for a
     /// sampler that never followed a loader): a spec that samples the way a
     /// loader does would otherwise sample a clip differently from the engine's
-    /// own server.
+    /// own server. The interval walk is refused none and takes the rate a
+    /// `video.fps` entry states (`interval_walk_start_fps`).
     pub video_loader_rule: Option<String>,
     /// The engine's encoder budget: the most feature tokens it can place for
     /// one media item (vLLM's encoder-cache budget, the "budget of N tokens"
@@ -181,7 +184,9 @@ fn default_loader_reads(entry: &str) -> bool {
 /// stamps of a clip without decoder timing). A key one of these loaders
 /// ignores (`min_frames` for the walk, `temporal_patch_size` for the spread)
 /// is refused with the others rather than telling the per-class loaders apart
-/// by key.
+/// by key. The interval walk ([`FrameSampling::Interval`]) is the walk of
+/// such a loader as well, one that reads the rate alone of these keys: no
+/// rule refuses it, and it follows the rate ([`interval_walk_start_fps`]).
 fn loader_rule_conflict(
     rule: Option<&str>,
     spec_name: &str,
@@ -209,6 +214,43 @@ fn loader_rule_conflict(
          inprocess or redis",
         conflicting.join("; ")
     ))
+}
+
+/// The rate the reported loader rules state for the interval walk
+/// ([`FrameSampling::Interval`]): the engine's loader for that walk reads the
+/// `fps` of the media kwargs as its rate, so the engine's own server walks a
+/// clip at the rate its start states, and the pipeline does the same. A value
+/// that is no number inside the range a part's own rate is held to is no
+/// rate: the walk keeps the spec's default, as under a start that states
+/// none, and says so in one warning that names the key and the range. The
+/// engine's own default, `-1`, alone gets no warning: it states no rate. No
+/// other sampler takes a rate from the rules: [`loader_rule_conflict`]
+/// refuses the loader-style ones, and the rest never followed a loader.
+fn interval_walk_start_fps(rule: Option<&str>, sampling: FrameSampling) -> Option<f64> {
+    if sampling != FrameSampling::Interval {
+        return None;
+    }
+    let stated = rule?
+        .split("; ")
+        .find_map(|entry| {
+            entry
+                .trim()
+                .strip_prefix(LOADER_FLAG_RULE)?
+                .strip_prefix("video.fps=")
+        })?
+        .trim();
+    match stated.parse::<f64>() {
+        Ok(fps) if llm_multimodal::sample_fps_in_range(fps) => Some(fps),
+        Ok(-1.0) => None,
+        _ => {
+            warn!(
+                stated,
+                "the video.fps of the engine's start is no rate from 0.2 to 5, the range the \
+                 interval walk takes; the walk keeps the processor's default rate"
+            );
+            None
+        }
+    }
 }
 
 /// What set a modality's effective per-request item limit.
@@ -335,7 +377,26 @@ fn check_item_counts(
 pub struct WorkerMediaItem {
     pub modality: Modality,
     pub url: String,
+    pub detail: Option<ImageDetail>,
 }
+
+impl WorkerMediaItem {
+    /// Construct a plain item without per-item image detail overrides.
+    pub fn new(modality: Modality, url: String) -> Self {
+        Self {
+            modality,
+            url,
+            detail: None,
+        }
+    }
+}
+
+/// Expanded prompt, primary SGLang inputs and additional modality batches.
+pub type SglangMediaOutput = (
+    Vec<u32>,
+    sglang::MultimodalInputs,
+    Vec<sglang::MultimodalInputs>,
+);
 
 /// What the pipeline produced: the prompt with its anchors expanded, the
 /// request's multimodal batches (the first is `mm_inputs`, the rest
@@ -657,6 +718,13 @@ impl WorkerMediaPipeline {
             drain_fetches_on_error: true,
             inflight: None,
             video_frame_budget: settings.video_frame_budget,
+            video_start_fps: interval_walk_start_fps(
+                settings.video_loader_rule.as_deref(),
+                video_sampling,
+            ),
+            // The worker processes its own requests' media: no router's
+            // mode applies.
+            pixels_go_to: WorkerType::Regular,
         };
         // Only processors with a pixel-less Decode metadata contract advertise reuse.
         let sglang_identity_key = if spec_name == "glm53_flash"
@@ -714,7 +782,7 @@ impl WorkerMediaPipeline {
             model_dir: settings.model_dir,
             tokenizer,
             assembly: VllmAssembly {
-                encoder_dtype: settings.encoder_dtype,
+                encoder_dtype: settings.encoder_dtype.into(),
                 device_normalizes: settings.pixel_format == PixelFormat::RawU8,
                 // In-process: the batches never leave this process as protos.
                 shm_enabled: false,
@@ -775,11 +843,16 @@ impl WorkerMediaPipeline {
     pub async fn process(
         &self,
         prompt_token_ids: Vec<u32>,
-        items: &[WorkerMediaItem],
+        items: Vec<WorkerMediaItem>,
         want_identity: bool,
     ) -> Result<WorkerMediaOutput, WorkerMediaError> {
         let output = self
-            .process_inputs(prompt_token_ids, items, RuntimeType::Vllm)
+            .process_inputs(
+                prompt_token_ids,
+                items,
+                RuntimeType::Vllm,
+                self.assembly.image_wire_dtype(),
+            )
             .await?;
         let data = assemble_vllm_batches_with(output.intermediate, &self.assembly)
             .map_err(classify_assembly)?;
@@ -804,17 +877,36 @@ impl WorkerMediaPipeline {
     pub async fn process_sglang(
         &self,
         prompt_token_ids: Vec<u32>,
-        items: &[WorkerMediaItem],
-    ) -> Result<
-        (
-            Vec<u32>,
-            sglang::MultimodalInputs,
-            Vec<sglang::MultimodalInputs>,
-        ),
-        WorkerMediaError,
-    > {
+        items: Vec<WorkerMediaItem>,
+    ) -> Result<SglangMediaOutput, WorkerMediaError> {
+        self.process_sglang_with_wire_dtype(Some(prompt_token_ids), items, None)
+            .await
+    }
+
+    /// Preprocess single- or multi-modality items for Managed E using the visual
+    /// model dtype directly and resolving anchor tokens from the model spec.
+    pub async fn process_sglang_encoder_items(
+        &self,
+        items: Vec<WorkerMediaItem>,
+    ) -> Result<SglangMediaOutput, WorkerMediaError> {
+        self.process_sglang_with_wire_dtype(None, items, self.assembly.image_wire_dtype())
+            .await
+    }
+
+    /// Share SGLang assembly while applying a visual dtype only when explicitly supplied.
+    async fn process_sglang_with_wire_dtype(
+        &self,
+        prompt_token_ids: Option<Vec<u32>>,
+        items: Vec<WorkerMediaItem>,
+        image_wire_dtype: Option<EncoderDtype>,
+    ) -> Result<SglangMediaOutput, WorkerMediaError> {
         let output = self
-            .process_inputs(prompt_token_ids, items, RuntimeType::Sglang)
+            .process_inputs_inner(
+                prompt_token_ids,
+                items,
+                RuntimeType::Sglang,
+                image_wire_dtype,
+            )
             .await?;
         let dtype = self.assembly.encoder_dtype.clone();
         let span = tracing::Span::current();
@@ -832,17 +924,30 @@ impl WorkerMediaPipeline {
     async fn process_inputs(
         &self,
         prompt_token_ids: Vec<u32>,
-        items: &[WorkerMediaItem],
+        items: Vec<WorkerMediaItem>,
         runtime: RuntimeType,
+        image_wire_dtype: Option<EncoderDtype>,
+    ) -> Result<super::MultimodalOutput, WorkerMediaError> {
+        self.process_inputs_inner(Some(prompt_token_ids), items, runtime, image_wire_dtype)
+            .await
+    }
+
+    /// Shared fetch, placeholder synthesis/validation, and preprocessing core.
+    async fn process_inputs_inner(
+        &self,
+        prompt_token_ids: Option<Vec<u32>>,
+        items: Vec<WorkerMediaItem>,
+        runtime: RuntimeType,
+        image_wire_dtype: Option<EncoderDtype>,
     ) -> Result<super::MultimodalOutput, WorkerMediaError> {
         if items.is_empty() {
             return Err(WorkerMediaError::Invalid(
                 "media_refs is set but carries no items".to_string(),
             ));
         }
-        check_item_counts(items, &self.item_limits)?;
+        check_item_counts(&items, &self.item_limits)?;
         let parts = items
-            .iter()
+            .into_iter()
             .enumerate()
             .map(|(index, item)| self.part(index, item))
             .collect::<Result<Vec<_>, _>>()?;
@@ -862,6 +967,10 @@ impl WorkerMediaPipeline {
         )
         .await
         .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
+        let prompt_token_ids = match prompt_token_ids {
+            Some(ids) => ids,
+            None => synthesize_anchor_token_ids(&plan, &placeholders, tokenizer)?,
+        };
         validate_rendered_media_anchors(&plan, &placeholders, tokenizer, &prompt_token_ids)
             .map_err(|error| WorkerMediaError::Invalid(format!("{error:#}")))?;
         // Follow the destination engine's image loader. SGLang drops alpha,
@@ -874,11 +983,10 @@ impl WorkerMediaPipeline {
             &self.components,
             CONFIG_KEY,
             &self.model_dir,
-            if runtime == RuntimeType::Vllm {
-                self.assembly.image_wire_dtype()
-            } else {
-                None
-            },
+            image_wire_dtype,
+            // In-process: the tensors ride no gRPC message of this worker's
+            // own; the framing of the hop that carries them answers.
+            None,
             super::transparency::runtime_transparency_policy(runtime),
             self.encoder_budget,
         )
@@ -897,7 +1005,7 @@ impl WorkerMediaPipeline {
     fn part(
         &self,
         index: usize,
-        item: &WorkerMediaItem,
+        item: WorkerMediaItem,
     ) -> Result<MediaContentPart, WorkerMediaError> {
         let scheme = item
             .url
@@ -919,13 +1027,13 @@ impl WorkerMediaPipeline {
         }
         Ok(match item.modality {
             Modality::Image => MediaContentPart::ImageUrl {
-                url: item.url.clone(),
-                detail: None,
+                url: Arc::new(item.url),
+                detail: item.detail,
                 max_long_side_pixel: None,
                 uuid: None,
             },
             Modality::Video => MediaContentPart::VideoUrl {
-                url: item.url.clone(),
+                url: Arc::new(item.url),
                 uuid: None,
                 fps: None,
                 max_long_side_pixel: None,
@@ -937,6 +1045,46 @@ impl WorkerMediaPipeline {
             }
         })
     }
+}
+
+/// Synthesize one anchor token per media item in `plan` using the model spec's
+/// resolved placeholder tokens so Managed E does not depend on `hf_config` heuristics.
+fn synthesize_anchor_token_ids(
+    plan: &MediaPlan,
+    placeholders: &super::plan::PlaceholderTokens,
+    tokenizer: &dyn TokenizerTrait,
+) -> Result<Vec<u32>, WorkerMediaError> {
+    if placeholders.is_worker_only() {
+        return Err(WorkerMediaError::Invalid(
+            "managed encoder requires a registered multimodal model spec".to_string(),
+        ));
+    }
+    let mut token_ids = Vec::with_capacity(plan.parts().len());
+    for part in plan.parts() {
+        let modality = match part {
+            MediaContentPart::ImageUrl { .. }
+            | MediaContentPart::ImageBase64 { .. }
+            | MediaContentPart::ImageData { .. } => Modality::Image,
+            MediaContentPart::VideoUrl { .. } | MediaContentPart::VideoData { .. } => {
+                Modality::Video
+            }
+            _ => {
+                return Err(WorkerMediaError::Invalid(
+                    "managed encoder supports images and videos only".to_string(),
+                ))
+            }
+        };
+        let anchor = placeholders.get(modality).ok_or_else(|| {
+            WorkerMediaError::Invalid(format!("missing resolved {modality} placeholder token"))
+        })?;
+        let token_id = tokenizer.token_to_id(anchor).ok_or_else(|| {
+            WorkerMediaError::Invalid(format!(
+                "{modality} placeholder token '{anchor}' is missing from the tokenizer vocabulary"
+            ))
+        })?;
+        token_ids.push(token_id);
+    }
+    Ok(token_ids)
 }
 
 /// The model's configs with `kwargs` laid over each preprocessor config, or
@@ -990,7 +1138,8 @@ fn apply_processor_kwargs(
 /// fetch or decode failure is the media's, by the connector's own reading of
 /// it (the request's, or its host's for now) and under the connector's code
 /// (the verdict the router-side pipeline answers directly, see
-/// `multimodal::processing_failed_response`); a bad part or a prompt the
+/// `multimodal::processing_failed_response`); an image size the processor's
+/// rule refuses is the request's media too; a bad part or a prompt the
 /// anchors do not fit or an item above the engine's encoder budget the
 /// caller's; anything else ours.
 fn classify(error: anyhow::Error) -> WorkerMediaError {
@@ -1003,6 +1152,14 @@ fn classify(error: anyhow::Error) -> WorkerMediaError {
     }
     if let Some(fetch) = media_verdict(&error) {
         return classify_fetch(fetch, message);
+    }
+    // The request's media, as a decoder's refusal of it is.
+    if super::process::ImageSizeRefused::is(&error) {
+        return WorkerMediaError::Media {
+            fault: WorkerMediaFault::Client,
+            code: MediaErrorCode::InvalidRequest,
+            message,
+        };
     }
     match error
         .chain()
@@ -1053,7 +1210,7 @@ mod tests {
 
     use llm_tokenizer::MockTokenizer;
 
-    use super::*;
+    use super::{super::process::VideoDecoderUnavailable, *};
 
     /// Set to a non-empty value where the video tools must be installed (CI sets
     /// it on the shards that install ffmpeg): the tests that decode a clip then
@@ -1094,13 +1251,7 @@ mod tests {
     }
 
     fn image_items(count: usize) -> Vec<WorkerMediaItem> {
-        vec![
-            WorkerMediaItem {
-                modality: Modality::Image,
-                url: "data:image/png;base64,AAAA".to_string(),
-            };
-            count
-        ]
+        vec![WorkerMediaItem::new(Modality::Image, "data:image/png;base64,AAAA".to_string()); count]
     }
 
     /// The settings every pipeline test starts from: a model at `model_dir`
@@ -1202,13 +1353,11 @@ mod tests {
         );
         assert!(check_item_counts(&image_items(1), &limits).is_ok());
         // A modality without a limit here is the spec's to validate.
-        let videos = vec![
-            WorkerMediaItem {
-                modality: Modality::Video,
-                url: "data:video/mp4;base64,AAAA".to_string(),
-            };
-            3
-        ];
+        let videos =
+            vec![
+                WorkerMediaItem::new(Modality::Video, "data:video/mp4;base64,AAAA".to_string());
+                3
+            ];
         assert!(check_item_counts(&videos, &limits).is_ok());
     }
 
@@ -1245,7 +1394,7 @@ mod tests {
         assert_eq!(pipeline.encoder_budget(), Some(192_000));
 
         let error = pipeline
-            .process(vec![1, 2, 3], &image_items(9), false)
+            .process(vec![1, 2, 3], image_items(9), false)
             .await
             .unwrap_err();
         assert!(
@@ -1259,7 +1408,7 @@ mod tests {
         // Within the limit the request reaches the pipeline proper (which the
         // mock tokenizer, lacking the placeholder token, then refuses).
         let error = pipeline
-            .process(vec![1, 2, 3], &image_items(1), false)
+            .process(vec![1, 2, 3], image_items(1), false)
             .await
             .unwrap_err();
         assert!(!error.to_string().contains("limit of"), "{error}");
@@ -1292,16 +1441,13 @@ mod tests {
             ..pipeline_settings(&path)
         };
         let tokenizer = || Arc::new(MockTokenizer::new().with_tokens(&[("<image>", 32000)]));
-        let items = vec![WorkerMediaItem {
-            modality: Modality::Image,
-            url: PIXEL.to_string(),
-        }];
+        let items = [WorkerMediaItem::new(Modality::Image, PIXEL.to_string())];
 
         let pipeline = WorkerMediaPipeline::new(settings(Some(575)), tokenizer())
             .await
             .unwrap();
         let error = pipeline
-            .process(vec![1, 32000, 2], &items, false)
+            .process(vec![1, 32000, 2], items.to_vec(), false)
             .await
             .unwrap_err();
         assert!(
@@ -1318,7 +1464,7 @@ mod tests {
             .await
             .unwrap();
         let output = pipeline
-            .process(vec![1, 32000, 2], &items, false)
+            .process(vec![1, 32000, 2], items.to_vec(), false)
             .await
             .unwrap();
         assert_eq!(output.prompt_token_ids.len(), 2 + 576);
@@ -1332,7 +1478,7 @@ mod tests {
         );
         assert_eq!(output.batches.len(), 1);
         let (tokens, sglang, _) = pipeline
-            .process_sglang(vec![1, 32000, 2], &items)
+            .process_sglang(vec![1, 32000, 2], items.to_vec())
             .await
             .unwrap();
         assert_eq!(tokens, output.prompt_token_ids);
@@ -1355,10 +1501,10 @@ mod tests {
         );
         // PIXEL stores half-transparent blue. SGLang drops alpha, so its
         // tensor must equal opaque blue, while vLLM composites it over white.
-        let mut opaque = items.clone();
+        let mut opaque = items.to_vec();
         opaque[0].url = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC".into();
         let (_, opaque_sglang, _) = pipeline
-            .process_sglang(vec![1, 32000, 2], &opaque)
+            .process_sglang(vec![1, 32000, 2], opaque.clone())
             .await
             .unwrap();
         let pixels = &sglang.pixel_values.as_ref().unwrap().data;
@@ -1406,6 +1552,52 @@ mod tests {
         (dir, pipeline)
     }
 
+    /// The GLM pipeline the video tests share: the family's image tokens, its
+    /// video token and the pieces of a frame timestamp.
+    async fn glm_video_test_pipeline() -> (tempfile::TempDir, WorkerMediaPipeline) {
+        vision_test_pipeline(
+            r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
+            &[
+                ("<|image|>", 32000),
+                ("<|begin_of_image|>", 32001),
+                ("<|end_of_image|>", 32002),
+                ("<|video|>", 32003),
+                ("0.0", 32004),
+                ("seconds", 32005),
+            ],
+        )
+        .await
+    }
+
+    /// A blank 56x56 PNG as an image item.
+    fn blank_png_item() -> WorkerMediaItem {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(56, 56))
+            .write_to(&mut png, image::ImageFormat::Png)
+            .unwrap();
+        WorkerMediaItem::new(
+            Modality::Image,
+            format!(
+                "data:image/png;base64,{}",
+                STANDARD.encode(png.into_inner())
+            ),
+        )
+    }
+
+    /// The one-second test clip as a video item.
+    fn testsrc_video_item() -> WorkerMediaItem {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let video = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../crates/multimodal/tests/fixtures/videos/testsrc_128x96_8fps_1s.mp4"
+        ));
+        WorkerMediaItem::new(
+            Modality::Video,
+            format!("data:video/mp4;base64,{}", STANDARD.encode(video)),
+        )
+    }
+
     #[tokio::test]
     /// Compare BF16 pixels with an independent nearest-even reference and unchanged metadata.
     async fn sglang_worker_bfloat16_rounds_once_and_preserves_metadata() {
@@ -1426,20 +1618,20 @@ mod tests {
         image::DynamicImage::ImageRgb8(image)
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
-        let items = [WorkerMediaItem {
-            modality: Modality::Image,
-            url: format!(
+        let items = [WorkerMediaItem::new(
+            Modality::Image,
+            format!(
                 "data:image/png;base64,{}",
                 STANDARD.encode(bytes.into_inner())
             ),
-        }];
+        )];
         let (float_tokens, float, _) = pipeline
-            .process_sglang(vec![1, 32000, 2], &items)
+            .process_sglang(vec![1, 32000, 2], items.to_vec())
             .await
             .unwrap();
         pipeline.assembly.encoder_dtype = "bfloat16".into();
         let (bf_tokens, bf, _) = pipeline
-            .process_sglang(vec![1, 32000, 2], &items)
+            .process_sglang(vec![1, 32000, 2], items.to_vec())
             .await
             .unwrap();
         assert_eq!(float_tokens, bf_tokens);
@@ -1465,7 +1657,7 @@ mod tests {
         }
         pipeline.assembly.encoder_dtype = "int8".into();
         assert!(pipeline
-            .process_sglang(vec![1, 32000, 2], &items)
+            .process_sglang(vec![1, 32000, 2], items.to_vec())
             .await
             .unwrap_err()
             .to_string()
@@ -1478,7 +1670,6 @@ mod tests {
     /// placeholders as sent. A caller that wants no identity gets none.
     #[tokio::test]
     async fn the_worker_side_identity_is_the_batch_without_its_pixels() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
         let (_dir, pipeline) = vision_test_pipeline(
             r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
             &[
@@ -1488,19 +1679,9 @@ mod tests {
             ],
         )
         .await;
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(image::RgbImage::new(56, 56))
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        let items = [WorkerMediaItem {
-            modality: Modality::Image,
-            url: format!(
-                "data:image/png;base64,{}",
-                STANDARD.encode(png.into_inner())
-            ),
-        }];
+        let items = [blank_png_item()];
         let output = pipeline
-            .process(vec![1, 32000, 2], &items, true)
+            .process(vec![1, 32000, 2], items.to_vec(), true)
             .await
             .unwrap();
         let batch = &output.batches[0];
@@ -1524,6 +1705,7 @@ mod tests {
         assert_eq!(stripped.mm_placeholders, batch.mm_placeholders);
         assert_eq!(stripped.im_token_id, batch.im_token_id);
         assert_eq!(stripped.batched_keys, ["image_grid_thw"]);
+        assert_eq!(stripped.keep_on_cpu_keys, ["image_grid_thw"]);
         // This family lays its pixels out flat: they are named in `flat_keys`
         // with their sizes tensor, never in `batched_keys`, and the identity
         // drops the entry with the pixels.
@@ -1531,7 +1713,7 @@ mod tests {
         assert!(stripped.flat_keys.is_empty());
 
         let output = pipeline
-            .process(vec![1, 32000, 2], &items, false)
+            .process(vec![1, 32000, 2], items.to_vec(), false)
             .await
             .unwrap();
         assert!(output.identity.is_none());
@@ -1541,44 +1723,14 @@ mod tests {
     /// Runs where ffmpeg and ffprobe are installed, skips elsewhere.
     #[tokio::test]
     async fn sglang_mixed_media_preserves_interleaved_anchors() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
         if !video_tools_available() {
             return;
         }
-        let (_dir, pipeline) = vision_test_pipeline(
-            r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
-            &[
-                ("<|image|>", 32000),
-                ("<|begin_of_image|>", 32001),
-                ("<|end_of_image|>", 32002),
-                ("<|video|>", 32003),
-                ("0.0", 32004),
-                ("seconds", 32005),
-            ],
-        )
-        .await;
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::ImageRgb8(image::RgbImage::new(56, 56))
-            .write_to(&mut png, image::ImageFormat::Png)
-            .unwrap();
-        let video = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../crates/multimodal/tests/fixtures/videos/testsrc_128x96_8fps_1s.mp4"
-        ));
-        let item = |modality, url| WorkerMediaItem { modality, url };
+        let (_dir, pipeline) = glm_video_test_pipeline().await;
         // Match the reference adapter: URLs grouped by modality, while the
         // actual prompt interleaves media in either order.
-        let image = item(
-            Modality::Image,
-            format!(
-                "data:image/png;base64,{}",
-                STANDARD.encode(png.into_inner())
-            ),
-        );
-        let video = item(
-            Modality::Video,
-            format!("data:video/mp4;base64,{}", STANDARD.encode(video)),
-        );
+        let image = blank_png_item();
+        let video = testsrc_video_item();
         for prompt in [
             vec![1, 32000, 2, 32003, 2, 32000, 2],
             vec![1, 32003, 2, 32000, 2, 32000, 2],
@@ -1586,11 +1738,11 @@ mod tests {
             let video_first = prompt[1] == 32003;
             let items = [image.clone(), image.clone(), video.clone()];
             let (tokens, mm, extras) = pipeline
-                .process_sglang(prompt.clone(), &items)
+                .process_sglang(prompt.clone(), items.to_vec())
                 .await
                 .unwrap();
             let expected = pipeline
-                .process_inputs(prompt, &items, RuntimeType::Sglang)
+                .process_inputs(prompt, items.to_vec(), RuntimeType::Sglang, None)
                 .await
                 .unwrap();
             assert_eq!(tokens, expected.expanded_token_ids);
@@ -1633,36 +1785,17 @@ mod tests {
     /// Runs where ffmpeg and ffprobe are installed, skips elsewhere.
     #[tokio::test]
     async fn sglang_glm_video_preserves_tensors_and_temporal_patch_offsets() {
-        use base64::{engine::general_purpose::STANDARD, Engine};
         if !video_tools_available() {
             return;
         }
-        let (_dir, pipeline) = vision_test_pipeline(
-            r#"{"model_type":"glm53_flash","image_token_id":32000}"#,
-            &[
-                ("<|image|>", 32000),
-                ("<|begin_of_image|>", 32001),
-                ("<|end_of_image|>", 32002),
-                ("<|video|>", 32003),
-                ("0.0", 32004),
-                ("seconds", 32005),
-            ],
-        )
-        .await;
-        let bytes = include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../crates/multimodal/tests/fixtures/videos/testsrc_128x96_8fps_1s.mp4"
-        ));
-        let items = [WorkerMediaItem {
-            modality: Modality::Video,
-            url: format!("data:video/mp4;base64,{}", STANDARD.encode(bytes)),
-        }];
+        let (_dir, pipeline) = glm_video_test_pipeline().await;
+        let items = [testsrc_video_item()];
         let (tokens, sglang, _) = pipeline
-            .process_sglang(vec![1, 32003, 2], &items)
+            .process_sglang(vec![1, 32003, 2], items.to_vec())
             .await
             .unwrap();
         let vllm = pipeline
-            .process(vec![1, 32003, 2], &items, false)
+            .process(vec![1, 32003, 2], items.to_vec(), false)
             .await
             .unwrap();
         assert_eq!(tokens, vllm.prompt_token_ids);
@@ -1703,6 +1836,75 @@ mod tests {
             panic!("worker pipeline must return inline tensors")
         };
         assert_eq!(&sglang.pixel_values.as_ref().unwrap().data, pixels);
+    }
+
+    /// The identity of a request spanning two modalities strips its extra
+    /// batch by the same rule as the first: the video batch rides without
+    /// its pixels, with its inline grid tensors alone, and with its hashes
+    /// and placeholders as sent. Runs where ffmpeg and ffprobe are
+    /// installed, skips elsewhere.
+    #[tokio::test]
+    async fn the_worker_side_identity_strips_the_extra_batch_too() {
+        if !video_tools_available() {
+            return;
+        }
+        let (_dir, pipeline) = glm_video_test_pipeline().await;
+        let items = [blank_png_item(), testsrc_video_item()];
+        let output = pipeline
+            .process(vec![1, 32000, 2, 32003, 2], items.to_vec(), true)
+            .await
+            .unwrap();
+        assert_eq!(output.batches.len(), 2, "one batch per modality");
+        let video_batch = output
+            .batches
+            .iter()
+            .find(|batch| batch.model_specific_tensors.contains_key("video_grid_thw"))
+            .expect("the video's batch");
+        assert!(video_batch.pixel_values.is_some());
+        assert!(!video_batch.mm_hashes.is_empty());
+        let identity = output
+            .identity
+            .as_ref()
+            .expect("the identity the caller wanted");
+        assert_eq!(identity.prompt_token_ids, output.prompt_token_ids);
+        let [extra] = identity.extra_mm_inputs.as_slice() else {
+            panic!(
+                "one extra batch, the video's, not {}",
+                identity.extra_mm_inputs.len()
+            );
+        };
+        assert!(
+            extra.pixel_values.is_none(),
+            "the extra batch carries no pixels"
+        );
+        let mut kept: Vec<&String> = extra.model_specific_tensors.keys().collect();
+        kept.sort();
+        assert_eq!(
+            kept,
+            ["video_grid_thw", "video_second_per_grid"],
+            "the inline grids alone ride"
+        );
+        assert_eq!(extra.mm_hashes, video_batch.mm_hashes);
+        assert_eq!(extra.mm_placeholders, video_batch.mm_placeholders);
+        assert_eq!(extra.modality, video_batch.modality);
+        assert_eq!(extra.im_token_id, video_batch.im_token_id);
+        // The key lists shrink to the tensors that stay: the pixels' entry
+        // goes, the two grids keep theirs. Pinned whole: an emptied list
+        // passes any check over its members.
+        let mut batched: Vec<&String> = extra.batched_keys.iter().collect();
+        batched.sort();
+        assert_eq!(batched, ["video_grid_thw", "video_second_per_grid"]);
+        assert_eq!(extra.keep_on_cpu_keys, ["video_grid_thw"]);
+        assert!(extra.flat_keys.is_empty());
+        let first = identity
+            .mm_inputs
+            .as_ref()
+            .expect("the first batch's identity");
+        assert!(first.pixel_values.is_none());
+        assert_eq!(first.mm_hashes, output.batches[0].mm_hashes);
+        assert_eq!(first.batched_keys, ["image_grid_thw"]);
+        assert_eq!(first.keep_on_cpu_keys, ["image_grid_thw"]);
+        assert!(first.flat_keys.is_empty());
     }
 
     /// Only GLM with both tokenizer files can advertise the pixel-less contract.
@@ -1801,24 +2003,24 @@ mod tests {
         ]));
         let pipeline = WorkerMediaPipeline::new(settings, tokenizer).await.unwrap();
         for (width, height, tokens, router_tokens) in [
-            (1000, 1000, 1296, 1296),
-            (2200, 100, 216, 72),
-            (1000, 50, 320, 320),
-            (224, 112, 32, 32),
+            (1000, 1000, 1296, 1225),
+            (2200, 100, 288, 70),
+            (1000, 50, 288, 70),
+            (224, 112, 72, 72),
         ] {
             let mut bytes = std::io::Cursor::new(Vec::new());
             image::DynamicImage::new_rgb8(width, height)
                 .write_to(&mut bytes, image::ImageFormat::Png)
                 .unwrap();
-            let item = WorkerMediaItem {
-                modality: Modality::Image,
-                url: format!(
+            let item = WorkerMediaItem::new(
+                Modality::Image,
+                format!(
                     "data:image/png;base64,{}",
                     STANDARD.encode(bytes.into_inner())
                 ),
-            };
+            );
             let output = pipeline
-                .process(vec![1, 32000, 2], std::slice::from_ref(&item), false)
+                .process(vec![1, 32000, 2], vec![item.clone()], false)
                 .await
                 .unwrap();
             assert_eq!(
@@ -1836,7 +2038,7 @@ mod tests {
             // The router also accepts a non-grid request cap, before handing
             // the aligned dimensions to the same cached image processor.
             let plan = MediaPlan::new(vec![MediaContentPart::ImageUrl {
-                url: item.url,
+                url: item.url.into(),
                 detail: None,
                 uuid: None,
                 max_long_side_pixel: Some(1000),
@@ -1850,6 +2052,7 @@ mod tests {
                 CONFIG_KEY,
                 &pipeline.model_dir,
                 pipeline.assembly.image_wire_dtype(),
+                None,
                 llm_multimodal::TransparencyPolicy::CompositeOverWhite,
                 None,
             )
@@ -1896,12 +2099,9 @@ mod tests {
             "data:image/png;base64,AAAAAAAA",
             "DATA:image/png;base64,AAAAAAAA",
         ] {
-            let items = vec![WorkerMediaItem {
-                modality: Modality::Image,
-                url: url.to_string(),
-            }];
+            let items = [WorkerMediaItem::new(Modality::Image, url.to_string())];
             let error = pipeline
-                .process(vec![1, 2, 3], &items, false)
+                .process(vec![1, 2, 3], items.to_vec(), false)
                 .await
                 .unwrap_err();
             assert!(
@@ -1933,9 +2133,10 @@ mod tests {
         assert_eq!(data_url_payload_bytes("https://example.com/x.png"), None);
     }
 
-    /// A fetch that ran out of its budget is the media host's fault for now,
-    /// a reference the request got wrong the request's, neither the worker's,
-    /// both fetch failures to the client; a clip over the decoded-size cap is
+    /// A fetch that ran out of its budget is the media host's fault for now
+    /// (a fetch failure to the client); a reference the request got wrong is
+    /// the request's own, refused as sent; neither is the worker's; a clip
+    /// over the decoded-size cap is
     /// the request's own under the size code; a scratch file that failed on
     /// this side and a decoder this side cannot start are the worker's own,
     /// as is a failure with no connector error in its chain.
@@ -1959,7 +2160,7 @@ mod tests {
             classify(scheme),
             WorkerMediaError::Media {
                 fault: WorkerMediaFault::Client,
-                code: MediaErrorCode::FetchFailed,
+                code: MediaErrorCode::InvalidRequest,
                 ..
             }
         ));
@@ -1994,6 +2195,18 @@ mod tests {
         assert!(matches!(classify(decoder), WorkerMediaError::Internal(_)));
         let other = anyhow::anyhow!("preprocess failed");
         assert!(matches!(classify(other), WorkerMediaError::Internal(_)));
+        // A video part on a worker whose host lacks the video decoder is
+        // refused up front as this host's own fault (INTERNAL on the wire),
+        // which the router replays on another worker, as the decode's
+        // DecoderUnavailable was before the short-circuit.
+        let no_decoder = anyhow::Error::new(VideoDecoderUnavailable {
+            why: "ffmpeg executable not found; install ffmpeg to decode video_url inputs",
+        })
+        .context("Failed to process the plan");
+        assert!(matches!(
+            classify(no_decoder),
+            WorkerMediaError::Internal(message) if message.contains("ffmpeg executable not found")
+        ));
         // An item above the engine's encoder budget is the caller's, with the
         // item's size and the budget in the message, at any depth of the chain.
         let over_budget = anyhow::Error::new(ItemOverEncoderBudget {
@@ -2010,6 +2223,17 @@ mod tests {
             WorkerMediaError::Invalid(message)
                 if message.contains("192001 feature tokens (900 sampled frames)")
                     && message.contains("192000-token encoder budget")
+        ));
+        // A size the processor's rule refuses is the request's media.
+        let size = anyhow::Error::new(super::super::process::ImageSizeRefused("thin".into()))
+            .context("Failed to process the plan");
+        assert!(matches!(
+            classify(size),
+            WorkerMediaError::Media {
+                fault: WorkerMediaFault::Client,
+                code: MediaErrorCode::InvalidRequest,
+                ..
+            }
         ));
     }
     /// SGLang follows its day-0 source geometry and advertises pixel-less Decode reuse.
@@ -2062,6 +2286,15 @@ mod tests {
             loaded.video_preprocessor_config.as_ref().unwrap().do_resize,
             Some(false)
         );
+        // The family's entry stamps a video only where its config carries the mark.
+        assert_eq!(
+            loaded
+                .video_preprocessor_config
+                .as_ref()
+                .unwrap()
+                .get_extra::<bool>(llm_multimodal::minimax_resize::SGLANG_RESIZE_KEY),
+            Some(true)
+        );
         // Independent day-0 source resize: 112², 504², 1036², and 2016x112.
         for (width, height, tokens) in [
             (56, 56, 16),
@@ -2073,15 +2306,15 @@ mod tests {
             image::DynamicImage::new_rgb8(width, height)
                 .write_to(&mut bytes, image::ImageFormat::Png)
                 .unwrap();
-            let item = WorkerMediaItem {
-                modality: Modality::Image,
-                url: format!(
+            let item = WorkerMediaItem::new(
+                Modality::Image,
+                format!(
                     "data:image/png;base64,{}",
                     STANDARD.encode(bytes.into_inner())
                 ),
-            };
+            );
             let (ids, mm, _) = pipeline
-                .process_sglang(vec![1, 32000, 2], &[item])
+                .process_sglang(vec![1, 32000, 2], vec![item])
                 .await
                 .unwrap();
             assert_eq!(ids.iter().filter(|&&id| id == 32000).count(), tokens);
@@ -2161,6 +2394,7 @@ mod processor_kwargs_tests {
 #[cfg(test)]
 mod unsupported_model_tests {
     use llm_tokenizer::MockTokenizer;
+    use tracing_test::traced_test;
 
     use super::{tests::pipeline_settings, *};
 
@@ -2271,6 +2505,110 @@ mod unsupported_model_tests {
             );
         }
         assert_eq!(loader_rule_conflict(None, "gemma4", loader), None);
+    }
+
+    /// A start that states a loader rate walks a clip of the interval walk at
+    /// that rate, the rate the engine's own loader reads: a clip of twelve
+    /// seconds gives 25 frames at the rate 2 where the spec's default of 1
+    /// gives 13.
+    /// A value the loader takes for no rate, a start that states none and
+    /// every other sampler keep the default.
+    #[tokio::test]
+    async fn the_interval_walk_follows_the_rate_the_start_states() {
+        let dir = tempfile::Builder::new()
+            .prefix("minimax-m3-")
+            .tempdir()
+            .unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type":"minimax_m3_vl","image_token_index":32000}"#,
+        )
+        .unwrap();
+        let settings = WorkerMediaSettings {
+            video_loader_rule: Some("--media-io-kwargs video.fps=2".to_string()),
+            ..pipeline_settings(dir.path().to_str().unwrap())
+        };
+        let tokenizer = Arc::new(MockTokenizer::new().with_tokens(&[
+            ("]<]image[>[", 32000),
+            ("]<]start of image[>[", 32001),
+            ("]<]end of image[>[", 32002),
+        ]));
+        let pipeline = WorkerMediaPipeline::new(settings, tokenizer).await.unwrap();
+        assert_eq!(pipeline.components.video_start_fps, Some(2.0));
+        let frames = |sample_fps| {
+            let walk = llm_multimodal::VideoFetchConfig {
+                sample_fps,
+                sampling: FrameSampling::Interval,
+                ..Default::default()
+            };
+            llm_multimodal::media::sampled_frame_indices(360, 30.0, walk).len()
+        };
+        assert_eq!((frames(1.0), frames(2.0)), (13, 25));
+
+        let stated = "--media-io-kwargs video.fps=2";
+        for (rule, rate) in [
+            (Some(stated), Some(2.0)),
+            (
+                Some("VLLM_VIDEO_LOADER_BACKEND=opencv_dynamic; --media-io-kwargs video.fps=0.5"),
+                Some(0.5),
+            ),
+            (Some("--media-io-kwargs video.fps=-1"), None),
+            (Some("--media-io-kwargs video.fps=10"), None),
+            (Some("--media-io-kwargs video.fps=fast"), None),
+            (Some("--media-io-kwargs video.num_frames=8"), None),
+            (None, None),
+        ] {
+            assert_eq!(
+                interval_walk_start_fps(rule, FrameSampling::Interval),
+                rate,
+                "{rule:?}"
+            );
+        }
+        assert_eq!(
+            interval_walk_start_fps(Some(stated), FrameSampling::Even),
+            None
+        );
+    }
+
+    /// A stated rate the interval walk does not take is named in one warning
+    /// with its key and the range, zero and the negatives too. The engine's
+    /// own default, `-1`, and a rate inside the range, its edges included,
+    /// stay silent.
+    #[test]
+    #[traced_test]
+    fn a_start_rate_the_interval_walk_does_not_take_is_warned() {
+        for (stated, rate, warned) in [
+            ("0.2", Some(0.2), false),
+            ("5", Some(5.0), false),
+            ("-1", None, false),
+            ("-1.0", None, false),
+            ("0", None, true),
+            ("-2", None, true),
+            ("0.19", None, true),
+            ("5.01", None, true),
+            ("NaN", None, true),
+            ("fast", None, true),
+        ] {
+            let rule = format!("--media-io-kwargs video.fps={stated}");
+            assert_eq!(
+                interval_walk_start_fps(Some(&rule), FrameSampling::Interval),
+                rate,
+                "{stated}"
+            );
+            let field = format!("stated=\"{stated}\"");
+            logs_assert(|lines: &[&str]| {
+                let said: Vec<&&str> = lines.iter().filter(|line| line.contains(&field)).collect();
+                let named = said
+                    .iter()
+                    .filter(|line| line.contains("video.fps") && line.contains("0.2 to 5"))
+                    .count();
+                if (said.len(), named) == (usize::from(warned), usize::from(warned)) {
+                    Ok(())
+                } else {
+                    Err(format!("{stated}: {said:?}"))
+                }
+            });
+        }
     }
 
     /// A family on the engine's default loader passes the rules that loader

@@ -135,3 +135,66 @@ func TestGenerateRequestSkipsSpecialTokensAsTheParserNeeds(t *testing.T) {
 		})
 	}
 }
+
+// A forced call reaches the engine with its JSON-schema constraint: a named
+// function is held to that function's parameters, `required` to the list of
+// calls to any of the tools; a choice that forces no call sets no constraint.
+func TestGenerateRequestCarriesTheForcedCallConstraint(t *testing.T) {
+	handle, err := ffi.CreateTokenizerHandle(testTokenizerDir(t))
+	if err != nil {
+		t.Fatalf("tokenizer handle: %v", err)
+	}
+	defer ffi.FreeTokenizerHandle(handle)
+	scheduler := &capturingScheduler{}
+	client := &GrpcClient{
+		client:          scheduler,
+		tokenizerHandle: handle,
+		bufferSizes:     ChannelBufferSizes{ResultJSONChan: 16, ErrChan: 4, RecvChan: 4},
+		timeouts:        Timeouts{CloseTimeout: 5 * time.Second},
+	}
+
+	const parameters = `{"type":"object","properties":{"city":{"type":"string"}}}`
+	const request = `{"model":"m","messages":[{"role":"user","content":"hi"}],` +
+		`"tools":[{"type":"function","function":{"name":"get_weather","parameters":` + parameters + `}}]`
+	for _, tc := range []struct {
+		name       string
+		toolChoice string
+		wantType   string
+	}{
+		{name: "a named function", toolChoice: `{"type":"function","function":{"name":"get_weather"}}`, wantType: "object"},
+		{name: "required", toolChoice: `"required"`, wantType: "array"},
+		{name: "auto", toolChoice: `"auto"`, wantType: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream, err := client.CreateChatCompletionStream(context.Background(), request+`,"tool_choice":`+tc.toolChoice+`}`)
+			if err != nil {
+				t.Fatalf("CreateChatCompletionStream: %v", err)
+			}
+			defer stream.Close()
+			got := scheduler.last()
+			if got == nil || got.SamplingParams == nil {
+				t.Fatal("no generate request reached the scheduler")
+			}
+			schema, held := got.SamplingParams.Constraint.(*proto.SamplingParams_JsonSchema)
+			if tc.wantType == "" {
+				if got.SamplingParams.Constraint != nil {
+					t.Fatalf("constraint = %#v, want none", got.SamplingParams.Constraint)
+				}
+				return
+			}
+			if !held {
+				t.Fatalf("constraint = %#v, want a JSON schema", got.SamplingParams.Constraint)
+			}
+			var decoded map[string]interface{}
+			if err := json.Unmarshal([]byte(schema.JsonSchema), &decoded); err != nil {
+				t.Fatalf("the constraint is not a JSON schema: %v (%q)", err, schema.JsonSchema)
+			}
+			if decoded["type"] != tc.wantType {
+				t.Fatalf("constraint schema type = %v, want %q (%s)", decoded["type"], tc.wantType, schema.JsonSchema)
+			}
+			if tc.wantType == "object" && schema.JsonSchema != parameters {
+				t.Fatalf("constraint schema = %s, want the function's parameters %s", schema.JsonSchema, parameters)
+			}
+		})
+	}
+}
