@@ -78,6 +78,10 @@ pub struct WorkerSelectionPolicy {
     filters: Vec<Box<dyn WorkerFilter>>,
     scorers: Vec<Box<dyn WorkerScorer>>,
     picker: Box<dyn WorkerPicker>,
+    /// Whether the picker acts on a request's end
+    /// ([`WorkerPicker::on_request_complete`]): yes unless the policy was
+    /// built with [`Self::picker_ignores_request_complete`].
+    picker_hears_request_complete: bool,
 }
 
 impl WorkerSelectionPolicy {
@@ -94,7 +98,22 @@ impl WorkerSelectionPolicy {
             filters,
             scorers,
             picker,
+            picker_hears_request_complete: true,
         }
+    }
+
+    /// Says the picker leaves [`WorkerPicker::on_request_complete`] empty, so
+    /// a host that books nothing of its own need not be told of a request's
+    /// end. A picker that gives the hook a body is never built with this.
+    pub(super) fn picker_ignores_request_complete(mut self) -> Self {
+        self.picker_hears_request_complete = false;
+        self
+    }
+
+    /// Whether the picker acts on a request's end. A constant for the
+    /// policy's lifetime.
+    pub(crate) fn hears_request_complete(&self) -> bool {
+        self.picker_hears_request_complete
     }
 
     pub fn name(&self) -> &'static str {

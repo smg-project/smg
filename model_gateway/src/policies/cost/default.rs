@@ -89,4 +89,7 @@ pub(super) fn policy(temperature: f32) -> WorkerSelectionPolicy {
         vec![Box::new(NegatedAffinity)],
         Box::new(AffinityGroupPicker { temperature }),
     )
+    // `AffinityGroupPicker` books nothing: its `on_request_complete` is the
+    // trait's empty default.
+    .picker_ignores_request_complete()
 }

@@ -186,8 +186,10 @@ The servicer relays the engine's publisher into `SubscribeKvEvents` through one 
   fleet's (`--worker-warmup-thin-ratio`), receives a share of cache-miss traffic until its index has
   grown, so an empty index does not starve it while every prompt has a holder elsewhere.
 - **Completion reporting and the selection layer.** Every request's end reaches the policy that
-  placed it through the worker's load guard, on every path; booked state is reconciled with the
-  live in-flight count each poll. Worker selection runs through a cost-function selection layer
+  placed it through the worker's load guard, on every path, while that policy books dispatches
+  (`--selection-accounting-ttl-ms` above 0), and booked state is reconciled with the live
+  in-flight count each poll; until a policy that acts on a request's end is registered, the end
+  is reported to none. Worker selection runs through a cost-function selection layer
   (`model_gateway/src/policies/cost/`) whose default reproduces the existing cache-aware decision;
   event-driven requests are hashed under their cache namespace.
 - **Protection by default.** Worker overload protection is on as steering: a worker at or above

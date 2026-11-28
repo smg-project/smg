@@ -4133,9 +4133,10 @@ mod tests {
         );
     }
 
-    /// Of the stock policies cache_aware alone hears a request's end, and a
-    /// policy that hears is noted on every road it enters the registry by:
-    /// as the default, for a model's hint and on each side.
+    /// Of the stock policies cache_aware alone hears a request's end, and
+    /// only while it books dispatches (`selection_accounting_ttl_ms` above
+    /// 0). A policy that hears is noted on every road it enters the registry
+    /// by: as the default, for a model's hint and on each side.
     #[test]
     fn a_policy_that_hears_is_noted_on_every_road_it_enters_by() {
         let heard = |registry: &PolicyRegistry| registry.completion_heard.load(Ordering::Acquire);
@@ -4151,6 +4152,7 @@ mod tests {
             "manual",
             "consistent_hashing",
             "prefix_hash",
+            "cache_aware",
         ] {
             let registry = quiet();
             let policy = registry.on_worker_added("model", Some(name));
@@ -4158,14 +4160,33 @@ mod tests {
             assert!(!heard(&registry), "{name}");
         }
 
-        let by_hint = quiet();
+        // A cache_aware that books nothing, the default, is the tenth that
+        // does not hear.
+        assert!(!heard(&PolicyRegistry::new(cache_aware_config())));
+
+        let booking = || {
+            let mut config = cache_aware_config();
+            if let PolicyConfig::CacheAware {
+                selection_accounting_ttl_ms,
+                ..
+            } = &mut config
+            {
+                *selection_accounting_ttl_ms = 500;
+            }
+            PolicyRegistry::new(config)
+        };
+        assert!(heard(&booking()));
+
+        // A hinted cache_aware takes the operator's settings and so books
+        // too. The default policy set the word already: it is cleared to
+        // show the hint's road alone.
+        let by_hint = booking();
+        by_hint.completion_heard.store(false, Ordering::Release);
         assert_eq!(
             by_hint.on_worker_added("model", Some("cache_aware")).name(),
             "cache_aware"
         );
         assert!(heard(&by_hint));
-
-        assert!(heard(&PolicyRegistry::new(cache_aware_config())));
 
         for set in [
             PolicyRegistry::set_prefill_policy,

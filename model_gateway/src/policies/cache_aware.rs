@@ -1340,6 +1340,14 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         self.selection.on_request_complete(worker_url);
     }
 
+    /// Yes only while the policy books dispatches: its optimistic accounting
+    /// stands (`selection_accounting_ttl_ms > 0`) or the picker of its
+    /// selection policy acts on a request's end. Else `on_request_complete`
+    /// does nothing, and a registry need not walk to it.
+    fn hears_request_complete(&self) -> bool {
+        self.accounting.is_some() || self.selection.hears_request_complete()
+    }
+
     fn name(&self) -> &'static str {
         "cache_aware"
     }
