@@ -660,16 +660,35 @@ itself. Every request carries its own token ids, so prefix caching never
 hides a prefill, and the engine's prefix cache is flushed at the end. One INFO line per shape
 with its time (a chunk remainder's at DEBUG, with an INFO progress line every
 500 remainders and one at their end); readiness (the gRPC health service, so the startup and
-readiness probes) stays NOT_SERVING until the pass ran, and flips SERVING
-whatever the pass returned (a failed request is a logged line, never a worker
-kept out of rotation). `SMG_VLLM_SERVICER_WARMUP` = `full` (the default:
+readiness probes) stays NOT_SERVING until the pass ran. Partial coverage,
+explicit request refusals and ordinary warm-up errors remain best effort,
+subject to the supervisor's current server/engine health checks. On the Rust
+path, a Generate deadline, cancellation or lost connection leaves its
+engine-side completion unconfirmed: a later successful request or cache flush
+is not an acknowledgement that the old request was cancelled or drained.
+That worker keeps NOT_SERVING and exits nonzero through server/engine cleanup;
+a fresh engine must start before admission. The plan and request shapes are
+unchanged, and an unsupported cache flush alone is still a logged line. The
+shared asynchronous pass records the same transport facts; the Python
+servicer's health/shutdown decision policy is unchanged, but the shared pass
+can lengthen its NOT_SERVING window. `SMG_VLLM_SERVICER_WARMUP` = `full` (the default:
 every 128-token class; about a minute on a 16k step), `fast` (the tuners'
 bucket grid only: seconds), `off`, a budget in seconds (`120`) or
-`<level>:<seconds>` (`fast:30`); the budget (default 300 s; 900 s for
-TokenSpeed, whose plan holds the chunk remainders, below) bounds the pass:
-it ends between shapes, the remaining ones named in the log, and each
-request's timeout is clamped to what is left of it (one second at least), so
-a shape that hangs cannot hold readiness past the budget. On the Rust path the
+`<level>:<seconds>` (`fast:30`). The budget `B` (default 300 s; 900 s for
+TokenSpeed, whose plan holds the chunk remainders, below) controls admission
+of new steps: no step starts at or after `B`. It is not a hard wall-clock
+bound for the pass. Each admitted request keeps the fixed finite ceiling
+`D = min(R, max(initial B, F))`, where `R` is the caller's request timeout and
+`F` is the timeout floor (one second by default), rather than the shrinking
+budget remainder. For wires that honor their deadlines, Generate can take
+roughly `B + D`, plus fanout and scheduling overhead. A pass with recorded
+results attempts one final cache flush, with a separate 60-second deadline on
+the gRPC wires; generic in-process async flushes gain no new bound here. With the
+default caller timeout and
+floor, `fast:30` gives an admitted request a 30-second ceiling, so even a
+healthy 40-second cold JIT or kernel compile can time out. Its engine-side
+completion is then unconfirmed: the Rust worker stays NOT_SERVING and exits
+nonzero. On the Rust path the
 pass runs over the servicer's own gRPC port between the engine's handshake and
 SERVING, once the KV-event relay's subscription has reached the engine's
 publisher (the warm-up's batches are the engine's first, and a subscription

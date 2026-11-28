@@ -838,13 +838,13 @@ def test_the_async_pass_matches_the_blocking_one():
     assert len(wire.requests) == sum(len(step.requests) for step in plan.steps)
 
 
-def test_a_requests_timeout_is_the_callers_clamped_to_what_is_left_of_the_budget():
+def test_a_requests_timeout_is_the_callers_capped_to_the_initial_admission_budget():
     plan = plan_warmup(SMALL, "fast")
     wire = _Wire(delay=0.01)
     run_warmup(plan, wire, budget_secs=5.0, request_timeout_secs=600.0)
     assert len(wire.timeouts) == sum(len(step.requests) for step in plan.steps)
     assert max(wire.timeouts) <= 5.0 and min(wire.timeouts) >= warmup.REQUEST_TIMEOUT_FLOOR_SECS
-    assert wire.timeouts[0] > wire.timeouts[-1]  # the remainder shrinks as the pass runs
+    assert set(wire.timeouts) == {5.0}  # elapsed work does not shorten admitted requests
     wire = _Wire()
     run_warmup(plan, wire, budget_secs=5.0, request_timeout_secs=0.5)
     assert set(wire.timeouts) == {0.5}  # a shorter timeout of the caller's stands
@@ -865,6 +865,41 @@ def test_a_requests_timeout_is_the_callers_clamped_to_what_is_left_of_the_budget
     wire = AsyncWire()
     asyncio.run(warmup.run_warmup_async(plan, wire, budget_secs=5.0, request_timeout_secs=600.0))
     assert max(wire.timeouts) <= 5.0 and min(wire.timeouts) >= warmup.REQUEST_TIMEOUT_FLOOR_SECS
+    assert set(wire.timeouts) == {5.0}
+
+
+@pytest.mark.parametrize("async_wire", [False, True], ids=["blocking", "async"])
+def test_the_budget_admits_no_new_step_at_its_exact_boundary(monkeypatch, async_wire):
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(warmup, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    plan = plan_warmup(dataclasses.replace(SMALL, max_num_seqs=1), "fast")
+    assert len(plan.steps) > 2
+    assert all(len(step.requests) == 1 for step in plan.steps)
+
+    class Wire(_Wire):
+        def generate(self, request, timeout):
+            super().generate(request, timeout)
+            clock.now += 0.5
+
+    class AsyncWire(Wire):
+        async def generate(self, request, timeout):
+            await asyncio.sleep(0)
+            return super().generate(request, timeout)
+
+        async def flush_cache(self):
+            return super().flush_cache()
+
+    wire = AsyncWire() if async_wire else Wire()
+    if async_wire:
+        report = asyncio.run(warmup.run_warmup_async(plan, wire, budget_secs=1.0))
+    else:
+        report = run_warmup(plan, wire, budget_secs=1.0)
+    assert clock.now == report.secs == 1.0
+    assert len(wire.requests) == report.covered == 2
+    assert wire.timeouts == [1.0, 1.0]
+    assert report.errors == report.unrecovered_transport_errors == 0
+    assert report.budget_hit is True
+    assert wire.flushes == 1
 
 
 def test_a_hanging_request_cannot_hold_the_pass_past_the_budget(monkeypatch):
