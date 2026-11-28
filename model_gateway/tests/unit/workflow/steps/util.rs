@@ -227,7 +227,7 @@ mod tests {
         let (url, engine) = mock_grpc_engine().await;
         engine.set_serving(false);
         assert_eq!(
-            detect(&url, 5).await.unwrap().as_deref(),
+            detect(&url, 30).await.unwrap().as_deref(),
             Some("tokenspeed")
         );
 

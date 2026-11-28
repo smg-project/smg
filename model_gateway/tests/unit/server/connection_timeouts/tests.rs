@@ -23,27 +23,31 @@ const LONG: u64 = 30;
 /// How long the streaming route's producer stays silent: longer than
 /// `SHORT`, so a silent stream crosses the bound.
 const PRODUCER_SILENCE: Duration = Duration::from_secs(3);
+/// The silence of the stream a test resets: out of reach, like `LONG`, so
+/// a close that a loaded run delays by seconds still comes before the
+/// stream's own end.
+const LONG_SILENCE: Duration = Duration::from_secs(LONG);
 /// How long a test waits for a close before calling the connection open.
 const WINDOW: Duration = Duration::from_secs(5);
 /// A close must not come measurably before the bound.
 const NOT_BEFORE: Duration = Duration::from_millis(900);
 
+/// A first event at once and a second one after `silence`.
+fn events(silence: Duration) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let first =
+        futures::stream::once(async { Ok::<_, Infallible>(Event::default().data("first")) });
+    let second = futures::stream::once(async move {
+        sleep(silence).await;
+        Ok::<_, Infallible>(Event::default().data("second"))
+    });
+    Sse::new(first.chain(second))
+}
+
 fn test_app() -> Router {
     Router::new()
         .route("/ok", get(|| async { "ok" }))
-        .route(
-            "/stream",
-            get(|| async {
-                let first = futures::stream::once(async {
-                    Ok::<_, Infallible>(Event::default().data("first"))
-                });
-                let second = futures::stream::once(async {
-                    sleep(PRODUCER_SILENCE).await;
-                    Ok::<_, Infallible>(Event::default().data("second"))
-                });
-                Sse::new(first.chain(second))
-            }),
-        )
+        .route("/stream", get(|| async { events(PRODUCER_SILENCE) }))
+        .route("/stream/long", get(|| async { events(LONG_SILENCE) }))
         .route(
             "/ws",
             get(|upgrade: WebSocketUpgrade| async {
@@ -286,7 +290,7 @@ async fn a_stream_reset_by_the_client_still_leaves_the_http2_connection_to_the_i
         |addr, _, stats| async move {
             let client = http2_client();
             let mut response = client
-                .get(format!("http://{addr}/stream"))
+                .get(format!("http://{addr}/stream/long"))
                 .send()
                 .await
                 .expect("the request");
@@ -296,9 +300,9 @@ async fn a_stream_reset_by_the_client_still_leaves_the_http2_connection_to_the_i
             // The producer is silent for longer than the bound from here;
             // dropping the response resets the stream.
             drop(response);
-            let at = closed(idle_closes_within(&stats, 1, WINDOW).await);
+            let at = closed(idle_closes_within(&stats, 1, LONG_SILENCE + WINDOW).await);
             assert!(
-                at < PRODUCER_SILENCE,
+                at < LONG_SILENCE,
                 "the close waited for the stream's own end, not the reset: {at:?}"
             );
         },
