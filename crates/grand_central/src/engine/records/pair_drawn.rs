@@ -72,7 +72,7 @@ impl PoolRecords {
         if !admits() {
             return None;
         }
-        // The classes are asked last: the question reads every row's class.
+        // The classes are asked last: a yes reads every row's class.
         if !pairs() {
             return None;
         }
