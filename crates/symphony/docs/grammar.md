@@ -107,6 +107,16 @@ and the call's end carries the terminal that ends the turn wherever the model st
 table has one (Kimi K3's message close), since nothing may follow; a turn a stop token ends has
 nothing after the call.
 
+Where a call is required and several are allowed, free text after a call would be read as content
+beside the calls. A table whose layout says what its template writes between two calls
+(`Layout::between_calls`) therefore gets a tag of one or more calls and no free text. In the tag
+built from the table's markers that text may follow each call, once or twice (between two calls
+and before the turn ends), nothing else may, and the terminal that ends the turn comes last where
+the table has one; in the tag written from the layout that text stands between two calls and the
+layout's `after_calls` follows the last. A table that says no such text keeps the tag that opens
+in free text. In a block syntax the text between two calls is written inside the block, and none
+stands between two blocks.
+
 `Format::answer_grammar` is the tag for an answer that is JSON a schema accepts, the
 `response_format` of a request, from the same table: the rows into the state the answer is written
 in, the schema, and the answer's close with the end of the turn. Where the output starts in

@@ -33,6 +33,16 @@ The definition is the table below; the `Engine` runs it, and decides everything 
   table's, the close kept (`registry`). The Nemotron 3 groups' thinking-off prompt ends with the
   bare `<think></think>`, so the newline stays the tag's; Step 3.5 Flash's prompt always opens the
   thought.
+- Between two calls the Qwen3 and Qwen 3.5 templates write one newline
+  (`</tool_call>\n<tool_call>`), which the table's layout carries too (`between_calls`): the tag
+  of a required turn that may hold several calls takes the calls, that newline after each once,
+  twice or not at all, and no other text (`grammar`). A group's `after` does not replace it. The
+  NVIDIA Nemotron 3 groups' templates write the same one newline; the LFM3 templates and d1-2B's
+  write two (`</tool_call>\n\n<tool_call>`), and Step 3.5 Flash's and Step 5 Preview's write
+  nothing (`</tool_call><tool_call>`): the tag takes both, since the newline may stand twice or
+  be left out. The fixture test
+  `every_recorded_qwen3_models_text_between_two_calls_is_one_its_tag_takes` reads every recorded
+  group's rendering against this and names the groups that write nothing or two newlines.
 
 The tests here are the engine's as much as this format's: they were written against the hand-written
 parser this table replaced, and hold the table to the same events.
