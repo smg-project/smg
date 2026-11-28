@@ -146,7 +146,7 @@ fn holders(tree: &TokenTree, tokens: &[u32]) -> Vec<WorkerId> {
 ///
 /// The classic policy answers the same: its tree matches the whole prompt,
 /// and the share is over the threshold
-/// (`model_gateway/src/policies/cache_aware.rs:3473-3491`).
+/// (`select_worker_with_tokens`, `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_conversation_placed_by_the_one_call_goes_back_to_its_worker() {
     let (engine, _tree) = lent("cache_aware", Also::Nothing);
@@ -378,8 +378,8 @@ fn a_request_that_states_no_entry_leaves_the_tree_alone() {
 ///
 /// The classic router sends to no worker the rule refuses, and its policy
 /// stores the worker it selects among the ones the rule left
-/// (`model_gateway/src/routers/common/placement.rs:504-509`,
-/// `model_gateway/src/policies/cache_aware.rs:3470-3491`).
+/// (`model_gateway/src/routers/common/placement.rs:504-509`, and
+/// `select_worker_with_tokens`, `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_prompt_is_stored_for_the_worker_its_rule_admits() {
     let (engine, tree) = lent("cache_aware", Also::Nothing);
@@ -550,7 +550,8 @@ fn a_rule_is_asked_of_a_target_once_a_decision() {
 ///
 /// The classic policy picks among the workers that can be sent to, and
 /// stores the one it selects
-/// (`model_gateway/src/policies/cache_aware.rs:1497-1499`, `:3470-3491`).
+/// (`select_worker_scanned` and `select_worker_with_tokens`,
+/// `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_target_that_cannot_be_sent_to_is_passed_over_inside_the_lookup() {
     let (engine, tree, _) = lent_in_order();

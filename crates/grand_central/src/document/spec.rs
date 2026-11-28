@@ -258,14 +258,18 @@ pub struct Needs {
     /// `token_hashes` reads the request's holders from the index. For its
     /// profile a host names a single request of token ids by the index
     /// alone where the model's index holds a block, and every other
-    /// request's holders in the index ahead of the record's. A stage that
-    /// reads the events for another fact of a row, as a warm-up does,
-    /// declares no hashes beside it.
+    /// request's holders in the index ahead of the record's. Neither
+    /// holds for a request decided inside a placement map its host lends
+    /// under a hash index: that map alone names it, and no index is read.
+    /// A stage that reads the events for another fact of a row, as a
+    /// warm-up does, declares no hashes beside it.
     pub events: bool,
     /// The stage reads the prefixes sent to each worker. Beside a stage of
     /// its profile that reads a request's holders from the index, it is
     /// named none for a single request of token ids under a model whose
-    /// index holds a block: the index names that request alone.
+    /// index holds a block: the index names that request alone, unless
+    /// its host lends a placement map under a hash index. That map then
+    /// names it alone.
     #[serde(default)]
     pub sent_prefixes: bool,
     /// A consistent-hash ring per model. A host that keeps one lends it with
@@ -588,6 +592,12 @@ pub enum IndexKind {
     /// at any boundary; a document written by hand writes `threshold: 0`
     /// for the same. No placement of the engine's record expires: the
     /// index's `max_size` bounds the record instead.
+    ///
+    /// A host of the in-process engine may lend its own placement map for
+    /// a model in the record's place. A single request whose host names
+    /// its token ids is then decided inside that map: by the ids
+    /// themselves at every boundary the prompt reaches, each holder living
+    /// `ttl_s`. The record is not read there.
     Hash,
 }
 
@@ -601,8 +611,9 @@ pub enum IndexKind {
 pub struct IndexSpec {
     pub kind: IndexKind,
     /// How long a placement of the classic hash index stays routable, in
-    /// seconds. The crate's engine does not read it: no placement of its
-    /// record expires.
+    /// seconds. The in-process engine reads a placement map its host lends
+    /// by it: a holder touched longer ago is not named. Its own record
+    /// does not read it: no placement of the record expires.
     #[schemars(range(min = 1))]
     pub ttl_s: u32,
     /// The size bound of a tree index, summed over the workers: on a text
@@ -621,7 +632,9 @@ pub struct IndexSpec {
     /// each tree of a model, by itself, toward `max_size`, and writes take a
     /// tree past it until the next. At `4294967295` it starts no sweep: a
     /// tree under such an entry is held to no size. The engine's record
-    /// keeps its bound at any cadence.
+    /// keeps its bound at any cadence. Under a hash index each sweep takes
+    /// the placements past `ttl_s` out of the gateway's map, and with no
+    /// sweep the map is held to no size.
     #[schemars(range(min = 1))]
     pub sweep_s: u32,
 }
@@ -760,10 +773,13 @@ pub enum AffinitySource {
     /// The record of the prefixes sent alone.
     Predictor,
     /// Each worker by what it has: its cache events where it publishes
-    /// them, and the prefixes sent to it where it does not. A request
-    /// hashed by its text reads the prefixes sent to every worker: cache
-    /// events are token blocks. A single request of token ids under a
-    /// model whose index holds a block is read from the index alone.
+    /// them, and the prefixes sent to it where it does not. That is for a
+    /// request no placement map names: under a hash index a single request
+    /// whose host lends its map is named by that map alone. Of the others,
+    /// a request hashed by its text reads the prefixes sent to every
+    /// worker, since cache events are token blocks, and a single request
+    /// of token ids under a model whose index holds a block is read from
+    /// the index alone.
     #[default]
     Merged,
 }
@@ -2509,8 +2525,9 @@ pub struct SessionsSpec {
     /// Whether a request this rule placed alone is the profile's own
     /// (default `told`). Under `untold` no stage hears that request's
     /// issue or its dispatch, it is none of the profile's sends, and
-    /// neither the engine's record of sent prefixes nor a lent tree
-    /// takes its prompt. The session table still hears its dispatch,
+    /// nothing takes its prompt: not the engine's record of sent
+    /// prefixes, not a lent tree, not a lent placement map. The
+    /// session table still hears its dispatch,
     /// and the stages its completion and its release. Under the `pd-pair`
     /// plan each side of a pair follows the word on its own: a side the
     /// rule placed alone is kept from that side's profile, beside a side

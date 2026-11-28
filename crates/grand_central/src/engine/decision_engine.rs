@@ -238,11 +238,16 @@ pub trait RequestMaker {
     /// prompt, and from a maker that does not say. `page` is the tree's
     /// page in tokens, which the marker of a cache partition fills whole.
     ///
+    /// Under a hash index it is the request's entry in the placement map
+    /// the host lends ([`CacheIndexes::placement_map`]), asked for at a
+    /// page of one token: the marker is then the partition's two ids.
+    ///
     /// Asked at most once a decision, and only where the host lends the
-    /// request's place such a tree: never by a place one pick decides, and
-    /// never by an engine that reads its own rows.
+    /// request's place such a tree or map: never by a place one pick
+    /// decides, and never by an engine that reads its own rows.
     ///
     /// [`CacheIndexes::token_tree`]: crate::engine::CacheIndexes::token_tree
+    /// [`CacheIndexes::placement_map`]: crate::engine::CacheIndexes::placement_map
     #[cfg(feature = "in-process")]
     fn token_key(&self, page: usize) -> Option<TokenKey<'_>> {
         let _ = page;
@@ -268,9 +273,9 @@ pub trait RequestMaker {
 
     /// Whether the request's caller sends it to `target`, a target of the
     /// decision's pick. A decision that stores where its prompt went, in
-    /// the host's token tree ([`Self::token_key`]), in its string tree
-    /// ([`Self::text_key`]) or in the engine's record of sent prefixes,
-    /// asks it of the pick's targets, best first,
+    /// the host's token tree or placement map ([`Self::token_key`]), in
+    /// its string tree ([`Self::text_key`]) or in the engine's record of
+    /// sent prefixes, asks it of the pick's targets, best first,
     /// and stores the prompt for the first one answered `true`: for none
     /// where each is answered `false`, so neither names a worker the
     /// request was not sent to. A pair's decode decided again asks it of
@@ -443,13 +448,21 @@ pub enum WorkerLists<'a> {
 /// within the marker, and says how long the marker is. The engine keeps two
 /// partitions apart exactly as well as these ids do.
 ///
+/// Under a hash index it is the prompt's entry in the placement map the
+/// host lends ([`CacheIndexes::placement_map`]), asked for at a page of one
+/// token. The marker is then two ids, which are hashed ahead of each head,
+/// or none: an entry with a marker of any other length names nobody.
+///
 /// It is never a field of a request's facts: no stage, trace or kept
 /// sample holds a client's tokens. Its `Debug` prints sizes alone.
+///
+/// [`CacheIndexes::placement_map`]: crate::engine::CacheIndexes::placement_map
 #[cfg(feature = "in-process")]
 #[non_exhaustive]
 pub struct TokenKey<'a> {
-    /// The ids the tree is matched and written by: the prompt's token ids,
-    /// behind the partition's marker where the request has one.
+    /// The ids the tree is matched and written by, or the placement map
+    /// read and written by: the prompt's token ids, behind the partition's
+    /// marker where the request has one.
     pub tokens: Cow<'a, [u32]>,
     /// How many of the leading ids are the marker and no part of the
     /// prompt: a match's length has them taken off. Zero with no partition.

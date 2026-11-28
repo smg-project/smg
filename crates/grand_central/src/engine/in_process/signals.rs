@@ -131,11 +131,11 @@ impl PoolMembers {
 /// column.
 ///
 /// `maker` is the request's own, handed on with the copy: where the
-/// request's host lends a tree, the copy's decision asks it for the
-/// request's entry there. It is taken as a trait object, so this function
-/// is compiled once, and the copy's decision is no second caller of the
-/// decision a request with no cells takes: as one, it put that decision
-/// out of line for every request. `late` is handed on with it
+/// request's host lends a tree or a placement map, the copy's decision asks
+/// it for the request's entry there. It is taken as a trait object, so this
+/// function is compiled once, and the copy's decision is no second caller
+/// of the decision a request with no cells takes: as one, it put that
+/// decision out of line for every request. `late` is handed on with it
 /// ([`Loaded::decide_into`]).
 #[inline(never)]
 #[expect(

@@ -625,7 +625,9 @@ pub enum OverlapSource {
 /// statement, so nothing is stated of the decode. A decision given no rows
 /// states nothing. Neither does a pair's decode decided again, an encode
 /// request's pair, or a pick the binding's sessions rule keeps from the
-/// profile.
+/// profile. A single request decided inside a placement map its host
+/// lends under a hash index states no share, as the classic policy
+/// observes no match ratio under that index.
 /// [`Engine::decide`](crate::engine::Engine::decide) itself states nothing.
 ///
 /// A request decided inside a tree its host lends is given the rows the
@@ -755,10 +757,11 @@ impl Overlap {
 /// (`lease_events::stages_hear`): by the front in a gateway's own process,
 /// and by a controller where it files the pick's lease. Under `untold` no
 /// stage hears the issue or the dispatch of such a single request, the
-/// record of sent prompts takes no entry behind it and a lent tree
-/// stores no prompt for it, as a gateway's sticky map keeps a request it
-/// places from the gateway's policy. Under `told`, the default, the stages
-/// hear both and where the prompt went is kept as behind any pick. The
+/// record of sent prompts takes no entry behind it, and a lent tree or
+/// placement map stores no prompt for it, as a gateway's sticky map keeps
+/// a request it places from the gateway's policy. Under `told`, the
+/// default, each of the two is heard by the stages that name it, and
+/// where the prompt went is kept as behind any pick. The
 /// session table hears the dispatch under either. Each side of a pair is
 /// placed by a decision of its own and states its own word: the pick the
 /// prefill side's, and its pairs the decode side's

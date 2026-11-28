@@ -113,12 +113,14 @@ fn a_profile_of_the_engines_own_filters_draws_as_one_asked_a_call_a_filter() {
 /// own. Over every set of the engine's filters, as the build folds them
 /// and as a host's own, the function and a call a filter agree on every
 /// row: under a mask, a row tried, a row excluded and the overload veto
-/// lifted.
+/// lifted. Its hard part agrees the same way with a call to each filter
+/// that says it is not soft ([`Filter::soft`]), on both roads: the folded
+/// test less its soft bits, and a host's filters one by one.
 #[test]
 fn the_namings_test_is_the_draws_own() {
     use crate::stages::filters::tests::filters_of;
     let (pool, mask) = tested_rows();
-    let mut refused = 0u32;
+    let (mut refused, mut softly) = (0u32, 0u32);
     for set in 0..32u8 {
         let folded = engine_of(filters_of(set), Box::new(Random));
         let hosted = filters_of(set)
@@ -148,11 +150,21 @@ fn the_namings_test_is_the_draws_own() {
                     let at = format!("set {set:#07b}, {built}, seed {seed}");
                     assert_eq!(keeps.keeps(row), want, "{at}, row {}", row.position);
                     refused += u32::from(!want);
+                    let mut hard = asked.iter().filter(|filter| !filter.soft());
+                    let hard = hard.all(|filter| filter.keep(&facts, row, &cx));
+                    assert_eq!(keeps.keeps_hard(row), hard, "{at}, row {}", row.position);
+                    softly += u32::from(hard && !want);
                 }
             }
         }
     }
-    assert!(refused > 10_000, "{refused} rows refused");
+    // The spread of the case's own rows, counted by the filters' word:
+    // rows the soft filters alone refuse are among them, where the hard
+    // part and the whole test part.
+    assert!(
+        refused > 10_000 && softly > 1_000,
+        "{refused} rows refused, {softly} by soft filters alone"
+    );
 }
 
 /// The function answers none where the pass alone can say which rows

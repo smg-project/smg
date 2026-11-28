@@ -156,7 +156,7 @@ fn a_number_handed_on_under_a_lookup_names_nobody() {
 /// again inside its second and names the young worker by its age. The
 /// classic policy calls its warm-up slice on its road of cache events
 /// alone, which it takes once the index holds a block
-/// (`model_gateway/src/policies/cache_aware.rs:1802-1808`).
+/// (`event_index_for`, `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_models_first_block_names_a_single_request_its_young_worker() {
     let (affinity, index, _tree) = lending_whenever();

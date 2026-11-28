@@ -1190,10 +1190,11 @@ impl Loaded<'_, '_> {
     /// too, as the copy that carries them ([`signals::decide`]).
     ///
     /// `maker` is the request's own, handed on for its entry in a token
-    /// tree its host lends. A copy that carries signal cells is decided
-    /// inside that tree like the request it was made of, and hands its
-    /// maker as a trait object ([`signals::decide`]). `late` is handed on
-    /// with it ([`Self::decide_into`]).
+    /// tree or a placement map its host lends. A copy that carries signal
+    /// cells is decided inside that tree or map like the request it was
+    /// made of, and hands its maker as a trait object
+    /// ([`signals::decide`]). `late` is handed on with it
+    /// ([`Self::decide_into`]).
     #[inline]
     #[expect(
         clippy::too_many_arguments,

@@ -19,7 +19,8 @@
 //! ([`IndexKind`](crate::document::spec::IndexKind)). Under `tree` a key is
 //! a block of the request. Under `hash` the engine hands in one key for
 //! each boundary of the view the request reaches, and the record is the
-//! same.
+//! same. Where a host lends its placement map under `hash`, a single
+//! request is decided inside that map and reads no record.
 //!
 //! Nothing here is locked or ordered against another thread. A read takes
 //! the predictor by a shared reference and writes nothing, so an owner may

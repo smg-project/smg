@@ -130,10 +130,11 @@ pub(crate) fn stated_facts(workers: &[Arc<dyn Worker>]) -> Box<[FixedFacts]> {
 /// - The prompt's text and token ids, and the two seeds of its cache
 ///   partition. The engine hashes the prompt under them, where a classic
 ///   policy keys its trees under the partition's marker.
-/// - The prompt's entry in the tree the gateway lends the engine for it
-///   ([`PromptEntry`]): the inputs themselves, which name the classic
-///   policy's key, by the prompt's token ids or by its text. The engine
-///   asks for it where a decision reads that tree, and of no other request.
+/// - The prompt's entry in the tree or the placement map the gateway lends
+///   the engine for it ([`PromptEntry`]): the inputs themselves, which name
+///   the classic policy's key, by the prompt's token ids or by its text.
+///   The engine asks for it where a decision reads that tree or that map,
+///   and of no other request.
 /// - The headers, and the body's `rid` as the request states it
 ///   ([`PlacementInputs::rid`]). The engine derives the request's routing
 ///   value from the sources its document names, and takes the id's retry

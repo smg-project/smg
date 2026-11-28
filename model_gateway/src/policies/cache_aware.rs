@@ -3365,8 +3365,13 @@ impl CacheAwarePolicy {
     }
 
     /// Drop expired holders and empty keys; refresh the per-model entry
-    /// gauge. Returns total live entries across models.
-    fn sweep_placement_index(index: &ModelPlacements, ttl: Duration, now: Instant) -> usize {
+    /// gauge. Returns total live entries across models. The owner of the
+    /// maps Grand Central is lent sweeps them by this call too.
+    pub(super) fn sweep_placement_index(
+        index: &ModelPlacements,
+        ttl: Duration,
+        now: Instant,
+    ) -> usize {
         index.sweep(ttl, now, Metrics::set_cache_placement_entries)
     }
 

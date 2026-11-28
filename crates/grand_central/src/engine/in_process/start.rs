@@ -45,10 +45,11 @@ pub struct WorkerData {
     /// hands a channel ([`InProcess::set_loads`]).
     pub loads: Option<LoadReceiver>,
     /// The program's indexes of cache events, by model, and with them its
-    /// two trees, where it keeps them ([`CacheIndexes::token_tree`],
-    /// [`CacheIndexes::string_tree`]). `None` from a program that keeps
+    /// two trees and its placement maps, where it keeps them
+    /// ([`CacheIndexes::token_tree`], [`CacheIndexes::string_tree`],
+    /// [`CacheIndexes::placement_map`]). `None` from a program that keeps
     /// none of them: every worker reads as publishing no cache events, and
-    /// no request is decided inside a tree of the program's.
+    /// no request is decided inside a tree or a map of the program's.
     pub cache_indexes: Option<Arc<dyn CacheIndexes>>,
 }
 

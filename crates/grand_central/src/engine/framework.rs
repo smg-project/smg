@@ -3991,7 +3991,9 @@ impl NamedBy {
     /// Whether a profile named by `other` is named the rows this one is:
     /// by one cap, one ruling and one reading of the record. A naming
     /// that fills its cap is held to its profile's own test of a row. So
-    /// under a cap that can fill, the two are held to one test too.
+    /// under a cap that can fill, the two are held to one test too. A
+    /// host that holds a naming to that test under any cap asks whether
+    /// the two are held alike itself ([`Engine::shadow_held_alike`]).
     fn names_as(&self, other: &Self) -> bool {
         let fills = self.cap != u32::MAX;
         (self.cap, self.rule) == (other.cap, other.rule)
@@ -5317,8 +5319,10 @@ pub(crate) struct RowTest<'a> {
 }
 
 impl RowTest<'_> {
-    /// Whether the pass keeps `row`. In its caller's loop: the folded test
-    /// is a few bits of the row.
+    /// Whether every filter of the profile keeps `row`: such a row the
+    /// pass keeps. A row a soft filter alone refuses the pass keeps too,
+    /// where that filter steps aside ([`Self::keeps_hard`]). In its
+    /// caller's loop: the folded test is a few bits of the row.
     #[inline(always)]
     pub(crate) fn keeps(&self, row: &Candidate) -> bool {
         match self.tests {
@@ -5327,6 +5331,33 @@ impl RowTest<'_> {
                     && !(self.masked && self.cx.masks(row.position))
             }
             None => self.each(row),
+        }
+    }
+
+    /// Whether the profile's hard filters keep `row`: [`Self::keeps`] less
+    /// the soft filters. The staged pass lets a soft filter step aside
+    /// where it would leave no row ([`filter`]), and that filter then drops
+    /// none. So a row the hard filters keep stays where every soft filter
+    /// that refuses it steps aside. Whether one steps aside is a word on
+    /// every row the pass is run over: none does where one of those rows
+    /// passes [`Self::keeps`].
+    #[cfg_attr(
+        not(any(test, feature = "in-process")),
+        expect(
+            dead_code,
+            reason = "The engine in process alone asks a holder's test before it names the holder."
+        )
+    )]
+    pub(crate) fn keeps_hard(&self, row: &Candidate) -> bool {
+        match self.tests {
+            Some(tests) => {
+                tests.hard().keeps(self.facts, row, self.cx)
+                    && !(self.masked && self.cx.masks(row.position))
+            }
+            None => {
+                let mut hard = self.filters.iter().filter(|filter| !filter.soft());
+                hard.all(|filter| filter.keep(self.facts, row, self.cx))
+            }
         }
     }
 
@@ -6577,6 +6608,34 @@ impl Engine {
         self.shadow_at(self.binding_position(model, phase)?)
     }
 
+    /// Whether the single shadow of the binding at `at` is known to be
+    /// held to the test of a row its live profile is held to
+    /// ([`Self::keeps_for`]): the two profiles' tests are one as far as
+    /// the build can tell ([`Held::same_test`]), and both stand under the
+    /// key's mark or neither does. Two profiles whose filters are asked
+    /// by a call each are told apart, two of one rule too
+    /// ([`Held::Called`]). The shadow's word ([`ShadowRows::of`]) compares
+    /// the two tests under a cap that can fill alone, where a naming is
+    /// held to its profile's test. A host that holds a naming to that
+    /// test under any cap asks this beside the word. `false` where the
+    /// binding names no single shadow.
+    #[cfg(any(test, feature = "in-process"))]
+    pub(crate) fn shadow_held_alike(&self, at: u32) -> bool {
+        let Some(entry) = self.bindings.get(at as usize) else {
+            return false;
+        };
+        let Some(shadow) = entry.binding.single_shadow().map(usize::from) else {
+            return false;
+        };
+        let live = usize::from(entry.binding.profile);
+        let held = |at: usize| self.named_by.get(at).map(|by| by.held);
+        let keyed = |at: usize| self.marks.get(at).map(|marks| marks.keyed());
+        let (Some(own), Some(others)) = (held(live), held(shadow)) else {
+            return false;
+        };
+        own.same_test(others) && keyed(live) == keyed(shadow)
+    }
+
     /// The profile a request resolves to for its phase; `None` when no
     /// binding matches or the binding's plan has no side for the phase.
     pub fn profile_for(&self, model: &str, phase: Phase) -> Option<(u16, &Profile)> {
@@ -6638,9 +6697,10 @@ impl Engine {
     /// reads cache events
     /// keeps the index's holders first, whatever another reads: under a
     /// cap it would lose them. For a single request of token ids under a
-    /// model whose index holds a block they are the only holders named. A
-    /// stage that reads cache events for a row's warm-up reads no holder
-    /// and turns nothing here.
+    /// model whose index holds a block they are the only holders named,
+    /// but where its host lends a placement map under a hash index: that
+    /// map then names it alone. A stage that reads cache events for a
+    /// row's warm-up reads no holder and turns nothing here.
     /// Kept at the build, as [`Self::reads_sent_for`] is.
     #[cfg(any(test, feature = "in-process"))]
     pub(crate) fn reads_sent_alone_for(&self, model: &str, phase: Phase) -> bool {
@@ -6775,11 +6835,20 @@ impl Engine {
     /// function reads nothing of the request's key. The profile's own part
     /// is said once at the build ([`Profile::asked_by_row`]). `None` too
     /// where no binding matches.
+    ///
+    /// A row the test keeps is a row the pass keeps. A row it refuses the
+    /// pass keeps all the same where a soft filter alone refuses it and
+    /// steps aside, which no test of one row says. So a host that would
+    /// pass a holder over for the test's refusal asks the hard filters of
+    /// it too ([`RowTest::keeps_hard`]).
+    ///
+    /// The engine in process asks it of the holders a lent placement map
+    /// names, ahead of the decision.
     #[cfg_attr(
-        not(test),
+        not(any(test, feature = "in-process")),
         expect(
             dead_code,
-            reason = "No host asks a holder's test before it names the holder yet."
+            reason = "The engine in process alone asks a holder's test before it names the holder."
         )
     )]
     pub(crate) fn keeps_for<'a>(

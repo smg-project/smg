@@ -142,7 +142,8 @@ fn a_predicted_placement_counts_only_above_the_threshold_and_the_index_at_any_de
 
 /// A sent prefix's share is taken of the whole prompt, as the classic
 /// policy takes it: its matched tokens over the prompt's tokens, above
-/// the threshold (`model_gateway/src/policies/cache_aware.rs:3561-3569`).
+/// the threshold (`select_worker_with_tokens`,
+/// `model_gateway/src/policies/cache_aware.rs`).
 /// A prompt that ends inside a block is larger than its whole blocks, so
 /// a share of those would let a prefix under the threshold count. The
 /// share is one division of the two counts: at the threshold itself it
@@ -262,7 +263,7 @@ fn decided_past_the_sample(engine: &Engine, pool: &[Candidate], tokens: u32, see
 /// nothing there: they are under 0.3 of the prompt, and a third of its
 /// three whole blocks. The classic policy divides the same two counts,
 /// and under its threshold it selects with no holder named
-/// (`model_gateway/src/policies/cache_aware.rs:3561-3569`, `:3579-3588`).
+/// (`select_worker_with_tokens`, `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn behind_a_draw_a_sent_prefix_counts_by_its_share_of_the_whole_prompt() {
     let engine = built_in();
@@ -478,6 +479,56 @@ fn a_trees_match_is_priced_in_whole_blocks_and_said_in_its_own_unit() {
     };
     assert_eq!(said(128, 256, 1).1, miss);
     assert_eq!(said(30, 100, 0).1, miss);
+}
+
+/// A head a placement map holds is priced by its whole count, where a
+/// tree's match of as many tokens is priced by its whole blocks
+/// ([`TreeMatch::counted`]). Forty-seven tokens at eight a request are six
+/// requests' worth, and their two whole blocks are four. A holder seven
+/// requests over three idle workers stands under the first margin and
+/// over the second: it keeps the request as a map's holder, and spills it
+/// as a tree's. A head is in tokens whatever the request's hash kind: under
+/// the text kind nothing divides it by four, so the holder keeps the
+/// request there too.
+///
+/// The classic policy prices a hash index's holder by its boundary's
+/// tokens: `select_worker_hash` hands `select_final_from_affinity` the
+/// boundary, and `held_prefix_margin` divides it
+/// (`model_gateway/src/policies/cache_aware.rs`).
+#[test]
+fn a_counted_head_is_priced_by_its_tokens() {
+    let stage = affinity(Some(SpillParams {
+        rel: Some(1.1),
+        prefix_margin_tokens: Some(8),
+        ..SpillParams::default()
+    }));
+    let pool = rows(&[
+        candidate(0, 7, 0),
+        candidate(1, 0, 0),
+        candidate(2, 0, 0),
+        candidate(3, 0, 0),
+    ]);
+    let holders = [AffinityHolder {
+        row: 0,
+        overlap_blocks: 0,
+        predicted_blocks: 2,
+    }];
+    let scored = |tree: TreeMatch, hash_kind: HashKind| {
+        let rows = AffinityRows {
+            tree: Some(tree),
+            ..named(&holders, &[], false)
+        };
+        let facts = RequestFacts {
+            hash_kind,
+            ..facts(6)
+        };
+        scores_named(&stage, &facts, &pool, rows)
+    };
+    let held = [1.0, 0.5, 0.5, 0.5];
+    assert_eq!(scored(TreeMatch::head(47, 96), HashKind::Token), held);
+    assert_eq!(scored(TreeMatch::head(47, 96), HashKind::Text), held);
+    let spilt = [0.0, 0.5, 0.5, 0.5];
+    assert_eq!(scored(TreeMatch::new(47, 96), HashKind::Token), spilt);
 }
 
 /// One holder over the swing's margin and under the priced one: the

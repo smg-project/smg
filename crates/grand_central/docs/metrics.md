@@ -118,7 +118,8 @@ The table below sets the classic gateway's metrics beside those of a gateway tha
 | `smg_cache_aware_policy_branch_total{branch}`, `smg_manual_policy_branch_total{branch}`, `smg_consistent_hashing_policy_branch_total{branch}`, `smg_prefix_hash_policy_branch_total{branch}` | — | — |
 | `smg_policy_inflight_reconciled_total{policy}` | — | Planned rename to `smg_policy_lease_expired_total{kind}`. No code writes the new name yet. |
 | `smg_cache_aware_match_ratio` | Same | Kept. [The match ratio](#the-match-ratio) has the rules. |
-| `smg_kv_index_lookup_seconds`, `smg_cache_placement_entries` | — | Written by the classic `cache_aware` policy alone: at its index lookup and at its placement sweep. |
+| `smg_kv_index_lookup_seconds` | — | Written by the classic `cache_aware` policy alone, at its index lookup. |
+| `smg_cache_placement_entries` | Same | Kept under a hash index: each sweep of the placement maps the gateway lends the engine writes it, as the classic policy's placement sweep does. |
 | `smg_cache_tree_tokens`, `smg_cache_tree_chars`, `smg_cache_tree_tenants` | Same | Kept for the trees the gateway lends the engine. See [The tree sizes](#the-tree-sizes). |
 | `smg_manual_policy_cache_entries` | — | Ends with the classic manual cache. |
 | `smg_cache_aware_prefix_margin_held_total` | — | Open. An embedded successor requires the scorer to report whether the margin held without an extra read. Otherwise the counter ends with classic routing. |
@@ -144,6 +145,8 @@ Under the engine `smg_cache_aware_match_ratio` is observed from the overlap a pi
 - It does so where the placement's worker is the one its pick's first target names.
 - A pair's pick states what its prefill holds and nothing of its decode. So a pair's placement observes once at most, where a classic pair can observe each `cache_aware` side.
 - An encode request decided with its items states none yet, so it observes nothing.
+- Under a hash index a single request decided inside the placement map the gateway lends states no share. So the gateway observes nothing for it, as a classic hash decision observes none.
+- A pair under a hash index is lent no map. Where its prefill's profile reads cached blocks, its pick states its share by what the prefill's column holds. That is the engine's record of sent prefixes or the model's index of cache events. A classic hash pair observes none.
 - Where a lent tree's match names the chosen worker to the decision, the pick states the tree's own two numbers, so the gateway divides what a classic tree decision divides.
 
 These still differ there, among others:

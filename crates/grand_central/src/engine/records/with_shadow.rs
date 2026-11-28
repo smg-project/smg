@@ -57,8 +57,12 @@ pub(crate) type Lends<'a> = &'a dyn Fn(u16) -> Option<(&'a dyn LentRing, &'a [u6
 /// profile's where that profile would be handed others: rows of another
 /// warm-up ruling or another record ([`ShadowRows::Apart`]), or rows of
 /// its own ([`ShadowRows::Own`]), which no caller builds for a shadow
-/// here. A shadow profile that reads no affinity column runs without the
-/// rows named for the live one ([`ShadowRows::Unnamed`]).
+/// here. A caller states the last for one request too: a head of a lent
+/// placement map stands by the live profile's test, and a shadow profile
+/// not known to be held to that test would be named rows of its own
+/// (`in_process::with_shadow`). A shadow profile that reads no affinity
+/// column runs without the rows named for the live one
+/// ([`ShadowRows::Unnamed`]).
 ///
 /// A shadow profile that reads a ring beside a live profile that reads
 /// none is stated its own place on the ring the request is lent

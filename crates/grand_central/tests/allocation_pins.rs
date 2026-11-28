@@ -13,7 +13,8 @@
 //! and the sweep's pass. A host in process is pinned
 //! too, in a build
 //! with the `in-process` feature: a request held from its decision to its
-//! completion allocates nothing after the first ones. A keeper of worker
+//! completion allocates nothing after the first ones, and neither does one
+//! decided inside a placement map its host lends. A keeper of worker
 //! objects is pinned in a build with the `worker-host` feature: a status
 //! tell copies each id of its worker's models once, and only for a store
 //! that tells a journal. A read of a row copies no model card. A separate
@@ -893,16 +894,22 @@ fn a_fused_walk_of_one_page_allocates_one_list_for_its_path() {
 /// list, asked through the one call a host makes for a request.
 #[cfg(feature = "in-process")]
 mod in_process {
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+    use std::{
+        borrow::Cow,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant},
     };
 
+    use kv_index::{record_in, PlacementMap};
     use smg_grand_central::{
-        document::{AppliedSpec, PolicySpec, ScoreSpec},
+        document::{AppliedSpec, IndexKind, IndexSpec, PolicySpec, ScoreSpec, ScoreStage},
         engine::{
-            Candidate, Decision, InProcess, LentList, ListCell, PairAdmission, PairLists,
-            PartnerClasses, PlaceRequest, RequestFacts, Scorer, Target, TieBand, WorkerLists,
+            CacheIndex, CacheIndexes, Candidate, Decision, InProcess, LentList, ListCell,
+            PairAdmission, PairLists, PartnerClasses, Phase, PlaceRequest, PromptEntry,
+            RequestFacts, Scorer, Target, TieBand, TokenKey, WorkerLists,
         },
         stages::{Lifecycle, StageRegistry},
         tracking::{
@@ -1059,6 +1066,239 @@ mod in_process {
                 assert_eq!(since, [each, each, each, 0], "{n} workers");
             }
         }
+    }
+
+    /// A host that lends one placement map, whatever the model, and keeps
+    /// no index of cache events. It counts how often it was asked for the
+    /// map: the engine asks once where it reads a list's table.
+    struct LendsMap(Arc<PlacementMap>, AtomicUsize);
+
+    impl CacheIndexes for LendsMap {
+        fn index(&self, _: &str) -> Option<Arc<dyn CacheIndex>> {
+            None
+        }
+
+        fn block_size(&self, _: &str) -> Option<u32> {
+            None
+        }
+
+        fn placement_map(&self, _: &str, _: Phase) -> Option<Arc<PlacementMap>> {
+            self.1.fetch_add(1, Ordering::Relaxed);
+            Some(Arc::clone(&self.0))
+        }
+    }
+
+    /// A prompt's entry by its token ids, under no partition.
+    struct Ids<'a>(&'a [u32]);
+
+    impl PromptEntry for Ids<'_> {
+        fn token_key(&self, _: usize) -> Option<TokenKey<'_>> {
+            Some(TokenKey::of(Cow::Borrowed(self.0), 0))
+        }
+    }
+
+    /// The engine of the `cache_aware` preset under a hash index whose heads
+    /// end at 16 and at 48 tokens, over a host that lends `map`, and that
+    /// host. Its prefix stage follows a match of any share, as the settings'
+    /// translation writes the stage under that index.
+    fn engine_inside(map: &Arc<PlacementMap>) -> (&'static InProcess, Arc<LendsMap>) {
+        let mut document = PolicySpec::preset("cache_aware").expect("a preset of this build");
+        document.view.boundaries = vec![16, 48];
+        let mut hashed = IndexSpec::default();
+        hashed.kind = IndexKind::Hash;
+        document.index.insert("*".to_owned(), hashed);
+        let profile = document.profiles.get_mut("cache_aware");
+        for stage in &mut profile.expect("the preset's profile").score {
+            if let ScoreSpec::Params(ScoreStage::PrefixAffinity(prefix)) = stage {
+                prefix.threshold = Some(0.0);
+            }
+        }
+        let spec = AppliedSpec::validate(&document).expect("the document validates");
+        let engine: &'static InProcess = Box::leak(Box::new(InProcess::new(spec)));
+        let host = Arc::new(LendsMap(Arc::clone(map), AtomicUsize::new(0)));
+        let lent = Arc::clone(&host) as Arc<dyn CacheIndexes>;
+        engine.affinity().set_indexes(lent);
+        (engine, host)
+    }
+
+    /// A list of `n` ready workers of the model.
+    fn ready_list(n: usize) -> Arc<[Arc<dyn Worker>]> {
+        (0..n)
+            .map(|at| ready_worker(&format!("http://w{at}:8000"), MODEL))
+            .collect()
+    }
+
+    /// A request of the prompt `ids` over `lent`, which names its entry.
+    fn asking<'a>(ids: &'a [u32], entry: &'a Ids<'a>, lent: LentList<'a>) -> PlaceRequest<'a> {
+        let mut request = PlaceRequest::of(MODEL, WorkerLists::Single(lent));
+        request.prompt.tokens = Some(ids);
+        request.prompt.entry = Some(entry);
+        request
+    }
+
+    /// The sends a worker's count keeps between two of its reports
+    /// (`tracking::DispatchCredit`). The preset's load stages read that
+    /// count, and a worker that reports no load keeps every send up to it.
+    /// The send that finds the count full is the last that grows it: a pin
+    /// sends its worker this many behind the first, and what a later send
+    /// allocates is its decision's own.
+    const SENDS_KEPT: usize = 8_192;
+
+    /// Places `request`, holds it to its end, and says the place in `list`
+    /// of the worker it went to.
+    fn served(
+        engine: &'static InProcess,
+        request: &PlaceRequest<'_>,
+        list: &[Arc<dyn Worker>],
+    ) -> usize {
+        let mut placement = engine.place(request).expect("a worker of the list");
+        let went = placement.worker.url();
+        let at = list.iter().position(|worker| worker.url() == went);
+        placement.sent(Side::Single);
+        placement.ended(Side::Single, Outcome::reported(200, TransportClass::Ok));
+        at.expect("a worker of the list")
+    }
+
+    /// What `work` answers, and what it allocates where no table of the
+    /// list is read inside it. The engine reads a list's table again by one
+    /// decision a second, by the process's clock. That read allocates the
+    /// table, and it asks the host for its map, once ([`LendsMap`] counts
+    /// the asks). No count where the asks moved: what was counted holds a
+    /// table's read. The answer is handed back either way.
+    fn between_tables<T>(host: &LendsMap, work: impl FnOnce() -> T) -> (T, Option<usize>) {
+        let asks = host.1.load(Ordering::Relaxed);
+        let (answer, counted) = allocations_during(work);
+        let read = host.1.load(Ordering::Relaxed) != asks;
+        (answer, (!read).then_some(counted))
+    }
+
+    /// [`between_tables`] for work that can run again: it is run until no
+    /// table is read inside it, eight times at most. A table read in one
+    /// run stands for a second, so eight runs in a row that each hold a
+    /// read span seven seconds or more. Where every one of the eight
+    /// holds a read, no count is taken and the case fails.
+    fn warm(host: &LendsMap, mut work: impl FnMut()) -> usize {
+        let counted = (0..8).find_map(|_| between_tables(host, &mut work).1);
+        counted.expect("a run with no table's read among eight")
+    }
+
+    /// Under a hash index a request decided inside the placement map its
+    /// host lends allocates nothing once its prompt has a holder. The read
+    /// names the holder, the pass's own test keeps it, the decision follows
+    /// it, and the write touches it where it stands. The first requests
+    /// size the thread's buffers and write the holder at both of the
+    /// prompt's heads: a holder's first write keeps its address, as the
+    /// classic policy's does (`crates/kv_index/src/placements.rs`,
+    /// `record_in`). They fill the holder's count of sends too
+    /// ([`SENDS_KEPT`]). The count is of a run no table is read in
+    /// ([`warm`]).
+    #[test]
+    fn a_request_decided_inside_a_lent_placement_map_allocates_nothing() {
+        for n in [8usize, 64] {
+            let map = Arc::new(PlacementMap::default());
+            let (engine, host) = engine_inside(&map);
+            let list = ready_list(n);
+            let cell = ListCell::default();
+            let lent = LentList::of(&list, &cell);
+            let ids: Vec<u32> = (0..64).collect();
+            let entry = Ids(&ids);
+            let request = asking(&ids, &entry, lent);
+            // The first request writes its worker at both heads, and every
+            // later one goes back to it: as many as fill its count of sends.
+            let holder = served(engine, &request, &list);
+            for _ in 0..SENDS_KEPT {
+                assert_eq!(served(engine, &request, &list), holder, "{n} workers");
+            }
+            assert_eq!(map.len(), 2, "{n} workers: a key for each head");
+            let allocations = warm(&host, || {
+                (0..256).for_each(|_| assert_eq!(served(engine, &request, &list), holder));
+            });
+            assert_eq!(
+                allocations, 0,
+                "{n} workers: a request decided inside the map allocated"
+            );
+            assert_eq!(map.len(), 2, "{n} workers: no key was added");
+        }
+    }
+
+    /// A request whose deepest head's one holder left the ready workers is
+    /// decided at its next head, where another holder stands. It allocates
+    /// what the map's write of that holder at the deepest head keeps, the
+    /// holder's address, and nothing more: the store's own write of a new
+    /// holder beside one keeps as much (`crates/kv_index/src/placements.rs`,
+    /// `record_in`). The requests behind it find that holder at the
+    /// deepest head and allocate nothing. The worker that stays has its
+    /// count of sends full ahead of the request ([`SENDS_KEPT`]). Three
+    /// prompts pass a head so, once each. Each count is held to the
+    /// write's, but one a table's read fell into ([`between_tables`]).
+    ///
+    /// The classic policy passes a boundary none of whose live holders is
+    /// among its available workers, and writes the worker it picks at every
+    /// boundary the request reaches (`select_worker_hash`,
+    /// `model_gateway/src/policies/cache_aware.rs`).
+    #[test]
+    fn a_head_passed_for_the_next_allocates_its_new_holders_write_alone() {
+        let map = Arc::new(PlacementMap::default());
+        let (engine, host) = engine_inside(&map);
+        let list = ready_list(8);
+        let cell = ListCell::default();
+        let lent = LentList::of(&list, &cell);
+        // Four prompts that share their first head alone.
+        let prompt = |tail: u32| -> Vec<u32> { (0..16).chain(tail..tail + 48).collect() };
+        let ones = [prompt(1_000), prompt(2_000), prompt(3_000)];
+        let other = prompt(9_000);
+        let firsts = ones.each_ref().map(|one| Ids(one));
+        let fourth = Ids(&other);
+        let asked = [0, 1, 2].map(|at| asking(&ones[at], &firsts[at], lent));
+        let shares = asking(&other, &fourth, lent);
+        // The first three prompts' holder, at the shared head and at each
+        // one's own.
+        let left = served(engine, &asked[0], &list);
+        for _ in 0..16 {
+            for asked in &asked {
+                assert_eq!(served(engine, asked, &list), left);
+            }
+        }
+        // It leaves the ready workers. The fourth prompt finds it alone at
+        // the head they share, is named nobody, and is written for a worker
+        // that stays.
+        list[left].set_status(WorkerStatus::NotReady);
+        let stays = served(engine, &shares, &list);
+        assert_ne!(stays, left);
+        for _ in 0..SENDS_KEPT {
+            assert_eq!(served(engine, &shares, &list), stays);
+        }
+        assert_eq!(map.len(), 5, "the shared head and each prompt's own");
+
+        // What the store's own write keeps for a new holder beside one, in
+        // a map written the same way.
+        let twin = PlacementMap::default();
+        let (now, ttl) = (Instant::now(), Duration::from_secs(3_600));
+        let (gone, kept) = (list[left].url(), list[stays].url());
+        record_in(&twin, None::<[u32; 2]>, &ones[0], &[16, 48], gone, now, ttl);
+        record_in(&twin, None::<[u32; 2]>, &other, &[16, 48], kept, now, ttl);
+        let ((), written) = allocations_during(|| {
+            record_in(&twin, None::<[u32; 2]>, &ones[0], &[16, 48], kept, now, ttl);
+        });
+        assert!(written > 0, "a new holder's address is kept");
+
+        // Each of the three prompts again, once. Its deepest head's one
+        // holder is refused, and the next head's other holder is kept and
+        // followed.
+        let passed = asked.each_ref().map(|asked| {
+            let (went, allocations) = between_tables(&host, || served(engine, asked, &list));
+            assert_eq!(went, stays, "whether a table was read inside it or not");
+            allocations
+        });
+        let counted: Vec<usize> = passed.into_iter().flatten().collect();
+        assert!(!counted.is_empty(), "a table was read inside each request");
+        let own = vec![written; counted.len()];
+        assert_eq!(counted, own, "the decision's own allocations");
+        let allocations = warm(&host, || {
+            (0..256).for_each(|_| assert_eq!(served(engine, &asked[0], &list), stays));
+        });
+        assert_eq!(allocations, 0, "behind the write of the new holder");
+        assert_eq!(map.len(), 5, "no key was added");
     }
 
     /// A ready worker of `worker_type` at `url`, with no health checker

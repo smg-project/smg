@@ -657,11 +657,22 @@ impl PrefixAffinity {
     /// rounded to a block, as the classic policy tests a tree's match.
     /// Where it is not followed nobody holds anything. The pass that scores
     /// and the word of the pick both read here.
+    ///
+    /// A match its maker says is priced by its whole count
+    /// ([`TreeMatch::counted`]) is priced so: a head a placement map holds,
+    /// which the classic policy prices by its boundary's tokens. Such a
+    /// count is in tokens whatever the request's hash kind, so nothing
+    /// converts it.
     fn followed(&self, tree: TreeMatch, kind: HashKind) -> (u32, f32) {
         if self.source == AffinitySource::Index || !tree.clears(self.threshold) {
             return (0, 0.0);
         }
-        (tree.matched, self.gates.tokens_in_tree(tree.matched, kind))
+        let price = if tree.counted {
+            tree.matched as f32
+        } else {
+            self.gates.tokens_in_tree(tree.matched, kind)
+        };
+        (tree.matched, price)
     }
 
     /// The stage's scores over the rows a lent tree's match named, as the

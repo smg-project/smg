@@ -171,7 +171,8 @@ fn a_write_handed_no_entry_for_its_worker_is_no_repeat() {
 /// holds it. So where the index holds a block for every worker of the list.
 /// The classic router keeps a tree of sent texts a side, and reads and
 /// writes it for a request with no token ids whatever its index holds
-/// (`model_gateway/src/policies/cache_aware.rs:1511-1538`, `:3519-3596`).
+/// (`select_worker_scanned` and `select_worker_with_text`,
+/// `model_gateway/src/policies/cache_aware.rs`).
 ///
 /// A request hashed by token blocks answers as before beside it: a pick of
 /// a worker the index speaks for writes nothing, and a list whose every

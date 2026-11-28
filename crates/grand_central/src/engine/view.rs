@@ -583,12 +583,13 @@ pub struct AffinityRows<'a> {
     /// leaves `None`, which reads as the mean of the rows a stage is
     /// handed, and a debug build asserts that it did.
     pub mean_in_flight: Option<f32>,
-    /// The match the holders were named from, where a tree a host lends
-    /// named them ([`TreeMatch`]): every holder holds that match. `None`
-    /// from any other naming, whose holders say what each holds in whole
-    /// blocks. The built-in prefix stage reads the match in place of the
-    /// holders' blocks: it divides the two counts as the classic policy
-    /// divides a tree's match, and holds every row named a holder alike.
+    /// The match the holders were named from, where a tree or a placement
+    /// map a host lends named them ([`TreeMatch`]): every holder holds
+    /// that match. `None` from any other naming, whose holders say what
+    /// each holds in whole blocks. The built-in prefix stage reads the
+    /// match in place of the holders' blocks: it divides the two counts
+    /// as the classic policy divides a tree's match, and holds every row
+    /// named a holder alike.
     pub tree: Option<TreeMatch>,
 }
 
@@ -602,6 +603,11 @@ pub struct AffinityRows<'a> {
 /// count is rounded to a block: a match that ends inside a block is larger
 /// than its whole blocks say.
 ///
+/// A placement map a host lends names its rows by the same record: the
+/// head of the request whose live holders are named, and the request's
+/// size, both in tokens. Such a head is priced by its whole count
+/// ([`Self::counted`]).
+///
 /// The record gains fields: code outside this crate starts from the default
 /// and assigns what it knows, and a pattern of it ends with `..`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -611,6 +617,16 @@ pub struct TreeMatch {
     pub matched: u32,
     /// The request's size, in the same unit.
     pub of: u32,
+    /// Whether the match is priced by its whole count. A tree's match is
+    /// priced by its whole blocks, as the classic policy prices it. A
+    /// placement map holds a head at its boundary, which need be no whole
+    /// number of blocks, and the classic policy prices a holder of it by
+    /// the boundary's tokens. A counted match is in tokens, both of its
+    /// counts, whatever the request's hash kind. The price is held in
+    /// single precision: a head of more than 16,777,216 tokens is priced
+    /// by the nearest count that holds, where the classic policy's double
+    /// holds each.
+    pub counted: bool,
 }
 
 impl TreeMatch {
@@ -618,7 +634,23 @@ impl TreeMatch {
     /// walk makes, in the engine over a host's worker lists.
     #[cfg(any(test, feature = "in-process"))]
     pub(crate) const fn new(matched: u32, of: u32) -> Self {
-        Self { matched, of }
+        Self {
+            matched,
+            of,
+            counted: false,
+        }
+    }
+
+    /// A head of `matched` tokens of a request of `of`, priced by its whole
+    /// count ([`Self::counted`]): what the read of a lent placement map
+    /// makes, in the engine over a host's worker lists.
+    #[cfg(any(test, feature = "in-process"))]
+    pub(crate) const fn head(matched: u32, of: u32) -> Self {
+        Self {
+            matched,
+            of,
+            counted: true,
+        }
     }
 
     /// Whether the match is more than the share `threshold` of the request:

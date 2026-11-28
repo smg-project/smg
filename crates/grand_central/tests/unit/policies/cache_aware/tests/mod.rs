@@ -433,7 +433,8 @@ fn every_reader_of_the_column_declares_it_whatever_feeds_it() {
 /// source: a host may state zero where no stage declares the size
 /// ([`Needs::prompt_size`]), and a zero size reads every sent prefix as
 /// the whole prompt. The classic policy is handed the prompt's length
-/// always (`model_gateway/src/policies/cache_aware.rs:3474-3482`).
+/// always (`select_worker_with_tokens`,
+/// `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn the_stages_that_read_the_prompts_size_declare_it() {
     for source in [

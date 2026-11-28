@@ -1071,11 +1071,14 @@ impl AppContextBuilder {
     /// the routing settings never raise that count. Where the document the
     /// settings mean holds an index entry of the hash kind and a boundary
     /// past those blocks, the start runs and `cache_aware` remembers no
-    /// request at that boundary, which this start says in one warning that
-    /// names the setting, `cache_boundaries`. It counts with the document's
-    /// block size, which a request is hashed by until the model's workers
-    /// report their own. A supplied document states its own view, which
-    /// the warning does not read.
+    /// prefill-decode pair at that boundary, which this start says in one
+    /// warning that names the setting, `cache_boundaries`. It counts with
+    /// the document's block size, which a request is hashed by until the
+    /// model's workers report their own. A request of token ids placed
+    /// alone is decided inside the placement map the engine is lent
+    /// ([`Self::engine_caches`]), which keys every boundary its prompt
+    /// reaches. A supplied document states its own view, which the warning
+    /// does not read.
     fn policy_in_force(
         config: &RouterConfig,
         stages: Option<&StageRegistry>,
@@ -1098,9 +1101,11 @@ impl AppContextBuilder {
             None => config.hosted_policy(&document, &StageRegistry::builtin()),
         };
         let spec = checked.map_err(|refused| format!("Grand Central: {refused}"))?;
-        // A hash entry keys a request at the view's boundaries, and no
-        // request carries a block past the view's bound. The line stands
-        // behind the check, so a refused start says its refusal alone.
+        // A hash entry keys a pair's side at the view's boundaries by the
+        // request's blocks, and no request carries a block past the view's
+        // bound. A request placed alone is keyed by its token ids in the
+        // lent placement map, at every boundary. The line stands behind
+        // the check, so a refused start says its refusal alone.
         let mut entries = document.index.values();
         if config.policy_spec.is_none() && entries.any(|entry| entry.kind == IndexKind::Hash) {
             let block = spec.block_size().max(1);
@@ -1115,7 +1120,7 @@ impl AppContextBuilder {
             if !past.is_empty() {
                 let reach = u64::from(most) * u64::from(block);
                 tracing::warn!(
-                    "Grand Central: cache_index = hash: cache_boundaries {past:?} lie past the {reach} tokens a request is hashed to at the document's block size of {block} tokens, so cache_aware remembers no request at them unless the model's workers report a larger block"
+                    "Grand Central: cache_index = hash: cache_boundaries {past:?} lie past the {reach} tokens a request is hashed to at the document's block size of {block} tokens, so cache_aware remembers no prefill-decode pair at them unless the model's workers report a larger block"
                 );
             }
         }
@@ -1903,6 +1908,129 @@ mod tests {
         assert!(policies.lent_trees().is_some());
     }
 
+    /// Under `cache_aware` with a hash index the start lends Grand Central
+    /// the gateway's own placement map. A conversation's next turns go back
+    /// to the worker its first turn was sent to, and so does a prompt that
+    /// shares the conversation's first head alone. The map names that
+    /// worker at every boundary the conversation reaches, and the worker
+    /// leaves the map when it leaves the registry. No turn observes a
+    /// match ratio, a first turn and a turn that goes back alike.
+    ///
+    /// The classic policy keeps such a map itself and decides inside it the
+    /// same way, and its hash decision observes no match ratio
+    /// (`model_gateway/src/policies/cache_aware.rs`, `select_worker_hash`).
+    #[tokio::test]
+    async fn the_start_lends_the_engine_the_placement_map_a_hash_index_reads() {
+        use std::time::Instant;
+
+        use kv_index::{hash_token_head, live_holders_in};
+        use openai_protocol::worker::RuntimeType;
+
+        use crate::{
+            config::types::CacheIndexKind,
+            routers::common::{
+                placement::{select_single, PlacementInputs, Stated},
+                snapshot::{test_support::grpc_worker, RoutingPool},
+            },
+        };
+
+        let mut policy = PolicyConfig::cache_aware(0.5, 32, 1.1, 0, 4096);
+        if let PolicyConfig::CacheAware {
+            cache_index,
+            cache_boundaries,
+            ..
+        } = &mut policy
+        {
+            *cache_index = CacheIndexKind::Hash;
+            *cache_boundaries = vec![64, 256];
+        }
+        let mut config = config_with_policy(policy);
+        config.grand_central = true;
+        config.health_check.disable_health_check = true;
+        let context = AppContext::from_config(config, 30, None, None).await;
+        let context = context.expect("a context");
+        let owner = context.policy_registry.lent_trees();
+        let owner = owner.expect("the start made the owner of the map");
+        for at in 0..4 {
+            let url = format!("grpc://w{at}:9000");
+            let worker = grpc_worker(&url, "m", RuntimeType::Vllm, &[]);
+            context.worker_registry.register(worker).expect("a worker");
+        }
+        // Each turn is placed under the case's own recorder.
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let scrape = recorder.handle();
+        let turn = |said: &[u32]| {
+            let inputs = PlacementInputs {
+                tokens: Some(said),
+                ..PlacementInputs::default()
+            };
+            let placed = metrics::with_local_recorder(&recorder, || {
+                select_single(
+                    &context.worker_registry,
+                    &context.policy_registry,
+                    "m",
+                    RoutingPool::GrpcPipelineRegular,
+                    None,
+                    inputs,
+                    Stated::nothing,
+                )
+            });
+            placed.expect("a worker").into_worker().url().to_owned()
+        };
+        let mut said: Vec<u32> = (0..256).collect();
+        let first = turn(&said);
+        for next in 1..8_u32 {
+            said.extend(next * 1_000_000..next * 1_000_000 + 16);
+            assert_eq!(turn(&said), first, "turn {next}");
+        }
+        // The first 64 tokens alone are shared: a small share of the
+        // prompt, and the deepest head that has a holder.
+        let mut other: Vec<u32> = (0..64).collect();
+        other.extend(9_000_000..9_000_400);
+        assert_eq!(turn(&other), first, "the head of 64 tokens");
+        // The recorder heard the nine turns, and no match ratio of any: a
+        // first turn and a turn that went back to its holder alike.
+        let rendered = scrape.render();
+        let selections = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_worker_selection_total{"));
+        let counted: u64 = selections
+            .filter_map(|line| line.rsplit_once(' ')?.1.parse::<u64>().ok())
+            .sum();
+        assert_eq!(counted, 9, "{rendered}");
+        let ratio = "smg_cache_aware_match_ratio";
+        assert!(
+            !rendered.lines().any(|line| line.starts_with(ratio)),
+            "{rendered}"
+        );
+
+        let map = owner.placement_map("m");
+        let hour = Duration::from_secs(3_600);
+        let holders = |prompt: &[u32], end: usize| {
+            let key = (end, hash_token_head(None::<[u32; 2]>, &prompt[..end]));
+            let names = |held: &[kv_index::PlacementHolder]| {
+                let names = held.iter().map(|holder| holder.worker_url.clone());
+                names.collect::<Vec<_>>()
+            };
+            live_holders_in(&map, key, Instant::now(), hour, names)
+        };
+        for (prompt, end) in [(&said, 64), (&said, 256), (&other, 256)] {
+            let held = holders(prompt, end);
+            assert_eq!(held, Some(vec![first.clone()]), "the head of {end}");
+        }
+        assert_eq!(map.len(), 3, "a key for each head written");
+
+        // The start made the map with the task that follows the context's
+        // own registry: the worker that leaves it is taken out of the map.
+        let registry = &context.worker_registry;
+        registry.remove_by_url(&first).expect("the removal");
+        let bound = Instant::now() + Duration::from_secs(60);
+        while !map.is_empty() {
+            assert!(Instant::now() < bound, "the map's task never purged");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     /// A model whose index of cache events holds no block is decided in the
     /// token tree the gateway lends, and its list leaves the tree once the
     /// index holds a block. A gRPC model's index stands from the enrolment
@@ -1915,7 +2043,7 @@ mod tests {
     ///
     /// The classic policy reads an index that holds no block as no index
     /// and then reads its own token tree
-    /// (`model_gateway/src/policies/cache_aware.rs:1800`, `event_index_for`).
+    /// (`event_index_for`, `model_gateway/src/policies/cache_aware.rs`).
     /// It asks at each request, so it leaves its tree with the block.
     #[tokio::test]
     async fn a_model_whose_index_holds_no_block_is_decided_in_the_lent_tree() {
@@ -2230,8 +2358,9 @@ mod tests {
     }
 
     /// Under Grand Central a `cache_aware` policy over the hash kind of the
-    /// cache index keeps what it placed in the engine's record of sent
-    /// prefixes. With boundaries a request reaches, the start runs its
+    /// cache index keeps a request it placed alone in the placement map
+    /// the engine is lent, and a side of a pair in the engine's record of
+    /// sent prefixes. With boundaries a request reaches, the start runs its
     /// engine and says no line of the index: not at its step with Grand
     /// Central off, under the tree kind or over a supplied document, not
     /// where the check refuses the start, and not where the gateway starts.
@@ -2311,17 +2440,18 @@ mod tests {
 
     /// A request carries `view.max_block_hashes` block hashes at most, which
     /// the routing settings never raise, so under the hash kind of the
-    /// cache index a boundary past them keys no request. The start runs its
-    /// engine and says so once, by the setting's name and the boundaries
-    /// past. Its step says nothing with Grand Central off, under the tree
-    /// kind, or over a supplied document, which states its own view.
+    /// cache index a boundary past them keys no side of a prefill-decode
+    /// pair. The start runs its engine and says so once, by the setting's
+    /// name and the boundaries past. Its step says nothing with Grand
+    /// Central off, under the tree kind, or over a supplied document, which
+    /// states its own view.
     #[traced_test]
     #[tokio::test]
-    async fn the_start_says_once_which_boundaries_of_a_hash_index_key_no_request() {
+    async fn the_start_says_once_which_boundaries_of_a_hash_index_key_no_pair() {
         use crate::config::{CacheIndexKind, PolicyConfig};
 
         const LINE: &str = "cache_index = hash";
-        const SAID: &str = "cache_boundaries [8192, 32768] lie past the 4096 tokens a request is hashed to at the document's block size of 16 tokens";
+        const SAID: &str = "cache_boundaries [8192, 32768] lie past the 4096 tokens a request is hashed to at the document's block size of 16 tokens, so cache_aware remembers no prefill-decode pair at them";
         let of_kind = |kind: CacheIndexKind| {
             let boundaries = vec![512, 8192, 32768];
             let mut config = RouterConfig {

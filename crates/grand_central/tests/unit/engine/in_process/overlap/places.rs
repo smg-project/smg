@@ -11,7 +11,7 @@ use super::*;
 /// would leave each out for some. The classic policy narrows its workers
 /// first (`model_gateway/src/routers/common/placement.rs:474-484`) and
 /// gathers the deepest holders among them, one or both by its cap's draw
-/// (`model_gateway/src/policies/cache_aware.rs:2916-2939`, `:2951-2957`).
+/// (`top_group`, `holders_at`, `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_held_request_is_named_its_holders_among_its_places() {
     let (affinity, _, index) = hosted(true);
@@ -34,7 +34,7 @@ fn a_held_request_is_named_its_holders_among_its_places() {
 /// outside them are more than the sample: it is the deepest among the
 /// places. The classic policy's whole gather finds it where none of its
 /// drawn holders is a candidate
-/// (`model_gateway/src/policies/cache_aware.rs:2931-2938`).
+/// (`top_group`, `model_gateway/src/policies/cache_aware.rs`).
 #[test]
 fn a_held_request_is_named_the_deepest_holder_among_its_places() {
     let (affinity, _, index) = hosted(true);
