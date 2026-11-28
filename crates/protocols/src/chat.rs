@@ -107,10 +107,24 @@ pub enum ChatMessage {
     /// Hoisted to the front for dispatch (several merge into one), where the
     /// chat template reads it; a template without a root branch gets it as
     /// the leading system message. Rejected by other profiles.
+    ///
+    /// The vendor's chat templates read a date and a location off this
+    /// message beside its content and print one line for each behind the
+    /// text of the slot it fills. Both are plain fields with a default, not
+    /// a flattened struct: a variant with a flattened field is no longer
+    /// read from the array form of a message, which this one is. A date or
+    /// a location that is no string is dropped, as a key the message does
+    /// not know is: the request is not refused for it.
     #[serde(rename = "root")]
     Root {
         content: MessageContent,
         name: Option<String>,
+        /// The text behind `Current date: ` in the rendered prompt.
+        #[serde(default, deserialize_with = "crate::chat::deserialize_text_or_none")]
+        current_date: Option<String>,
+        /// The text behind `Current location: ` in the rendered prompt.
+        #[serde(default, deserialize_with = "crate::chat::deserialize_text_or_none")]
+        current_location: Option<String>,
     },
 }
 }
@@ -811,6 +825,19 @@ where
             "reasoning_effort must be a string, number, or null",
         )),
     }
+}
+
+/// The date or the location of a root message: the string where the key
+/// holds one, nothing for any other value, so a key of another shape is
+/// dropped as it was before the message read the two keys.
+fn deserialize_text_or_none<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Value::deserialize(deserializer)? {
+        Value::String(text) => Some(text),
+        _ => None,
+    })
 }
 
 // ============================================================================

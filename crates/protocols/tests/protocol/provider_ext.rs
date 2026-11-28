@@ -1207,6 +1207,87 @@ fn minimax_merges_root_parts_and_text_into_one_parts_list() {
     assert_eq!(messages[1]["content"], json!("Be terse"));
 }
 
+/// The date and the location a root message carries for the template's
+/// system slot survive the read and the write; a root without them writes
+/// neither key.
+#[test]
+fn minimax_root_keeps_its_date_and_location() {
+    let request = |root: &Value| {
+        json!({
+            "model": "MiniMax-M3",
+            "messages": [root, {"role": "user", "content": "hi"}]
+        })
+    };
+    let dated = json!({
+        "role": "root",
+        "content": "Answer in French",
+        "current_date": "2026-03-14",
+        "current_location": "Lyon, France"
+    });
+    assert_eq!(roundtrip(request(&dated))["messages"][0], dated);
+    assert_eq!(normalized(request(&dated))["messages"][0], dated);
+
+    let bare = json!({"role": "root", "content": "Answer in French"});
+    assert_eq!(normalized(request(&bare))["messages"][0], bare);
+}
+
+/// Merged roots keep, for the date and for the location, the first one a
+/// root names: a root that names none, or an empty text, does not blank a
+/// later root's.
+#[test]
+fn minimax_merged_roots_keep_the_first_date_and_location() {
+    let merged = normalized(json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {
+                "role": "root",
+                "content": "Answer in French",
+                "current_date": "",
+                "current_location": "Lyon, France"
+            },
+            {"role": "user", "content": "hi"},
+            {
+                "role": "root",
+                "content": "Be brief",
+                "current_date": "2026-03-14",
+                "current_location": "Paris, France"
+            }
+        ]
+    }));
+    assert_eq!(
+        merged["messages"][0],
+        json!({
+            "role": "root",
+            "content": "Answer in French\n\nBe brief",
+            "current_date": "2026-03-14",
+            "current_location": "Lyon, France"
+        })
+    );
+    assert_eq!(merged["messages"][1]["role"], json!("user"));
+}
+
+/// A date or a location that is no string is dropped at the read, as a key
+/// the message does not know is: the request is read, and the root is
+/// written without the two keys.
+#[test]
+fn minimax_root_drops_a_date_or_location_that_is_no_string() {
+    let request = json!({
+        "model": "MiniMax-M3",
+        "messages": [
+            {
+                "role": "root",
+                "content": "Answer in French",
+                "current_date": 20260314,
+                "current_location": {"city": "Lyon"}
+            },
+            {"role": "user", "content": "hi"}
+        ]
+    });
+    let bare = json!({"role": "root", "content": "Answer in French"});
+    assert_eq!(roundtrip(request.clone())["messages"][0], bare);
+    assert_eq!(normalized(request)["messages"][0], bare);
+}
+
 #[test]
 fn kimi_and_openai_reject_root_role() {
     for model in ["kimi-k3", "gpt-4o-mini"] {
