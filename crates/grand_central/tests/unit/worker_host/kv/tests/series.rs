@@ -303,7 +303,7 @@ fn a_batch_that_holds_a_released_state_names_no_series() {
         let (_host, sink) = opened(&f);
         let feed = sink.feeds.lock().get(&f.row).cloned();
         let feed = feed.expect("the stream's feed");
-        let state = sink.applied(f.row, f.row).expect("the row's state");
+        let state = sink.applied(f.row, (f.row, 0)).expect("the row's state");
         sink.removed(f.row);
         let late = wide(1, 32);
         let outcome = sink.admit_under(f.row, (f.row, 0), &feed, state, facts(1), &late);

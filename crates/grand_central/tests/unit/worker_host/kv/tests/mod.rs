@@ -144,7 +144,7 @@ fn begun(sink: &KvAdapter, row: WorkerId) -> bool {
         let own = written.filter(|written| written.stream == row && !written.leaving);
         own.map(|written| Arc::clone(&written.applied))
     };
-    // The state by itself, outside the rows' lock, as the adapter locks it.
+    // The state by itself, outside the rows' lock, as the gauge locks it.
     own.is_some_and(|applied| applied.lock().emptied.is_none())
 }
 
