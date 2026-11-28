@@ -4362,8 +4362,9 @@ selection.
 
 Classic's `least_load` credits the worker it picks among several with the request's work at the
 pick (`decide` in `model_gateway/src/policies/least_load.rs`). The credit stays until a load report
-of that worker sampled behind the pick (a worker keeps its newest 8,192), and classic takes no pick
-back. So a request that is selected and never sent weighs on its worker until that report.
+of that worker sampled behind the pick (a worker's history holds 8,192 entries; a full one folds its
+oldest entry into the one behind it, so a pick past 8,192 keeps its credit), and classic takes no
+pick back. So a request that is selected and never sent weighs on its worker until that report.
 
 The engine's counts of sends take a send at its dispatch (section 6). A request that is never sent
 enters none of them.
