@@ -21,6 +21,17 @@ fn opaque(width: u32, height: u32) -> image::RgbaImage {
     })
 }
 
+/// How many leading pixels of `rgba` the composite copies as stored.
+fn copied(rgba: &image::RgbaImage) -> usize {
+    let (pixels, _) = rgba.as_raw().as_chunks::<4>();
+    opaque_lead(pixels, &mut vec![0_u8; 3 * pixels.len()])
+}
+
+/// The first pixel of the block of the opacity read that holds pixel `at`.
+fn block_of(at: u32) -> usize {
+    usize::try_from(at).expect("a pixel index") / OPAQUE_BLOCK * OPAQUE_BLOCK
+}
+
 #[test]
 fn an_opaque_image_keeps_its_stored_colour() {
     // One pixel, the sizes around one block of the opacity read, several
@@ -38,6 +49,7 @@ fn an_opaque_image_keeps_its_stored_colour() {
             .pixels()
             .flat_map(|px| [px.0[0], px.0[1], px.0[2]])
             .collect();
+        assert_eq!(copied(&rgba), stored.len() / 3, "{width}x{height}");
         let out = composite_over_white(&rgba);
         assert_eq!(out.as_raw(), &stored, "{width}x{height}");
         assert_eq!(out.as_raw(), &expected(&rgba), "{width}x{height}");
@@ -54,6 +66,8 @@ fn one_transparent_pixel_anywhere_reads_the_blend_at_every_pixel() {
         for alpha in [0, 1, 128, 254] {
             let mut rgba = opaque(width, height);
             rgba.get_pixel_mut(at % width, at / width).0[3] = alpha;
+            // The copy stops at the block that holds the pixel.
+            assert_eq!(copied(&rgba), block_of(at), "pixel {at} at alpha {alpha}");
             let out = composite_over_white(&rgba);
             assert_eq!(
                 out.as_raw(),
@@ -82,6 +96,7 @@ fn an_opaque_lead_keeps_its_stored_colour_and_the_rest_reads_the_blend() {
             .flat_map(|px| [px.0[0], px.0[1], px.0[2]])
             .collect();
         let lead = 3 * usize::try_from(first).expect("a pixel index");
+        assert_eq!(copied(&rgba), block_of(first), "the blocks before {first}");
         let out = composite_over_white(&rgba);
         assert_eq!(out.as_raw()[..lead], stored[..lead], "the lead of {first}");
         assert_eq!(out.as_raw(), &expected(&rgba), "transparent from {first}");
