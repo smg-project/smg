@@ -361,10 +361,10 @@ pub fn refuse_unenforceable_constraint(
     }
 }
 
-/// Whether the guidance backend compiles `tag`: it reads a structural tag by
-/// its top-level `structures` and `triggers`, the older vocabulary, and fails
-/// one without both at grammar compile. Text that is no JSON object reads as
-/// a tag it fails.
+/// Whether `tag` has the top-level `structures` and `triggers` the guidance
+/// backend reads a structural tag by: one without both always fails at
+/// grammar compile, one with them is the engine's to judge. Text that is no
+/// JSON object reads as a tag without them.
 fn guidance_reads_structural_tag(tag: &str) -> bool {
     serde_json::from_str::<serde_json::Value>(tag)
         .is_ok_and(|tag| tag.get("structures").is_some() && tag.get("triggers").is_some())
@@ -534,11 +534,11 @@ mod tests {
 
     /// The guidance backend reads a structural tag by its `structures` and
     /// `triggers`: a tag without both, the triggered-tags format among them,
-    /// is refused, naming the backend and the two keys; a tag of the older
-    /// vocabulary passes, and every other backend takes either tag.
+    /// is refused, naming the backend and the two keys; a tag in that
+    /// spelling passes, and every other backend takes either tag.
     #[test]
     fn a_structural_tag_the_guidance_backend_cannot_read_is_refused() {
-        const OLDER: &str = r#"{"type":"structural_tag","structures":[],"triggers":["<w>"]}"#;
+        let by_structures = crate::test_support::structures_call_tag();
         let guidance = StructuredOutputsSupport::from(Pinned(StructuredOutputBackend::Guidance));
         for tag in [
             r#"{"format":{"type":"triggered_tags","triggers":["<w>"],"tags":[]}}"#,
@@ -556,10 +556,10 @@ mod tests {
                 "{tag}: {refused}"
             );
         }
-        let older = Some(ConstraintRef::StructuralTag(OLDER));
-        assert_eq!(refuse_unenforceable_constraint(older, guidance), Ok(()));
+        let read = Some(ConstraintRef::StructuralTag(&by_structures));
+        assert_eq!(refuse_unenforceable_constraint(read, guidance), Ok(()));
         for backend in [Auto, Pinned(StructuredOutputBackend::Xgrammar), Other] {
-            for tag in [OLDER, r#"{"format":{}}"#] {
+            for tag in [by_structures.as_str(), r#"{"format":{}}"#] {
                 let tag_ref = Some(ConstraintRef::StructuralTag(tag));
                 assert_eq!(
                     refuse_unenforceable_constraint(tag_ref, backend.into()),
@@ -625,12 +625,12 @@ mod tests {
                 );
             }
         }
-        // The guidance backend reads a tag of the older vocabulary alone.
-        let older = format!(
+        // The guidance backend reads a tag by its `structures` and `triggers` alone.
+        let by_structures = format!(
             r#"{{"structures":[{{"begin":"<w>","schema":{MULTIPLE_OF},"end":"</w>"}}],"triggers":["<w>"]}}"#
         );
         for (backend, tag) in [
-            (Pinned(StructuredOutputBackend::Guidance), &older),
+            (Pinned(StructuredOutputBackend::Guidance), &by_structures),
             (Other, &tag),
         ] {
             let support = StructuredOutputsSupport::from(backend);

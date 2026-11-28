@@ -3622,8 +3622,8 @@ async fn a_constraint_the_grammar_backend_cannot_enforce_is_refused_before_the_s
 
 /// `llguidance` reads a structural tag by its `structures` and `triggers`:
 /// the triggered-tags format is refused before the scheduler, which would
-/// admit the request and fail it at grammar compile; a tag of the older
-/// vocabulary reaches the scheduler.
+/// admit the request and fail it at grammar compile; a tag in that spelling
+/// reaches the scheduler.
 #[tokio::test]
 async fn a_structural_tag_llguidance_cannot_read_is_refused_before_the_scheduler() {
     use sg::sampling_params::Constraint;
@@ -3655,10 +3655,13 @@ async fn a_structural_tag_llguidance_cannot_read_is_refused_before_the_scheduler
         status.message()
     );
     assert_scheduler_idle(&mut h.engine_in).await;
-    let older = r#"{"type":"structural_tag","structures":[],"triggers":["<w>"]}"#;
+    let by_structures = serde_json::json!({"type": "structural_tag",
+        "structures": [{"begin": "<w>", "schema": {"type": "object"}, "end": "</w>"}],
+        "triggers": ["<w>"]})
+    .to_string();
     let _stream = h
         .client
-        .generate(tagged("t2", older))
+        .generate(tagged("t2", &by_structures))
         .await
         .expect("generate")
         .into_inner();

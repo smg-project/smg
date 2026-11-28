@@ -766,14 +766,21 @@ the grammar xgrammar compiles), but it cannot run xgrammar's parser, so a regex
 or grammar that only guidance accepts fails that request at the engine's
 grammar compile instead of falling back. Pin `guidance` (or `xgrammar`)
 explicitly when that matters; the engine keeps the backend of its first
-structured request either way, as it does behind vLLM's own frontend.
+structured request either way, as it does behind vLLM's own frontend. A pinned
+`guidance` serves no tool call the gateway constrains by a structural tag (see
+the refusals below).
 
 A constraint the engine's backend cannot enforce is refused before the engine,
 the same way on every Rust servicer: a JSON-schema feature xgrammar drops
 (`multipleOf`, `uniqueItems`, a string `format` it lacks, ...) wherever
 xgrammar is the backend, whether the schema is a `response_format`'s or inside
 a forced tool call's structural tag; every kind of constraint on an engine with
-no grammar backend; a kind the backend does not compile. A structural tag that
+no grammar backend; a kind the backend does not compile; a structural tag
+without top-level `structures` and `triggers` where guidance is the backend
+(`guidance` pinned on vLLM, `llguidance` on SGLang), which reads a tag by those
+two keys alone. The gateway writes a tool call's tag under a `format` key, so
+under that backend a tool call it constrains by a tag (`tool_choice` `required`
+or a named function, for one) is refused, not served. A structural tag that
 holds nothing but a JSON answer's schema goes to the engine as that schema
 where the backend is pinned to another name than `xgrammar`, or compiles a
 JSON schema and no structural tag. The vLLM servicer
@@ -1285,9 +1292,11 @@ enforce before the scheduler, as the vLLM servicer does: every kind under
 `none` (the scheduler itself would admit the request and abort it with a 400),
 an EBNF grammar or a structural tag under `outlines`, which compiles JSON
 schemas and regular expressions only (a tag that holds nothing but a JSON
-answer's schema goes to it as that schema), and a JSON-schema feature xgrammar
-drops under `xgrammar`; a backend it does not know (a plugin of the
-scheduler's) is left to the engine.
+answer's schema goes to it as that schema), a structural tag without
+top-level `structures` and `triggers` under `llguidance`, which reads a tag by
+those two keys alone (so it serves no tool call the gateway constrains by a
+tag), and a JSON-schema feature xgrammar drops under `xgrammar`; a backend it
+does not know (a plugin of the scheduler's) is left to the engine.
 
 The Rust servicer's launcher also writes the `structural_tag_vocabulary` key
 (`older`) when the xgrammar installed beside the engine predates the

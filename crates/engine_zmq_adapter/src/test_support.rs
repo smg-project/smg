@@ -44,9 +44,10 @@ pub(crate) fn call_tag() -> String {
     )
 }
 
-/// The same call in the older vocabulary, a tag by its `structures` and
-/// `triggers`: the one the guidance backend reads.
-pub(crate) fn older_call_tag() -> String {
+/// A forced call as a tag by its `structures` and `triggers`, the spelling
+/// the guidance backend reads: one tool, any JSON object between the
+/// template's tags.
+pub(crate) fn structures_call_tag() -> String {
     serde_json::json!({"type": "structural_tag",
         "structures": [{"begin": "<tool_call>", "schema": {"type": "object"},
                         "end": "</tool_call>"}],

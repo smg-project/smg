@@ -2101,8 +2101,8 @@ async fn structured_output_backend_follows_the_launcher_config() {
 
 /// `guidance` reads a structural tag by its `structures` and `triggers`: the
 /// triggered-tags format is refused before the engine, which would admit the
-/// request and fail it at grammar compile; a tag of the older vocabulary
-/// still goes to the engine under the configured backend.
+/// request and fail it at grammar compile; a tag in that spelling still goes
+/// to the engine under the configured backend.
 #[tokio::test]
 async fn a_structural_tag_guidance_cannot_read_is_refused_before_the_engine() {
     use vllm::sampling_params::Constraint;
@@ -2130,15 +2130,15 @@ async fn a_structural_tag_guidance_cannot_read_is_refused_before_the_engine() {
         "{}",
         status.message()
     );
-    // Nothing refused reached the engine: its next request is the older tag.
-    let older = serde_json::json!({"type": "structural_tag",
+    // Nothing refused reached the engine: its next request is a tag that backend reads.
+    let by_structures = serde_json::json!({"type": "structural_tag",
         "structures": [{"begin": "<tool_call>", "schema": {"type": "object"},
                         "end": "</tool_call>"}],
         "triggers": ["<tool_call>"]})
     .to_string();
     let mut request = generate_request("tag2", true, Vec::new());
     request.sampling_params.as_mut().unwrap().constraint =
-        Some(Constraint::StructuralTag(older.clone()));
+        Some(Constraint::StructuralTag(by_structures.clone()));
     let _stream = h
         .client
         .generate(request)
@@ -2154,7 +2154,7 @@ async fn a_structural_tag_guidance_cannot_read_is_refused_before_the_engine() {
     assert_eq!(structured.backend, StructuredOutputBackend::Guidance);
     assert_eq!(
         structured.constraint,
-        StructuredOutputConstraint::StructuralTag(older)
+        StructuredOutputConstraint::StructuralTag(by_structures)
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
