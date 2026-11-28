@@ -28,13 +28,13 @@
     dead_code,
     reason = "this binary reads the admin pages alone; the other helpers are the listeners' tests'"
 )]
-#[path = "common/net.rs"]
+#[path = "../common/net.rs"]
 mod net;
 #[expect(
     dead_code,
     reason = "the replicas over a Lease object are the Kubernetes cell's"
 )]
-#[path = "common/replicas.rs"]
+#[path = "../common/replicas.rs"]
 mod replicas;
 
 use std::{
