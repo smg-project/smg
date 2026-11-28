@@ -34,6 +34,7 @@ grpc:
           - 'crates/worker/proto/**/*'
           - 'grpc_servicer/**/*'
           - 'model_gateway/src/routers/grpc/**/*'
+          - 'model_gateway/tests/unit/routers/grpc/**/*'
 
 mcp:
   - changed-files:
@@ -64,6 +65,7 @@ wasm:
       - any-glob-to-any-file:
           - 'crates/wasm/**/*'
           - 'model_gateway/src/wasm/**/*'
+          - 'model_gateway/tests/unit/wasm/**/*'
 
 auth:
   - changed-files:
