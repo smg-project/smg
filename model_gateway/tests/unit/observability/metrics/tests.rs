@@ -121,7 +121,7 @@ impl Shadowing {
                 inputs,
                 Stated::nothing,
             );
-            assert!(placed.is_some(), "the one worker is selectable");
+            assert!(placed.is_ok(), "the one worker is selectable");
         }
     }
 }
@@ -364,7 +364,7 @@ impl Faulty {
             inputs,
             Stated::nothing,
         );
-        placed.is_some()
+        placed.is_ok()
     }
 
     /// One poll of the engine's own task: its first upkeep runs at that

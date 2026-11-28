@@ -364,9 +364,11 @@ impl Bed {
                     PlacementFailure::PolicyDeclined(_) => "declined",
                     PlacementFailure::NoCompatiblePair { .. } => "other",
                     // The recorder starts no Grand Central, so no row of
-                    // its sheet records this refusal. It has its name all
-                    // the same, as in the encode pairs' recorder.
+                    // its sheet records these refusals. Each has its name
+                    // all the same, as in the encode pairs' recorder.
                     PlacementFailure::NoPlanBound(_) => "no_plan_bound",
+                    PlacementFailure::DecisionFailed(_) => "decision_failed",
+                    PlacementFailure::ShedUnder(_) => "shed_under",
                 },
             },
         }

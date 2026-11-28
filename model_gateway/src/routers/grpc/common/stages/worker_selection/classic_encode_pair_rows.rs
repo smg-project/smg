@@ -355,6 +355,8 @@ fn refusal(failure: EpdSelectionFailure) -> Answer {
                 PlacementFailure::NoCompatiblePair { .. } => "no_compatible_pair",
                 PlacementFailure::PrefillAtCapacity => "at_capacity",
                 PlacementFailure::NoPlanBound(_) => "no_plan_bound",
+                PlacementFailure::DecisionFailed(_) => "decision_failed",
+                PlacementFailure::ShedUnder(_) => "shed_under",
             }),
         },
     }

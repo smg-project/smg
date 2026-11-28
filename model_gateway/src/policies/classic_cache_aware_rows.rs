@@ -381,7 +381,7 @@ impl Bed {
             placement::Stated::nothing,
         );
         let place = match picked {
-            Some(worker) => {
+            Ok(worker) => {
                 let place = self
                     .workers
                     .iter()
@@ -390,12 +390,13 @@ impl Bed {
                 worker.increment_load();
                 place
             }
-            None => {
+            Err(miss) => {
                 let failure = placement::single_failure(
                     &self.registry,
                     MODEL,
                     RoutingPool::HttpRegular,
                     None,
+                    miss,
                 );
                 match failure {
                     PlacementFailure::AllOverloaded(_) => self.workers.len(),

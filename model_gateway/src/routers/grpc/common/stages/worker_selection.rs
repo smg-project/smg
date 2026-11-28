@@ -648,13 +648,14 @@ impl WorkerSelectionStage {
                     wire,
                     &[],
                 ) {
-                    Some(w) => (WorkerSelection::Single { worker: w }, None),
-                    None => {
+                    Ok(w) => (WorkerSelection::Single { worker: w }, None),
+                    Err(miss) => {
                         return Err(self.context_selection_failure(
                             model_id,
                             wire,
                             media,
                             context_requirements,
+                            miss,
                         ));
                     }
                 }
@@ -892,13 +893,14 @@ impl WorkerSelectionStage {
                     wire,
                     &ctx.tried,
                 ) {
-                    Some(w) => WorkerSelection::Single { worker: w },
-                    None => {
+                    Ok(w) => WorkerSelection::Single { worker: w },
+                    Err(miss) => {
                         return Err(self.context_selection_failure(
                             model_id,
                             wire,
                             media,
                             context_requirements,
+                            miss,
                         ))
                     }
                 }
@@ -1799,13 +1801,17 @@ impl WorkerSelectionStage {
     }
 
     /// Judge capacity over the same wire and media candidates, before health.
-    /// A sufficiently large but unavailable worker yields 503, never a false 400.
+    /// A sufficiently large but unavailable worker never yields a false 400.
+    /// A request's own 400, for its media or its context, keeps its rank
+    /// ahead of what the placement said of the miss (`miss`), which is
+    /// judged with the fitting workers ([`placement::miss_failure`]).
     fn context_selection_failure(
         &self,
         model_id: &str,
         wire: Option<WireConstraint>,
         media: MediaDemands,
         context: ContextRequirements,
+        miss: placement::SingleMiss,
     ) -> Response {
         let media = media.with_wire(wire);
         let capable = self.capable_regular(model_id, wire, media);
@@ -1820,12 +1826,19 @@ impl WorkerSelectionStage {
             .filter(|worker| context.admits(worker.as_ref(), model_id))
             .cloned()
             .collect();
-        match placement::failure_from(
+        match placement::miss_failure(
+            miss,
             &fitting,
             model_id,
             self.worker_registry.overload_shed_enabled(),
         ) {
-            PlacementFailure::AllOverloaded(shed) => shed,
+            PlacementFailure::AllOverloaded(refusal)
+            | PlacementFailure::NoPlanBound(refusal)
+            | PlacementFailure::DecisionFailed(refusal) => refusal,
+            // The client's words stay, and the line names the engine's word.
+            PlacementFailure::ShedUnder(name) => {
+                Self::workers_unavailable_because(model_id, placement::shed_under(name, None))
+            }
             _ => Self::workers_unavailable(model_id),
         }
     }
@@ -1859,12 +1872,16 @@ impl WorkerSelectionStage {
         for role in roles {
             let verdict = match role {
                 // The regular role is judged from exactly the pool the shared
-                // placement drew from.
+                // placement drew from. What a placement said of its miss is
+                // judged where the regular mode answers it
+                // (`context_selection_failure`): this verdict is of a pool
+                // nobody capable is in.
                 WorkerType::Regular => placement::single_failure(
                     &self.worker_registry,
                     model_id,
                     role_pool(WorkerType::Regular),
                     wire,
+                    placement::SingleMiss::UNSAID,
                 ),
                 WorkerType::Prefill | WorkerType::Decode | WorkerType::Encode => {
                     self.disaggregated_role_verdict(model_id, role_pool(*role), wire)
@@ -1872,8 +1889,10 @@ impl WorkerSelectionStage {
             };
             match verdict {
                 PlacementFailure::AllOverloaded(refusal)
-                | PlacementFailure::NoPlanBound(refusal) => return refusal,
+                | PlacementFailure::NoPlanBound(refusal)
+                | PlacementFailure::DecisionFailed(refusal) => return refusal,
                 PlacementFailure::Unavailable
+                | PlacementFailure::ShedUnder(_)
                 | PlacementFailure::PolicyDeclined(_)
                 | PlacementFailure::NoCompatiblePair { .. }
                 | PlacementFailure::PrefillAtCapacity => {
@@ -1960,8 +1979,10 @@ impl WorkerSelectionStage {
                 self.worker_registry.overload_shed_enabled(),
             ) {
                 PlacementFailure::AllOverloaded(refusal)
-                | PlacementFailure::NoPlanBound(refusal) => return refusal,
+                | PlacementFailure::NoPlanBound(refusal)
+                | PlacementFailure::DecisionFailed(refusal) => return refusal,
                 PlacementFailure::Unavailable
+                | PlacementFailure::ShedUnder(_)
                 | PlacementFailure::PolicyDeclined(_)
                 | PlacementFailure::NoCompatiblePair { .. }
                 | PlacementFailure::PrefillAtCapacity => unavailable = true,
@@ -2198,13 +2219,19 @@ impl WorkerSelectionStage {
     /// the missing role), and a role whose workers are all unavailable is the
     /// 503 the HTTP router gives.
     fn pair_failure(&self, model_id: &str, failure: PairFailure) -> Response {
-        let role = pair_role(failure.role).map_or("worker", role_name);
+        let side = pair_role(failure.role).map(role_name);
+        let role = side.unwrap_or("worker");
         match failure.verdict {
             // Each was built where it was judged.
-            PlacementFailure::AllOverloaded(refusal) | PlacementFailure::NoPlanBound(refusal) => {
-                refusal
-            }
+            PlacementFailure::AllOverloaded(refusal)
+            | PlacementFailure::NoPlanBound(refusal)
+            | PlacementFailure::DecisionFailed(refusal) => refusal,
             PlacementFailure::Unavailable => Self::workers_unavailable(model_id),
+            // The client reads the 503's usual message; the line names the
+            // engine's word, and the side the answer is for.
+            PlacementFailure::ShedUnder(name) => {
+                Self::workers_unavailable_because(model_id, placement::shed_under(name, side))
+            }
             // The client reads the 503's usual message; the line names the
             // policy and the role, as the HTTP PD router's does. Under Grand
             // Central the name is the engine's, and a decline that names no
@@ -2316,7 +2343,7 @@ impl WorkerSelectionStage {
         cache_namespace: Option<CacheNamespace>,
         wire: Option<WireConstraint>,
         tried: &[String],
-    ) -> Option<Placed> {
+    ) -> Result<Placed, placement::SingleMiss> {
         let snapshot = self.worker_registry.get_routing_snapshot(model_id);
         // What the pool's windows leave of the demand narrows the candidates.
         // The demand as the request states it keeps the budget Grand
@@ -2381,6 +2408,7 @@ impl WorkerSelectionStage {
             &[],
             placement::Stated::nothing,
         )
+        .ok()
         .map(Placed::into_worker)
     }
 
@@ -2409,7 +2437,7 @@ impl WorkerSelectionStage {
         candidate_filter: Option<CandidateFilter<'_>>,
         tried: &[String],
         stated: impl FnOnce() -> placement::Stated,
-    ) -> Option<Placed> {
+    ) -> Result<Placed, placement::SingleMiss> {
         // A retry pins the retained wire, and with it the media pin and the
         // pipeline pin, on top of whatever the caller excludes.
         let pipeline = wire.map_or(PipelinePin::Any, |w| w.pipeline);
@@ -3078,6 +3106,7 @@ impl SelectionBench {
                 None,
                 &[],
             )
+            .ok()
             .map(Placed::into_worker)
     }
 
@@ -3128,6 +3157,7 @@ mod tests {
         routers::{
             common::{
                 attempt_ledger::{mark_upstream_answer, AttemptLedger},
+                placement::tests::Refusing,
                 prefill_admission::{
                     test_support::select_worker, PrefillLoadGuard, PrefillReservation,
                 },
@@ -9680,6 +9710,204 @@ mod tests {
             errors.load(Ordering::Relaxed),
             0,
             "a refusal is not an error of the gateway"
+        );
+    }
+
+    /// The refusal of one generate request for `test-model` by a stage in
+    /// `mode` over `workers`, with the engine on under a policy spec that
+    /// refuses so: a single request in the regular mode, a pair in the
+    /// pair's.
+    async fn refused_by_the_engine(
+        mode: WorkerSelectionMode,
+        refusing: Refusing,
+        workers: &[Arc<dyn Worker>],
+    ) -> Response {
+        let registry = Arc::new(WorkerRegistry::new());
+        for worker in workers {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+        let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        match mode {
+            WorkerSelectionMode::Regular => refusing.single_on(&policies),
+            WorkerSelectionMode::PrefillDecode | WorkerSelectionMode::EncodePrefillDecode => {
+                refusing.pair_on(&policies);
+            }
+        }
+        let policies = Arc::new(policies);
+        let stage = WorkerSelectionStage::new(Arc::clone(&registry), policies, mode, None);
+        let mut ctx = prepared_ctx(registry, None);
+        stage
+            .execute(&mut ctx)
+            .await
+            .expect_err("the engine places nobody")
+    }
+
+    /// What the stage's entry point answers a single request by the
+    /// engine's word, on a pool whose one worker is open. A model that the
+    /// policy spec in force binds no single-request plan for is refused
+    /// with a 501 under the cause's own code. A decision the engine refuses
+    /// is a 500 under its own code. Neither carries a retry hint, and the
+    /// retry layer replays neither. Judged from the pool, each read as
+    /// every worker unavailable, with a retry hint. A filter of the spec
+    /// that keeps nobody still reads so, and the refusal's line names the
+    /// filter. A model nobody serves keeps its 404 under each spec, as the
+    /// gateway's own selection answers it (`failure_from`, in
+    /// `model_gateway/src/routers/common/placement.rs`). So does the 400
+    /// of a request that no worker's window holds (`unheld_by`, in this
+    /// file). For the 501 and the 500 the gateway's own selection has no
+    /// like case: it reads no spec, and it has no engine to refuse. A
+    /// policy of its own that picks nobody reads as unavailable on this
+    /// route (`context_selection_failure`, in this file), and names
+    /// nothing.
+    #[tokio::test]
+    async fn the_stage_answers_a_single_request_by_the_engines_word() {
+        let regular = WorkerSelectionMode::Regular;
+        let open = [regular_worker(
+            "grpc://127.0.0.1:8770",
+            "test-model",
+            UNLABELED,
+        )];
+
+        let unbound = refused_by_the_engine(regular, Refusing::Unbound, &open).await;
+        assert_eq!(unbound.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&unbound),
+            placement::NO_PLAN_BOUND_CODE
+        );
+        assert_eq!(
+            placement::refusal_reason(&unbound),
+            Some("the policy spec in force binds no single-request plan for model 'test-model'")
+        );
+        assert!(
+            unbound.extensions().get::<ReportedRefusal>().is_some(),
+            "written under the allowance, as a pair's is"
+        );
+
+        let faulted = refused_by_the_engine(regular, Refusing::Faulted, &open).await;
+        assert_eq!(faulted.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error::extract_error_code_from_response(&faulted),
+            placement::DECISION_FAILED_CODE
+        );
+        for refused in [&unbound, &faulted] {
+            assert_eq!(retry_after(refused), None);
+            assert!(!is_retryable_response(refused));
+        }
+
+        let nobody = refused_by_the_engine(regular, Refusing::Nobody, &open).await;
+        assert_eq!(nobody.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&nobody),
+            placement::NO_AVAILABLE_WORKERS_CODE
+        );
+        assert_eq!(retry_after(&nobody), Some("1"));
+        assert_eq!(
+            placement::refusal_reason(&nobody),
+            Some("Grand Central shed the request under nobody")
+        );
+
+        // A request's own 400 keeps its rank ahead of the engine's word: the
+        // one worker's window holds no request of three tokens.
+        let narrow: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:8771")
+                .models(vec![ModelCard::new("test-model").with_context_length(1)])
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(no_health_check())
+                .build(),
+        );
+        for refusing in [Refusing::Unbound, Refusing::Faulted, Refusing::Nobody] {
+            let unserved = refused_by_the_engine(regular, refusing, &[]).await;
+            assert_eq!(unserved.status(), StatusCode::NOT_FOUND, "{refusing:?}");
+            let unheld = refused_by_the_engine(regular, refusing, &[Arc::clone(&narrow)]).await;
+            assert_eq!(unheld.status(), StatusCode::BAD_REQUEST, "{refusing:?}");
+            assert_eq!(
+                error::extract_error_code_from_response(&unheld),
+                "context_length_exceeded"
+            );
+        }
+    }
+
+    /// A retry's re-selection answers by the engine's word as the entry
+    /// point does, by an argument of its own: a decision the engine refuses
+    /// there is the 500, and a model no single-request plan binds is the
+    /// 501. Judged from the pool, each read as every worker unavailable.
+    /// The gateway's own selection has no like case for either.
+    #[tokio::test]
+    async fn a_retrys_reselection_answers_by_the_engines_word() {
+        let model_id = "reselected-model";
+        let refused = |refusing: Refusing| async move {
+            let registry = Arc::new(WorkerRegistry::new());
+            let open = BasicWorkerBuilder::new("grpc://127.0.0.1:9320")
+                .model(ModelCard::new(model_id))
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(RuntimeType::Vllm)
+                .health_config(no_health_check())
+                .build();
+            registry.register(Arc::new(open)).unwrap();
+            let policies = PolicyRegistry::new(PolicyConfig::RoundRobin);
+            refusing.single_on(&policies);
+            let regular = WorkerSelectionMode::Regular;
+            let stage = WorkerSelectionStage::new(registry, Arc::new(policies), regular, None);
+            let mut ctx = dispatch_ctx(model_id, grpc_wire(RuntimeType::Vllm));
+            stage
+                .reselect(&mut ctx, &retained_plan(&[1, 2, 3]))
+                .await
+                .expect_err("the engine places nobody")
+        };
+
+        let faulted = refused(Refusing::Faulted).await;
+        assert_eq!(faulted.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error::extract_error_code_from_response(&faulted),
+            placement::DECISION_FAILED_CODE
+        );
+        let unbound = refused(Refusing::Unbound).await;
+        assert_eq!(unbound.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            error::extract_error_code_from_response(&unbound),
+            placement::NO_PLAN_BOUND_CODE
+        );
+    }
+
+    /// What the stage's entry point answers a pair by the engine's word,
+    /// on a fleet whose every worker is open. A pair's decision the engine
+    /// refuses is the 500 a single request's is, with no retry hint, and
+    /// the retry layer does not replay it: judged from the pools, the
+    /// decode's role read as unavailable, with a retry hint. A filter that
+    /// keeps no prefill reads as unavailable, and the refusal's line names
+    /// the filter and the side. The gateway's own pair selection has no
+    /// like case for the first: it has no engine to refuse. For the second
+    /// it names a policy that picked nobody (`pair_pass`, in
+    /// `model_gateway/src/routers/common/placement.rs`), and no stage: it
+    /// has none.
+    #[tokio::test]
+    async fn the_stage_answers_a_pair_by_the_engines_word() {
+        let mode = WorkerSelectionMode::PrefillDecode;
+        let pair = [
+            worker("grpc://127.0.0.1:8000", WorkerType::Prefill),
+            worker("grpc://127.0.0.1:8100", WorkerType::Decode),
+        ];
+
+        let faulted = refused_by_the_engine(mode, Refusing::Faulted, &pair).await;
+        assert_eq!(faulted.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            error::extract_error_code_from_response(&faulted),
+            placement::DECISION_FAILED_CODE
+        );
+        assert_eq!(retry_after(&faulted), None);
+        assert!(!is_retryable_response(&faulted));
+
+        let nobody = refused_by_the_engine(mode, Refusing::Nobody, &pair).await;
+        assert_eq!(nobody.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error::extract_error_code_from_response(&nobody),
+            placement::NO_AVAILABLE_WORKERS_CODE
+        );
+        assert_eq!(
+            placement::refusal_reason(&nobody),
+            Some("Grand Central shed the pair under nobody, answered for its prefill side")
         );
     }
 
