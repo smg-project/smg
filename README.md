@@ -113,6 +113,41 @@ Full documentation lives at **[lightseek.org/smg](https://lightseek.org/smg/)**.
 | [API Reference](https://lightseek.org/smg/reference/api/openai) | OpenAI-compatible endpoints |
 | [Kubernetes Setup](https://lightseek.org/smg/getting-started/service-discovery) | In-cluster discovery and production setup |
 
+### Responses WebSockets
+
+Set `--enable-responses-websocket` on the gateway to enable authenticated
+`GET /v1/responses` upgrades. The Python launcher accepts the same flag, and
+`RouterArgs(enable_responses_websocket=True)` enables it when embedding the
+gateway. For the Helm chart, pass the flag in `router.extraArgs`.
+
+Send a gateway API key as `Authorization: Bearer <key>`. If an upgrade sends an
+`Origin` header, that origin must appear explicitly in the gateway's CORS
+allowlist. The wildcard does not permit browser upgrades. Browser WebSocket
+clients need a trusted proxy that authenticates the browser and adds the
+gateway bearer header. Use TLS at the gateway or at the proxy.
+
+A session handles one `response.create` at a time. Set `store: false` or omit
+`store`. `previous_response_id` refers to a recent response on the same socket.
+After reconnecting or losing an entry to eviction, resend the full input.
+Each continuation replays client input and prior model output through the
+current request hooks, just as sending the full transcript would.
+`generate: false` accepts context and returns a typed response without
+dispatching inference. For a model absent from its registry, the gateway first
+checks the model inventory of OpenAI-compatible workers. Background responses,
+conversation-backed requests, and multiplexed `stream_id` requests are refused.
+
+A listener accepts up to 32 Responses sockets, with up to four per authenticated
+tenant. A frame or expanded request is limited to the smaller of 4 MiB and the
+configured HTTP payload limit. History keeps up to four responses per socket.
+Its accounting limits are 16 MiB per socket and 128 MiB per process. The
+cache stores compact JSON and charges three times the transcript and response ID
+size. The gateway sends a
+WebSocket ping every 15 seconds, including while a worker is quiet. Set proxy
+idle timeouts above that interval. Control frames do not renew the session's
+15-minute wait for the next turn, and every connection expires after one hour.
+During shutdown, idle sockets receive close code 1012, and active responses can
+finish within the gateway's shutdown grace period.
+
 ## Contributing
 
 We welcome contributions! See the [Contributing Guide](https://lightseek.org/smg/contributing) for details.

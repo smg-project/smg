@@ -580,6 +580,7 @@ struct Router {
     drain_settle_secs: u64,
     enable_igw: bool,
     enable_mesh: bool,
+    enable_responses_websocket: bool,
     enable_rl: bool,
     enable_trace: bool,
     enable_wasm: bool,
@@ -1551,6 +1552,7 @@ impl Router {
             .grand_central(grand_central)
             .maybe_policy_spec_path(self.policy_spec.as_ref())
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
+            .enable_responses_websocket(self.enable_responses_websocket)
             .enable_wasm(self.enable_wasm)
             .dp_aware(self.dp_aware)
             .engine_metrics(self.engine_metrics)
@@ -1671,6 +1673,7 @@ impl Router {
         drain_settle_secs = 5,
         enable_igw = false,
         enable_mesh = false,
+        enable_responses_websocket = false,
         enable_rl = false,
         enable_trace = false,
         enable_wasm = false,
@@ -1902,6 +1905,7 @@ impl Router {
         drain_settle_secs: u64,
         enable_igw: bool,
         enable_mesh: bool,
+        enable_responses_websocket: bool,
         enable_rl: bool,
         enable_trace: bool,
         enable_wasm: bool,
@@ -2184,6 +2188,7 @@ impl Router {
             drain_settle_secs,
             enable_igw,
             enable_mesh,
+            enable_responses_websocket,
             enable_rl,
             enable_trace,
             enable_wasm,
